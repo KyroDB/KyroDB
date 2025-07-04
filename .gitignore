@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+/**/target/
+
+# Rust/Cargo
+**/*.rs.bk
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs and temp files
+*.log
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env

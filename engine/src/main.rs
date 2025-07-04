@@ -1,5 +1,8 @@
+// engine/src/main.rs
+
 use clap::{Parser, Subcommand};
-use tokio::signal;
+use ngdb_engine::{EventLog}; // adjust crate name if needed
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "ngdb-engine", about = "NextGen-DB Engine")]
@@ -10,7 +13,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Append an event (JSON) to the log
+    /// Append an event (as a UTF-8 string) to the log
     Append { payload: String },
     /// Replay events from `start` to `end` offsets
     Replay { start: u64, end: Option<u64> },
@@ -21,21 +24,25 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let log = EventLog::new();
 
     match cli.cmd {
         Commands::Append { payload } => {
-            println!("(stub) append: {}", payload);
-            // TODO: call EventLog::append(...)
+            let id = Uuid::new_v4();
+            let result = log.append(id, payload.into_bytes()).await;
+            println!("Appended at offset {}", result.offset);
         }
         Commands::Replay { start, end } => {
-            println!("(stub) replay from {} to {:?}", start, end);
-            // TODO: call EventLog::replay(...)
+            let events = log.replay(start, end).await;
+            for e in events {
+                println!("[{}] {:?}: {}", e.offset, e.request_id, String::from_utf8_lossy(&e.payload));
+            }
         }
         Commands::Subscribe { from } => {
-            println!("(stub) subscribe from {}", from);
-            // TODO: call EventLog::subscribe(...)
-            //       plus handle Ctrl-C via tokio::signal
-            signal::ctrl_c().await?;
+            let events = log.subscribe(from).await;
+            for e in events {
+                println!("[{}] {:?}", e.offset, e.request_id);
+            }
         }
     }
 
