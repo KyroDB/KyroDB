@@ -1,5 +1,5 @@
 
-//! Durable, crash-recoverable Event Log
+//! Durable, crash‑recoverable Event Log with real‑time subscribe.
 
 use anyhow::{Context, Result};
 use bincode::{deserialize_from, serialize_into};
@@ -11,23 +11,24 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 /// A log event
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub offset: u64,
-    pub timestamp: u64, // Unix nanos
+    pub timestamp: u64,    // Unix nanos
     pub request_id: Uuid,
     pub payload: Vec<u8>,
 }
 
-/// WAL‐and‐Snapshot durable log
+/// WAL‑and‑Snapshot durable log with broadcast for live tailing
 pub struct PersistentEventLog {
-    inner: Arc<RwLock<Vec<Event>>>,
-    wal: Arc<RwLock<BufWriter<File>>>,
+    inner:    Arc<RwLock<Vec<Event>>>,
+    wal:      Arc<RwLock<BufWriter<File>>>,
     data_dir: PathBuf,
+    tx:       broadcast::Sender<Event>,
 }
 
 impl PersistentEventLog {
@@ -36,11 +37,10 @@ impl PersistentEventLog {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
 
-        // Snapshot path and WAL path
         let snap_path = data_dir.join("snapshot.bin");
         let wal_path  = data_dir.join("wal.bin");
 
-        // 1) Recover snapshot (if exists)
+        // 1) Load snapshot if it exists
         let mut events: Vec<Event> = if snap_path.exists() {
             let f = File::open(&snap_path).context("opening snapshot")?;
             let mut rdr = BufReader::new(f);
@@ -49,32 +49,34 @@ impl PersistentEventLog {
             Vec::new()
         };
 
-        // 2) Open WAL for append, then replay any entries after snapshot
+        // 2) Open WAL, replay any events after snapshot
         let mut wal_file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(&wal_path)
             .context("opening wal")?;
-        // Seek to start for replay:
-        wal_file.seek(SeekFrom::Start(0)).context("seek wal")?;
+        wal_file.seek(SeekFrom::Start(0)).context("seek wal for replay")?;
         {
             let mut rdr = BufReader::new(&wal_file);
             while let Ok(ev) = deserialize_from::<_, Event>(&mut rdr) {
-                // Only append events beyond snapshot
                 if ev.offset as usize >= events.len() {
                     events.push(ev);
                 }
             }
         }
-        // Now reposition WAL writer at end:
         wal_file.seek(SeekFrom::End(0)).context("seek wal to end")?;
         let wal = Arc::new(RwLock::new(BufWriter::new(wal_file)));
 
+        // 3) Setup broadcast channel
+        let (tx, _) = broadcast::channel(1_024);
+
+        // 4) Build log
         let log = Self {
-            inner: Arc::new(RwLock::new(events)),
+            inner:    Arc::new(RwLock::new(events)),
             wal,
             data_dir,
+            tx,
         };
 
         Ok(log)
@@ -82,7 +84,7 @@ impl PersistentEventLog {
 
     /// Append (durably) and return its offset.
     pub async fn append(&self, request_id: Uuid, payload: Vec<u8>) -> Result<u64> {
-        // 1) In-memory idempotency check
+        // Idempotency check
         {
             let read = self.inner.read().await;
             if let Some(e) = read.iter().find(|e| e.request_id == request_id) {
@@ -90,7 +92,7 @@ impl PersistentEventLog {
             }
         }
 
-        // 2) Build the new event
+        // Build event
         let mut write = self.inner.write().await;
         let offset = write.len() as u64;
         let event = Event {
@@ -100,19 +102,24 @@ impl PersistentEventLog {
             payload,
         };
 
-        // 3) Serialize to WAL and flush
+        // Write to WAL
         {
             let mut w = self.wal.write().await;
             serialize_into(&mut *w, &event).context("writing to wal")?;
             w.flush().context("flushing wal")?;
         }
 
-        // 4) Append in memory
-        write.push(event);
+        // Append in-memory
+        write.push(event.clone());
+
+        // Broadcast to subscribers
+        let _ = self.tx.send(event);
+
         Ok(offset)
     }
 
-    /// Replay events in-memory; this never touches disk.
+    /// Replay events from `start` (inclusive) to `end` (exclusive).  
+    /// If `end` is `None`, replay to the latest.
     pub async fn replay(&self, start: u64, end: Option<u64>) -> Vec<Event> {
         let read = self.inner.read().await;
         let end = end.unwrap_or_else(|| read.len() as u64);
@@ -122,11 +129,22 @@ impl PersistentEventLog {
             .collect()
     }
 
-    /// Force a new full snapshot to disk
+    /// Subscribe to all events ≥ `from_offset`.  
+    /// Returns `(past_events, live_receiver)`.
+    pub async fn subscribe(
+        &self,
+        from_offset: u64,
+    ) -> (Vec<Event>, broadcast::Receiver<Event>) {
+        let past = self.replay(from_offset, None).await;
+        let rx = self.tx.subscribe();
+        (past, rx)
+    }
+
+    /// Force-write a full snapshot to disk.
     pub async fn snapshot(&self) -> Result<()> {
         let path = self.data_dir.join("snapshot.bin");
         let tmp  = self.data_dir.join("snapshot.tmp");
-        // Serialize current state to temp
+
         {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
             let mut w = BufWriter::new(f);
@@ -134,13 +152,49 @@ impl PersistentEventLog {
             serialize_into(&mut w, &*read).context("writing snapshot")?;
             w.flush().context("flushing snapshot")?;
         }
-        // Atomically rename
+
         std::fs::rename(&tmp, &path).context("renaming snapshot")?;
         Ok(())
     }
 
-    /// Current log length
+    /// Get the next write offset (i.e. current log length).
     pub async fn get_offset(&self) -> u64 {
         self.inner.read().await.len() as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn test_recovery_after_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // 1st run: append two events, snapshot
+        {
+            let log = PersistentEventLog::open(&path).await.unwrap();
+            assert_eq!(log.append(Uuid::new_v4(), b"a".to_vec()).await.unwrap(), 0);
+            assert_eq!(log.append(Uuid::new_v4(), b"b".to_vec()).await.unwrap(), 1);
+            log.snapshot().await.unwrap();
+        }
+
+        // 2nd run: recover and append one more
+        {
+            let log = PersistentEventLog::open(&path).await.unwrap();
+            assert_eq!(log.get_offset().await, 2);
+            assert_eq!(log.append(Uuid::new_v4(), b"c".to_vec()).await.unwrap(), 2);
+        }
+
+        // 3rd run: full replay
+        {
+            let log = PersistentEventLog::open(&path).await.unwrap();
+            let all = log.replay(0, None).await;
+            let payloads: Vec<_> = all.iter().map(|e| e.payload.clone()).collect();
+            assert_eq!(payloads, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        }
     }
 }

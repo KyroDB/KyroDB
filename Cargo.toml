@@ -3,3 +3,6 @@ resolver = "2"
 members = [
     "engine",
 ]
+
+[workspace.dependencies]
+tempfile = "3"
