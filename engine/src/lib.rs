@@ -1,16 +1,12 @@
-
 //! Durable, crash‑recoverable Event Log with real‑time subscribe.
 
 use anyhow::{Context, Result};
 use bincode::{deserialize_from, serialize_into};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, Seek, SeekFrom},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
@@ -97,7 +93,7 @@ impl PersistentEventLog {
         let offset = write.len() as u64;
         let event = Event {
             offset,
-            timestamp: Utc::now().timestamp_nanos() as u64,
+            timestamp: Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
             request_id,
             payload,
         };
