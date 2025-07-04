@@ -1,7 +1,7 @@
 // engine/src/main.rs
 
 use clap::{Parser, Subcommand};
-use ngdb_engine::{EventLog}; // adjust crate name if needed
+use engine::{EventLog}; // adjust crate name if needed
 use uuid::Uuid;
 
 #[derive(Parser)]

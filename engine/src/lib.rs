@@ -49,7 +49,7 @@ impl EventLog {
         let offset = log.len() as u64;
         let event = Event {
             offset,
-            timestamp: Utc::now().timestamp_nanos() as u64,
+            timestamp: Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
             request_id,
             payload,
         };
