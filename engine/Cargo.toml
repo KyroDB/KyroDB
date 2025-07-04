@@ -3,14 +3,17 @@ name = "engine"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "ngdb_engine"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 clap  = { version = "4", features = ["derive"] }
-anyhow = "1.0.98"
-chrono = "0.4"
-uuid = { version = "1", features = ["v4"] }
+uuid  = { version = "1", features = ["serde", "v4"] }
+chrono= { version = "0.4", features = ["serde"] }
 
-[lib]
-name = "engine"
-path = "src/lib.rs"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
 
+anyhow = "1.0"
