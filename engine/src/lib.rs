@@ -20,6 +20,7 @@ pub struct Event {
 }
 
 /// WAL‑and‑Snapshot durable log with broadcast for live tailing
+#[derive(Clone)]
 pub struct PersistentEventLog {
     inner:    Arc<RwLock<Vec<Event>>>,
     wal:      Arc<RwLock<BufWriter<File>>>,

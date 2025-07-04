@@ -12,6 +12,10 @@ tokio = { version = "1", features = ["full"] }
 clap  = { version = "4", features = ["derive"] }
 uuid  = { version = "1", features = ["serde", "v4"] }
 chrono= { version = "0.4", features = ["serde"] }
+warp = "0.3"            # HTTP framework
+serde_json = "1.0"      # for JSON responses
+tokio-stream = { version = "0.1", features = ["sync"] } # to convert broadcast into a Stream
+futures = "0.3"         # for stream combinators
 
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
