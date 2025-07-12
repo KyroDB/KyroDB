@@ -33,7 +33,14 @@ enum Commands {
     /// Tail live events from offset (Ctrl+C to exit)
     Subscribe { from: u64 },
 
-    Serve { host: String, port: u16 },
+    Serve {
+        host: String,
+        port: u16,
+
+        /// Automatically trigger snapshot every N seconds
+        #[arg(long)]
+        auto_snapshot_secs: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -87,7 +94,31 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Serve { host, port } => {
+        Commands::Serve {
+            host,
+            port,
+            auto_snapshot_secs,
+        } => {
+            if let Some(secs) = auto_snapshot_secs {
+                if secs > 0 {
+                    let snapshot_log = log.clone();
+                    tokio::spawn(async move {
+                        println!("📸 Auto-snapshot enabled every {} seconds.", secs);
+                        let mut interval =
+                            tokio::time::interval(tokio::time::Duration::from_secs(secs));
+                        loop {
+                            interval.tick().await;
+                            println!("📸 Kicking off automatic snapshot...");
+                            if let Err(e) = snapshot_log.snapshot().await {
+                                eprintln!("❌ Auto-snapshot failed: {}", e);
+                            } else {
+                                println!("✅ Snapshot complete.");
+                            }
+                        }
+                    });
+                }
+            }
+
             let append_log = log.clone();
             let append_route = warp::path("append")
                 .and(warp::post())
