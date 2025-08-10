@@ -138,6 +138,48 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // --- NEW: Health check endpoint ----------------------------------------------------
+            let health_route = warp::path("health")
+                .and(warp::get())
+                .map(|| warp::reply::json(&serde_json::json!({ "status": "ok" })));
+
+            // --- NEW: Snapshot trigger endpoint -----------------------------------------------
+            let snapshot_log = log.clone();
+            let snapshot_route = warp::path("snapshot")
+                .and(warp::post())
+                .and_then(move || {
+                    let log = snapshot_log.clone();
+                    async move {
+                        if let Err(e) = log.snapshot().await {
+                            eprintln!("❌ Snapshot failed: {}", e);
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            ));
+                        }
+                        Ok::<_, warp::Rejection>(
+                            warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
+                                warp::http::StatusCode::OK,
+                            ),
+                        )
+                    }
+                });
+
+            // --- NEW: Offset endpoint ---------------------------------------------------------
+            let offset_log = log.clone();
+            let offset_route = warp::path("offset")
+                .and(warp::get())
+                .and_then(move || {
+                    let log = offset_log.clone();
+                    async move {
+                        let off = log.get_offset().await;
+                        Ok::<_, warp::Rejection>(
+                            warp::reply::json(&serde_json::json!({ "offset": off })),
+                        )
+                    }
+                });
+
             let replay_log = log.clone();
             let replay_route = warp::path("replay")
                 .and(warp::get())
@@ -195,6 +237,9 @@ async fn main() -> Result<()> {
             let routes = append_route
                 .or(replay_route)
                 .or(subscribe_route)
+                .or(health_route)
+                .or(snapshot_route)
+                .or(offset_route)
                 .with(warp::log("ngdb"));
 
             println!("🚀 Starting server at http://{}:{}", host, port);
