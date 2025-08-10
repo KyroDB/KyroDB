@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -93,7 +94,54 @@ var snapshotCmd = &cobra.Command{
 }
 
 func main() {
-	rootCmd.AddCommand(healthCmd, offsetCmd, snapshotCmd)
+	// sql command: POST /sql {sql: "..."}
+	sqlCmd := &cobra.Command{
+		Use:   "sql",
+		Short: "Execute a simple SQL statement",
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			stmt := args[0]
+			url := fmt.Sprintf("%s/sql", engineAddr)
+			payload := map[string]string{"sql": stmt}
+			body, _ := json.Marshal(payload)
+			client := http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			io.Copy(os.Stdout, resp.Body)
+			fmt.Println()
+		},
+	}
+
+	// lookup command: GET /lookup?key=123
+	lookupCmd := &cobra.Command{
+		Use:   "lookup [key]",
+		Short: "Lookup value by key",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			url := fmt.Sprintf("%s/lookup?key=%s", engineAddr, args[0])
+			client := http.Client{Timeout: 2 * time.Second}
+			resp, err := client.Get(url)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == 200 {
+				io.Copy(os.Stdout, resp.Body)
+				fmt.Println()
+			} else {
+				body, _ := io.ReadAll(resp.Body)
+				fmt.Printf("⚠️  Engine returned %d: %s\n", resp.StatusCode, body)
+				os.Exit(1)
+			}
+		},
+	}
+
+	rootCmd.AddCommand(healthCmd, offsetCmd, snapshotCmd, sqlCmd, lookupCmd)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}

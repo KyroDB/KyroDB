@@ -7,6 +7,7 @@ use ngdb_engine::PersistentEventLog;
 use tokio::signal;
 use uuid::Uuid;
 use warp::Filter;
+mod sql;
 
 #[derive(Parser)]
 #[command(name = "ngdb-engine", about = "NextGen-DB Engine")]
@@ -203,6 +204,62 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // Simple lookup by key: GET /lookup?key=123
+            let lookup_log = log.clone();
+            let lookup_route = warp::path("lookup")
+                .and(warp::get())
+                .and(warp::query::<std::collections::HashMap<String, String>>())
+                .and_then(move |q: std::collections::HashMap<String, String>| {
+                    let log = lookup_log.clone();
+                    async move {
+                        if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
+                            if let Some(offset) = log.lookup_key(k).await {
+                                let evs = log.replay(offset, Some(offset + 1)).await;
+                                if let Some(ev) = evs.into_iter().next() {
+                                    if let Ok(rec) = bincode::deserialize::<ngdb_engine::Record>(&ev.payload) {
+                                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                            "key": rec.key,
+                                            "value": String::from_utf8_lossy(&rec.value)
+                                        })));
+                                    }
+                                }
+                            }
+                        }
+                        Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"not found"})),
+                            warp::http::StatusCode::NOT_FOUND,
+                        ))
+                    }
+                });
+
+            // POST /sql  { sql: "INSERT ..." | "SELECT ..." }
+            let sql_log = log.clone();
+            let sql_route = warp::path("sql")
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = sql_log.clone();
+                    async move {
+                        let stmt = body["sql"].as_str().unwrap_or("");
+                        match sql::execute_sql(&log, stmt).await {
+                            Ok(sql::SqlResponse::Ack { offset }) => Ok::<_, warp::Rejection>(
+                                warp::reply::json(&serde_json::json!({"ack": {"offset": offset}})),
+                            ),
+                            Ok(sql::SqlResponse::Rows(rows)) => {
+                                let resp: Vec<_> = rows.into_iter().map(|(k, v)| serde_json::json!({
+                                    "key": k,
+                                    "value": String::from_utf8_lossy(&v)
+                                })).collect();
+                                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
+                            }
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({"error": e.to_string()})),
+                                warp::http::StatusCode::BAD_REQUEST,
+                            )),
+                        }
+                    }
+                });
+
             let subscribe_log = log.clone();
             let subscribe_route = warp::path("subscribe")
                 .and(warp::get())
@@ -240,6 +297,8 @@ async fn main() -> Result<()> {
                 .or(health_route)
                 .or(snapshot_route)
                 .or(offset_route)
+                .or(lookup_route)
+                .or(sql_route)
                 .with(warp::log("ngdb"));
 
             println!("🚀 Starting server at http://{}:{}", host, port);
