@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Statement, Value};
+use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -19,17 +19,16 @@ pub async fn execute_sql(log: &PersistentEventLog, sql: &str) -> Result<SqlRespo
     }
 
     match &ast[0] {
-        Statement::Insert(insert) => {
+        Statement::Insert { source: Some(source), .. } => {
             // Expect form: INSERT INTO table(key, value) VALUES (123, 'hex:...')
-            let source = insert.source.clone().ok_or_else(|| anyhow!("missing values"))?;
-            let query = match *source.body {
+            let values = match &*source.body {
                 SetExpr::Values(v) => v,
                 _ => return Err(anyhow!("only VALUES supported")),
             };
-            if query.0.is_empty() {
+            if values.rows.is_empty() {
                 return Err(anyhow!("no values"));
             }
-            let row = &query.0[0];
+            let row = &values.rows[0];
             if row.len() < 2 {
                 return Err(anyhow!("need key,value"));
             }
@@ -58,10 +57,6 @@ async fn select_by_key(log: &PersistentEventLog, q: &Box<Query>) -> Result<SqlRe
     let SetExpr::Select(sel) = &**body else {
         return Err(anyhow!("only SELECT supported"));
     };
-
-    // Expect SELECT value FROM table WHERE key = 123
-    let projection = &sel.projection;
-    let _want_value = matches!(projection.as_slice(), [SelectItem::UnnamedExpr(_)] | [SelectItem::Wildcard(_)]);
 
     let mut key_opt: Option<u64> = None;
     if let Some(selection) = &sel.selection {

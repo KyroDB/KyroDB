@@ -225,10 +225,8 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error":"not found"})),
-                            warp::http::StatusCode::NOT_FOUND,
-                        ))
+                        let not_found = serde_json::json!({"error":"not found"});
+                        Ok::<_, warp::Rejection>(warp::reply::json(&not_found))
                     }
                 });
 
@@ -252,10 +250,10 @@ async fn main() -> Result<()> {
                                 })).collect();
                                 Ok::<_, warp::Rejection>(warp::reply::json(&resp))
                             }
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({"error": e.to_string()})),
-                                warp::http::StatusCode::BAD_REQUEST,
-                            )),
+                            Err(e) => {
+                                let err = serde_json::json!({"error": e.to_string()});
+                                Ok::<_, warp::Rejection>(warp::reply::json(&err))
+                            },
                         }
                     }
                 });

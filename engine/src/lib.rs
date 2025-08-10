@@ -183,6 +183,7 @@ impl PersistentEventLog {
     pub async fn snapshot(&self) -> Result<()> {
         let path = self.data_dir.join("snapshot.bin");
         let tmp  = self.data_dir.join("snapshot.tmp");
+        let wal_path = self.data_dir.join("wal.bin");
 
         {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
@@ -193,6 +194,19 @@ impl PersistentEventLog {
         }
 
         std::fs::rename(&tmp, &path).context("renaming snapshot")?;
+
+        // After a successful snapshot, truncate WAL to checkpoint.
+        {
+            let mut wal_writer = self.wal.write().await;
+            wal_writer.flush().context("flush wal before truncate")?;
+            let new_wal = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&wal_path)
+                .context("truncate wal after snapshot")?;
+            *wal_writer = BufWriter::new(new_wal);
+        }
         Ok(())
     }
 

@@ -24,3 +24,4 @@ Thumbs.db
 .env
 
 visiondocument.md
+node_modules/*
