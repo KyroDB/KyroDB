@@ -9,6 +9,8 @@ use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
+mod index;
+pub use index::{BTreeIndex, Index};
 
 /// Current on-disk schema version. Increment when Event/Record layout changes.
 pub const SCHEMA_VERSION: u8 = 1;
@@ -36,6 +38,7 @@ pub struct PersistentEventLog {
     wal:      Arc<RwLock<BufWriter<File>>>,
     data_dir: PathBuf,
     tx:       broadcast::Sender<Event>,
+    index:    Arc<RwLock<index::BTreeIndex>>, // primary key → offset
 }
 
 impl PersistentEventLog {
@@ -79,11 +82,20 @@ impl PersistentEventLog {
         let (tx, _) = broadcast::channel(1_024);
 
         // 4) Build log
+        // Build index from recovered events
+        let mut idx = index::BTreeIndex::new();
+        for ev in &events {
+            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                idx.insert(rec.key, ev.offset);
+            }
+        }
+
         let log = Self {
             inner:    Arc::new(RwLock::new(events)),
             wal,
             data_dir,
             tx,
+            index:   Arc::new(RwLock::new(idx)),
         };
 
         Ok(log)
@@ -120,6 +132,12 @@ impl PersistentEventLog {
         // Append in-memory
         write.push(event.clone());
 
+        // Update index if payload is Record
+        if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
+            let mut idx = self.index.write().await;
+            idx.insert(rec.key, event.offset);
+        }
+
         // Broadcast to subscribers
         let _ = self.tx.send(event);
 
@@ -131,6 +149,12 @@ impl PersistentEventLog {
         let rec = Record { key, value };
         let bytes = bincode::serialize(&rec)?;
         self.append(request_id, bytes).await
+    }
+
+    /// Get offset for a given key if present via index.
+    pub async fn lookup_key(&self, key: u64) -> Option<u64> {
+        let idx = self.index.read().await;
+        idx.get(&key)
     }
 
     /// Replay events from `start` (inclusive) to `end` (exclusive).  
