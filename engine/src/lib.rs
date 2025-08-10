@@ -10,9 +10,19 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
-/// A log event
+/// Current on-disk schema version. Increment when Event/Record layout changes.
+pub const SCHEMA_VERSION: u8 = 1;
+
+/// A key-value record stored as event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    pub key:   u64,
+    pub value: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
+    pub schema_version: u8,
     pub offset: u64,
     pub timestamp: u64,    // Unix nanos
     pub request_id: Uuid,
@@ -93,6 +103,7 @@ impl PersistentEventLog {
         let mut write = self.inner.write().await;
         let offset = write.len() as u64;
         let event = Event {
+            schema_version: SCHEMA_VERSION,
             offset,
             timestamp: Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
             request_id,
@@ -113,6 +124,13 @@ impl PersistentEventLog {
         let _ = self.tx.send(event);
 
         Ok(offset)
+    }
+
+    /// Append a key-value record. Serializes the record with bincode and stores as payload.
+    pub async fn append_kv(&self, request_id: Uuid, key: u64, value: Vec<u8>) -> Result<u64> {
+        let rec = Record { key, value };
+        let bytes = bincode::serialize(&rec)?;
+        self.append(request_id, bytes).await
     }
 
     /// Replay events from `start` (inclusive) to `end` (exclusive).  
