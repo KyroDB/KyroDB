@@ -19,13 +19,20 @@ pub async fn execute_sql(log: &PersistentEventLog, sql: &str) -> Result<SqlRespo
 
     match &ast[0] {
         Statement::CreateTable { name, columns, .. } => {
-            // Very minimal: support CREATE TABLE t (key U64, value BYTES)
+            // Heuristic: if table name ends with _vec or vector keyword appears, treat as vectors with dim from column count-1
             let tbl = name.to_string();
             let mut reg = crate::schema::SchemaRegistry::load(&log.registry_path());
-            reg.upsert_table(crate::schema::TableSchema { name: tbl, kind: crate::schema::TableKind::Kv });
+            if tbl.to_ascii_lowercase().contains("vector") || tbl.ends_with("_vec") {
+                // Expect last column like dim
+                let dim = columns.len().saturating_sub(1).max(1);
+                reg.upsert_table(crate::schema::TableSchema { name: tbl, kind: crate::schema::TableKind::Vectors { dim } });
+            } else {
+                reg.upsert_table(crate::schema::TableSchema { name: tbl, kind: crate::schema::TableKind::Kv });
+            }
             reg.save(&log.registry_path()).map_err(|e| anyhow!(e))?;
             Ok(SqlResponse::Ack { offset: 0 })
         }
+        Statement::CreateView { .. } => Err(anyhow!("views not supported")),
         Statement::Insert { source: Some(source), .. } => {
             let values = match &*source.body { SetExpr::Values(v) => v, _ => return Err(anyhow!("only VALUES supported")) };
             if values.rows.is_empty() { return Err(anyhow!("no values")); }
@@ -42,6 +49,9 @@ pub async fn execute_sql(log: &PersistentEventLog, sql: &str) -> Result<SqlRespo
                 Expr::Array(arr) => {
                     let mut vec: Vec<f32> = Vec::with_capacity(arr.elem.len());
                     for e in &arr.elem { if let Expr::Value(Value::Number(n, _)) = e { vec.push(n.parse::<f32>()?); } }
+                    // Enforce dimension if registry has one
+                    let reg = crate::schema::SchemaRegistry::load(&log.registry_path());
+                    if let Some(dim) = reg.get_default_vectors_dim() { if dim != vec.len() { return Err(anyhow!("vector dim mismatch")); } }
                     let offset = log.append_vector(Uuid::new_v4(), key, vec).await?;
                     Ok(SqlResponse::Ack { offset })
                 }
@@ -72,6 +82,9 @@ async fn select_query(log: &PersistentEventLog, q: &Box<Query>) -> Result<SqlRes
                             }
                             _ => {}
                         }
+                        // Enforce vector dim
+                        let reg = crate::schema::SchemaRegistry::load(&log.registry_path());
+                        if let Some(dim) = reg.get_default_vectors_dim() { if dim != query.len() { return Err(anyhow!("vector dim mismatch")); } }
                         let k = if let Some(lim) = &q.limit {
                             if let Expr::Value(Value::Number(n, _)) = lim { n.parse::<usize>().unwrap_or(10) } else { 10 }
                         } else { 10 };

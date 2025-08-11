@@ -47,4 +47,8 @@ impl SchemaRegistry {
     pub fn get_vectors_dim(&self, name: &str) -> Option<usize> {
         self.tables.get(name).and_then(|t| match &t.kind { TableKind::Vectors { dim } => Some(*dim), _ => None })
     }
+
+    pub fn get_default_vectors_dim(&self) -> Option<usize> {
+        self.tables.values().find_map(|t| match &t.kind { TableKind::Vectors { dim } => Some(*dim), _ => None })
+    }
 }
