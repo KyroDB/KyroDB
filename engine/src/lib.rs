@@ -10,7 +10,7 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 mod index;
-pub use index::{BTreeIndex, Index};
+pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 
 /// Current on-disk schema version. Increment when Event/Record layout changes.
@@ -39,7 +39,7 @@ pub struct PersistentEventLog {
     wal:      Arc<RwLock<BufWriter<File>>>,
     data_dir: PathBuf,
     tx:       broadcast::Sender<Event>,
-    index:    Arc<RwLock<index::BTreeIndex>>, // primary key → offset
+    index:    Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
 }
 
 impl PersistentEventLog {
@@ -102,7 +102,7 @@ impl PersistentEventLog {
 
         // 4) Build log
         // Build index from recovered events
-        let mut idx = index::BTreeIndex::new();
+        let mut idx = index::PrimaryIndex::new_btree();
         for ev in &events {
             if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
                 idx.insert(rec.key, ev.offset);
