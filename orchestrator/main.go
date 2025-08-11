@@ -141,7 +141,93 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(healthCmd, offsetCmd, snapshotCmd, sqlCmd, lookupCmd)
+	// vector-insert: POST /vector/insert
+	vecInsertCmd := &cobra.Command{
+		Use:   "vector-insert [key] [comma-separated-floats]",
+		Short: "Insert a vector",
+		Args:  cobra.ExactArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			key := args[0]
+			query := args[1]
+			url := fmt.Sprintf("%s/vector/insert", engineAddr)
+			// parse floats client-side
+			vals := []float64{}
+			for _, s := range bytes.Split([]byte(query), []byte(",")) {
+				if len(bytes.TrimSpace(s)) == 0 {
+					continue
+				}
+				var f float64
+				if _, err := fmt.Sscan(string(s), &f); err == nil {
+					vals = append(vals, f)
+				}
+			}
+			payload := map[string]interface{}{"key": key, "vector": vals}
+			body, _ := json.Marshal(payload)
+			client := http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			io.Copy(os.Stdout, resp.Body)
+			fmt.Println()
+		},
+	}
+
+	// vector-search: POST /vector/search
+	vecSearchCmd := &cobra.Command{
+		Use:   "vector-search [comma-separated-floats] [k]",
+		Short: "Search nearest vectors",
+		Args:  cobra.ExactArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			query := args[0]
+			var k string = args[1]
+			url := fmt.Sprintf("%s/vector/search", engineAddr)
+			vals := []float64{}
+			for _, s := range bytes.Split([]byte(query), []byte(",")) {
+				if len(bytes.TrimSpace(s)) == 0 {
+					continue
+				}
+				var f float64
+				if _, err := fmt.Sscan(string(s), &f); err == nil {
+					vals = append(vals, f)
+				}
+			}
+			payload := map[string]interface{}{"query": vals, "k": k}
+			body, _ := json.Marshal(payload)
+			client := http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			io.Copy(os.Stdout, resp.Body)
+			fmt.Println()
+		},
+	}
+
+	// rmi-build: POST /rmi/build (if feature enabled)
+	rmiBuildCmd := &cobra.Command{
+		Use:   "rmi-build",
+		Short: "Build the RMI index (if supported)",
+		Run: func(cmd *cobra.Command, args []string) {
+			url := fmt.Sprintf("%s/rmi/build", engineAddr)
+			client := http.Client{Timeout: 10 * time.Second}
+			req, _ := http.NewRequest("POST", url, nil)
+			resp, err := client.Do(req)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
+				os.Exit(1)
+			}
+			defer resp.Body.Close()
+			io.Copy(os.Stdout, resp.Body)
+			fmt.Println()
+		},
+	}
+
+	rootCmd.AddCommand(healthCmd, offsetCmd, snapshotCmd, sqlCmd, lookupCmd, vecInsertCmd, vecSearchCmd, rmiBuildCmd)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
