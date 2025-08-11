@@ -102,14 +102,17 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Sql { stmt } => {
-            match sql::execute_sql(&log, &stmt).await? {
-                sql::SqlResponse::Ack { offset } => {
+            match sql::execute_sql(&log, &stmt).await {
+                Ok(sql::SqlResponse::Ack { offset }) => {
                     println!("ACK offset={}", offset);
                 }
-                sql::SqlResponse::Rows(rows) => {
+                Ok(sql::SqlResponse::Rows(rows)) => {
                     for (k, v) in rows {
                         println!("key={} value={}", k, String::from_utf8_lossy(&v));
                     }
+                }
+                Err(e) => {
+                    eprintln!("SQL Error: {}", e);
                 }
             }
         }
@@ -124,7 +127,11 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                println!("not found");
+                if let Some((off, rec)) = log.find_key_scan(key).await {
+                    println!("key={} value={} (offset={})", rec.key, String::from_utf8_lossy(&rec.value), off);
+                } else {
+                    println!("not found");
+                }
             }
         }
         Commands::Serve {
@@ -270,6 +277,11 @@ async fn main() -> Result<()> {
                                         })));
                                     }
                                 }
+                            } else if let Some((_, rec)) = log.find_key_scan(k).await {
+                                return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                    "key": rec.key,
+                                    "value": String::from_utf8_lossy(&rec.value)
+                                })));
                             }
                         }
                         let not_found = serde_json::json!({"error":"not found"});

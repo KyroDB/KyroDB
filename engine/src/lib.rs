@@ -183,6 +183,19 @@ impl PersistentEventLog {
         idx.get(&key)
     }
 
+    /// Fallback: scan the log to find the first event matching key, returning (offset, Record)
+    pub async fn find_key_scan(&self, key: u64) -> Option<(u64, Record)> {
+        let read = self.inner.read().await;
+        for ev in read.iter() {
+            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                if rec.key == key {
+                    return Some((ev.offset, rec));
+                }
+            }
+        }
+        None
+    }
+
     /// Replay events from `start` (inclusive) to `end` (exclusive).  
     /// If `end` is `None`, replay to the latest.
     pub async fn replay(&self, start: u64, end: Option<u64>) -> Vec<Event> {

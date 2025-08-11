@@ -47,6 +47,9 @@ pub async fn execute_sql(log: &PersistentEventLog, sql: &str) -> Result<SqlRespo
                 .await?;
             Ok(SqlResponse::Ack { offset })
         }
+        Statement::Insert { source: None, .. } => {
+            Err(anyhow!("INSERT missing VALUES clause"))
+        }
         Statement::Query(q) => select_by_key(log, q).await,
         _ => Err(anyhow!("only INSERT and simple SELECT supported")),
     }
