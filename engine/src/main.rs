@@ -258,6 +258,12 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // Metrics endpoint
+            let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
+                let text = crate::metrics::render();
+                warp::reply::with_header(text, "Content-Type", "text/plain; version=0.0.4")
+            });
+
             let subscribe_log = log.clone();
             let subscribe_route = warp::path("subscribe")
                 .and(warp::get())
@@ -297,6 +303,7 @@ async fn main() -> Result<()> {
                 .or(offset_route)
                 .or(lookup_route)
                 .or(sql_route)
+                .or(metrics_route)
                 .with(warp::log("ngdb"));
 
             println!("🚀 Starting server at http://{}:{}", host, port);

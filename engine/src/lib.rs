@@ -11,6 +11,7 @@ use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 mod index;
 pub use index::{BTreeIndex, Index};
+mod metrics;
 
 /// Current on-disk schema version. Increment when Event/Record layout changes.
 pub const SCHEMA_VERSION: u8 = 1;
@@ -103,10 +104,13 @@ impl PersistentEventLog {
 
     /// Append (durably) and return its offset.
     pub async fn append(&self, request_id: Uuid, payload: Vec<u8>) -> Result<u64> {
+        let timer = metrics::APPEND_LATENCY_SECONDS.start_timer();
         // Idempotency check
         {
             let read = self.inner.read().await;
             if let Some(e) = read.iter().find(|e| e.request_id == request_id) {
+                metrics::APPENDS_TOTAL.inc();
+                timer.observe_duration();
                 return Ok(e.offset);
             }
         }
@@ -141,6 +145,8 @@ impl PersistentEventLog {
         // Broadcast to subscribers
         let _ = self.tx.send(event);
 
+        metrics::APPENDS_TOTAL.inc();
+        timer.observe_duration();
         Ok(offset)
     }
 
@@ -181,6 +187,7 @@ impl PersistentEventLog {
 
     /// Force-write a full snapshot to disk.
     pub async fn snapshot(&self) -> Result<()> {
+        let timer = metrics::SNAPSHOT_LATENCY_SECONDS.start_timer();
         let path = self.data_dir.join("snapshot.bin");
         let tmp  = self.data_dir.join("snapshot.tmp");
         let wal_path = self.data_dir.join("wal.bin");
@@ -207,6 +214,8 @@ impl PersistentEventLog {
                 .context("truncate wal after snapshot")?;
             *wal_writer = BufWriter::new(new_wal);
         }
+        metrics::SNAPSHOTS_TOTAL.inc();
+        timer.observe_duration();
         Ok(())
     }
 
