@@ -9,7 +9,7 @@ use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
-mod index;
+pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 pub mod schema;

@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
                 use std::path::PathBuf;
                 let mut p = PathBuf::from(&cli.data_dir);
                 p.push("index-rmi.bin");
-                if index::RmiIndex::write_empty_file(&p).is_ok() {
+                if ngdb_engine::index::RmiIndex::write_empty_file(&p).is_ok() {
                     println!("RMI index written (stub) at {}", p.display());
                 } else {
                     eprintln!("Failed to write RMI index file");
@@ -419,7 +419,7 @@ async fn main() -> Result<()> {
                             tmp.push("index-rmi.tmp");
                             let mut dst = std::path::PathBuf::from(&data_dir);
                             dst.push("index-rmi.bin");
-                            let ok = index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
+                            let ok = ngdb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
                                 && std::fs::rename(&tmp, &dst).is_ok();
                             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                                 "ok": ok,
