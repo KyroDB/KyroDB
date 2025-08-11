@@ -12,6 +12,7 @@ use uuid::Uuid;
 mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
+pub mod schema;
 
 /// Current on-disk schema version. Increment when Event/Record layout changes.
 pub const SCHEMA_VERSION: u8 = 1;
@@ -312,6 +313,11 @@ impl PersistentEventLog {
     /// Get the next write offset (i.e. current log length).
     pub async fn get_offset(&self) -> u64 {
         self.inner.read().await.len() as u64
+    }
+
+    /// Path to the schema registry JSON file.
+    pub fn registry_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("schema.json")
     }
 }
 

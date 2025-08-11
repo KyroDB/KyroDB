@@ -18,6 +18,14 @@ pub async fn execute_sql(log: &PersistentEventLog, sql: &str) -> Result<SqlRespo
     if ast.is_empty() { return Err(anyhow!("empty SQL")); }
 
     match &ast[0] {
+        Statement::CreateTable { name, columns, .. } => {
+            // Very minimal: support CREATE TABLE t (key U64, value BYTES)
+            let tbl = name.to_string();
+            let mut reg = crate::schema::SchemaRegistry::load(&log.registry_path());
+            reg.upsert_table(crate::schema::TableSchema { name: tbl, kind: crate::schema::TableKind::Kv });
+            reg.save(&log.registry_path()).map_err(|e| anyhow!(e))?;
+            Ok(SqlResponse::Ack { offset: 0 })
+        }
         Statement::Insert { source: Some(source), .. } => {
             let values = match &*source.body { SetExpr::Values(v) => v, _ => return Err(anyhow!("only VALUES supported")) };
             if values.rows.is_empty() { return Err(anyhow!("no values")); }
