@@ -407,13 +407,25 @@ async fn main() -> Result<()> {
             #[cfg(feature = "learned-index")]
             let rmi_build = {
                 let data_dir = cli.data_dir.clone();
+                let build_log = log.clone();
                 warp::path!("rmi" / "build")
                     .and(warp::post())
-                    .map(move || {
-                        let mut p = std::path::PathBuf::from(&data_dir);
-                        p.push("index-rmi.bin");
-                        let ok = index::RmiIndex::write_empty_file(&p).is_ok();
-                        warp::reply::json(&serde_json::json!({"ok": ok}))
+                    .and_then(move || {
+                        let log = build_log.clone();
+                        let data_dir = data_dir.clone();
+                        async move {
+                            let pairs = log.collect_key_offset_pairs().await;
+                            let mut tmp = std::path::PathBuf::from(&data_dir);
+                            tmp.push("index-rmi.tmp");
+                            let mut dst = std::path::PathBuf::from(&data_dir);
+                            dst.push("index-rmi.bin");
+                            let ok = index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
+                                && std::fs::rename(&tmp, &dst).is_ok();
+                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "ok": ok,
+                                "count": pairs.len()
+                            })))
+                        }
                     })
             };
 

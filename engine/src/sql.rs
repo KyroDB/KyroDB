@@ -19,12 +19,14 @@ pub async fn execute_sql(log: &PersistentEventLog, sql: &str) -> Result<SqlRespo
 
     match &ast[0] {
         Statement::CreateTable { name, columns, .. } => {
-            // Heuristic: if table name ends with _vec or vector keyword appears, treat as vectors with dim from column count-1
+            // Explicit: CREATE VECTORS v (dim INT) → table name contains vectors and single column dim
             let tbl = name.to_string();
             let mut reg = crate::schema::SchemaRegistry::load(&log.registry_path());
-            if tbl.to_ascii_lowercase().contains("vector") || tbl.ends_with("_vec") {
-                // Expect last column like dim
-                let dim = columns.len().saturating_sub(1).max(1);
+            let lower = tbl.to_ascii_lowercase();
+            if lower == "vectors" || lower.ends_with("_vectors") || lower.contains("vectors") {
+                // Parse first column as dim if present, else error
+                let dim = if let Some(col) = columns.first() { col.name.to_string().parse::<usize>().unwrap_or(0) } else { 0 };
+                if dim == 0 { return Err(anyhow!("CREATE VECTORS requires dim INT as first column")); }
                 reg.upsert_table(crate::schema::TableSchema { name: tbl, kind: crate::schema::TableKind::Vectors { dim } });
             } else {
                 reg.upsert_table(crate::schema::TableSchema { name: tbl, kind: crate::schema::TableKind::Kv });
@@ -88,7 +90,18 @@ async fn select_query(log: &PersistentEventLog, q: &Box<Query>) -> Result<SqlRes
                         let k = if let Some(lim) = &q.limit {
                             if let Expr::Value(Value::Number(n, _)) = lim { n.parse::<usize>().unwrap_or(10) } else { 10 }
                         } else { 10 };
-                        let res = log.search_vector_l2(&query, k).await;
+                        // Detect USING ANN: if selection also includes MODE='ANN'
+                        let mut use_ann = false;
+                        if let Some(selection2) = &sel.selection {
+                            if let Expr::BinaryOp { left: l2, op: op2, right: r2 } = selection2 {
+                                if op2.to_string() == "=" {
+                                    if let (Expr::Identifier(id2), Expr::Value(Value::SingleQuotedString(s))) = (&**l2, &**r2) {
+                                        if id2.value.to_ascii_uppercase() == "MODE" && s.to_ascii_uppercase() == "ANN" { use_ann = true; }
+                                    }
+                                }
+                            }
+                        }
+                        let res = if use_ann { log.search_vector_ann(&query, k).await } else { log.search_vector_l2(&query, k).await };
                         return Ok(SqlResponse::VecRows(res));
                     }
                 }

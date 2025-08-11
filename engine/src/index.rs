@@ -72,6 +72,20 @@ impl RmiIndex {
         f.flush()
     }
 
+    /// Build a trivial RMI file from key→offset pairs (placeholder for real model)
+    pub fn write_from_pairs(path: &std::path::Path, pairs: &[(u64, u64)]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        let mut header = [0u8; 16];
+        header[0..8].copy_from_slice(&RMI_MAGIC);
+        header[8] = 1u8; // version
+        f.write_all(&header)?;
+        // Write count (u64 LE)
+        let count: u64 = pairs.len() as u64;
+        f.write_all(&count.to_le_bytes())?;
+        f.flush()
+    }
+
     pub fn insert_delta(&mut self, key: u64, offset: u64) {
         self.delta.insert(key, offset);
     }

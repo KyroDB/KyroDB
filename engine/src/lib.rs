@@ -252,6 +252,24 @@ impl PersistentEventLog {
         results
     }
 
+    /// Collect latest (key, offset) pairs for all KV records, sorted by key
+    pub async fn collect_key_offset_pairs(&self) -> Vec<(u64, u64)> {
+        use std::collections::BTreeMap;
+        let read = self.inner.read().await;
+        let mut latest: BTreeMap<u64, u64> = BTreeMap::new();
+        for ev in read.iter() {
+            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                latest.insert(rec.key, ev.offset);
+            }
+        }
+        latest.into_iter().collect()
+    }
+
+    /// Placeholder ANN search: currently forwards to exact L2 until ANN backend is integrated
+    pub async fn search_vector_ann(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.search_vector_l2(query, k).await
+    }
+
     /// Replay events from `start` (inclusive) to `end` (exclusive).  
     /// If `end` is `None`, replay to the latest.
     pub async fn replay(&self, start: u64, end: Option<u64>) -> Vec<Event> {
