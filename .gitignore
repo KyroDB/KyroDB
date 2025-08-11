@@ -1,4 +1,3 @@
-ProjectKyro.md
 # Build artifacts
 /target/
 /**/target/
@@ -22,6 +21,15 @@ Thumbs.db
 
 # Environment
 .env
+.env.*.local
 
-visiondocument.md
+# Runtime data
+/data/*.bin
+/engine/data/*.bin
+
+# Local binaries
+/orchestrator/ngdbctl
+
+# Node (not used now but harmless)
 node_modules/*
+
