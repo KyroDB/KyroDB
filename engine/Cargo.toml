@@ -7,6 +7,9 @@ edition = "2021"
 name = "ngdb_engine"
 path = "src/lib.rs"
 
+[features]
+learned-index = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 clap  = { version = "4", features = ["derive"] }

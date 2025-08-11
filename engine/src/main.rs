@@ -117,6 +117,11 @@ async fn main() -> Result<()> {
                         println!("key={} value={}", k, String::from_utf8_lossy(&v));
                     }
                 }
+                Ok(sql::SqlResponse::VecRows(rows)) => {
+                    for (k, d) in rows {
+                        println!("key={} dist={}", k, d);
+                    }
+                }
                 Err(e) => {
                     eprintln!("SQL Error: {}", e);
                 }
@@ -339,6 +344,13 @@ async fn main() -> Result<()> {
                                 let resp: Vec<_> = rows.into_iter().map(|(k, v)| serde_json::json!({
                                     "key": k,
                                     "value": String::from_utf8_lossy(&v)
+                                })).collect();
+                                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
+                            }
+                            Ok(sql::SqlResponse::VecRows(rows)) => {
+                                let resp: Vec<_> = rows.into_iter().map(|(k, d)| serde_json::json!({
+                                    "key": k,
+                                    "dist": d
                                 })).collect();
                                 Ok::<_, warp::Rejection>(warp::reply::json(&resp))
                             }

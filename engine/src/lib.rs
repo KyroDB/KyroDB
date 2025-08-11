@@ -116,6 +116,17 @@ impl PersistentEventLog {
             }
         }
 
+        // If learned-index feature is enabled and RMI file exists, attempt to load
+        #[cfg(feature = "learned-index")]
+        {
+            let rmi_path = data_dir.join("index-rmi.bin");
+            if rmi_path.exists() {
+                if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
+                    idx = index::PrimaryIndex::Rmi(rmi);
+                }
+            }
+        }
+
         let log = Self {
             inner:    Arc::new(RwLock::new(events)),
             wal,

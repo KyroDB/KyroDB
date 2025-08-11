@@ -9,57 +9,78 @@ use uuid::Uuid;
 pub enum SqlResponse {
     Ack { offset: u64 },
     Rows(Vec<(u64, Vec<u8>)>),
+    VecRows(Vec<(u64, f32)>),
 }
 
 pub async fn execute_sql(log: &PersistentEventLog, sql: &str) -> Result<SqlResponse> {
     let dialect = GenericDialect {};
     let ast = Parser::parse_sql(&dialect, sql)?;
-    if ast.is_empty() {
-        return Err(anyhow!("empty SQL"));
-    }
+    if ast.is_empty() { return Err(anyhow!("empty SQL")); }
 
     match &ast[0] {
         Statement::Insert { source: Some(source), .. } => {
-            // Expect form: INSERT INTO table(key, value) VALUES (123, 'hex:...')
-            let values = match &*source.body {
-                SetExpr::Values(v) => v,
-                _ => return Err(anyhow!("only VALUES supported")),
-            };
-            if values.rows.is_empty() {
-                return Err(anyhow!("no values"));
-            }
+            let values = match &*source.body { SetExpr::Values(v) => v, _ => return Err(anyhow!("only VALUES supported")) };
+            if values.rows.is_empty() { return Err(anyhow!("no values")); }
             let row = &values.rows[0];
-            if row.len() < 2 {
-                return Err(anyhow!("need key,value"));
+            if row.len() < 2 { return Err(anyhow!("need key,value")); }
+
+            let key = match &row[0] { Expr::Value(Value::Number(n, _)) => n.parse::<u64>()?, _ => return Err(anyhow!("key must be number")), };
+
+            match &row[1] {
+                Expr::Value(Value::SingleQuotedString(s)) => {
+                    let offset = log.append_kv(Uuid::new_v4(), key, s.clone().into_bytes()).await?;
+                    Ok(SqlResponse::Ack { offset })
+                }
+                Expr::Array(arr) => {
+                    let mut vec: Vec<f32> = Vec::with_capacity(arr.elem.len());
+                    for e in &arr.elem { if let Expr::Value(Value::Number(n, _)) = e { vec.push(n.parse::<f32>()?); } }
+                    let offset = log.append_vector(Uuid::new_v4(), key, vec).await?;
+                    Ok(SqlResponse::Ack { offset })
+                }
+                _ => Err(anyhow!("unsupported value type")),
             }
-            let key = match &row[0] {
-                Expr::Value(Value::Number(n, _)) => n.parse::<u64>()?,
-                _ => return Err(anyhow!("key must be number")),
-            };
-            // Accept string literal; treat as raw bytes (UTF-8)
-            let value = match &row[1] {
-                Expr::Value(Value::SingleQuotedString(s)) => s.clone().into_bytes(),
-                Expr::Value(Value::HexStringLiteral(h)) => hex::decode(h).unwrap_or_default(),
-                _ => return Err(anyhow!("value must be string")),
-            };
-            let offset = log
-                .append_kv(Uuid::new_v4(), key, value)
-                .await?;
-            Ok(SqlResponse::Ack { offset })
         }
-        Statement::Insert { source: None, .. } => {
-            Err(anyhow!("INSERT missing VALUES clause"))
-        }
-        Statement::Query(q) => select_by_key(log, q).await,
+        Statement::Query(q) => select_query(log, q).await,
         _ => Err(anyhow!("only INSERT and simple SELECT supported")),
     }
 }
 
+async fn select_query(log: &PersistentEventLog, q: &Box<Query>) -> Result<SqlResponse> {
+    let body = &q.body;
+    let SetExpr::Select(sel) = &**body else { return Err(anyhow!("only SELECT supported")); };
+
+    if let Some(selection) = &sel.selection {
+        if let Expr::BinaryOp { left, op, right } = selection {
+            if op.to_string() == "=" {
+                if let (Expr::Identifier(ident), expr) = (&**left, &**right) {
+                    if ident.value.to_ascii_uppercase() == "QUERY" {
+                        let mut query: Vec<f32> = Vec::new();
+                        match expr {
+                            Expr::Array(arr) => {
+                                for e in &arr.elem { if let Expr::Value(Value::Number(n, _)) = e { query.push(n.parse::<f32>()?); } }
+                            }
+                            Expr::Tuple(ts) => {
+                                for e in ts { if let Expr::Value(Value::Number(n, _)) = e { query.push(n.parse::<f32>()?); } }
+                            }
+                            _ => {}
+                        }
+                        let k = if let Some(lim) = &q.limit {
+                            if let Expr::Value(Value::Number(n, _)) = lim { n.parse::<usize>().unwrap_or(10) } else { 10 }
+                        } else { 10 };
+                        let res = log.search_vector_l2(&query, k).await;
+                        return Ok(SqlResponse::VecRows(res));
+                    }
+                }
+            }
+        }
+    }
+
+    select_by_key(log, q).await
+}
+
 async fn select_by_key(log: &PersistentEventLog, q: &Box<Query>) -> Result<SqlResponse> {
     let body = &q.body;
-    let SetExpr::Select(sel) = &**body else {
-        return Err(anyhow!("only SELECT supported"));
-    };
+    let SetExpr::Select(sel) = &**body else { return Err(anyhow!("only SELECT supported")); };
 
     let mut key_opt: Option<u64> = None;
     if let Some(selection) = &sel.selection {
@@ -79,7 +100,6 @@ async fn select_by_key(log: &PersistentEventLog, q: &Box<Query>) -> Result<SqlRe
 
     let Some(key) = key_opt else { return Err(anyhow!("missing key in WHERE")); };
     if let Some(offset) = log.lookup_key(key).await {
-        // Fetch the single event
         let events = log.replay(offset, Some(offset + 1)).await;
         if let Some(ev) = events.into_iter().next() {
             if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {

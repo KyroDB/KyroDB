@@ -31,9 +31,11 @@ impl BTreeIndex {
 }
 
 #[cfg(feature = "learned-index")]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RmiIndex {
     // Placeholder: actual model params to be added
+    // Delta map: keys appended after last build
+    delta: BTreeMap<u64, u64>,
 }
 
 #[cfg(feature = "learned-index")]
@@ -50,12 +52,14 @@ const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
 
 #[cfg(feature = "learned-index")]
 impl RmiIndex {
+    pub fn new() -> Self { Self { delta: BTreeMap::new() } }
+
     pub fn load_from_file(path: &std::path::Path) -> Option<Self> {
         use std::io::Read;
         let mut f = std::fs::File::open(path).ok()?;
         let mut buf = [0u8; 16];
         f.read_exact(&mut buf).ok()?;
-        if buf[0..8] == RMI_MAGIC && buf[8] == 1u8 { Some(Self {}) } else { None }
+        if buf[0..8] == RMI_MAGIC && buf[8] == 1u8 { Some(Self::new()) } else { None }
     }
 
     pub fn write_empty_file(path: &std::path::Path) -> std::io::Result<()> {
@@ -66,6 +70,14 @@ impl RmiIndex {
         header[8] = 1u8; // version
         f.write_all(&header)?;
         f.flush()
+    }
+
+    pub fn insert_delta(&mut self, key: u64, offset: u64) {
+        self.delta.insert(key, offset);
+    }
+
+    pub fn delta_get(&self, key: &u64) -> Option<u64> {
+        self.delta.get(key).copied()
     }
 
     pub fn predict_get(&self, _key: &u64) -> Option<u64> {
@@ -85,12 +97,15 @@ impl PrimaryIndex {
         PrimaryIndex::BTree(BTreeIndex::new())
     }
 
+    #[cfg(feature = "learned-index")]
+    pub fn new_rmi() -> Self { PrimaryIndex::Rmi(RmiIndex::new()) }
+
     pub fn insert(&mut self, key: u64, offset: u64) {
         match self {
             PrimaryIndex::BTree(b) => b.insert(key, offset),
             #[cfg(feature = "learned-index")]
-            PrimaryIndex::Rmi(_r) => {
-                // RMI uses delta map (to be implemented)
+            PrimaryIndex::Rmi(r) => {
+                r.insert_delta(key, offset);
             }
         }
     }
@@ -99,7 +114,7 @@ impl PrimaryIndex {
         match self {
             PrimaryIndex::BTree(b) => b.get(key),
             #[cfg(feature = "learned-index")]
-            PrimaryIndex::Rmi(r) => r.predict_get(key),
+            PrimaryIndex::Rmi(r) => r.delta_get(key).or_else(|| r.predict_get(key)),
         }
     }
 }
