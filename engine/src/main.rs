@@ -43,6 +43,9 @@ enum Commands {
     /// Exact vector search: provide comma-separated floats and top-k
     VecSearch { query: String, k: usize },
 
+    /// Build RMI index from current state (feature: learned-index)
+    RmiBuild,
+
     Serve {
         host: String,
         port: u16,
@@ -145,6 +148,23 @@ async fn main() -> Result<()> {
             let res = log.search_vector_l2(&q, k).await;
             for (key, dist) in res {
                 println!("key={} dist={}", key, dist);
+            }
+        }
+        Commands::RmiBuild => {
+            #[cfg(feature = "learned-index")]
+            {
+                use std::path::PathBuf;
+                let mut p = PathBuf::from(&cli.data_dir);
+                p.push("index-rmi.bin");
+                if index::RmiIndex::write_empty_file(&p).is_ok() {
+                    println!("RMI index written (stub) at {}", p.display());
+                } else {
+                    eprintln!("Failed to write RMI index file");
+                }
+            }
+            #[cfg(not(feature = "learned-index"))]
+            {
+                eprintln!("learned-index feature not enabled");
             }
         }
         Commands::Serve {
@@ -371,6 +391,20 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // RMI build: POST /rmi/build  (feature-gated)
+            #[cfg(feature = "learned-index")]
+            let rmi_build = {
+                let data_dir = cli.data_dir.clone();
+                warp::path!("rmi" / "build")
+                    .and(warp::post())
+                    .map(move || {
+                        let mut p = std::path::PathBuf::from(&data_dir);
+                        p.push("index-rmi.bin");
+                        let ok = index::RmiIndex::write_empty_file(&p).is_ok();
+                        warp::reply::json(&serde_json::json!({"ok": ok}))
+                    })
+            };
+
             let subscribe_log = log.clone();
             let subscribe_route = warp::path("subscribe")
                 .and(warp::get())
@@ -413,8 +447,14 @@ async fn main() -> Result<()> {
                 .or(sql_route)
                 .or(vector_insert)
                 .or(vector_search)
-                .or(metrics_route)
-                .with(warp::log("ngdb"));
+                
+                
+            ;
+
+            #[cfg(feature = "learned-index")]
+            let routes = routes.or(rmi_build).with(warp::log("ngdb"));
+            #[cfg(not(feature = "learned-index"))]
+            let routes = routes.with(warp::log("ngdb"));
 
             println!("🚀 Starting server at http://{}:{}", host, port);
             warp::serve(routes)

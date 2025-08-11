@@ -31,15 +31,41 @@ impl BTreeIndex {
 }
 
 #[cfg(feature = "learned-index")]
+#[derive(Debug)]
 pub struct RmiIndex {
     // Placeholder: actual model params to be added
 }
 
 #[cfg(feature = "learned-index")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RmiFileHeader {
+    magic: [u8; 8],
+    version: u8,
+    _pad: [u8; 7],
+}
+
+#[cfg(feature = "learned-index")]
+const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
+
+#[cfg(feature = "learned-index")]
 impl RmiIndex {
-    pub fn load_from_file(_path: &std::path::Path) -> Option<Self> {
-        // TODO: Implement loading of index-rmi.bin
-        None
+    pub fn load_from_file(path: &std::path::Path) -> Option<Self> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = [0u8; 16];
+        f.read_exact(&mut buf).ok()?;
+        if buf[0..8] == RMI_MAGIC && buf[8] == 1u8 { Some(Self {}) } else { None }
+    }
+
+    pub fn write_empty_file(path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        let mut header = [0u8; 16];
+        header[0..8].copy_from_slice(&RMI_MAGIC);
+        header[8] = 1u8; // version
+        f.write_all(&header)?;
+        f.flush()
     }
 
     pub fn predict_get(&self, _key: &u64) -> Option<u64> {
