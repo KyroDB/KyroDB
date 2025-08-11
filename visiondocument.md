@@ -59,27 +59,27 @@ Features are categorized by maturity level, based on research from sources like 
 
 This roadmap outlines phased progression, informed by agile methodologies and research on database evolution (e.g., from single-node to AI-native eras).
 
-1. **Research and Planning (Months 1-3)**:
+1. **Research and Planning **:
    - Conduct literature reviews on learned components and DB4AI.
    - Define architecture blueprints and user stories.
    - Milestone: Completed vision document and initial prototypes sketches.
 
-2. **Prototype Building (Months 4-9)**:
+2. **Prototype Building **:
    - Implement MVP features.
    - Integrate basic AI elements like learned indexes.
    - Milestone: Working MVP with benchmarks showing performance gains.
 
-3. **Feature Expansion (Months 10-15)**:
+3. **Feature Expansion **:
    - Add intermediate features like vector ANN and query optimization.
    - Develop distributed capabilities using Kubernetes for scaling.
    - Milestone: Alpha release with end-to-end AI workload support.
 
-4. **Advanced Optimization and Testing (Months 16-21)**:
+4. **Advanced Optimization and Testing **:
    - Incorporate self-healing, declarative AI, and governance.
    - Rigorous testing on real-world workloads (e.g., TPC benchmarks adapted for AI).
    - Milestone: Beta release with security audits and compliance checks.
 
-5. **Product Launch and Iteration (Months 22+)**:
+5. **Product Launch and Iteration **:
    - Polish UX, documentation, and integrations (e.g., with cloud providers).
    - Launch open-source core with premium features.
    - Milestone: Market release, user feedback loops, and v1.0 stable.
