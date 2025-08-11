@@ -1,7 +1,7 @@
 //! Durable, crash‑recoverable Event Log with real‑time subscribe.
 
 use anyhow::{Context, Result};
-use bincode::{deserialize_from, serialize_into};
+use bincode::Options;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 mod index;
 pub use index::{BTreeIndex, Index};
-mod metrics;
+pub mod metrics;
 
 /// Current on-disk schema version. Increment when Event/Record layout changes.
 pub const SCHEMA_VERSION: u8 = 1;
@@ -51,11 +51,20 @@ impl PersistentEventLog {
         let snap_path = data_dir.join("snapshot.bin");
         let wal_path  = data_dir.join("wal.bin");
 
-        // 1) Load snapshot if it exists
+        // bincode options with a safety limit (16 MiB) to avoid huge allocations on corrupt/legacy files
+        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+
+        // 1) Load snapshot if it exists (best-effort; tolerate legacy or corrupt files)
         let mut events: Vec<Event> = if snap_path.exists() {
             let f = File::open(&snap_path).context("opening snapshot")?;
             let mut rdr = BufReader::new(f);
-            deserialize_from(&mut rdr).context("deserializing snapshot")?
+            match bopt.deserialize_from::<_, Vec<Event>>(&mut rdr) {
+                Ok(v) if v.iter().all(|e| e.schema_version == SCHEMA_VERSION) => v,
+                _ => {
+                    eprintln!("⚠️  snapshot incompatible or corrupt; starting with empty state");
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
@@ -70,9 +79,18 @@ impl PersistentEventLog {
         wal_file.seek(SeekFrom::Start(0)).context("seek wal for replay")?;
         {
             let mut rdr = BufReader::new(&wal_file);
-            while let Ok(ev) = deserialize_from::<_, Event>(&mut rdr) {
-                if ev.offset as usize >= events.len() {
-                    events.push(ev);
+            loop {
+                match bopt.deserialize_from::<_, Event>(&mut rdr) {
+                    Ok(ev) => {
+                        if ev.schema_version != SCHEMA_VERSION {
+                            eprintln!("⚠️  skipping WAL record with mismatched schema_version: {}", ev.schema_version);
+                            continue;
+                        }
+                        if ev.offset as usize >= events.len() {
+                            events.push(ev);
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
         }
@@ -105,6 +123,8 @@ impl PersistentEventLog {
     /// Append (durably) and return its offset.
     pub async fn append(&self, request_id: Uuid, payload: Vec<u8>) -> Result<u64> {
         let timer = metrics::APPEND_LATENCY_SECONDS.start_timer();
+        // bincode options with a safety limit for serialization
+        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
         // Idempotency check
         {
             let read = self.inner.read().await;
@@ -129,7 +149,7 @@ impl PersistentEventLog {
         // Write to WAL
         {
             let mut w = self.wal.write().await;
-            serialize_into(&mut *w, &event).context("writing to wal")?;
+            bopt.serialize_into(&mut *w, &event).context("writing to wal")?;
             w.flush().context("flushing wal")?;
         }
 
@@ -188,6 +208,8 @@ impl PersistentEventLog {
     /// Force-write a full snapshot to disk.
     pub async fn snapshot(&self) -> Result<()> {
         let timer = metrics::SNAPSHOT_LATENCY_SECONDS.start_timer();
+        // bincode options with a safety limit for serialization
+        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
         let path = self.data_dir.join("snapshot.bin");
         let tmp  = self.data_dir.join("snapshot.tmp");
         let wal_path = self.data_dir.join("wal.bin");
@@ -196,7 +218,7 @@ impl PersistentEventLog {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
             let mut w = BufWriter::new(f);
             let read = self.inner.read().await;
-            serialize_into(&mut w, &*read).context("writing snapshot")?;
+            bopt.serialize_into(&mut w, &*read).context("writing snapshot")?;
             w.flush().context("flushing snapshot")?;
         }
 

@@ -34,6 +34,12 @@ enum Commands {
     /// Tail live events from offset (Ctrl+C to exit)
     Subscribe { from: u64 },
 
+    /// Execute a simple SQL statement (INSERT/SELECT)
+    Sql { stmt: String },
+
+    /// Lookup value by primary key
+    Lookup { key: u64 },
+
     Serve {
         host: String,
         port: u16,
@@ -93,6 +99,32 @@ async fn main() -> Result<()> {
                         break;
                     }
                 }
+            }
+        }
+        Commands::Sql { stmt } => {
+            match sql::execute_sql(&log, &stmt).await? {
+                sql::SqlResponse::Ack { offset } => {
+                    println!("ACK offset={}", offset);
+                }
+                sql::SqlResponse::Rows(rows) => {
+                    for (k, v) in rows {
+                        println!("key={} value={}", k, String::from_utf8_lossy(&v));
+                    }
+                }
+            }
+        }
+        Commands::Lookup { key } => {
+            if let Some(offset) = log.lookup_key(key).await {
+                let evs = log.replay(offset, Some(offset + 1)).await;
+                if let Some(ev) = evs.into_iter().next() {
+                    if let Ok(rec) = bincode::deserialize::<ngdb_engine::Record>(&ev.payload) {
+                        println!("key={} value={} (offset={})", rec.key, String::from_utf8_lossy(&rec.value), offset);
+                    } else {
+                        println!("not found");
+                    }
+                }
+            } else {
+                println!("not found");
             }
         }
         Commands::Serve {
@@ -204,6 +236,21 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // KV PUT: POST /put { key: u64, value: string }
+            let put_log = log.clone();
+            let put_route = warp::path("put")
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = put_log.clone();
+                    async move {
+                        let key = body["key"].as_u64().unwrap_or(0);
+                        let value = body["value"].as_str().unwrap_or("").as_bytes().to_vec();
+                        let off = log.append_kv(Uuid::new_v4(), key, value).await.unwrap();
+                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({ "offset": off })))
+                    }
+                });
+
             // Simple lookup by key: GET /lookup?key=123
             let lookup_log = log.clone();
             let lookup_route = warp::path("lookup")
@@ -260,7 +307,7 @@ async fn main() -> Result<()> {
 
             // Metrics endpoint
             let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
-                let text = crate::metrics::render();
+                let text = ngdb_engine::metrics::render();
                 warp::reply::with_header(text, "Content-Type", "text/plain; version=0.0.4")
             });
 
@@ -301,6 +348,7 @@ async fn main() -> Result<()> {
                 .or(health_route)
                 .or(snapshot_route)
                 .or(offset_route)
+                .or(put_route)
                 .or(lookup_route)
                 .or(sql_route)
                 .or(metrics_route)
