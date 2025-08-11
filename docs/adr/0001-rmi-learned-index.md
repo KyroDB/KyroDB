@@ -2,7 +2,7 @@
 
 Status: Proposed
 Date: 2025-08-10
-Authors: ProjectKyro Team
+Authors: Kishan
 
 ## Context
 We need a high-performance primary-key index to support point lookups and range scans. The vision targets a learned index (AI4DB) to reduce memory footprint and improve lookup speed. The current engine already maintains a WAL+snapshot log and a naive `BTreeIndex` for key→offset mapping.

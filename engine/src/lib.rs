@@ -48,6 +48,8 @@ pub struct PersistentEventLog {
     data_dir: PathBuf,
     tx:       broadcast::Sender<Event>,
     index:    Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
+    #[cfg(feature = "ann-hnsw")]
+    ann:      Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
 }
 
 impl PersistentEventLog {
@@ -134,6 +136,8 @@ impl PersistentEventLog {
             data_dir,
             tx,
             index:   Arc::new(RwLock::new(idx)),
+            #[cfg(feature = "ann-hnsw")]
+            ann:     Arc::new(RwLock::new(None)),
         };
 
         Ok(log)
@@ -267,6 +271,34 @@ impl PersistentEventLog {
 
     /// Placeholder ANN search: currently forwards to exact L2 until ANN backend is integrated
     pub async fn search_vector_ann(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        #[cfg(feature = "ann-hnsw")]
+        {
+            use hora::core::ann_index::ANNIndex;
+            // Build index lazily if not present
+            let mut annw = self.ann.write().await;
+            if annw.is_none() {
+                let read = self.inner.read().await;
+                let dim = query.len();
+                let mut idx = hora::index::hnsw_idx::HNSWIndex::<f32, u64>::new(
+                    dim,
+                    &hora::index::hnsw_params::HNSWParams::<f32>::default(),
+                );
+                for ev in read.iter() {
+                    if let Ok(vrec) = bincode::deserialize::<VectorRecord>(&ev.payload) {
+                        if vrec.vector.len() == dim {
+                            let _ = idx.add(&vrec.vector, vrec.key);
+                        }
+                    }
+                }
+                let _ = idx.build(hora::core::metrics::Metric::Euclidean);
+                *annw = Some(idx);
+            }
+            if let Some(idx) = annw.as_ref() {
+                let res = idx.search(&query.to_vec(), k);
+                return res.into_iter().map(|id| (id as u64, 0.0)).collect();
+            }
+        }
+        // Fallback
         self.search_vector_l2(query, k).await
     }
 
