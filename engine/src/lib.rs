@@ -23,6 +23,13 @@ pub struct Record {
     pub value: Vec<u8>,
 }
 
+/// A vector record stored as event payload for exact similarity search
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorRecord {
+    pub key:    u64,
+    pub vector: Vec<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub schema_version: u8,
@@ -177,6 +184,13 @@ impl PersistentEventLog {
         self.append(request_id, bytes).await
     }
 
+    /// Append a vector record
+    pub async fn append_vector(&self, request_id: Uuid, key: u64, vector: Vec<f32>) -> Result<u64> {
+        let rec = VectorRecord { key, vector };
+        let bytes = bincode::serialize(&rec)?;
+        self.append(request_id, bytes).await
+    }
+
     /// Get offset for a given key if present via index.
     pub async fn lookup_key(&self, key: u64) -> Option<u64> {
         let idx = self.index.read().await;
@@ -194,6 +208,36 @@ impl PersistentEventLog {
             }
         }
         None
+    }
+
+    /// Exact L2 search over all VectorRecord events. Returns top-k (key, distance) ascending.
+    pub async fn search_vector_l2(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        if k == 0 { return Vec::new(); }
+        let read = self.inner.read().await;
+        let mut results: Vec<(u64, f32)> = Vec::new();
+        for ev in read.iter() {
+            if let Ok(vrec) = bincode::deserialize::<VectorRecord>(&ev.payload) {
+                if vrec.vector.len() != query.len() { continue; }
+                let mut dist: f32 = 0.0;
+                for (a, b) in vrec.vector.iter().zip(query.iter()) {
+                    let d = a - b;
+                    dist += d * d;
+                }
+                if results.len() < k {
+                    results.push((vrec.key, dist));
+                } else if let Some((idx, _)) = results
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    if dist < results[idx].1 {
+                        results[idx] = (vrec.key, dist);
+                    }
+                }
+            }
+        }
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results
     }
 
     /// Replay events from `start` (inclusive) to `end` (exclusive).  

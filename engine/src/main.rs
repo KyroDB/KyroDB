@@ -40,6 +40,9 @@ enum Commands {
     /// Lookup value by primary key
     Lookup { key: u64 },
 
+    /// Exact vector search: provide comma-separated floats and top-k
+    VecSearch { query: String, k: usize },
+
     Serve {
         host: String,
         port: u16,
@@ -132,6 +135,16 @@ async fn main() -> Result<()> {
                 } else {
                     println!("not found");
                 }
+            }
+        }
+        Commands::VecSearch { query, k } => {
+            let q: Vec<f32> = query
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .collect();
+            let res = log.search_vector_l2(&q, k).await;
+            for (key, dist) in res {
+                println!("key={} dist={}", key, dist);
             }
         }
         Commands::Serve {
@@ -323,6 +336,41 @@ async fn main() -> Result<()> {
                 warp::reply::with_header(text, "Content-Type", "text/plain; version=0.0.4")
             });
 
+            // Vector insert: POST /vector/insert { key: u64, vector: [f32,...] }
+            let vec_ins_log = log.clone();
+            let vector_insert = warp::path!("vector" / "insert")
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = vec_ins_log.clone();
+                    async move {
+                        let key = body["key"].as_u64().unwrap_or(0);
+                        let vec: Vec<f32> = body["vector"].as_array().map(|arr| {
+                            arr.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect()
+                        }).unwrap_or_default();
+                        let off = log.append_vector(Uuid::new_v4(), key, vec).await.unwrap();
+                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"offset": off})))
+                    }
+                });
+
+            // Vector search: POST /vector/search { query: [f32,...], k: usize }
+            let vec_search_log = log.clone();
+            let vector_search = warp::path!("vector" / "search")
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = vec_search_log.clone();
+                    async move {
+                        let q: Vec<f32> = body["query"].as_array().map(|arr| {
+                            arr.iter().filter_map(|v| v.as_f64().map(|x| x as f32)).collect()
+                        }).unwrap_or_default();
+                        let k = body["k"].as_u64().unwrap_or(10) as usize;
+                        let res = log.search_vector_l2(&q, k).await;
+                        let out: Vec<_> = res.into_iter().map(|(key, dist)| serde_json::json!({"key": key, "dist": dist})).collect();
+                        Ok::<_, warp::Rejection>(warp::reply::json(&out))
+                    }
+                });
+
             let subscribe_log = log.clone();
             let subscribe_route = warp::path("subscribe")
                 .and(warp::get())
@@ -363,6 +411,8 @@ async fn main() -> Result<()> {
                 .or(put_route)
                 .or(lookup_route)
                 .or(sql_route)
+                .or(vector_insert)
+                .or(vector_search)
                 .or(metrics_route)
                 .with(warp::log("ngdb"));
 
