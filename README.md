@@ -97,7 +97,7 @@ See `visiondocument.md` for the AI‑native design and long‑term roadmap.
 PRs and issues welcome.
 
 ## License
-ISC
+Apache-2.0
 
 ## Architecture
 

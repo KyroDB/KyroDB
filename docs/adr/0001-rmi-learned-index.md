@@ -1,7 +1,6 @@
 # ADR-0001: Recursive-Model Index (RMI) for Primary-Key Lookup
 
 Status: Proposed
-Date: 2025-08-10
 Authors: Kishan
 
 ## Context
