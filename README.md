@@ -104,17 +104,18 @@ ISC
 ```mermaid
 graph TD
   subgraph Clients
-    A[Apps / Tools]
-    B[ngdbctl (Go)]
+    A[Apps and Tools]
+    B[ngdbctl CLI]
   end
-  A -->|HTTP/SQL/SSE| E
+
+  A -->|HTTP + SQL + SSE| E
   B -->|HTTP| E
 
-  subgraph Engine (Rust)
+  subgraph Engine
     E[Warp HTTP Server]
     S[PersistentEventLog]
-    I[PrimaryIndex\nBTree / RMI]
-    V[Vector Engine\nExact L2 / ANN(HNSW)]
+    I[PrimaryIndex: BTree or RMI]
+    V[Vector Engine: L2 or ANN]
     M[Metrics Exporter]
   end
 
@@ -124,12 +125,12 @@ graph TD
   E --> M
 
   subgraph Storage
-    W[(wal.bin)]
-    P[(snapshot.bin)]
-    R[(index-rmi.bin)]
+    W[wal.bin]
+    P[snapshot.bin]
+    R[index-rmi.bin]
   end
 
-  S <-->|append/replay/snapshot| W
+  S <-->|append / replay / snapshot| W
   S <-->|snapshot load| P
   I -->|autoload| R
 
@@ -141,14 +142,14 @@ graph TD
 ```mermaid
 sequenceDiagram
   autonumber
-  participant Disk as Disk (snapshot.bin, wal.bin)
+  participant Disk as Disk [snapshot.bin, wal.bin]
   participant Engine as Engine
   participant Client as Client
 
   Engine->>Disk: Load snapshot.bin (if present)
   alt snapshot valid
     Engine-->>Engine: in-memory events = snapshot
-  else invalid/missing
+  else invalid or missing
     Engine-->>Engine: start empty
   end
   Engine->>Disk: Replay wal.bin from start
@@ -156,12 +157,17 @@ sequenceDiagram
     Engine-->>Engine: push if offset beyond snapshot
   end
   Client->>Engine: POST /append
-  Engine-->>Disk: serialize event to wal.bin (fsync/flush)
+  Engine-->>Disk: write event to wal.bin (flush)
   Engine-->>Engine: append to memory, update index, broadcast
   Client->>Engine: POST /snapshot
-  Engine->>Disk: write snapshot.tmp, rename -> snapshot.bin
+  Engine->>Disk: write snapshot.tmp
+  Engine->>Disk: rename to snapshot.bin
   Engine->>Disk: truncate wal.bin
 ```
 
 ## Design Docs
 - RMI ADR: `docs/adr/0001-rmi-learned-index.md`
+
+## Status vs MVP
+- Current: BTree primary index; learned-index feature includes RMI scaffolding (delta writes, autoload swap) and an `/rmi/build` stub that writes an index file from key→offset pairs.
+- MVP target: full RMI with 2‑stage models + ε‑bounds and bounded probe; measurable ≥2x point‑lookup speedup. ANN HNSW with tunables and background rebuilds.
