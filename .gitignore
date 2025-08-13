@@ -26,6 +26,7 @@ Thumbs.db
 # Runtime data
 /data/*.bin
 /engine/data/*.bin
+/orchestrator/data/*.bin
 
 # Local binaries
 /orchestrator/ngdbctl

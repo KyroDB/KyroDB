@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -60,6 +61,11 @@ var offsetCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			fmt.Printf("⚠️  Engine returned %d: %s\n", resp.StatusCode, body)
+			os.Exit(1)
+		}
 		var obj map[string]uint64
 		if err := json.NewDecoder(resp.Body).Decode(&obj); err != nil {
 			fmt.Fprintf(os.Stderr, "❌ invalid response: %v\n", err)
@@ -182,7 +188,11 @@ func main() {
 		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
 			query := args[0]
-			var k string = args[1]
+			kVal, err := strconv.Atoi(args[1])
+			if err != nil || kVal <= 0 {
+				fmt.Fprintf(os.Stderr, "❌ invalid k: %v\n", args[1])
+				os.Exit(1)
+			}
 			url := fmt.Sprintf("%s/vector/search", engineAddr)
 			vals := []float64{}
 			for _, s := range bytes.Split([]byte(query), []byte(",")) {
@@ -194,7 +204,7 @@ func main() {
 					vals = append(vals, f)
 				}
 			}
-			payload := map[string]interface{}{"query": vals, "k": k}
+			payload := map[string]interface{}{"query": vals, "k": kVal}
 			body, _ := json.Marshal(payload)
 			client := http.Client{Timeout: 5 * time.Second}
 			resp, err := client.Post(url, "application/json", bytes.NewReader(body))

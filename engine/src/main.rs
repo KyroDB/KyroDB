@@ -4,6 +4,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
 use ngdb_engine::PersistentEventLog;
+use serde_json::json;
+use std::sync::Arc;
 use tokio::signal;
 use uuid::Uuid;
 use warp::Filter;
@@ -57,9 +59,9 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
-    let log = PersistentEventLog::open(&cli.data_dir).await?;
+    let log = Arc::new(ngdb_engine::PersistentEventLog::open(std::path::Path::new("data")).await.unwrap());
 
     match cli.cmd {
         Commands::Append { payload } => {
