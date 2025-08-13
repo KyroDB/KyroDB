@@ -10,7 +10,7 @@ AI‑native database kernel: durable event log + KV + vector search with the pat
 - Vector search: exact L2; optional ANN via HNSW (feature‑gated)
 - Indexing: B‑Tree by default; RMI scaffolding (feature `learned-index`) with delta writes and autoload swap
 - Observability: Prometheus metrics at `/metrics`
-- Orchestrator: Go CLI (`ngdbctl`) for health, snapshot, SQL, vector ops, RMI build
+- Orchestrator: Go CLI (`kyrodbctl`) for health, snapshot, SQL, vector ops, RMI build
 
 ## Quickstart
 
@@ -53,13 +53,13 @@ curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
 
 ### Orchestrator (optional)
 ```bash
-cd orchestrator && go build -o ngdbctl
-./ngdbctl -e http://127.0.0.1:3030 health
-./ngdbctl sql "INSERT INTO t VALUES (42, 'hello')"
-./ngdbctl lookup 42
-./ngdbctl vector-insert 1 "0.1,0.2,0.3"
-./ngdbctl vector-search "0.1,0.2,0.31" 5
-./ngdbctl rmi-build
+cd orchestrator && go build -o kyrodbctl
+./kyrodbctl -e http://127.0.0.1:3030 health
+./kyrodbctl sql "INSERT INTO t VALUES (42, 'hello')"
+./kyrodbctl lookup 42
+./kyrodbctl vector-insert 1 "0.1,0.2,0.3"
+./kyrodbctl vector-search "0.1,0.2,0.31" 5
+./kyrodbctl rmi-build
 ```
 
 ## HTTP API
@@ -105,7 +105,7 @@ Apache-2.0
 graph TD
   subgraph Clients
     A[Apps and Tools]
-    B[ngdbctl CLI]
+    B[kyrodbctl CLI]
   end
 
   A -->|HTTP + SQL + SSE| E

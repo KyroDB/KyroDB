@@ -15,7 +15,7 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "ngdbctl",
+	Use:   "kyrodbctl",
 	Short: "KyroDB orchestrator CLI",
 }
 

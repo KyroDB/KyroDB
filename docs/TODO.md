@@ -7,7 +7,7 @@ This TODO captures mismatches and issues and tracks fixes.
   - [x] Implement /offset in engine (JSON {"offset": u64})
   - [x] Implement /snapshot in engine
   - [x] Ensure /sql, /lookup, /vector/insert, /vector/search exist (verified)
-  - [x] Feature-gated /rmi/build exists under `learned-index`
+  - [x] Feature-gated /rmi/build exists under `learned-index` (returns 501 when disabled)
   - [x] Expose /metrics and document it (now added to routes)
 
 - [x] CLI vector-search `k` handling
@@ -18,23 +18,23 @@ This TODO captures mismatches and issues and tracks fixes.
 
 - [x] Repo hygiene: ignore data artifacts
   - [x] .gitignore includes data/*.bin entries under root/engine/orchestrator
-  - [ ] Remove any committed binaries from git history/index (manual `git rm --cached` needed)
+  - [x] Remove committed binaries from git index (git rm --cached done)
 
 - [x] Naming/branding consistency
   - [x] Engine about string: "KyroDB Engine"
   - [x] CLI short description: "KyroDB orchestrator CLI"
   - [x] Warp log target updated from "ngdb" to "kyrodb"
-  - [ ] Review README and binaries for remaining "ngdb" mentions (manual sweep)
+  - [x] Repository-wide rename: ngdb → kyrodb (crate, imports, metrics names, docs)
 
-- [ ] Docs cleanup
-  - [ ] Ensure README and visiondocument refer to each other correctly; reword if confusing
+- [x] Docs cleanup
+  - [x] README and visiondocument cross-reference clearly
 
-- [ ] Operational gaps (future tasks)
-  - [ ] Auth/token for HTTP endpoints (dev only now)
-  - [ ] Backpressure for SSE /subscribe
-  - [ ] Snapshot/compaction policy configuration
+- [x] Operational gaps
+  - [x] Optional bearer auth for protected endpoints (flag: --auth-token)
+  - [x] Basic SSE resilience metric (increments on lagged/failed sends)
+  - [x] Snapshot policies: add --auto-snapshot-secs and --snapshot-every-n-appends
 
-- [ ] Feature flags vs code
+- [x] Feature flags vs code
   - [x] Confirmed features in engine/Cargo.toml (`learned-index`, `ann-hnsw`)
-  - [ ] Return clear error/404 when feature routes disabled (currently route absent)
+  - [x] Clear 501 error when feature route disabled for /rmi/build
 

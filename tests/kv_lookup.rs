@@ -1,4 +1,4 @@
-use ngdb_engine::PersistentEventLog;
+use kyrodb_engine::PersistentEventLog;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -22,7 +22,7 @@ async fn kv_append_lookup_across_restart() {
         assert_eq!(log.lookup_key(key).await.is_some(), true);
         let off = log.lookup_key(key).await.unwrap();
         let evs = log.replay(off, Some(off + 1)).await;
-        let rec = bincode::deserialize::<ngdb_engine::Record>(&evs[0].payload).unwrap();
+        let rec = bincode::deserialize::<kyrodb_engine::Record>(&evs[0].payload).unwrap();
         assert_eq!(rec.key, key);
         assert_eq!(rec.value, value);
     }

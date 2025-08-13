@@ -1,4 +1,4 @@
-use ngdb_engine::PersistentEventLog;
+use kyrodb_engine::PersistentEventLog;
 use uuid::Uuid;
 use std::fs;
 

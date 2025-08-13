@@ -3,8 +3,8 @@ use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use ngdb_engine::{PersistentEventLog, Record};
-use ngdb_engine::schema::{SchemaRegistry, TableKind, TableSchema};
+use kyrodb_engine::{PersistentEventLog, Record};
+use kyrodb_engine::schema::{SchemaRegistry, TableKind, TableSchema};
 use uuid::Uuid;
 
 pub enum SqlResponse {
