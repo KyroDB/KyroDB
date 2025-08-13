@@ -18,19 +18,19 @@ Prereqs: Rust, Go.
 
 ```bash
 # Run engine
-RUST_LOG=ngdb=info,warp=info cargo run -p engine -- serve 127.0.0.1 3030
+RUST_LOG=kyrodb=info,warp=info cargo run -p engine -- serve 127.0.0.1 3030
 
 # With ANN (optional)
-RUST_LOG=ngdb=info,warp=info cargo run -p engine --features ann-hnsw -- serve 127.0.0.1 3030
+RUST_LOG=kyrodb=info,warp=info cargo run -p engine --features ann-hnsw -- serve 127.0.0.1 3030
 
 # With learned index feature available
-RUST_LOG=ngdb=info,warp=info cargo run -p engine --features learned-index -- serve 127.0.0.1 3030
+RUST_LOG=kyrodb=info,warp=info cargo run -p engine --features learned-index -- serve 127.0.0.1 3030
 ```
 
 ### KV via SQL
 ```bash
 curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
-  -d '{"sql":"INSERT INTO t VALUES (42, '"'"'hello'"'"')"}'
+  -d '{"sql":"INSERT INTO t VALUES (42, '\''hello'\'')"}'
 
 curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT * FROM t WHERE key = 42"}'
@@ -48,7 +48,7 @@ curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
 
 # Search (ANN)
 curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT * FROM vectors WHERE QUERY = [0.1,0.2,0.31] AND MODE='"'"'ANN'"'"' LIMIT 5"}'
+  -d '{"sql":"SELECT * FROM vectors WHERE QUERY = [0.1,0.2,0.31] AND MODE='\''ANN'\'' LIMIT 5"}'
 ```
 
 ### Orchestrator (optional)
