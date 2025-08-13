@@ -16,7 +16,7 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "ngdbctl",
-	Short: "NextGen‑DB orchestrator CLI",
+	Short: "KyroDB orchestrator CLI",
 }
 
 var engineAddr string

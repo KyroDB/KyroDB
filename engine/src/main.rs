@@ -12,7 +12,7 @@ use warp::Filter;
 mod sql;
 
 #[derive(Parser)]
-#[command(name = "ngdb-engine", about = "NextGen-DB Engine")]
+#[command(name = "ngdb-engine", about = "KyroDB Engine")]
 struct Cli {
     /// Directory for data files (snapshots + WAL)
     #[arg(short, long, default_value = "./data")]
@@ -59,9 +59,9 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let log = Arc::new(ngdb_engine::PersistentEventLog::open(std::path::Path::new("data")).await.unwrap());
+    let log = Arc::new(ngdb_engine::PersistentEventLog::open(std::path::Path::new(&cli.data_dir)).await.unwrap());
 
     match cli.cmd {
         Commands::Append { payload } => {
@@ -431,6 +431,21 @@ async fn main() {
                     })
             };
 
+            #[cfg(not(feature = "learned-index"))]
+            let rmi_build = {
+                use warp::http::StatusCode;
+                warp::path!("rmi" / "build")
+                    .and(warp::post())
+                    .map(|| {
+                        warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "learned-index feature not enabled"
+                            })),
+                            StatusCode::NOT_IMPLEMENTED,
+                        )
+                    })
+            };
+
             let subscribe_log = log.clone();
             let subscribe_route = warp::path("subscribe")
                 .and(warp::get())
@@ -473,14 +488,11 @@ async fn main() {
                 .or(sql_route)
                 .or(vector_insert)
                 .or(vector_search)
-                
-                
+                .or(metrics_route)
+                .or(rmi_build)
             ;
 
-            #[cfg(feature = "learned-index")]
-            let routes = routes.or(rmi_build).with(warp::log("ngdb"));
-            #[cfg(not(feature = "learned-index"))]
-            let routes = routes.with(warp::log("ngdb"));
+            let routes = routes.with(warp::log("kyrodb"));
 
             println!("🚀 Starting server at http://{}:{}", host, port);
             warp::serve(routes)
