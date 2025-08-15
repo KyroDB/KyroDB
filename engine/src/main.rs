@@ -4,15 +4,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
 use kyrodb_engine::PersistentEventLog;
-use serde_json::json;
 use std::sync::Arc;
-use tokio::signal;
+use tokio::signal; // still used in SSE handling
 use uuid::Uuid;
 use warp::Filter;
 mod sql;
 
 #[derive(Parser)]
-#[command(name = "kyrodb-engine", about = "KyroDB Engine")]
+#[command(name = "kyrodb-engine", about = "KyroDB Engine")] 
 struct Cli {
     /// Directory for data files (snapshots + WAL)
     #[arg(short, long, default_value = "./data")]
@@ -24,30 +23,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Append a UTF-8 string as a new event
-    Append { payload: String },
-
-    /// Replay events from `start` to `end` offsets
-    Replay { start: u64, end: Option<u64> },
-
-    /// Force a full snapshot to disk
-    Snapshot,
-
-    /// Tail live events from offset (Ctrl+C to exit)
-    Subscribe { from: u64 },
-
-    /// Execute a simple SQL statement (INSERT/SELECT)
-    Sql { stmt: String },
-
-    /// Lookup value by primary key
-    Lookup { key: u64 },
-
-    /// Exact vector search: provide comma-separated floats and top-k
-    VecSearch { query: String, k: usize },
-
-    /// Build RMI index from current state (feature: learned-index)
-    RmiBuild,
-
     Serve {
         host: String,
         port: u16,
@@ -71,116 +46,6 @@ async fn main() -> Result<()> {
     let log = Arc::new(kyrodb_engine::PersistentEventLog::open(std::path::Path::new(&cli.data_dir)).await.unwrap());
 
     match cli.cmd {
-        Commands::Append { payload } => {
-            let id = Uuid::new_v4();
-            let offset = log.append(id, payload.into_bytes()).await?;
-            println!("✅ Appended at offset {}", offset);
-        }
-
-        Commands::Replay { start, end } => {
-            let events = log.replay(start, end).await;
-            for e in events {
-                println!(
-                    "[{}] {} → {}",
-                    e.offset,
-                    e.request_id,
-                    String::from_utf8_lossy(&e.payload)
-                );
-            }
-        }
-
-        Commands::Snapshot => {
-            log.snapshot().await?;
-            println!("📦 Snapshot written.");
-        }
-
-        Commands::Subscribe { from } => {
-            let (past, mut rx) = log.subscribe(from).await;
-
-            // Emit past events
-            for e in past {
-                println!("[{}] {}", e.offset, String::from_utf8_lossy(&e.payload));
-            }
-            println!("📡 Tailing live events—press Ctrl+C to exit");
-
-            // Tail new events
-            loop {
-                tokio::select! {
-                    Ok(evt) = rx.recv() => {
-                        println!("[{}] {}", evt.offset, String::from_utf8_lossy(&evt.payload));
-                    }
-                    _ = signal::ctrl_c() => {
-                        println!("\n👋 Goodbye.");
-                        break;
-                    }
-                }
-            }
-        }
-        Commands::Sql { stmt } => {
-            match sql::execute_sql(&log, &stmt).await {
-                Ok(sql::SqlResponse::Ack { offset }) => {
-                    println!("ACK offset={}", offset);
-                }
-                Ok(sql::SqlResponse::Rows(rows)) => {
-                    for (k, v) in rows {
-                        println!("key={} value={}", k, String::from_utf8_lossy(&v));
-                    }
-                }
-                Ok(sql::SqlResponse::VecRows(rows)) => {
-                    for (k, d) in rows {
-                        println!("key={} dist={}", k, d);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("SQL Error: {}", e);
-                }
-            }
-        }
-        Commands::Lookup { key } => {
-            if let Some(offset) = log.lookup_key(key).await {
-                let evs = log.replay(offset, Some(offset + 1)).await;
-                if let Some(ev) = evs.into_iter().next() {
-                    if let Ok(rec) = bincode::deserialize::<kyrodb_engine::Record>(&ev.payload) {
-                        println!("key={} value={} (offset={})", rec.key, String::from_utf8_lossy(&rec.value), offset);
-                    } else {
-                        println!("not found");
-                    }
-                }
-            } else {
-                if let Some((off, rec)) = log.find_key_scan(key).await {
-                    println!("key={} value={} (offset={})", rec.key, String::from_utf8_lossy(&rec.value), off);
-                } else {
-                    println!("not found");
-                }
-            }
-        }
-        Commands::VecSearch { query, k } => {
-            let q: Vec<f32> = query
-                .split(',')
-                .filter_map(|s| s.trim().parse::<f32>().ok())
-                .collect();
-            let res = log.search_vector_l2(&q, k).await;
-            for (key, dist) in res {
-                println!("key={} dist={}", key, dist);
-            }
-        }
-        Commands::RmiBuild => {
-            #[cfg(feature = "learned-index")]
-            {
-                use std::path::PathBuf;
-                let mut p = PathBuf::from(&cli.data_dir);
-                p.push("index-rmi.bin");
-                if kyrodb_engine::index::RmiIndex::write_empty_file(&p).is_ok() {
-                    println!("RMI index written (stub) at {}", p.display());
-                } else {
-                    eprintln!("Failed to write RMI index file");
-                }
-            }
-            #[cfg(not(feature = "learned-index"))]
-            {
-                eprintln!("learned-index feature not enabled");
-            }
-        }
         Commands::Serve {
             host,
             port,
