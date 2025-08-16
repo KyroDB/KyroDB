@@ -73,8 +73,28 @@ pub struct PersistentEventLog {
     // rotation config
     wal_segment_bytes: Arc<RwLock<Option<u64>>>,
     wal_max_segments: Arc<RwLock<usize>>,
+    // Track last compaction timestamp precisely (seconds since epoch). Only updated on compaction.
+    last_compaction_ts: Arc<RwLock<Option<i64>>>,
     #[cfg(feature = "ann-hnsw")]
     ann:      Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
+}
+
+// Strict manifest view used at startup
+#[derive(Debug, Deserialize)]
+struct ManifestFile {
+    schema: u64,
+    version: String,
+    next_offset: u64,
+    snapshot: String,
+    snapshot_bytes: u64,
+    wal_segments: Vec<String>,
+    wal_total_bytes: u64,
+    rmi: String,
+    #[serde(default)]
+    rmi_header_version: Option<u8>,
+    #[serde(default)]
+    last_compaction_ts: Option<i64>,
+    ts: i64,
 }
 
 impl PersistentEventLog {
@@ -202,14 +222,27 @@ impl PersistentEventLog {
             }
         }
 
-        // 6) Read manifest (best-effort) to seed next_offset and paths
+        // 6) Read manifest with strict validation; seed next_offset and last_compaction_ts when valid
+        let mut last_compaction_ts_opt: Option<i64> = None;
         let manifest_path = data_dir.join("manifest.json");
         if manifest_path.exists() {
-            if let Ok(text) = std::fs::read_to_string(&manifest_path) {
-                if let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(n) = j.get("next_offset").and_then(|v| v.as_u64()) {
-                        if n > next { next = n; }
+            match std::fs::read_to_string(&manifest_path) {
+                Ok(text) => match serde_json::from_str::<ManifestFile>(&text) {
+                    Ok(m) => {
+                        if m.schema == 1 {
+                            // seed next_offset conservatively (never go backwards)
+                            if m.next_offset > next { next = m.next_offset; }
+                            last_compaction_ts_opt = m.last_compaction_ts;
+                        } else {
+                            eprintln!("⚠️  manifest schema {} unsupported; ignoring manifest", m.schema);
+                        }
                     }
+                    Err(e) => {
+                        eprintln!("⚠️  failed to parse manifest.json strictly: {}; ignoring manifest", e);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("⚠️  failed to read manifest.json: {}; ignoring manifest", e);
                 }
             }
         }
@@ -224,6 +257,7 @@ impl PersistentEventLog {
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
             wal_max_segments: Arc::new(RwLock::new(8)),
+            last_compaction_ts: Arc::new(RwLock::new(last_compaction_ts_opt)),
             #[cfg(feature = "ann-hnsw")]
             ann:     Arc::new(RwLock::new(None)),
         };
@@ -437,7 +471,7 @@ impl PersistentEventLog {
                 if f.read_exact(&mut ver).is_ok() { rmi_ver = Some(ver[0]); }
             }
         }
-        let last_compaction_ts = chrono::Utc::now().timestamp(); // approximate; refined when compacting
+        let last_compaction_ts = *self.last_compaction_ts.read().await;
         let manifest = serde_json::json!({
             "schema": 1,
             "version": env!("CARGO_PKG_VERSION"),
@@ -562,7 +596,11 @@ impl PersistentEventLog {
         self.snapshot().await?;
         metrics::COMPACTIONS_TOTAL.inc();
         timer.observe_duration();
-        // Update manifest after compaction
+        // Mark precise compaction time and write manifest
+        {
+            let mut tsw = self.last_compaction_ts.write().await;
+            *tsw = Some(Utc::now().timestamp());
+        }
         self.write_manifest().await;
         let after_bytes = Self::wal_total_bytes(&self.data_dir);
         let after_segments = Self::list_wal_segments(&self.data_dir).len();
