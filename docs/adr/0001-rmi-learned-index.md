@@ -1,88 +1,44 @@
 # ADR-0001: Recursive-Model Index (RMI) for Primary-Key Lookup
 
-Status: Proposed
+Status: Accepted
 Authors: Kishan
 
 ## Context
-We need a high-performance primary-key index to support point lookups and range scans. The vision targets a learned index (AI4DB) to reduce memory footprint and improve lookup speed. The current engine already maintains a WAL+snapshot log and a naive `BTreeIndex` for key→offset mapping.
+We need a high-performance primary-key index for point lookups. The engine uses a WAL + snapshot model; a learned RMI reduces memory and yields predictable tail latencies.
 
 ## Decision
-Adopt a two-stage Recursive-Model Index (RMI) for 1-D monotonic keys (u64). Start with read-optimized, offline-trained models, then add incremental maintenance.
+Adopt a per-leaf linear RMI with bounded last-mile probe and an mmap-friendly on-disk format with versioning and checksum.
 
-### Model Structure
-- Stage 0 (Root): small MLP or linear model mapping key → leaf-id.
-- Stage 1 (Leaves): per-leaf linear models mapping key → predicted position (offset). Each leaf stores an error bound ε.
-- Search: Use predicted position ± ε to binary search in the log’s in-memory vector or a per-leaf sorted key→offset structure.
+## Current Design (v2/v3/v4)
+- Magic: `KYRO_RMI` (8 bytes), then 1-byte version, then 3-byte pad.
+- v2: `[magic][ver=2][pad3][epsilon u32][count u64][keys u64[]][offs u64[]]` (no checksum).
+- v3: `[magic][ver=3][pad3][num_leaves u32][count u64][leaves][keys][offs][checksum u64]`.
+- v4: As v3 plus 8-byte alignment padding before `keys`; loaded via mmap with zero-copy when aligned. Checksum is xxh3_64 over everything before the footer.
+- Leaves store: key_min, key_max, slope, intercept, epsilon, start, len.
 
-### Training Pipeline
-- Data: extract `(key, offset)` pairs from recovered events, sorted by key.
-- Offline training (initial): Python notebook using scikit-learn or LightGBM; export weights.
-- On-device format: serialize as compact arrays (f32 coefficients) with per-leaf ε. Persist to `data/index-rmi.bin`.
-- Rebuild triggers: on snapshot, threshold of N appends, or explicit admin command.
+Lookup path:
+1) Check delta map (recent writes) first.
+2) Find leaf by key range (binary search over leaf metadata).
+3) Predict index position: `pos = round(slope * key + intercept)`.
+4) Bounded binary search within `[pos-ε, pos+ε]`, clamped to leaf range.
 
-### Integration Points
-- New `trait LearnedIndex` with `predict(key) -> (leaf_id, pos)` and `bound(key) -> ε`.
-- Adapter implements `Index` trait: `get(key)` performs refined search using (pos, ε).
-- During recovery, if `index-rmi.bin` exists and schema_version matches, load it; else fall back to `BTreeIndex`.
-- Background task: when thresholds are met, (re)train and atomically swap the index.
+Rebuild & swap:
+- Triggered by appends threshold or delta/total ratio; or manual `POST /rmi/build`.
+- Write to `index-rmi.tmp`, fsync, rename to `index-rmi.bin`, then load and atomically swap.
 
-### Storage Format v1
-- Header: magic bytes `KYRO_RMI\x01`, schema_version (u8), num_leaves (u32).
-- Root model: coefficients (f32[]), bias.
-- Leaves: for each leaf, coefficients (f32[]), bias, epsilon (u32), key-range min/max (u64).
-- Footer: checksum (xxhash64).
+Safety & Recovery:
+- On startup, validate magic, version, and checksum (v3+). If invalid, ignore and fall back to B-Tree.
+- v4 loader avoids unaligned pointers by padding and copies as fallback if necessary.
 
-### API Surface (Rust)
-```rust
-pub trait LearnedIndex {
-    fn predict_leaf(&self, key: u64) -> usize;
-    fn predict_pos(&self, leaf_id: usize, key: u64) -> i64;
-    fn epsilon(&self, leaf_id: usize) -> u64;
-}
+Metrics:
+- Hits/misses and hit rate, lookup latency, epsilon histogram and max, leaves count, index size, rebuild count and duration.
 
-pub struct RmiIndex { /* ... */ }
-impl LearnedIndex for RmiIndex { /* ... */ }
-
-pub enum PrimaryIndex {
-    BTree(BTreeIndex),
-    Rmi(RmiIndex),
-}
-```
-
-### Update Handling (Phase 1 → Phase 2)
-- Phase 1: Read-optimized. Appends captured in a small delta-structure (BT map). Lookup checks delta first, else consults RMI.
-- Phase 2: Periodic retraining compacts delta. Consider ALEX-style adaptive segments for online updates.
-
-### Failure & Recovery
-- Atomic index swap: write to `index-rmi.tmp`, fsync, rename to `index-rmi.bin`.
-- On startup: validate header + checksum; if invalid, discard and rebuild from log.
-- Maintain compatibility via `SCHEMA_VERSION` gating.
-
-## Alternatives Considered
-- Pure B-Tree: simple and robust, but higher memory and slower cache behavior.
-- PGM Index: good theoretical guarantees; may be adopted later for range scans.
-- ALEX: adaptive learned index with online maintenance; higher implementation complexity initially.
+## Alternatives
+- PGM/ALEX as future options for ranges or online updates; out of scope for now.
 
 ## Consequences
-- + Lower memory for large key spaces.
-- + Faster point lookups on skewed/read-heavy workloads.
-- − Requires training pipeline and careful error bounds.
-- − More complex recovery and validation logic.
+- Smaller memory footprint vs classical trees.
+- Tunable ε and leaf sizing trade off write cost and read tail.
 
-## Rollout Plan
-1. Implement `PrimaryIndex` enum with `BTreeIndex` default.
-2. Add loader for optional RMI file (guarded by feature flag `learned-index`).
-3. Build offline trainer, produce `index-rmi.bin` from snapshot.
-4. Integrate lookup path; add microbenchmarks.
-5. Add delta maintenance and retraining thresholds.
-
-## Testing
-- Unit tests for serialization/deserialization and bounds.
-- Property tests: ensure key is found within predicted ±ε window.
-- Chaos tests: crash during swap; ensure fallback to B-Tree works.
-
-## Metrics
-- Index memory size, training time, lookup p50/p99 latency, epsilon distribution, hit rate within 1 probe.
-
-## Security & Compliance
-- No PII stored in index files beyond keys; respect data governance when keys map to sensitive entities.
+## Rollout
+- v4 is default for new builds; loader supports v2/v3 for backwards compatibility.
