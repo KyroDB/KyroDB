@@ -346,8 +346,10 @@ dependencies = [
  "futures",
  "hex",
  "hora",
+ "memmap2",
  "once_cell",
  "prometheus",
+ "rand",
  "serde",
  "serde_json",
  "sqlparser",
@@ -356,6 +358,7 @@ dependencies = [
  "tokio-stream",
  "uuid",
  "warp",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -893,6 +896,15 @@ name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
+
+[[package]]
+name = "memmap2"
+version = "0.9.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "483758ad303d734cec05e5c12b41d7e93e6a6390c5e9dae6bdeb7c1259012d28"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "mime"
@@ -1917,6 +1929,12 @@ name = "writeable"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea2f10b9bb0928dfb1b42b65e1f9e36f7f54dbdf08457afefb38afcdec4fa2bb"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yoke"
