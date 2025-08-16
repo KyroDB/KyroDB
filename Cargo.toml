@@ -6,3 +6,6 @@ members = [
 
 [workspace.dependencies]
 tempfile = "3"
+
+[workspace.metadata]
+# to run with: cargo test -q --features engine/http-test

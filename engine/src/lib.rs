@@ -110,7 +110,7 @@ impl PersistentEventLog {
                 if let Err(_) = rdr.read_exact(&mut crc_buf) { break; }
                 let crc_read = u32::from_le_bytes(crc_buf);
                 let crc_calc = crc32c::crc32c(&buf);
-                if crc_read != crc_calc { metrics::WAL_CRC_ERRORS_TOTAL.inc(); break; }
+                if crc_read != crc_calc { crate::metrics::WAL_CRC_ERRORS_TOTAL.inc(); break; }
                 match bopt.deserialize::<Event>(&buf) {
                     Ok(ev) => {
                         if ev.schema_version != SCHEMA_VERSION { continue; }
@@ -136,7 +136,7 @@ impl PersistentEventLog {
                 idx.insert(rec.key, ev.offset);
             }
         }
-        let next = if events.is_empty() { 0 } else { max_off.saturating_add(1) };
+        let mut next = if events.is_empty() { 0 } else { max_off.saturating_add(1) };
 
         // If learned-index feature is enabled and RMI file exists, attempt to load
         #[cfg(feature = "learned-index")]
@@ -145,6 +145,18 @@ impl PersistentEventLog {
             if rmi_path.exists() {
                 if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
                     idx = index::PrimaryIndex::Rmi(rmi);
+                }
+            }
+        }
+
+        // 5) Read manifest (best-effort) to seed next_offset and paths
+        let manifest_path = data_dir.join("manifest.json");
+        if manifest_path.exists() {
+            if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(n) = j.get("next_offset").and_then(|v| v.as_u64()) {
+                        if n > next { next = n; }
+                    }
                 }
             }
         }
@@ -518,5 +530,32 @@ mod tests {
             let payloads: Vec<_> = all.iter().map(|e| e.payload.clone()).collect();
             assert_eq!(payloads, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         }
+    }
+}
+
+// Minimal HTTP filter for compaction to enable testing without the binary main
+#[cfg(feature = "http-test")] // optional feature to avoid polluting default build
+pub mod http_filters {
+    use super::*;
+    use warp::Filter;
+
+    pub fn compact_route(log: Arc<PersistentEventLog>) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
+        warp::path("compact")
+            .and(warp::post())
+            .and_then(move || {
+                let log = log.clone();
+                async move {
+                    match log.compact_keep_latest_and_snapshot().await {
+                        Ok(_) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"compact":"ok"})),
+                            warp::http::StatusCode::OK,
+                        )),
+                        Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error": e.to_string()})),
+                            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        )),
+                    }
+                }
+            })
     }
 }

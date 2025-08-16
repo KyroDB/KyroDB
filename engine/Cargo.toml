@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [features]
 learned-index = []
 ann-hnsw = ["dep:hora"]
+http-test = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
