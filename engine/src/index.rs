@@ -33,9 +33,11 @@ impl BTreeIndex {
 #[cfg(feature = "learned-index")]
 #[derive(Debug, Default)]
 pub struct RmiIndex {
-    // Placeholder: actual model params to be added
     // Delta map: keys appended after last build
     delta: BTreeMap<u64, u64>,
+    // Sorted snapshot view
+    sorted_keys: Vec<u64>,
+    sorted_offsets: Vec<u64>,
 }
 
 #[cfg(feature = "learned-index")]
@@ -52,14 +54,37 @@ const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
 
 #[cfg(feature = "learned-index")]
 impl RmiIndex {
-    pub fn new() -> Self { Self { delta: BTreeMap::new() } }
+    pub fn new() -> Self { Self { delta: BTreeMap::new(), sorted_keys: Vec::new(), sorted_offsets: Vec::new() } }
 
     pub fn load_from_file(path: &std::path::Path) -> Option<Self> {
         use std::io::Read;
         let mut f = std::fs::File::open(path).ok()?;
-        let mut buf = [0u8; 16];
-        f.read_exact(&mut buf).ok()?;
-        if buf[0..8] == RMI_MAGIC && buf[8] == 1u8 { Some(Self::new()) } else { None }
+        let mut hdr = [0u8; 16];
+        f.read_exact(&mut hdr).ok()?;
+        if hdr[0..8] != RMI_MAGIC || hdr[8] != 1u8 { return None; }
+        // Read count
+        let mut cnt_buf = [0u8; 8];
+        f.read_exact(&mut cnt_buf).ok()?;
+        let count = u64::from_le_bytes(cnt_buf) as usize;
+        // Read keys
+        let mut keys_bytes = vec![0u8; count * 8];
+        if count > 0 { f.read_exact(&mut keys_bytes).ok()?; }
+        let mut keys = Vec::with_capacity(count);
+        for chunk in keys_bytes.chunks_exact(8) {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(chunk);
+            keys.push(u64::from_le_bytes(arr));
+        }
+        // Read offsets
+        let mut offs_bytes = vec![0u8; count * 8];
+        if count > 0 { f.read_exact(&mut offs_bytes).ok()?; }
+        let mut offs = Vec::with_capacity(count);
+        for chunk in offs_bytes.chunks_exact(8) {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(chunk);
+            offs.push(u64::from_le_bytes(arr));
+        }
+        Some(Self { delta: BTreeMap::new(), sorted_keys: keys, sorted_offsets: offs })
     }
 
     pub fn write_empty_file(path: &std::path::Path) -> std::io::Result<()> {
@@ -69,20 +94,29 @@ impl RmiIndex {
         header[0..8].copy_from_slice(&RMI_MAGIC);
         header[8] = 1u8; // version
         f.write_all(&header)?;
+        // zero count
+        f.write_all(&0u64.to_le_bytes())?;
         f.flush()
     }
 
-    /// Build a trivial RMI file from key→offset pairs (placeholder for real model)
+    /// Build an RMI index file from key→offset pairs. Pairs can be unsorted; we will sort by key.
     pub fn write_from_pairs(path: &std::path::Path, pairs: &[(u64, u64)]) -> std::io::Result<()> {
         use std::io::Write;
+        let mut buf: Vec<(u64, u64)> = pairs.to_vec();
+        buf.sort_by_key(|(k, _)| *k);
+        let count: u64 = buf.len() as u64;
         let mut f = std::fs::File::create(path)?;
+        // header
         let mut header = [0u8; 16];
         header[0..8].copy_from_slice(&RMI_MAGIC);
         header[8] = 1u8; // version
         f.write_all(&header)?;
-        // Write count (u64 LE)
-        let count: u64 = pairs.len() as u64;
+        // count
         f.write_all(&count.to_le_bytes())?;
+        // keys
+        for (k, _) in &buf { f.write_all(&k.to_le_bytes())?; }
+        // offsets
+        for (_, o) in &buf { f.write_all(&o.to_le_bytes())?; }
         f.flush()
     }
 
@@ -94,9 +128,13 @@ impl RmiIndex {
         self.delta.get(key).copied()
     }
 
-    pub fn predict_get(&self, _key: &u64) -> Option<u64> {
-        // TODO: Implement predict + epsilon search against segments
-        None
+    /// Temporary: if no learned prediction, fall back to binary search over sorted_keys.
+    pub fn predict_get(&self, key: &u64) -> Option<u64> {
+        if self.sorted_keys.is_empty() { return None; }
+        match self.sorted_keys.binary_search(key) {
+            Ok(idx) => self.sorted_offsets.get(idx).copied(),
+            Err(_) => None,
+        }
     }
 }
 

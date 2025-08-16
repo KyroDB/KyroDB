@@ -3,9 +3,10 @@
 use anyhow::{Context, Result};
 use bincode::Options;
 use chrono::Utc;
+use crc32c;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write, Read};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
@@ -13,6 +14,14 @@ pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 pub mod schema;
+
+// fsync helper for directories (ensure rename/truncate is durable)
+fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    // On Unix, opening a directory and calling sync_all is supported.
+    // On other platforms, this may be a no-op if unsupported.
+    let f = File::open(dir)?;
+    f.sync_all()
+}
 
 /// Current on-disk schema version. Increment when Event/Record layout changes.
 pub const SCHEMA_VERSION: u8 = 1;
@@ -90,15 +99,21 @@ impl PersistentEventLog {
         {
             let mut rdr = BufReader::new(&wal_file);
             loop {
-                match bopt.deserialize_from::<_, Event>(&mut rdr) {
+                // read length prefix (u32), then payload, then crc32c(u32)
+                let mut len_buf = [0u8; 4];
+                if let Err(_) = rdr.read_exact(&mut len_buf) { break; }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                if let Err(_) = rdr.read_exact(&mut buf) { break; }
+                let mut crc_buf = [0u8; 4];
+                if let Err(_) = rdr.read_exact(&mut crc_buf) { break; }
+                let crc_read = u32::from_le_bytes(crc_buf);
+                let crc_calc = crc32c::crc32c(&buf);
+                if crc_read != crc_calc { break; }
+                match bopt.deserialize::<Event>(&buf) {
                     Ok(ev) => {
-                        if ev.schema_version != SCHEMA_VERSION {
-                            eprintln!("⚠️  skipping WAL record with mismatched schema_version: {}", ev.schema_version);
-                            continue;
-                        }
-                        if ev.offset as usize >= events.len() {
-                            events.push(ev);
-                        }
+                        if ev.schema_version != SCHEMA_VERSION { continue; }
+                        if ev.offset as usize >= events.len() { events.push(ev); }
                     }
                     Err(_) => break,
                 }
@@ -169,11 +184,18 @@ impl PersistentEventLog {
             payload,
         };
 
-        // Write to WAL
+        // Write to WAL (flush + fsync for durability)
         {
             let mut w = self.wal.write().await;
-            bopt.serialize_into(&mut *w, &event).context("writing to wal")?;
+            let mut frame = bopt.serialize(&event).context("encode wal frame")?;
+            let len = (frame.len() as u32).to_le_bytes();
+            let crc = crc32c::crc32c(&frame).to_le_bytes();
+            // write [len][frame][crc]
+            w.write_all(&len).context("write wal len")?;
+            w.write_all(&frame).context("write wal frame")?;
+            w.write_all(&crc).context("write wal crc")?;
             w.flush().context("flushing wal")?;
+            w.get_ref().sync_data().context("fsync wal (data)")?;
         }
 
         // Append in-memory
@@ -339,9 +361,14 @@ impl PersistentEventLog {
             let read = self.inner.read().await;
             bopt.serialize_into(&mut w, &*read).context("writing snapshot")?;
             w.flush().context("flushing snapshot")?;
+            // Ensure snapshot.tmp contents are durable before rename
+            let mut file = w.into_inner().context("snapshot into_inner")?;
+            file.sync_all().context("fsync snapshot.tmp")?;
         }
 
         std::fs::rename(&tmp, &path).context("renaming snapshot")?;
+        // Ensure the rename is durable
+        fsync_dir(&self.data_dir).ok();
 
         // After a successful snapshot, truncate WAL to checkpoint.
         {
@@ -353,8 +380,13 @@ impl PersistentEventLog {
                 .truncate(true)
                 .open(&wal_path)
                 .context("truncate wal after snapshot")?;
+            // fsync the truncated WAL file to persist size change
+            new_wal.sync_all().ok();
             *wal_writer = BufWriter::new(new_wal);
         }
+        // And fsync directory to persist metadata updates
+        fsync_dir(&self.data_dir).ok();
+
         metrics::SNAPSHOTS_TOTAL.inc();
         timer.observe_duration();
         Ok(())
