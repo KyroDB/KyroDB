@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use prometheus::{Counter, Encoder, Histogram, HistogramOpts, TextEncoder};
+use prometheus::{Counter, Encoder, Gauge, Histogram, HistogramOpts, TextEncoder};
 
 pub static APPENDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
@@ -102,6 +102,28 @@ pub static RMI_EPSILON_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
     )
     .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]);
     prometheus::register_histogram!(opts).expect("register kyrodb_rmi_epsilon")
+});
+
+// New: RMI gauges
+pub static RMI_INDEX_LEAVES: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_index_leaves",
+        "Number of leaves in the loaded RMI"
+    ).expect("register kyrodb_rmi_index_leaves")
+});
+
+pub static RMI_INDEX_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_index_size_bytes",
+        "Size of the RMI file on disk"
+    ).expect("register kyrodb_rmi_index_size_bytes")
+});
+
+pub static RMI_EPSILON_MAX: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_epsilon_max",
+        "Maximum epsilon across leaves"
+    ).expect("register kyrodb_rmi_epsilon_max")
 });
 
 pub fn inc_sse_lagged() { SSE_LAGGED_TOTAL.inc(); }

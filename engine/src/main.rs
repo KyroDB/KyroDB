@@ -40,6 +40,12 @@ enum Commands {
         /// Rotate/compact when WAL reaches this many bytes
         #[arg(long)]
         wal_max_bytes: Option<u64>,
+        /// Rebuild RMI when N appends since last build
+        #[arg(long)]
+        rmi_rebuild_appends: Option<u64>,
+        /// Rebuild RMI when delta/total ratio exceeds R (0.0-1.0)
+        #[arg(long)]
+        rmi_rebuild_ratio: Option<f64>,
     },
 }
 
@@ -56,6 +62,8 @@ async fn main() -> Result<()> {
             auth_token,
             snapshot_every_n_appends,
             wal_max_bytes,
+            rmi_rebuild_appends,
+            rmi_rebuild_ratio,
         } => {
             if let Some(secs) = auto_snapshot_secs {
                 if secs > 0 {
@@ -118,6 +126,54 @@ async fn main() -> Result<()> {
                         }
                     });
                 }
+            }
+
+            // Background RMI rebuild triggers (feature-gated)
+            #[cfg(feature = "learned-index")]
+            if rmi_rebuild_appends.unwrap_or(0) > 0 || rmi_rebuild_ratio.unwrap_or(0.0) > 0.0 {
+                let data_dir = cli.data_dir.clone();
+                let rebuild_log = log.clone();
+                let app_thresh = rmi_rebuild_appends.unwrap_or(0);
+                let ratio_thresh = rmi_rebuild_ratio.unwrap_or(0.0);
+                tokio::spawn(async move {
+                    let mut last_built = rebuild_log.get_offset().await;
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+                    loop {
+                        interval.tick().await;
+                        let cur = rebuild_log.get_offset().await;
+                        let appended = cur.saturating_sub(last_built);
+                        // compute ratio ~ delta/total keys
+                        let pairs = rebuild_log.collect_key_offset_pairs().await; // latest map
+                        let distinct = pairs.len() as u64;
+                        let ratio = if distinct == 0 { 0.0 } else { appended as f64 / distinct as f64 };
+                        if (app_thresh > 0 && appended >= app_thresh) || (ratio_thresh > 0.0 && ratio >= ratio_thresh) {
+                            // Build tmp
+                            let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
+                            let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
+                            if let Err(e) = kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs) {
+                                eprintln!("❌ RMI rebuild write failed: {}", e);
+                                continue;
+                            }
+                            // fsync tmp, rename
+                            if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+                                let _ = f.sync_all();
+                            }
+                            if let Err(e) = std::fs::rename(&tmp, &dst) {
+                                eprintln!("❌ RMI rename failed: {}", e);
+                                continue;
+                            }
+                            // Reload and swap
+                            if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
+                                let mut idx = rebuild_log.index.write().await;
+                                *idx = kyrodb_engine::index::PrimaryIndex::Rmi(rmi);
+                                last_built = cur;
+                                println!("✅ RMI rebuilt and swapped (appended={}, ratio={:.3})", appended, ratio);
+                            } else {
+                                eprintln!("❌ RMI reload failed after rebuild");
+                            }
+                        }
+                    }
+                });
             }
 
             let append_log = log.clone();

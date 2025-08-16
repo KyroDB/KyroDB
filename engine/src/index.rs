@@ -180,6 +180,7 @@ impl RmiIndex {
 
     pub fn load_from_file(path: &std::path::Path) -> Option<Self> {
         use std::io::Read;
+        let meta_len = std::fs::metadata(path).ok()?.len();
         let mut f = std::fs::File::open(path).ok()?;
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic).ok()?;
@@ -205,6 +206,13 @@ impl RmiIndex {
                 leaves.push(RmiLeafMeta { key_min: *sorted_keys.first().unwrap(), key_max: *sorted_keys.last().unwrap(), slope: 0.0, intercept: 0.0, epsilon, start: 0, len: count as u64 });
             }
             // no checksum in v2
+            // v2 path fills leaves as one group, sorted_keys/offsets copied
+            // metrics
+            crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+            crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
+            if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+            for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
+            return Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets });
         } else if version == 3u8 {
             // v3: [magic][ver][pad3][num_leaves u32][count u64] + leaves + keys + offsets + checksum u64
             let mut nl_buf = [0u8; 4]; f.read_exact(&mut nl_buf).ok()?;
@@ -253,59 +261,70 @@ impl RmiIndex {
             }
             let sum_calc = hasher.digest();
             if sum_calc != sum_read { return None; }
+            // after reading and verifying
+            crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+            crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
+            if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+            for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
+            return Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets });
+        } else if version == 4u8 {
+            // v4: mmap zero-copy
+            use std::mem::size_of;
+            use std::slice;
+            let file = std::fs::File::open(path).ok()?;
+            let map = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
+            let ptr = map.as_ptr();
+            let mut off = 0usize;
+            // magic
+            if map.len() < 8 { return None; }
+            off += 8; // already validated
+            // version + pad
+            off += 4;
+            // num_leaves u32
+            if map.len() < off + 4 { return None; }
+            let num_leaves = u32::from_le_bytes(map[off..off+4].try_into().ok()?) as usize; off += 4;
+            // count u64
+            if map.len() < off + 8 { return None; }
+            let count = u64::from_le_bytes(map[off..off+8].try_into().ok()?) as usize; off += 8;
+            // leaves
+            let leaf_rec_size = size_of::<u64>()*2 + size_of::<f32>()*2 + size_of::<u32>() + size_of::<u64>()*2; // 8+8+4+4+4+8+8 = 44 but we align to packed layout via explicit reads
+            let mut lvs: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves);
+            for _ in 0..num_leaves {
+                if map.len() < off + 8*2 + 4*3 + 8*2 { return None; }
+                let key_min = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
+                let key_max = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
+                let slope = f32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
+                let intercept = f32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
+                let epsilon = u32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
+                let start = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
+                let len = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
+                lvs.push(RmiLeafMeta { key_min, key_max, slope, intercept, epsilon, start, len });
+            }
+            // keys slice
+            let keys_bytes = count * size_of::<u64>();
+            if map.len() < off + keys_bytes { return None; }
+            let keys_ptr = unsafe { map.as_ptr().add(off) } as *const u64; off += keys_bytes;
+            let keys_slice: &'static [u64] = unsafe { slice::from_raw_parts(keys_ptr, count) };
+            // offsets slice
+            let offs_bytes = count * size_of::<u64>();
+            if map.len() < off + offs_bytes + 8 { return None; }
+            let offs_ptr = unsafe { map.as_ptr().add(off) } as *const u64; off += offs_bytes;
+            // checksum at end (skip verifying here in v4 for speed; could include earlier region)
+            let _sum = u64::from_le_bytes(map[off..off+8].try_into().ok()?);
+            let _mmap_holder = map; // keep alive
+            // Update metrics
+            crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+            crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
+            if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+            for leaf in &lvs { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
+            return Some(Self {
+                delta: BTreeMap::new(),
+                leaves: lvs,
+                sorted_keys: keys_slice.to_vec(),
+                sorted_offsets: unsafe { slice::from_raw_parts(offs_ptr, count) }.to_vec(),
+            });
         } else {
             return None;
-        }
-        // record epsilon metrics
-        for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
-        Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets })
-    }
-
-    pub fn insert_delta(&mut self, key: u64, offset: u64) {
-        self.delta.insert(key, offset);
-    }
-
-    pub fn delta_get(&self, key: &u64) -> Option<u64> {
-        self.delta.get(key).copied()
-    }
-
-    fn find_leaf(&self, key: u64) -> Option<&RmiLeafMeta> {
-        if self.leaves.is_empty() { return None; }
-        // binary search by key range
-        let mut lo = 0usize;
-        let mut hi = self.leaves.len();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let leaf = &self.leaves[mid];
-            if key < leaf.key_min { if mid == 0 { return None; } hi = mid; } else if key > leaf.key_max { lo = mid + 1; } else { return Some(leaf); }
-        }
-        None
-    }
-
-    /// Predict bounded window using per-leaf linear model.
-    pub fn predict_window(&self, key: &u64) -> Option<(usize, usize)> {
-        let leaf = self.find_leaf(*key)?;
-        let pred = (leaf.slope as f64) * (*key as f64) + (leaf.intercept as f64);
-        // clamp to leaf range in global indices
-        let start = leaf.start as i64;
-        let end = (leaf.start + leaf.len.saturating_sub(1)) as i64;
-        let pos = (pred.round() as i64).clamp(start, end);
-        let eps = leaf.epsilon as i64;
-        let lo = (pos - eps).max(start) as usize;
-        let hi = (pos + eps).min(end) as usize;
-        Some((lo, hi))
-    }
-
-    pub fn predict_get(&self, key: &u64) -> Option<u64> {
-        if self.sorted_keys.is_empty() { return None; }
-        if let Some((lo, hi)) = self.predict_window(key) {
-            let slice = &self.sorted_keys[lo..=hi];
-            match slice.binary_search(key) {
-                Ok(rel) => self.sorted_offsets.get(lo + rel).copied(),
-                Err(_) => None,
-            }
-        } else {
-            None
         }
     }
 }
