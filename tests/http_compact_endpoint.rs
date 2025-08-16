@@ -28,6 +28,9 @@ async fn http_compact_endpoint_smoke() {
         .reply(&api)
         .await;
     assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+    assert_eq!(body["compact"], "ok");
+    assert!(body["stats"]["before_bytes"].as_u64().unwrap() > body["stats"]["after_bytes"].as_u64().unwrap());
 
     // WAL should shrink after compaction
     let size = log.wal_size_bytes();

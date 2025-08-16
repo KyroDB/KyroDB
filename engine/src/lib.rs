@@ -49,6 +49,16 @@ pub struct Event {
     pub payload: Vec<u8>,
 }
 
+/// Compaction stats returned by compaction APIs and /compact endpoint
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionStats {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub segments_removed: usize,
+    pub segments_active: usize,
+    pub keys_retained: usize,
+}
+
 /// WAL‑and‑Snapshot durable log with broadcast for live tailing
 #[derive(Clone)]
 pub struct PersistentEventLog {
@@ -58,18 +68,52 @@ pub struct PersistentEventLog {
     tx:       broadcast::Sender<Event>,
     index:    Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
     next_offset: Arc<RwLock<u64>>,              // monotonic sequence (not tied to vec length)
+    // current WAL segment index for rotation
+    wal_seg_index: Arc<RwLock<u32>>,
+    // rotation config
+    wal_segment_bytes: Arc<RwLock<Option<u64>>>,
+    wal_max_segments: Arc<RwLock<usize>>,
     #[cfg(feature = "ann-hnsw")]
     ann:      Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
 }
 
 impl PersistentEventLog {
+    fn wal_segment_name(idx: u32) -> String { format!("wal.{idx:04}") }
+    fn wal_segment_path(dir: &std::path::Path, idx: u32) -> PathBuf { dir.join(Self::wal_segment_name(idx)) }
+
+    fn list_wal_segments(dir: &std::path::Path) -> Vec<(u32, PathBuf)> {
+        let mut segs: Vec<(u32, PathBuf)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if let Some(name) = e.file_name().to_str() {
+                    if name.starts_with("wal.") && name.len() == 8 {
+                        if let Ok(idx) = name[4..].parse::<u32>() {
+                            segs.push((idx, e.path()));
+                        }
+                    } else if name == "wal.bin" {
+                        // legacy single WAL; treat as segment 0 for replay
+                        segs.push((0, e.path()));
+                    }
+                }
+            }
+        }
+        segs.sort_by_key(|(i, _)| *i);
+        segs
+    }
+
+    fn wal_total_bytes(dir: &std::path::Path) -> u64 {
+        Self::list_wal_segments(dir)
+            .into_iter()
+            .map(|(_, p)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum()
+    }
+
     /// Open (or create) a log in `data_dir/` and recover state.
     pub async fn open(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
 
         let snap_path = data_dir.join("snapshot.bin");
-        let wal_path  = data_dir.join("wal.bin");
 
         // bincode options with a safety limit (16 MiB) to avoid huge allocations on corrupt/legacy files
         let bopt = bincode::options().with_limit(16 * 1024 * 1024);
@@ -89,18 +133,18 @@ impl PersistentEventLog {
             Vec::new()
         };
 
-        // 2) Open WAL, replay any events after snapshot
-        let mut wal_file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&wal_path)
-            .context("opening wal")?;
-        wal_file.seek(SeekFrom::Start(0)).context("seek wal for replay")?;
-        {
+        // 2) Replay WAL segments in order
+        let segs = Self::list_wal_segments(&data_dir);
+        let mut last_seg_idx: u32 = 0;
+        for (idx, path) in &segs {
+            last_seg_idx = (*idx).max(last_seg_idx);
+            let mut wal_file = OpenOptions::new()
+                .read(true)
+                .open(path)
+                .with_context(|| format!("opening wal segment: {}", path.display()))?;
+            wal_file.seek(SeekFrom::Start(0)).context("seek wal for replay")?;
             let mut rdr = BufReader::new(&wal_file);
             loop {
-                // read length prefix (u32), then payload, then crc32c(u32)
                 let mut len_buf = [0u8; 4];
                 if let Err(_) = rdr.read_exact(&mut len_buf) { break; }
                 let len = u32::from_le_bytes(len_buf) as usize;
@@ -120,14 +164,23 @@ impl PersistentEventLog {
                 }
             }
         }
+
+        // 3) Open current segment for append (create if none)
+        let seg_to_open = if segs.is_empty() { 0 } else { last_seg_idx };
+        let seg_path = Self::wal_segment_path(&data_dir, seg_to_open);
+        let mut wal_file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&seg_path)
+            .context("opening wal segment for append")?;
         wal_file.seek(SeekFrom::End(0)).context("seek wal to end")?;
         let wal = Arc::new(RwLock::new(BufWriter::new(wal_file)));
 
-        // 3) Setup broadcast channel
+        // 4) Setup broadcast channel
         let (tx, _) = broadcast::channel(1_024);
 
-        // 4) Build log
-        // Build index from recovered events
+        // 5) Build index from recovered events
         let mut idx = index::PrimaryIndex::new_btree();
         let mut max_off = 0u64;
         for ev in &events {
@@ -149,7 +202,7 @@ impl PersistentEventLog {
             }
         }
 
-        // 5) Read manifest (best-effort) to seed next_offset and paths
+        // 6) Read manifest (best-effort) to seed next_offset and paths
         let manifest_path = data_dir.join("manifest.json");
         if manifest_path.exists() {
             if let Ok(text) = std::fs::read_to_string(&manifest_path) {
@@ -168,6 +221,9 @@ impl PersistentEventLog {
             tx,
             index:   Arc::new(RwLock::new(idx)),
             next_offset: Arc::new(RwLock::new(next)),
+            wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
+            wal_segment_bytes: Arc::new(RwLock::new(None)),
+            wal_max_segments: Arc::new(RwLock::new(8)),
             #[cfg(feature = "ann-hnsw")]
             ann:     Arc::new(RwLock::new(None)),
         };
@@ -204,10 +260,10 @@ impl PersistentEventLog {
         };
         drop(noff);
 
-        // Write to WAL (flush + fsync for durability)
+        // Write to WAL current segment (flush + fsync for durability)
         {
             let mut w = self.wal.write().await;
-            let mut frame = bopt.serialize(&event).context("encode wal frame")?;
+            let frame = bopt.serialize(&event).context("encode wal frame")?;
             let len = (frame.len() as u32).to_le_bytes();
             let crc = crc32c::crc32c(&frame).to_le_bytes();
             // write [len][frame][crc]
@@ -217,6 +273,8 @@ impl PersistentEventLog {
             w.flush().context("flushing wal")?;
             w.get_ref().sync_data().context("fsync wal (data)")?;
         }
+        // maybe rotate
+        self.rotate_wal_if_needed().await;
 
         // Append in-memory
         write.push(event.clone());
@@ -374,7 +432,6 @@ impl PersistentEventLog {
         let bopt = bincode::options().with_limit(16 * 1024 * 1024);
         let path = self.data_dir.join("snapshot.bin");
         let tmp  = self.data_dir.join("snapshot.tmp");
-        let wal_path = self.data_dir.join("wal.bin");
 
         {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
@@ -391,19 +448,26 @@ impl PersistentEventLog {
         // Ensure the rename is durable
         fsync_dir(&self.data_dir).ok();
 
-        // After a successful snapshot, truncate WAL to checkpoint.
+        // After a successful snapshot, reset WAL segments (truncate to a fresh segment)
         {
-            let mut wal_writer = self.wal.write().await;
-            wal_writer.flush().context("flush wal before truncate")?;
+            // Close current writer and replace with a fresh segment 0
+            // Remove all existing wal.* files
+            let segs = Self::list_wal_segments(&self.data_dir);
+            for (_, p) in segs {
+                let _ = std::fs::remove_file(p);
+            }
+            let seg0 = Self::wal_segment_path(&self.data_dir, 0);
             let new_wal = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&wal_path)
-                .context("truncate wal after snapshot")?;
-            // fsync the truncated WAL file to persist size change
+                .open(&seg0)
+                .context("create fresh wal segment after snapshot")?;
             new_wal.sync_all().ok();
+            let mut wal_writer = self.wal.write().await;
             *wal_writer = BufWriter::new(new_wal);
+            let mut seg_idx = self.wal_seg_index.write().await;
+            *seg_idx = 0;
         }
         // And fsync directory to persist metadata updates
         fsync_dir(&self.data_dir).ok();
@@ -416,9 +480,11 @@ impl PersistentEventLog {
     }
 
     /// Compact to latest values per key, preserving original offsets. Then snapshot and truncate WAL.
-    pub async fn compact_keep_latest_and_snapshot(&self) -> Result<()> {
+    pub async fn compact_keep_latest_and_snapshot_stats(&self) -> Result<CompactionStats> {
         use std::collections::BTreeMap;
         let timer = metrics::COMPACTION_DURATION_SECONDS.start_timer();
+        let before_bytes = Self::wal_total_bytes(&self.data_dir);
+        let before_segments = Self::list_wal_segments(&self.data_dir).len();
         // 1) Build latest offset per key and capture the corresponding events
         let current_events = { self.inner.read().await.clone() };
         let mut latest: BTreeMap<u64, (u64, &Event)> = BTreeMap::new();
@@ -450,12 +516,26 @@ impl PersistentEventLog {
             }
         }
 
-        // 4) Persist snapshot of compacted state and truncate WAL
+        // 4) Persist snapshot of compacted state and reset WAL segments
         self.snapshot().await?;
         metrics::COMPACTIONS_TOTAL.inc();
         timer.observe_duration();
         // Update manifest after compaction
         self.write_manifest().await;
+        let after_bytes = Self::wal_total_bytes(&self.data_dir);
+        let after_segments = Self::list_wal_segments(&self.data_dir).len();
+        Ok(CompactionStats {
+            before_bytes,
+            after_bytes,
+            segments_removed: before_segments.saturating_sub(after_segments),
+            segments_active: after_segments,
+            keys_retained: compacted.len(),
+        })
+    }
+
+    /// Backwards-compatible wrapper without stats
+    pub async fn compact_keep_latest_and_snapshot(&self) -> Result<()> {
+        let _ = self.compact_keep_latest_and_snapshot_stats().await?;
         Ok(())
     }
 
@@ -465,25 +545,29 @@ impl PersistentEventLog {
     }
 
     /// Path to the schema registry JSON file.
-    pub fn registry_path(&self) -> std::path::PathBuf {
-        self.data_dir.join("schema.json")
-    }
+    pub fn registry_path(&self) -> std::path::PathBuf { self.data_dir.join("schema.json") }
 
-    /// Current WAL size in bytes (best-effort). Useful for size-based rotation/compaction triggers.
-    pub fn wal_size_bytes(&self) -> u64 {
-        let path = self.data_dir.join("wal.bin");
-        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-    }
+    /// Current WAL size in bytes (sum of segments).
+    pub fn wal_size_bytes(&self) -> u64 { Self::wal_total_bytes(&self.data_dir) }
 
     /// Minimal manifest path
     pub fn manifest_path(&self) -> std::path::PathBuf { self.data_dir.join("manifest.json") }
+
+    /// List current WAL segments' basenames
+    fn current_wal_segments(&self) -> Vec<String> {
+        Self::list_wal_segments(&self.data_dir)
+            .into_iter()
+            .map(|(_, p)| p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string())
+            .collect()
+    }
 
     /// Write minimal manifest with next_offset and active files.
     pub async fn write_manifest(&self) {
         let manifest = serde_json::json!({
             "next_offset": self.get_offset().await,
             "snapshot": "snapshot.bin",
-            "wal": "wal.bin",
+            "wal_segments": self.current_wal_segments(),
+            "wal_total_bytes": self.wal_size_bytes(),
             "rmi": "index-rmi.bin",
             "ts": chrono::Utc::now().timestamp()
         });
@@ -501,6 +585,51 @@ impl PersistentEventLog {
     pub async fn swap_primary_index(&self, new_index: index::PrimaryIndex) {
         let mut idx = self.index.write().await;
         *idx = new_index;
+    }
+
+    async fn rotate_wal_if_needed(&self) {
+        let seg_bytes = *self.wal_segment_bytes.read().await;
+        let Some(max_seg_bytes) = seg_bytes else { return; };
+        if max_seg_bytes == 0 { return; }
+        let cur_idx = *self.wal_seg_index.read().await;
+        let cur_path = Self::wal_segment_path(&self.data_dir, cur_idx);
+        let cur_size = std::fs::metadata(&cur_path).map(|m| m.len()).unwrap_or(0);
+        if cur_size < max_seg_bytes { return; }
+        // rotate
+        let mut w = self.wal.write().await;
+        let mut seg_idx = self.wal_seg_index.write().await;
+        let next_idx = seg_idx.saturating_add(1);
+        let next_path = Self::wal_segment_path(&self.data_dir, next_idx);
+        if let Ok(new_file) = OpenOptions::new().write(true).create(true).truncate(true).open(&next_path) {
+            *w = BufWriter::new(new_file);
+            *seg_idx = next_idx;
+            let _ = fsync_dir(&self.data_dir);
+            drop(w);
+            drop(seg_idx);
+            // retention
+            let max_keep = *self.wal_max_segments.read().await;
+            if max_keep > 0 {
+                let mut segs = Self::list_wal_segments(&self.data_dir);
+                if segs.len() > max_keep {
+                    let to_remove = segs.len() - max_keep;
+                    for (idx, path) in segs.drain(..to_remove) {
+                        // don't remove current
+                        if idx != next_idx {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                    let _ = fsync_dir(&self.data_dir);
+                }
+            }
+            // update manifest after rotation
+            self.write_manifest().await;
+        }
+    }
+
+    /// Configure WAL rotation: segment size threshold and max segments retained.
+    pub async fn configure_wal_rotation(&self, segment_bytes: Option<u64>, max_segments: usize) {
+        *self.wal_segment_bytes.write().await = segment_bytes;
+        *self.wal_max_segments.write().await = max_segments.max(1);
     }
 }
 
@@ -552,9 +681,9 @@ pub mod http_filters {
             .and_then(move || {
                 let log = log.clone();
                 async move {
-                    match log.compact_keep_latest_and_snapshot().await {
-                        Ok(_) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"compact":"ok"})),
+                    match log.compact_keep_latest_and_snapshot_stats().await {
+                        Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"compact":"ok","stats":stats})),
                             warp::http::StatusCode::OK,
                         )),
                         Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(

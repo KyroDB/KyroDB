@@ -47,6 +47,12 @@ enum Commands {
         /// Rebuild RMI when delta/total ratio exceeds R (0.0-1.0)
         #[arg(long)]
         rmi_rebuild_ratio: Option<f64>,
+        /// WAL rotation: per-segment max bytes
+        #[arg(long)]
+        wal_segment_bytes: Option<u64>,
+        /// WAL retention: max segments to keep
+        #[arg(long, default_value_t = 8)]
+        wal_max_segments: usize,
     },
 }
 
@@ -65,7 +71,14 @@ async fn main() -> Result<()> {
             wal_max_bytes,
             rmi_rebuild_appends,
             rmi_rebuild_ratio,
+            wal_segment_bytes,
+            wal_max_segments,
         } => {
+            // Configure WAL rotation if requested
+            if wal_segment_bytes.is_some() || wal_max_segments > 0 {
+                log.configure_wal_rotation(wal_segment_bytes, wal_max_segments).await;
+            }
+
             if let Some(secs) = auto_snapshot_secs {
                 if secs > 0 {
                     let snapshot_log = log.clone();
@@ -151,8 +164,11 @@ async fn main() -> Result<()> {
                             // Build tmp
                             let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
                             let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
+                            let rebuild_timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             if let Err(e) = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs) {
                                 eprintln!("❌ RMI rebuild write failed: {}", e);
+                                // record duration even on failure to get observability
+                                rebuild_timer.observe_duration();
                                 continue;
                             }
                             // fsync tmp, rename
@@ -161,15 +177,19 @@ async fn main() -> Result<()> {
                             }
                             if let Err(e) = std::fs::rename(&tmp, &dst) {
                                 eprintln!("❌ RMI rename failed: {}", e);
+                                rebuild_timer.observe_duration();
                                 continue;
                             }
                             // Reload and swap
                             if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
                                 rebuild_log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
                                 last_built = cur;
+                                engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
+                                rebuild_timer.observe_duration();
                                 println!("✅ RMI rebuilt and swapped (appended={}, ratio={:.3})", appended, ratio);
                             } else {
                                 eprintln!("❌ RMI reload failed after rebuild");
+                                rebuild_timer.observe_duration();
                             }
                         }
                     }
@@ -230,19 +250,16 @@ async fn main() -> Result<()> {
                 .and_then(move || {
                     let log = compact_log.clone();
                     async move {
-                        if let Err(e) = log.compact_keep_latest_and_snapshot().await {
-                            eprintln!("❌ Compaction failed: {}", e);
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                        match log.compact_keep_latest_and_snapshot_stats().await {
+                            Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "compact": "ok", "stats": stats })),
+                                warp::http::StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
                                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            ));
+                            )),
                         }
-                        Ok::<_, warp::Rejection>(
-                            warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "compact": "ok" })),
-                                warp::http::StatusCode::OK,
-                            ),
-                        )
                     }
                 });
 
@@ -406,8 +423,11 @@ async fn main() -> Result<()> {
                             tmp.push("index-rmi.tmp");
                             let mut dst = std::path::PathBuf::from(&data_dir);
                             dst.push("index-rmi.bin");
+                            let timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             let ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
                                 && std::fs::rename(&tmp, &dst).is_ok();
+                            if ok { engine_crate::metrics::RMI_REBUILDS_TOTAL.inc(); }
+                            timer.observe_duration();
                             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                                 "ok": ok,
                                 "count": pairs.len()

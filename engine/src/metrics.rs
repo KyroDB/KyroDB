@@ -126,6 +126,23 @@ pub static RMI_EPSILON_MAX: Lazy<Gauge> = Lazy::new(|| {
     ).expect("register kyrodb_rmi_epsilon_max")
 });
 
+// New: RMI rebuild metrics
+pub static RMI_REBUILDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_rmi_rebuilds_total",
+        "Total number of successful RMI rebuilds"
+    ).expect("register kyrodb_rmi_rebuilds_total")
+});
+
+pub static RMI_REBUILD_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_rmi_rebuild_duration_seconds",
+        "Duration of RMI rebuilds in seconds",
+    )
+    .buckets(vec![0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_rmi_rebuild_duration_seconds")
+});
+
 pub fn inc_sse_lagged() { SSE_LAGGED_TOTAL.inc(); }
 
 pub fn render() -> String {

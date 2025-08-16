@@ -43,7 +43,7 @@ pub struct RmiLeafMeta {
 }
 
 #[cfg(feature = "learned-index")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RmiIndex {
     // Delta map: keys appended after last build
     delta: BTreeMap<u64, u64>,
@@ -51,6 +51,8 @@ pub struct RmiIndex {
     leaves: Vec<RmiLeafMeta>,
     sorted_keys: Vec<u64>,
     sorted_offsets: Vec<u64>,
+    // Hold mmap to allow future zero-copy slices to remain valid
+    mmap: Option<memmap2::Mmap>,
 }
 
 #[cfg(feature = "learned-index")]
@@ -59,7 +61,7 @@ const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
 #[cfg(feature = "learned-index")]
 impl RmiIndex {
     pub fn new() -> Self {
-        Self { delta: BTreeMap::new(), leaves: Vec::new(), sorted_keys: Vec::new(), sorted_offsets: Vec::new() }
+        Self { delta: BTreeMap::new(), leaves: Vec::new(), sorted_keys: Vec::new(), sorted_offsets: Vec::new(), mmap: None }
     }
 
     /// Build per-leaf linear models and epsilon bounds from sorted pairs and write v3 format with checksum.
@@ -129,11 +131,11 @@ impl RmiIndex {
                 len: len as u64,
             });
         }
-        // write header v3
+        // write header v4 (mmap-capable layout)
         let mut f = std::fs::File::create(path)?;
         let mut header = Vec::new();
         header.extend_from_slice(&RMI_MAGIC);
-        header.push(3u8); // version 3
+        header.push(4u8); // version 4
         header.extend_from_slice(&[0u8; 3]); // pad
         header.extend_from_slice(&(num_leaves as u32).to_le_bytes());
         header.extend_from_slice(&total_keys.to_le_bytes());
@@ -147,6 +149,15 @@ impl RmiIndex {
             f.write_all(&leaf.epsilon.to_le_bytes())?;
             f.write_all(&leaf.start.to_le_bytes())?;
             f.write_all(&leaf.len.to_le_bytes())?;
+        }
+        // Align to 8-byte boundary before keys section
+        {
+            use std::io::Seek;
+            let pos = f.stream_position()?;
+            let pad = ((8 - (pos % 8)) % 8) as usize;
+            if pad > 0 {
+                f.write_all(&vec![0u8; pad])?;
+            }
         }
         // write keys and offsets
         for k in &keys { f.write_all(&k.to_le_bytes())?; }
@@ -210,7 +221,7 @@ impl RmiIndex {
             crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
             if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
             for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
-            return Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets });
+            return Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets, mmap: None });
         } else if version == 3u8 {
             // v3: [magic][ver][pad3][num_leaves u32][count u64] + leaves + keys + offsets + checksum u64
             let mut nl_buf = [0u8; 4]; f.read_exact(&mut nl_buf).ok()?;
@@ -264,11 +275,10 @@ impl RmiIndex {
             crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
             if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
             for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
-            return Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets });
+            return Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets, mmap: None });
         } else if version == 4u8 {
-            // v4: mmap zero-copy
+            // v4: mmap zero-copy capable (currently retains mmap; parses keys/offsets safely regardless of alignment)
             use std::mem::size_of;
-            use std::slice;
             let file = std::fs::File::open(path).ok()?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
             let mut off = 0usize;
@@ -284,10 +294,10 @@ impl RmiIndex {
             if map.len() < off + 8 { return None; }
             let count = u64::from_le_bytes(map[off..off+8].try_into().ok()?) as usize; off += 8;
             // leaves
-            let _leaf_rec_size = size_of::<u64>()*2 + size_of::<f32>()*2 + size_of::<u32>() + size_of::<u64>()*2; // packed length reference
+            let leaf_rec_size = size_of::<u64>()*2 + size_of::<f32>()*2 + size_of::<u32>() + size_of::<u64>()*2; // 44 bytes
             let mut lvs: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves);
             for _ in 0..num_leaves {
-                if map.len() < off + 8*2 + 4*3 + 8*2 { return None; }
+                if map.len() < off + leaf_rec_size { return None; }
                 let key_min = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
                 let key_max = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
                 let slope = f32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
@@ -297,19 +307,40 @@ impl RmiIndex {
                 let len = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
                 lvs.push(RmiLeafMeta { key_min, key_max, slope, intercept, epsilon, start, len });
             }
-            // keys slice
-            let keys_bytes = count * size_of::<u64>();
+            // Align to 8-byte boundary before keys
+            let pad = (8 - (off % 8)) & 7; // 0..7
+            if map.len() < off + pad { return None; }
+            off += pad;
+            // keys
+            let keys_bytes = count.checked_mul(size_of::<u64>())?;
             if map.len() < off + keys_bytes { return None; }
-            let keys_ptr = unsafe { map.as_ptr().add(off) } as *const u64; off += keys_bytes;
-            let keys_slice: &'static [u64] = unsafe { slice::from_raw_parts(keys_ptr, count) };
-            // offsets slice
-            let offs_bytes = count * size_of::<u64>();
+            let mut sorted_keys_local = Vec::with_capacity(count);
+            for chunk in map[off..off+keys_bytes].chunks_exact(8) {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(chunk);
+                sorted_keys_local.push(u64::from_le_bytes(a));
+            }
+            off += keys_bytes;
+            // offsets
+            let offs_bytes = count.checked_mul(size_of::<u64>())?;
             if map.len() < off + offs_bytes + 8 { return None; }
-            let offs_ptr = unsafe { map.as_ptr().add(off) } as *const u64; off += offs_bytes;
-            // checksum at end (skip verifying here in v4 for speed; could include earlier region)
-            let _sum = u64::from_le_bytes(map[off..off+8].try_into().ok()?);
-            let _mmap_holder = map; // keep alive
-            // Update metrics
+            let mut sorted_offsets_local = Vec::with_capacity(count);
+            for chunk in map[off..off+offs_bytes].chunks_exact(8) {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(chunk);
+                sorted_offsets_local.push(u64::from_le_bytes(a));
+            }
+            off += offs_bytes;
+            // checksum at end (verify)
+            if map.len() < off + 8 { return None; }
+            let sum_read = u64::from_le_bytes(map[off..off+8].try_into().ok()?);
+            // recompute checksum on prior bytes
+            use xxhash_rust::xxh3::Xxh3;
+            let mut hasher = Xxh3::new();
+            hasher.update(&map[..off]);
+            let sum_calc = hasher.digest();
+            if sum_calc != sum_read { return None; }
+            // Metrics
             crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
             crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
             if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
@@ -317,8 +348,9 @@ impl RmiIndex {
             return Some(Self {
                 delta: BTreeMap::new(),
                 leaves: lvs,
-                sorted_keys: keys_slice.to_vec(),
-                sorted_offsets: unsafe { slice::from_raw_parts(offs_ptr, count) }.to_vec(),
+                sorted_keys: sorted_keys_local,
+                sorted_offsets: sorted_offsets_local,
+                mmap: Some(map),
             });
         } else {
             return None;

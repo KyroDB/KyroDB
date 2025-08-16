@@ -25,10 +25,12 @@ async fn compaction_triggers_by_appends_and_size() {
     let before = log.wal_size_bytes();
     assert!(before > 1024);
 
-    // Manual compaction keeps latest and snapshots
-    log.compact_keep_latest_and_snapshot().await.unwrap();
+    // Manual compaction keeps latest and snapshots and returns stats
+    let stats = log.compact_keep_latest_and_snapshot_stats().await.unwrap();
     let after = log.wal_size_bytes();
     assert!(after < before, "wal did not shrink: before={}, after={}", before, after);
+    assert!(stats.before_bytes >= before && stats.after_bytes == after);
+    assert!(stats.keys_retained > 0);
 
     // Verify lookups still work (latest writes retained)
     for k in 0..7u64 {
