@@ -1,113 +1,197 @@
-# AI-Native Database Vision Document
+# KyroDB — Vision Document (Expanded)
 
-## Overview
+**Status:** Living vision — broad long-term goals while remaining grounded in the short-term KV + RMI focus in the README.
 
-This README serves as the vision document for ProjectKyro, an AI-native database designed to integrate artificial intelligence at its core. KyroDB aims to revolutionize data management by fusing self-optimizing learned components (AI4DB) with native support for AI workloads (DB4AI). This creates a database that is autonomous, efficient, and tailored for modern AI-driven applications, reducing operational overhead while accelerating AI development.
+> **Elevator pitch (long-term):** KyroDB aims to be an AI-native database that fuses learned systems and classical database correctness to become a self-optimizing, auditable, and developer-friendly data platform for AI-first applications — from single-node RMI-accelerated KV engines to federated, autonomous database fabrics that natively support model training, inference, provenance, and governance.
 
-The document outlines researched components, features, and development stages in markdown lists, progressing from basic foundations to advanced capabilities. It includes a defined MVP, architectural insights, and benefits, drawing from academic research, industry trends, and practical implementations in systems like learned indexes and vector databases.
+---
 
-## Vision Statement
-KyroDB envisions a future where databases are not just storage systems but intelligent entities that learn from data and workloads in real time. By embedding AI deeply into the database kernel, KyroDB will deliver self-driving operations, seamless AI integration, and superior performance for hybrid workloads—bridging traditional relational databases, vector stores, and autonomous systems. Target users include AI developers, data engineers, and enterprises handling semantic search, recommendations, and real-time analytics.
+## Current Status 
 
-## Key Features: From Basic to Advanced
+- Scope: production-grade single-node KV + RMI focus.
+- Transport: HTTP/JSON for both data and control today; gRPC data-plane planned in Phase A.
+- Tooling: kyrodb-engine (server) + kyrodbctl (Go CLI) over HTTP.
+- Vectors/ANN: deferred to later phases; not enabled by default.
+- “Kernel” is an explicit target: near-term work includes defining storage/index traits and swapping index implementations.
 
-Features are categorized by maturity level, based on research from sources like Tsinghua/Waterloo papers on AI-native databases and MIT's work on learned indexes. Each level builds incrementally, ensuring a logical progression.
+---
 
-### Basic Features (Foundational Building Blocks)
-- **Core Storage Engine**: A simple key-value store with durable persistence (WAL + snapshots).
-- **SQL-Like Query Interface**: Fundamental CRUD and simple vector queries.
-- **Data Ingestion Pipelines**: Batch and streaming inputs (append/subscribe).
-- **Basic Monitoring**: Prometheus metrics for latency and throughput.
+# 1. Vision Summary
 
-### Intermediate Features (Core AI Integration)
-- **Learned Indexes**: Replace traditional B-trees with machine learning models (e.g., recursive model indexes) to predict data locations, improving lookup speed by up to 3x on read-heavy workloads while reducing memory footprint.
-- **Vector Data Types**: Native support for high-dimensional embeddings, including storage and basic exact nearest neighbor search for semantic queries.
-- **ML-Based Query Optimization**: Use supervised learning for cardinality estimation and cost modeling, outperforming heuristic-based optimizers on skewed datasets.
-- **Autonomous Knob Tuning**: Reinforcement learning agents to automatically adjust configuration parameters like buffer sizes and parallelism based on workload patterns.
+KyroDB’s long-term ambition is to blur the lines between data platforms and model infrastructure. The database should not just *store data* — it should *learn from it*, *optimize itself*, and *enable AI workflows* with built-in primitives for provenance, reproducibility, and governance. Over time KyroDB will graduate from a production-grade single-node KV + RMI engine (the immediate focus) into a modular ecosystem supporting vectors, in‑database model ops, self-tuning knobs, and federated learning, while preserving strong durability, auditability, and developer ergonomics.
 
-### Advanced Features (Full Autonomy and AI-First Design)
-- **Multi-Dimensional Learned Indexes**: Extend learned structures to handle composite keys, spatial data, and temporal distributions with error-bounded guarantees for dynamic updates.
-- **Approximate Nearest Neighbor (ANN) Search**: Integrate algorithms like HNSW or IVF with hybrid filters for scalable semantic search, supporting retrieval-augmented generation (RAG) at production scales.
-- **Declarative AI Operators**: SQL extensions for in-database model training, inference, and composition (e.g., `SELECT EMBED(text) FROM docs`), enabling joint optimization of data and AI pipelines.
-- **Self-Healing and Predictive Maintenance**: Anomaly detection models that forecast failures, trigger automated recoveries, and adapt to hardware heterogeneity (e.g., GPU acceleration).
-- **Provenance and Governance**: Built-in tracking of data lineage, model versions, bias detection, and compliance tools for trustworthy AI operations.
-- **Federated Learning Support**: Enable distributed training across nodes while maintaining data privacy, for edge-to-cloud deployments.
+This vision balances two things:
 
-## Minimum Viable Product (MVP)
+1. **Research excellence** — publishable, reproducible contributions (e.g., integrating learned indexes in a durable KV engine).
+2. **Engineering pragmatism** — ship stable, benchmarked software that developers can run and trust.
 
-- **Scope**:
-  - Durable storage engine with learned index for KV (single-column key).
-  - Vector support (exact + ANN) with SQL/HTTP.
-  - One simple autotuned knob.
-  - SQL limited to INSERT/SELECT and vector similarity.
+---
 
-- **Success Criteria**:
-  - ≥2x faster point lookups with learned index vs baseline on synthetic workloads.
-  - Vector demo app (semantic search) working end-to-end.
-  - Crash safety (WAL recovery) and basic telemetry.
+# 2. Problem Space & Opportunity
 
-- **Technical Stack**:
-  - Language: Rust for performance, Go for orchestration layer.
-  - ML Framework: PyTorch for embedded models.
-  - Testing: Use datasets from ANN-Benchmarks for vector search evaluation.
+Modern AI stacks are complex: ingestion pipelines, streaming infra (Kafka), OLTP/OLAP stores, vector DBs, separate model infra, provenance tooling, and orchestration. This complexity results in:
 
-- **Risks and Mitigations**:
-  - Challenge: Update handling in learned indexes—mitigate by starting with read-optimized designs and adding incremental updates later.
-  - Validation: Beta testing with 10-20 users from AI developer communities.
+* operational overhead and expensive glue code;
+* brittle pipelines that break under a production incident;
+* lack of end-to-end provenance for model-driven decisions;
+* duplicated storage and inconsistency between vector/materialized views.
 
-## Development Roadmap: Stages and Milestones
+KyroDB reduces the stack surface by natively combining **event-sourced durability**, **learned indexing**, and **AI-friendly access patterns** while adding the governance and reproducibility primitives AI applications need.
 
-This roadmap outlines phased progression, informed by agile methodologies and research on database evolution (e.g., from single-node to AI-native eras).
+**Market signals:** increasing interest in learned indexes (research + early engineering), provider-built vector capabilities in major cloud DBs, and developer demand for simpler RAG pipelines.
 
-1. **Research and Planning**:
-   - Conduct literature reviews on learned components and DB4AI.
-   - Define architecture blueprints and user stories.
-   - Milestone: Completed vision document and initial prototypes sketches.
+---
 
-2. **Prototype Building**:
-   - Implement MVP features.
-   - Integrate basic AI elements like learned indexes.
-   - Milestone: Working MVP with benchmarks showing performance gains.
+# 3. North-Star Goals 
 
-3. **Feature Expansion**:
-   - Add intermediate features like vector ANN and query optimization.
-   - Develop distributed capabilities using Kubernetes for scaling.
-   - Milestone: Alpha release with end-to-end AI workload support.
+* **Research North-star:** Demonstrate that learned primary indexes can be productionized with durability guarantees and outperform classical indices on realistic workloads; publish reproducible results and release code artifacts.
+* **Product North-star:** A lightweight, pluggable database kernel that: durable by default, self-tuning, provides first-class vector and model ops, and can power both developer prototypes and regulated production services.
+* **Ecosystem North-star:** A healthy open-source community and reproducible benchmark suite that becomes the reference for learned-index research and engineering trade-offs.
 
-4. **Advanced Optimization and Testing**:
-   - Incorporate self-healing, declarative AI, and governance.
-   - Rigorous testing on real-world workloads (e.g., TPC benchmarks adapted for AI).
-   - Milestone: Beta release with security audits and compliance checks.
+Success signals: peer-reviewed paper or arXiv preprint, reproducible benchmarks used by third parties, stable 1.0 engine with adoption in small/medium production projects.
 
-5. **Product Launch and Iteration**:
-   - Polish UX, documentation, and integrations (e.g., with cloud providers).
-   - Launch open-source core with premium features.
-   - Milestone: Market release, user feedback loops, and v1.0 stable.
+---
 
-## Architecture Overview
+# 4. Pillars of KyroDB
 
-KyroDB's architecture is modular and cloud-native, blending traditional database layers with AI infusions:
+## 4.1 Correctness & Durability
 
-- **Storage Layer**: Persistent storage with learned indexes and vector-optimized formats.
-- **Execution Engine**: Hybrid optimizer using ML for plan selection and GPU acceleration for AI ops.
-- **Management Plane**: Autonomous controller for monitoring, tuning, and healing.
-- **Interface Layer**: Extended SQL for declarative AI, plus APIs for model deployment.
-- **Distributed Fabric**: Microservices on Kubernetes, supporting elastic scaling and federated ops.
+Durability is non-negotiable. All learned components must sit on top of clear, auditable storage semantics: WAL + atomic snapshots + clear recovery story. KyroDB’s design principle: **learning augments indexing/performance, never weakens correctness guarantees**.
 
-## Benefits and Market Differentiation
+## 4.2 Reproducible Research & Engineering
 
-- **Efficiency Gains**: Up to 70% reduction in memory for indexes and 50% faster queries via learning.
-- **Operational Savings**: Reduces DBA intervention by 80% through autonomy.
-- **AI Acceleration**: Lowers barriers for building RAG apps, with 10x faster semantic searches compared to bolt-on solutions.
-- **Differentiation**: Unlike vector databases (e.g., Pinecone) or extended RDBMS (e.g., pgvector), KyroDB offers end-to-end AI-native design for hybrid workloads.
+Every benchmark, experiment, and design choice must be reproducible: commit hashes, exact scripts, random seeds, and Dockerized runners. This provides credibility in the research community and confidence for adopters.
 
-## Challenges and Future Considerations
-- **ACID + learning** requires hybrid approaches.
-- **Ethical AI**: transparency, bias mitigation.
-- **Roadmap**: OSS core; managed offerings.
+## 4.3 Self-Optimization (AI4DB)
 
-- **Technical Hurdles**: Ensuring ACID compliance with learned structures—address via hybrid traditional/AI approaches.
-- **Ethical AI**: Prioritize bias mitigation and transparency in models.
-- **Market Strategy**: Position as open-source with managed cloud offerings, targeting AI startups and enterprises.
+KyroDB will use data-driven components to tune itself: learned indexes, cost models, autoregressive knob tuning, and query-plan selection. Human operators remain in control of policies and safety fences.
 
-This vision evolves with ongoing research; contributions welcome via GitHub issues. For inquiries, contact kishanvats2003@gmail.com.
+## 4.4 Developer Ergonomics
+
+Provide a small, composable surface: a binary + light SDKs (Rust/Go/TS), clear admin tooling, and worked examples (RAG demo, OLTP + auditing example). The product must be easy to run locally and in CI.
+
+## 4.5 Governance & Provenance
+
+Built-in mechanisms for lineage, immutable logs of model inferences, data-versioning, and audit trails for regulatory compliance.
+
+## 4.6 Modularity & Extensibility
+
+The kernel should expose clear extension points — storage engines, index plugins (RMI, B-Tree), vector backends — so advanced features can be added without monolithic complexity.
+
+---
+
+# 5. Roadmap (expanded — north-to-south view)
+
+This roadmap spans immediate priorities (KV + RMI) to advanced ambitions (distributed self-driving DB). Each phase includes deliverables and success criteria.
+
+## Phase A — Foundation 
+
+**Goal:** Production-grade KV + RMI.
+**Deliverables:** durable WAL, atomic snapshot+manifest, mmap RMI binary and builder, compaction, HTTP data-plane initially; migrate data-plane to gRPC, bench harness, CI fuzz tests.
+**Success:** reproducible benchmarks (10M/50M), recovery invariants proven by tests, preprint draft outlining RMI productionization.
+
+## Phase B — Polish & Research 
+
+**Goal:** polish RMI, thorough evaluation, and research dissemination.
+**Deliverables:** memory layout optimizations, mispredict heuristics, autoscheduler for re-index builds, publication-ready experiments, documentation & blog series.
+**Success:** accepted preprint or public peer feedback; external reproductions of benchmarks.
+
+## Phase C — Vertical Expansion 
+
+**Goal:** add vector primitives, filters, and simple declarative query extensions.
+**Deliverables:** vector storage + ANN integration (plugin), metadata filters for vector search, canonical RAG demo, SDK improvements.
+**Success:** RAG demo used by external devs; bench comparisons vs Pinecone/Weaviate for select workloads.
+
+## Phase D — Autonomy & Governance
+
+**Goal:** add self-tuning, workload-aware policies, governance and provenance features.
+**Deliverables:** adaptive knob tuning, model-registry integration, lineage trackers, explainability hooks, compliance features.
+**Success:** KyroDB demonstrates lower operational costs on targeted workloads and provides audit trails for sample regulated use-cases.
+
+## Phase E — Scale & Distribution 
+
+**Goal:** optional distributed mode — sharding, replication, and multi-region.
+**Deliverables:** consensus-backed metadata layer, partitioning strategies that preserve learned-index guarantees, WAL replication.
+**Success:** production-grade distributed offering or a managed service prototype.
+
+---
+
+# 6. Research Agenda
+
+KyroDB’s research contributions should be focused and reproducible. Candidate topics:
+
+* **Productionizing learned indexes:** error bounds, rebuild policies, mmapped layout, update handling and recovery semantics.
+* **Workload-adaptive indexing:** dynamic bucketization and hybrid RMI/B-Tree fallbacks.
+* **Cost of learning vs cost of rebuild:** model complexity vs rebuild frequency trade-offs.
+* **Combined vector+event provenance:** how to maintain reproducible RAG pipelines with immutable logs.
+
+Each research paper must include: code, dataset generation scripts, run commands, and an artifact bundled in a Docker image.
+
+---
+
+# 7. Architecture Principles (non-exhaustive)
+
+* **Immutable log as source-of-truth.** The WAL + snapshot becomes the canonical history for audits, rebuilds, and time-travel.
+* **Index immutability per epoch.** RMI indices are built off snapshots and swapped atomically; live writes land in the WAL + mem-delta.
+* **Mispredict detector.** Track probe lengths and mispredict rates; trigger rebuilds if error grows beyond thresholds.
+* **Separation of control & data planes.** Today: HTTP/JSON for data and admin while iterating; Phase A: migrate data-plane to gRPC for low-latency ops, keep HTTP for admin/metrics.
+* **Pluggable index/storage traits.** Provide documented interfaces for swapping implementations.
+
+---
+
+# 8. Use Cases & Target Customers
+
+* **AI startups building RAG systems** who want provenance and simplified infra.
+* **SMBs with heavy point-lookup workloads** who need low p99 and compact indexes without operating Kafka.
+* **Research groups** studying learned indexes and system-level trade-offs.
+* **Regulated industries** requiring immutable logs plus semantic search or auditability (finance, healthcare).
+
+---
+
+# 9. Ethics, Safety & Governance
+
+* Ensure **transparency**: logs include model versions used for inference and training artifacts.
+* **Bias detection hooks**: enable tooling to detect distributional drift or biased outcomes.
+* **Access controls**: plan for RBAC, TLS, and audit logs before adoption in regulated environments.
+* **Responsible release**: ensure any ML components released with clear caveats about training data and expected behavior.
+
+---
+
+# 10. Community & Growth Strategy
+
+* **Open artifacts**: publish paper drafts, bench results, and Dockerized experiments.
+* **Encourage reproducible PRs**: label PRs that add benchmark evidence.
+* **Engage researchers**: invite external reproductions, host dataset/bench challenges.
+* **Documentation & tutorials**: shipping canonical demos (RAG, audit log replay, small-scale production example).
+
+---
+
+# 11. Success Metrics (signals to track)
+
+* **Engineering:** green CI with fuzz tests; 0 reproducible correctness bugs in fuzz suite.
+* **Performance:** p99 improvement vs baseline on at least two distributions; memory reduction for index.
+* **Research:** completed reproducible paper + artifact.
+* **Adoption:** opensource stars, forks running benchmarks, at least one external production adopter or pilot.
+
+---
+
+# 12. Governance & Licensing
+
+KyroDB is Apache-2.0. Maintain a CLA/CONTRIBUTING doc for larger contributions. Keep governance minimal at first, formalize if community grows.
+
+---
+
+# 13. Next Actions (short-term)
+
+1. Finalize README + charter (done).
+2. Lock scope to KV + RMI and start Phase A deliverables.
+3. Create reproducible bench harness and publish first CSVs.
+4. Draft the first preprint outline using the `paper/` directory (data + scripts + Docker).
+
+---
+
+# Appendix
+
+**Glossary**: RMI = Recursive Model Index; mmap= Memory Mapped; WAL = Write-Ahead Log; RAG = Retrieval-Augmented Generation.
+
+**Contact**: [kishanvats2003@gmail.com](mailto:kishanvats2003@gmail.com) | GitHub: @vatskishan03

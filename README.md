@@ -1,173 +1,171 @@
-# ProjectKyro (KyroDB)
+# KyroDB — Durable KV store with a Production Recursive Model Index (RMI)
 
-AI‑native database kernel: durable event log + KV + vector search with the path to learned indexes (RMI) and ANN (HNSW).
+**Status:** Alpha (focused scope: KV + RMI)
 
-## Highlights
-- Durable storage: WAL + snapshots; crash‑recoverable; WAL truncation after snapshot
-- Real‑time: subscribe to live events (SSE)
-- KV storage: `Record { key, value }` with idempotent appends and primary‑key lookup
-- Minimal SQL: INSERT/SELECT for KV and vectors; vector queries with QUERY=[..] and optional MODE='ANN'
-- Vector search: exact L2; optional ANN via HNSW (feature‑gated)
-- Indexing: B‑Tree by default; RMI scaffolding (feature `learned-index`) with delta writes and autoload swap
-- Observability: Prometheus metrics at `/metrics`
-- Orchestrator: Go CLI (`kyrodbctl`) for health, snapshot, SQL, vector ops, RMI build
+**One-liner:** KyroDB is a durable, append-only key-value engine with a production-grade learned index (RMI) for ultra-fast point lookups and predictable tail latency.
 
-## Quickstart
+---
 
-Prereqs: Rust, Go.
+## Why KyroDB (what we’re solving)
+
+Many systems combine a log + key-value store + index and accept complexity, large memory overhead, or brittle tail latencies. KyroDB’s thesis:
+
+> You can get a smaller, simpler, and faster single-binary KV engine by pairing an immutable WAL + snapshot durability model with a learned primary index (RMI) tuned for real workload distributions.
+
+This repository is intentionally **narrow**: the primary goal is producing a **production-grade KV engine** (durability, compaction, recovery) + **RMI** implementation and reproducible benchmarks that demonstrate the advantages of learned indexes in real workloads.
+
+---
+
+## Scope (what this repo contains now)
+
+**IN SCOPE**
+
+- Durable append-only Write-Ahead Log (WAL) with configurable fsync policy.
+- Snapshotter with atomic swap for fast crash recovery.
+- In-memory recent-write delta and a single-node read path.
+- RMI scaffolding and an admin build endpoint; learned-index read path under active development.
+- WAL size management via snapshots and truncation hooks.
+- HTTP data plane for Put/Get and HTTP control plane (health, metrics, admin).
+- `kyrodbctl` client for basic admin and dev workflows.
+
+**OUT OF SCOPE (for now)**
+
+- Vector search, ANN (HNSW), and vector-related APIs.
+- Full SQL engine, complex query planner, joins, or multi-model features.
+- Distributed clustering, replication, sharding.
+- Production packaging beyond a single binary + Dockerfile (to be added once core is stable).
+
+---
+
+## Quickstart (developer)
+
+Prereqs: Rust toolchain, (optional) Go for `kyrodbctl`.
+
+Build and run engine (HTTP)
 
 ```bash
-# Run engine
-RUST_LOG=kyrodb=info,warp=info cargo run -p engine -- serve 127.0.0.1 3030
-
-# With ANN (optional)
-RUST_LOG=kyrodb=info,warp=info cargo run -p engine --features ann-hnsw -- serve 127.0.0.1 3030
-
-# With learned index feature available
-RUST_LOG=kyrodb=info,warp=info cargo run -p engine --features learned-index -- serve 127.0.0.1 3030
+# from repo root
+cargo run -p engine -- serve 127.0.0.1 3030
 ```
 
-### KV via SQL
-```bash
-curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
-  -d '{"sql":"INSERT INTO t VALUES (42, '\''hello'\'')"}'
+Build CLI (optional)
 
-curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT * FROM t WHERE key = 42"}'
+```bash
+cd orchestrator
+# build CLI binary in this folder
+go build -o kyrodbctl .
 ```
 
-### Vector via SQL
+Basic admin + KV demo (HTTP)
+
 ```bash
-# Insert a vector
-curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
-  -d '{"sql":"INSERT INTO vectors VALUES (1, [0.1,0.2,0.3])"}'
-
-# Search (exact)
-curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT * FROM vectors WHERE QUERY = [0.1,0.2,0.31] LIMIT 5"}'
-
-# Search (ANN)
-curl -s -X POST http://127.0.0.1:3030/sql -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT * FROM vectors WHERE QUERY = [0.1,0.2,0.31] AND MODE='\''ANN'\'' LIMIT 5"}'
-```
-
-### Orchestrator (optional)
-```bash
-cd orchestrator && go build -o kyrodbctl
+# health and offset
 ./kyrodbctl -e http://127.0.0.1:3030 health
-./kyrodbctl sql "INSERT INTO t VALUES (42, 'hello')"
-./kyrodbctl lookup 42
-./kyrodbctl vector-insert 1 "0.1,0.2,0.3"
-./kyrodbctl vector-search "0.1,0.2,0.31" 5
-./kyrodbctl rmi-build
+./kyrodbctl -e http://127.0.0.1:3030 offset
+
+# trigger a snapshot
+./kyrodbctl -e http://127.0.0.1:3030 snapshot
+
+# KV put via HTTP
+curl -sX POST http://127.0.0.1:3030/put \
+  -H 'content-type: application/json' \
+  -d '{"key":123,"value":"hello"}'
+
+# KV get via CLI (lookup by key)
+./kyrodbctl -e http://127.0.0.1:3030 lookup 123
 ```
 
-## HTTP API
-- `POST /append` {payload}
-- `GET /replay?start=..&end=..`
-- `GET /subscribe?from=..` (SSE)
-- `POST /put` {key, value}
-- `GET /lookup?key=..`
-- `POST /sql` { sql }
-- `POST /vector/insert` { key, vector }
-- `POST /vector/search` { query, k }
-- `POST /rmi/build` (feature learned-index)
-- `GET /offset`, `GET /health`, `POST /snapshot`, `GET /metrics`
+Notes:
+- If you start the server with `--auth-token <TOKEN>`, pass `Authorization: Bearer <TOKEN>` headers in your HTTP requests; the CLI will add a flag for this soon.
+- Release build: `cargo build -p engine --release` (binary at `target/release/engine`).
 
-## Features (current)
-- WAL + snapshot recovery, WAL truncation post‑snapshot
-- Minimal SQL for KV/vectors; ANN hint
-- `PrimaryIndex` with BTree; RMI scaffolding (delta writes, autoload swap)
-- Vector exact L2; optional HNSW ANN
-- Prometheus metrics
+---
 
-## Roadmap (MVP)
-- RMI v1: 2‑stage linear models with ε‑bounds; bounded probe; rebuild/swap; metrics
-- ANN v1: expose M/ef parameters, background rebuild; benchmarks (recall/latency)
-- DDL/schema: explicit `CREATE VECTORS name (dim INT)`, drops
-- Autotuner: one knob (buffer/broadcast)
-- Compaction/GC: latest‑value per key; bounded WAL growth
-- Security/packaging: token/TLS, Docker, optional Helm
-- Benchmarks + demo app
+## Protocol decision (current)
 
-## Vision
-See `visiondocument.md` for the AI‑native design and long‑term roadmap.
+- Data plane: HTTP/JSON for Put/Get (temporary while iterating).
+- Control plane: HTTP/JSON endpoints for `/health`, `/metrics` (Prometheus), `/snapshot`, `/offset`, and `/rmi/build`.
 
-## Contributing
-PRs and issues welcome.
+gRPC for the data plane is planned (see Roadmap) but not implemented yet.
+
+---
+
+## Architecture (high level)
+
+- **PersistentEventLog (WAL)** — append-only records with configurable fsync.
+- **Snapshotter** — write new snapshot → atomic rename/swap → truncate WAL.
+- **In-memory delta** — fast recent writes map checked before probing index.
+- **RMI (learned index)** — builder and on-disk format under active development; read path will predict approximate position and do a bounded last-mile probe.
+- **Compactor** — will build new snapshots with latest values and reclaim WAL space.
+
+Simplified flow (current):
+
+```
+Client -> HTTP -> WAL.append -> mem-delta -> background snapshot
+                 \-> Get -> mem-delta -> (future: RMI predict) -> last-mile probe -> disk
+```
+
+---
+
+## What’s implemented (current status)
+
+- WAL append + recovery ✅
+- Snapshot + atomic swap ✅
+- Cold start recovery (snapshot load + WAL replay) ✅
+- In-memory delta and baseline read path ✅
+- RMI scaffolding (admin build endpoint; on-disk loader WIP) ⚠️ in progress
+- Compaction (keep-latest) ⚠️ planned
+- Basic HTTP API + `kyrodbctl` for admin ✅
+
+---
+
+## Benchmarks (how we’ll present claims)
+
+Bench scripts and results will live in `/bench`. The README will only present **reproducible benchmarks** with exact hardware and commit hashes. Primary comparisons: RMI vs a baseline B-Tree/rocks-like indexing on point-lookup workloads across uniform and Zipfian keys.
+
+Example claim format (to be populated when results are published):
+
+> On N keys (V-byte values) on machine X with SSD: RMI p99 read latency = X ms vs B-Tree p99 = Y ms (exact bench scripts and CSV in /bench/results).
+
+Until the CSVs and run scripts are in the repo, treat any numbers as provisional.
+
+---
+
+## Roadmap (focus: KV + RMI)
+
+**Short-term (now)**
+
+- Harden WAL + snapshot atomicity and crash tests (fuzz/CI).
+- Finalize RMI file layout (mmap-friendly) + versioning.
+- Implement compaction + WAL truncation service.
+- Publish reproducible benches for 10M and 50M keys.
+
+**Mid-term**
+
+- gRPC data-plane for Put/Get/Subscribe.
+- Perf polish (prefetch, packed layouts), reduce probe tail latencies, autoswitch rebuild heuristics.
+- Deliver Docker image + reproducible bench workflow.
+
+**Long-term (after core is stable)**
+
+- Consider range queries, optional supplemental B-Tree fallback, replication model, and selective vector features (as an experimental plugin).
+
+---
+
+## How to help / contribute
+
+- Open issues with proposed changes and include tests (unit, property) when possible.
+- When touching WAL/snapshot/RMI code paths, include regression/bench evidence.
+- Share bench CSVs in `/bench/results/<your-name>` with machine specs for comparison.
+
+---
 
 ## License
+
 Apache-2.0
 
-## Architecture
+---
 
-```mermaid
-graph TD
-  subgraph Clients
-    A[Apps and Tools]
-    B[kyrodbctl CLI]
-  end
+## Contact / Community
 
-  A -->|HTTP + SQL + SSE| E
-  B -->|HTTP| E
-
-  subgraph Engine
-    E[Warp HTTP Server]
-    S[PersistentEventLog]
-    I[PrimaryIndex: BTree or RMI]
-    V[Vector Engine: L2 or ANN]
-    M[Metrics Exporter]
-  end
-
-  E --> S
-  E --> I
-  E --> V
-  E --> M
-
-  subgraph Storage
-    W[wal.bin]
-    P[snapshot.bin]
-    R[index-rmi.bin]
-  end
-
-  S <-->|append / replay / snapshot| W
-  S <-->|snapshot load| P
-  I -->|autoload| R
-
-  M -->|/metrics| C[Prometheus]
-```
-
-## Recovery Flow
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant Disk as Disk [snapshot.bin, wal.bin]
-  participant Engine as Engine
-  participant Client as Client
-
-  Engine->>Disk: Load snapshot.bin (if present)
-  alt snapshot valid
-    Engine-->>Engine: in-memory events = snapshot
-  else invalid or missing
-    Engine-->>Engine: start empty
-  end
-  Engine->>Disk: Replay wal.bin from start
-  loop each event
-    Engine-->>Engine: push if offset beyond snapshot
-  end
-  Client->>Engine: POST /append
-  Engine-->>Disk: write event to wal.bin (flush)
-  Engine-->>Engine: append to memory, update index, broadcast
-  Client->>Engine: POST /snapshot
-  Engine->>Disk: write snapshot.tmp
-  Engine->>Disk: rename to snapshot.bin
-  Engine->>Disk: truncate wal.bin
-```
-
-## Design Docs
-- RMI ADR: `docs/adr/0001-rmi-learned-index.md`
-
-## Status vs MVP
-- Current: BTree primary index; learned-index feature includes RMI scaffolding (delta writes, autoload swap) and an `/rmi/build` stub that writes an index file from key→offset pairs.
-- MVP target: full RMI with 2‑stage models + ε‑bounds and bounded probe; measurable ≥2x point‑lookup speedup. ANN HNSW with tunables and background rebuilds.
+Open an issue for design discussions; label PRs that are experimental with `experimental`. For fast feedback ping @vatskishan03 on GitHub or Twitter.
