@@ -57,6 +57,7 @@ pub struct PersistentEventLog {
     data_dir: PathBuf,
     tx:       broadcast::Sender<Event>,
     index:    Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
+    next_offset: Arc<RwLock<u64>>,              // monotonic sequence (not tied to vec length)
     #[cfg(feature = "ann-hnsw")]
     ann:      Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
 }
@@ -128,11 +129,14 @@ impl PersistentEventLog {
         // 4) Build log
         // Build index from recovered events
         let mut idx = index::PrimaryIndex::new_btree();
+        let mut max_off = 0u64;
         for ev in &events {
+            if ev.offset > max_off { max_off = ev.offset; }
             if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
                 idx.insert(rec.key, ev.offset);
             }
         }
+        let next = if events.is_empty() { 0 } else { max_off.saturating_add(1) };
 
         // If learned-index feature is enabled and RMI file exists, attempt to load
         #[cfg(feature = "learned-index")]
@@ -148,9 +152,10 @@ impl PersistentEventLog {
         let log = Self {
             inner:    Arc::new(RwLock::new(events)),
             wal,
-            data_dir,
+            data_dir: data_dir.clone(),
             tx,
             index:   Arc::new(RwLock::new(idx)),
+            next_offset: Arc::new(RwLock::new(next)),
             #[cfg(feature = "ann-hnsw")]
             ann:     Arc::new(RwLock::new(None)),
         };
@@ -175,7 +180,9 @@ impl PersistentEventLog {
 
         // Build event
         let mut write = self.inner.write().await;
-        let offset = write.len() as u64;
+        let mut noff = self.next_offset.write().await;
+        let offset = *noff;
+        *noff = noff.saturating_add(1);
         let event = Event {
             schema_version: SCHEMA_VERSION,
             offset,
@@ -183,6 +190,7 @@ impl PersistentEventLog {
             request_id,
             payload,
         };
+        drop(noff);
 
         // Write to WAL (flush + fsync for durability)
         {
@@ -200,6 +208,7 @@ impl PersistentEventLog {
 
         // Append in-memory
         write.push(event.clone());
+        drop(write);
 
         // Update index if payload is Record
         if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
@@ -392,9 +401,47 @@ impl PersistentEventLog {
         Ok(())
     }
 
-    /// Get the next write offset (i.e. current log length).
+    /// Compact to latest values per key, preserving original offsets. Then snapshot and truncate WAL.
+    pub async fn compact_keep_latest_and_snapshot(&self) -> Result<()> {
+        use std::collections::BTreeMap;
+        // 1) Build latest offset per key and capture the corresponding events
+        let current_events = { self.inner.read().await.clone() };
+        let mut latest: BTreeMap<u64, (u64, &Event)> = BTreeMap::new();
+        for ev in &current_events {
+            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                // Keep event with the highest offset for this key
+                match latest.get(&rec.key) {
+                    Some((off, _)) if *off >= ev.offset => {},
+                    _ => { latest.insert(rec.key, (ev.offset, ev)); }
+                }
+            }
+        }
+        // 2) Build compacted vector ordered by offset (ascending) to keep time order of latest writes
+        let mut compacted: Vec<Event> = latest.into_values().map(|(_, e)| e.clone()).collect();
+        compacted.sort_by_key(|e| e.offset);
+
+        // 3) Swap in-memory state under write lock and rebuild index consistently
+        {
+            let mut w = self.inner.write().await;
+            *w = compacted.clone();
+        }
+        {
+            let mut idx = self.index.write().await;
+            *idx = index::PrimaryIndex::new_btree();
+            for ev in &compacted {
+                if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                    idx.insert(rec.key, ev.offset);
+                }
+            }
+        }
+
+        // 4) Persist snapshot of compacted state and truncate WAL
+        self.snapshot().await
+    }
+
+    /// Get the next write offset (i.e. current monotonic sequence).
     pub async fn get_offset(&self) -> u64 {
-        self.inner.read().await.len() as u64
+        *self.next_offset.read().await
     }
 
     /// Path to the schema registry JSON file.
