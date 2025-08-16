@@ -110,7 +110,7 @@ impl PersistentEventLog {
                 if let Err(_) = rdr.read_exact(&mut crc_buf) { break; }
                 let crc_read = u32::from_le_bytes(crc_buf);
                 let crc_calc = crc32c::crc32c(&buf);
-                if crc_read != crc_calc { break; }
+                if crc_read != crc_calc { metrics::WAL_CRC_ERRORS_TOTAL.inc(); break; }
                 match bopt.deserialize::<Event>(&buf) {
                     Ok(ev) => {
                         if ev.schema_version != SCHEMA_VERSION { continue; }
@@ -398,12 +398,15 @@ impl PersistentEventLog {
 
         metrics::SNAPSHOTS_TOTAL.inc();
         timer.observe_duration();
+        // Update manifest after snapshot
+        self.write_manifest().await;
         Ok(())
     }
 
     /// Compact to latest values per key, preserving original offsets. Then snapshot and truncate WAL.
     pub async fn compact_keep_latest_and_snapshot(&self) -> Result<()> {
         use std::collections::BTreeMap;
+        let timer = metrics::COMPACTION_DURATION_SECONDS.start_timer();
         // 1) Build latest offset per key and capture the corresponding events
         let current_events = { self.inner.read().await.clone() };
         let mut latest: BTreeMap<u64, (u64, &Event)> = BTreeMap::new();
@@ -436,7 +439,12 @@ impl PersistentEventLog {
         }
 
         // 4) Persist snapshot of compacted state and truncate WAL
-        self.snapshot().await
+        self.snapshot().await?;
+        metrics::COMPACTIONS_TOTAL.inc();
+        timer.observe_duration();
+        // Update manifest after compaction
+        self.write_manifest().await;
+        Ok(())
     }
 
     /// Get the next write offset (i.e. current monotonic sequence).
@@ -447,6 +455,33 @@ impl PersistentEventLog {
     /// Path to the schema registry JSON file.
     pub fn registry_path(&self) -> std::path::PathBuf {
         self.data_dir.join("schema.json")
+    }
+
+    /// Current WAL size in bytes (best-effort). Useful for size-based rotation/compaction triggers.
+    pub fn wal_size_bytes(&self) -> u64 {
+        let path = self.data_dir.join("wal.bin");
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Minimal manifest path
+    pub fn manifest_path(&self) -> std::path::PathBuf { self.data_dir.join("manifest.json") }
+
+    /// Write minimal manifest with next_offset and active files.
+    pub async fn write_manifest(&self) {
+        let manifest = serde_json::json!({
+            "next_offset": self.get_offset().await,
+            "snapshot": "snapshot.bin",
+            "wal": "wal.bin",
+            "rmi": "index-rmi.bin",
+            "ts": chrono::Utc::now().timestamp()
+        });
+        let tmp = self.data_dir.join("manifest.tmp");
+        if let Ok(mut f) = File::create(&tmp) {
+            let _ = writeln!(f, "{}", manifest);
+            let _ = f.sync_all();
+            let _ = std::fs::rename(&tmp, self.manifest_path());
+            let _ = fsync_dir(&self.data_dir);
+        }
     }
 }
 

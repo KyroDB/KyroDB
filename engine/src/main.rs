@@ -37,6 +37,9 @@ enum Commands {
         /// Trigger snapshot when N new events have been appended since last snapshot
         #[arg(long)]
         snapshot_every_n_appends: Option<u64>,
+        /// Rotate/compact when WAL reaches this many bytes
+        #[arg(long)]
+        wal_max_bytes: Option<u64>,
     },
 }
 
@@ -52,6 +55,7 @@ async fn main() -> Result<()> {
             auto_snapshot_secs,
             auth_token,
             snapshot_every_n_appends,
+            wal_max_bytes,
         } => {
             if let Some(secs) = auto_snapshot_secs {
                 if secs > 0 {
@@ -82,12 +86,33 @@ async fn main() -> Result<()> {
                             interval.tick().await;
                             let cur = snap_log.get_offset().await;
                             if cur.saturating_sub(last) >= n {
-                                println!("📸 Threshold snapshot: {} new events", cur - last);
-                                if let Err(e) = snap_log.snapshot().await {
-                                    eprintln!("❌ Threshold snapshot failed: {}", e);
+                                println!("📦 Compaction trigger: {} new events", cur - last);
+                                if let Err(e) = snap_log.compact_keep_latest_and_snapshot().await {
+                                    eprintln!("❌ Compaction failed: {}", e);
                                 } else {
                                     last = cur;
-                                    println!("✅ Threshold snapshot complete.");
+                                    println!("✅ Compaction complete.");
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+            if let Some(maxb) = wal_max_bytes {
+                if maxb > 0 {
+                    let log_for_size = log.clone();
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+                        loop {
+                            interval.tick().await;
+                            let size = log_for_size.wal_size_bytes();
+                            if size >= maxb {
+                                println!("📦 Size-based compaction: wal={} bytes >= {}", size, maxb);
+                                if let Err(e) = log_for_size.compact_keep_latest_and_snapshot().await {
+                                    eprintln!("❌ Size-based compaction failed: {}", e);
+                                } else {
+                                    println!("✅ Size-based compaction complete.");
                                 }
                             }
                         }
@@ -136,6 +161,29 @@ async fn main() -> Result<()> {
                         Ok::<_, warp::Rejection>(
                             warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
+                                warp::http::StatusCode::OK,
+                            ),
+                        )
+                    }
+                });
+
+            // --- NEW: Compaction endpoint -----------------------------------------------------
+            let compact_log = log.clone();
+            let compact_route = warp::path("compact")
+                .and(warp::post())
+                .and_then(move || {
+                    let log = compact_log.clone();
+                    async move {
+                        if let Err(e) = log.compact_keep_latest_and_snapshot().await {
+                            eprintln!("❌ Compaction failed: {}", e);
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            ));
+                        }
+                        Ok::<_, warp::Rejection>(
+                            warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "compact": "ok" })),
                                 warp::http::StatusCode::OK,
                             ),
                         )
@@ -413,6 +461,7 @@ async fn main() -> Result<()> {
             let vector_insert = auth.clone().and(vector_insert).map(|(), r| r);
             let vector_search = auth.clone().and(vector_search).map(|(), r| r);
             let rmi_build = auth.clone().and(rmi_build).map(|(), r| r);
+            let compact_route = auth.clone().and(compact_route).map(|(), r| r);
 
             // Compose routes
             let routes = health_route
@@ -428,6 +477,7 @@ async fn main() -> Result<()> {
                 .or(vector_insert)
                 .or(vector_search)
                 .or(rmi_build)
+                .or(compact_route)
                 .recover(|rej: warp::Rejection| async move {
                     use warp::http::StatusCode;
                     if rej.find::<Unauthorized>().is_some() {

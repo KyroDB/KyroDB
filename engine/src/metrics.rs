@@ -40,6 +40,50 @@ pub static SSE_LAGGED_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_sse_lagged_total")
 });
 
+// New: WAL CRC errors
+pub static WAL_CRC_ERRORS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_wal_crc_errors_total",
+        "Total number of WAL frames dropped due to CRC error"
+    )
+    .expect("register kyrodb_wal_crc_errors_total")
+});
+
+// New: Compactions
+pub static COMPACTIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_compactions_total",
+        "Total number of compactions performed"
+    )
+    .expect("register kyrodb_compactions_total")
+});
+
+pub static COMPACTION_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_compaction_duration_seconds",
+        "Compaction duration in seconds",
+    )
+    .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_compaction_duration_seconds")
+});
+
+// New: RMI hits/misses (only incremented when learned-index feature is active)
+pub static RMI_HITS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_rmi_hits_total",
+        "Total number of RMI index hits (delta or main)"
+    )
+    .expect("register kyrodb_rmi_hits_total")
+});
+
+pub static RMI_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_rmi_misses_total",
+        "Total number of RMI index misses"
+    )
+    .expect("register kyrodb_rmi_misses_total")
+});
+
 pub fn inc_sse_lagged() { SSE_LAGGED_TOTAL.inc(); }
 
 pub fn render() -> String {

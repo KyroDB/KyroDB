@@ -38,6 +38,8 @@ pub struct RmiIndex {
     // Sorted snapshot view
     sorted_keys: Vec<u64>,
     sorted_offsets: Vec<u64>,
+    // Per-index global epsilon bound placeholder (until per-leaf is implemented)
+    epsilon: u64,
 }
 
 #[cfg(feature = "learned-index")]
@@ -54,7 +56,7 @@ const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
 
 #[cfg(feature = "learned-index")]
 impl RmiIndex {
-    pub fn new() -> Self { Self { delta: BTreeMap::new(), sorted_keys: Vec::new(), sorted_offsets: Vec::new() } }
+    pub fn new() -> Self { Self { delta: BTreeMap::new(), sorted_keys: Vec::new(), sorted_offsets: Vec::new(), epsilon: 0 } }
 
     pub fn load_from_file(path: &std::path::Path) -> Option<Self> {
         use std::io::Read;
@@ -136,6 +138,13 @@ impl RmiIndex {
             Err(_) => None,
         }
     }
+
+    /// Return a search window (lo, hi) around the predicted position. For now, binary search exact only.
+    pub fn predict_window(&self, _key: &u64) -> Option<(usize, usize)> {
+        if self.sorted_keys.is_empty() { return None; }
+        // Placeholder: full range; once model metadata exists, bound to [pos-eps, pos+eps]
+        Some((0, self.sorted_keys.len().saturating_sub(1)))
+    }
 }
 
 pub enum PrimaryIndex {
@@ -166,7 +175,18 @@ impl PrimaryIndex {
         match self {
             PrimaryIndex::BTree(b) => b.get(key),
             #[cfg(feature = "learned-index")]
-            PrimaryIndex::Rmi(r) => r.delta_get(key).or_else(|| r.predict_get(key)),
+            PrimaryIndex::Rmi(r) => {
+                if let Some(v) = r.delta_get(key) {
+                    kyrodb_engine::metrics::RMI_HITS_TOTAL.inc();
+                    Some(v)
+                } else if let Some(v) = r.predict_get(key) {
+                    kyrodb_engine::metrics::RMI_HITS_TOTAL.inc();
+                    Some(v)
+                } else {
+                    kyrodb_engine::metrics::RMI_MISSES_TOTAL.inc();
+                    None
+                }
+            }
         }
     }
 }
