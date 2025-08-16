@@ -44,15 +44,19 @@ pub struct RmiLeafMeta {
 
 #[cfg(feature = "learned-index")]
 #[derive(Debug)]
+enum RmiBacking {
+    Owned { sorted_keys: Vec<u64>, sorted_offsets: Vec<u64> },
+    Mmap { mmap: memmap2::Mmap, keys_off: usize, offs_off: usize, count: usize },
+}
+
+#[cfg(feature = "learned-index")]
+#[derive(Debug)]
 pub struct RmiIndex {
     // Delta map: keys appended after last build
     delta: BTreeMap<u64, u64>,
     // Model-backed snapshot view
     leaves: Vec<RmiLeafMeta>,
-    sorted_keys: Vec<u64>,
-    sorted_offsets: Vec<u64>,
-    // Hold mmap to allow future zero-copy slices to remain valid
-    mmap: Option<memmap2::Mmap>,
+    backing: RmiBacking,
 }
 
 #[cfg(feature = "learned-index")]
@@ -61,10 +65,30 @@ const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
 #[cfg(feature = "learned-index")]
 impl RmiIndex {
     pub fn new() -> Self {
-        Self { delta: BTreeMap::new(), leaves: Vec::new(), sorted_keys: Vec::new(), sorted_offsets: Vec::new(), mmap: None }
+        Self { delta: BTreeMap::new(), leaves: Vec::new(), backing: RmiBacking::Owned { sorted_keys: Vec::new(), sorted_offsets: Vec::new() } }
     }
 
-    /// Build per-leaf linear models and epsilon bounds from sorted pairs and write v3 format with checksum.
+    // Accessors for keys/offsets slices, zero-copy when mmap-backed
+    #[inline]
+    fn keys(&self) -> &[u64] {
+        match &self.backing {
+            RmiBacking::Owned { sorted_keys, .. } => sorted_keys,
+            RmiBacking::Mmap { mmap, keys_off, count, .. } => unsafe {
+                std::slice::from_raw_parts(mmap.as_ptr().add(*keys_off) as *const u64, *count)
+            },
+        }
+    }
+    #[inline]
+    fn offs(&self) -> &[u64] {
+        match &self.backing {
+            RmiBacking::Owned { sorted_offsets, .. } => sorted_offsets,
+            RmiBacking::Mmap { mmap, offs_off, count, .. } => unsafe {
+                std::slice::from_raw_parts(mmap.as_ptr().add(*offs_off) as *const u64, *count)
+            },
+        }
+    }
+
+    /// Build per-leaf linear models and epsilon bounds from sorted pairs and write v4 format with checksum.
     pub fn write_from_pairs(path: &std::path::Path, pairs: &[(u64, u64)]) -> std::io::Result<()> {
         use std::io::Write;
         // sort by key
@@ -155,9 +179,7 @@ impl RmiIndex {
             use std::io::Seek;
             let pos = f.stream_position()?;
             let pad = ((8 - (pos % 8)) % 8) as usize;
-            if pad > 0 {
-                f.write_all(&vec![0u8; pad])?;
-            }
+            if pad > 0 { f.write_all(&vec![0u8; pad])?; }
         }
         // write keys and offsets
         for k in &keys { f.write_all(&k.to_le_bytes())?; }
@@ -198,173 +220,150 @@ impl RmiIndex {
         f.read_exact(&mut ver).ok()?;
         let version = ver[0];
         let mut pad = [0u8; 3]; let _ = f.read_exact(&mut pad);
-        let mut sorted_keys: Vec<u64> = Vec::new();
-        let mut sorted_offsets: Vec<u64> = Vec::new();
-        let mut leaves: Vec<RmiLeafMeta> = Vec::new();
-        if version == 2u8 {
-            // v2: [magic][ver][pad3][epsilon u32][count u64] then keys, offsets
-            let mut eps_buf = [0u8; 4]; f.read_exact(&mut eps_buf).ok()?;
-            let epsilon = u32::from_le_bytes(eps_buf);
-            let mut cnt_buf = [0u8; 8]; f.read_exact(&mut cnt_buf).ok()?;
-            let count = u64::from_le_bytes(cnt_buf) as usize;
-            let mut kb = vec![0u8; count * 8]; if count > 0 { f.read_exact(&mut kb).ok()?; }
-            for ch in kb.chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(ch); sorted_keys.push(u64::from_le_bytes(a)); }
-            let mut ob = vec![0u8; count * 8]; if count > 0 { f.read_exact(&mut ob).ok()?; }
-            for ch in ob.chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(ch); sorted_offsets.push(u64::from_le_bytes(a)); }
-            if count > 0 {
-                leaves.push(RmiLeafMeta { key_min: *sorted_keys.first().unwrap(), key_max: *sorted_keys.last().unwrap(), slope: 0.0, intercept: 0.0, epsilon, start: 0, len: count as u64 });
-            }
-            // no checksum in v2
-            // v2 path fills leaves as one group, sorted_keys/offsets copied
-            // metrics
-            crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
-            crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
-            if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
-            for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
-            return Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets, mmap: None });
-        } else if version == 3u8 {
-            // v3: [magic][ver][pad3][num_leaves u32][count u64] + leaves + keys + offsets + checksum u64
-            let mut nl_buf = [0u8; 4]; f.read_exact(&mut nl_buf).ok()?;
-            let num_leaves = u32::from_le_bytes(nl_buf) as usize;
-            let mut cnt_buf = [0u8; 8]; f.read_exact(&mut cnt_buf).ok()?;
-            let count = u64::from_le_bytes(cnt_buf) as usize;
-            // read leaves
-            for _ in 0..num_leaves {
-                let mut b8 = [0u8; 8];
-                let mut b4 = [0u8; 4];
-                f.read_exact(&mut b8).ok()?; let key_min = u64::from_le_bytes(b8);
-                f.read_exact(&mut b8).ok()?; let key_max = u64::from_le_bytes(b8);
-                f.read_exact(&mut b4).ok()?; let slope = f32::from_le_bytes(b4);
-                f.read_exact(&mut b4).ok()?; let intercept = f32::from_le_bytes(b4);
-                f.read_exact(&mut b4).ok()?; let epsilon = u32::from_le_bytes(b4);
-                f.read_exact(&mut b8).ok()?; let start = u64::from_le_bytes(b8);
-                f.read_exact(&mut b8).ok()?; let len = u64::from_le_bytes(b8);
-                leaves.push(RmiLeafMeta { key_min, key_max, slope, intercept, epsilon, start, len });
-            }
-            // read keys and offsets
-            let mut kb = vec![0u8; count * 8]; if count > 0 { f.read_exact(&mut kb).ok()?; }
-            for ch in kb.chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(ch); sorted_keys.push(u64::from_le_bytes(a)); }
-            let mut ob = vec![0u8; count * 8]; if count > 0 { f.read_exact(&mut ob).ok()?; }
-            for ch in ob.chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(ch); sorted_offsets.push(u64::from_le_bytes(a)); }
-            // read checksum
-            let mut sum_buf = [0u8; 8]; f.read_exact(&mut sum_buf).ok()?;
-            let sum_read = u64::from_le_bytes(sum_buf);
-            // recompute checksum on prior bytes
-            use std::io::{Seek, SeekFrom};
-            use xxhash_rust::xxh3::Xxh3;
-            let mut all = std::fs::File::open(path).ok()?;
-            let end = all.metadata().ok()?.len();
-            all.seek(SeekFrom::Start(0)).ok()?;
-            let mut hasher = Xxh3::new();
-            {
-                let mut rdr = std::io::BufReader::new(&all);
-                let mut buf = vec![0u8; 64 * 1024];
-                // exclude last 8 bytes (checksum)
-                let mut remaining = (end - 8) as usize;
-                while remaining > 0 {
-                    let to_read = buf.len().min(remaining);
-                    if rdr.read_exact(&mut buf[..to_read]).is_err() { return None; }
-                    hasher.update(&buf[..to_read]);
-                    remaining -= to_read;
+        match version {
+            2 => {
+                // v2: [magic][ver][pad3][epsilon u32][count u64] then keys, offsets
+                let mut sorted_keys: Vec<u64> = Vec::new();
+                let mut sorted_offsets: Vec<u64> = Vec::new();
+                let mut leaves: Vec<RmiLeafMeta> = Vec::new();
+                let mut eps_buf = [0u8; 4]; f.read_exact(&mut eps_buf).ok()?;
+                let epsilon = u32::from_le_bytes(eps_buf);
+                let mut cnt_buf = [0u8; 8]; f.read_exact(&mut cnt_buf).ok()?;
+                let count = u64::from_le_bytes(cnt_buf) as usize;
+                let mut kb = vec![0u8; count * 8]; if count > 0 { f.read_exact(&mut kb).ok()?; }
+                for ch in kb.chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(ch); sorted_keys.push(u64::from_le_bytes(a)); }
+                let mut ob = vec![0u8; count * 8]; if count > 0 { f.read_exact(&mut ob).ok()?; }
+                for ch in ob.chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(ch); sorted_offsets.push(u64::from_le_bytes(a)); }
+                if count > 0 {
+                    leaves.push(RmiLeafMeta { key_min: *sorted_keys.first().unwrap(), key_max: *sorted_keys.last().unwrap(), slope: 0.0, intercept: 0.0, epsilon, start: 0, len: count as u64 });
                 }
+                // metrics
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
+                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+                for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
+                return Some(Self { delta: BTreeMap::new(), leaves, backing: RmiBacking::Owned { sorted_keys, sorted_offsets } });
             }
-            let sum_calc = hasher.digest();
-            if sum_calc != sum_read { return None; }
-            // after reading and verifying
-            crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
-            crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
-            if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
-            for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
-            return Some(Self { delta: BTreeMap::new(), leaves, sorted_keys, sorted_offsets, mmap: None });
-        } else if version == 4u8 {
-            // v4: mmap zero-copy capable (currently retains mmap; parses keys/offsets safely regardless of alignment)
-            use std::mem::size_of;
-            let file = std::fs::File::open(path).ok()?;
-            let map = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
-            let mut off = 0usize;
-            // magic
-            if map.len() < 8 { return None; }
-            off += 8; // already validated
-            // version + pad
-            off += 4;
-            // num_leaves u32
-            if map.len() < off + 4 { return None; }
-            let num_leaves = u32::from_le_bytes(map[off..off+4].try_into().ok()?) as usize; off += 4;
-            // count u64
-            if map.len() < off + 8 { return None; }
-            let count = u64::from_le_bytes(map[off..off+8].try_into().ok()?) as usize; off += 8;
-            // leaves
-            let leaf_rec_size = size_of::<u64>()*2 + size_of::<f32>()*2 + size_of::<u32>() + size_of::<u64>()*2; // 44 bytes
-            let mut lvs: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves);
-            for _ in 0..num_leaves {
-                if map.len() < off + leaf_rec_size { return None; }
-                let key_min = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
-                let key_max = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
-                let slope = f32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
-                let intercept = f32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
-                let epsilon = u32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
-                let start = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
-                let len = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
-                lvs.push(RmiLeafMeta { key_min, key_max, slope, intercept, epsilon, start, len });
+            3 => {
+                // v3: [magic][ver][pad3][num_leaves u32][count u64] + leaves + keys + offsets + checksum u64
+                let mut sorted_keys: Vec<u64> = Vec::new();
+                let mut sorted_offsets: Vec<u64> = Vec::new();
+                let mut leaves: Vec<RmiLeafMeta> = Vec::new();
+                let mut nl_buf = [0u8; 4]; f.read_exact(&mut nl_buf).ok()?;
+                let num_leaves = u32::from_le_bytes(nl_buf) as usize;
+                let mut cnt_buf = [0u8; 8]; f.read_exact(&mut cnt_buf).ok()?;
+                let count = u64::from_le_bytes(cnt_buf) as usize;
+                // read leaves
+                for _ in 0..num_leaves {
+                    let mut b8 = [0u8; 8];
+                    let mut b4 = [0u8; 4];
+                    f.read_exact(&mut b8).ok()?; let key_min = u64::from_le_bytes(b8);
+                    f.read_exact(&mut b8).ok()?; let key_max = u64::from_le_bytes(b8);
+                    f.read_exact(&mut b4).ok()?; let slope = f32::from_le_bytes(b4);
+                    f.read_exact(&mut b4).ok()?; let intercept = f32::from_le_bytes(b4);
+                    f.read_exact(&mut b4).ok()?; let epsilon = u32::from_le_bytes(b4);
+                    f.read_exact(&mut b8).ok()?; let start = u64::from_le_bytes(b8);
+                    f.read_exact(&mut b8).ok()?; let len = u64::from_le_bytes(b8);
+                    leaves.push(RmiLeafMeta { key_min, key_max, slope, intercept, epsilon, start, len });
+                }
+                // read keys and offsets
+                let mut kb = vec![0u8; count * 8]; if count > 0 { f.read_exact(&mut kb).ok()?; }
+                for ch in kb.chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(ch); sorted_keys.push(u64::from_le_bytes(a)); }
+                let mut ob = vec![0u8; count * 8]; if count > 0 { f.read_exact(&mut ob).ok()?; }
+                for ch in ob.chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(ch); sorted_offsets.push(u64::from_le_bytes(a)); }
+                // read checksum and verify
+                let mut sum_buf = [0u8; 8]; f.read_exact(&mut sum_buf).ok()?;
+                let sum_read = u64::from_le_bytes(sum_buf);
+                use std::io::{Seek, SeekFrom};
+                use xxhash_rust::xxh3::Xxh3;
+                let mut all = std::fs::File::open(path).ok()?;
+                let end = all.metadata().ok()?.len();
+                all.seek(SeekFrom::Start(0)).ok()?;
+                let mut hasher = Xxh3::new();
+                {
+                    let mut rdr = std::io::BufReader::new(&all);
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut remaining = (end - 8) as usize;
+                    while remaining > 0 {
+                        let to_read = buf.len().min(remaining);
+                        if rdr.read_exact(&mut buf[..to_read]).is_err() { return None; }
+                        hasher.update(&buf[..to_read]);
+                        remaining -= to_read;
+                    }
+                }
+                let sum_calc = hasher.digest();
+                if sum_calc != sum_read { return None; }
+                // metrics
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
+                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+                for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
+                return Some(Self { delta: BTreeMap::new(), leaves, backing: RmiBacking::Owned { sorted_keys, sorted_offsets } });
             }
-            // Align to 8-byte boundary before keys
-            let pad = (8 - (off % 8)) & 7; // 0..7
-            if map.len() < off + pad { return None; }
-            off += pad;
-            // keys
-            let keys_bytes = count.checked_mul(size_of::<u64>())?;
-            if map.len() < off + keys_bytes { return None; }
-            let mut sorted_keys_local = Vec::with_capacity(count);
-            for chunk in map[off..off+keys_bytes].chunks_exact(8) {
-                let mut a = [0u8; 8];
-                a.copy_from_slice(chunk);
-                sorted_keys_local.push(u64::from_le_bytes(a));
+            4 => {
+                // v4: mmap zero-copy capable with checksum verify and alignment padding
+                use std::mem::size_of;
+                let file = std::fs::File::open(path).ok()?;
+                let map = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
+                let mut off = 0usize;
+                if map.len() < 8 { return None; }
+                off += 8; // magic
+                off += 4; // version + pad
+                if map.len() < off + 4 { return None; }
+                let num_leaves = u32::from_le_bytes(map[off..off+4].try_into().ok()?) as usize; off += 4;
+                if map.len() < off + 8 { return None; }
+                let count = u64::from_le_bytes(map[off..off+8].try_into().ok()?) as usize; off += 8;
+                // leaves
+                let leaf_rec_size = size_of::<u64>()*2 + size_of::<f32>()*2 + size_of::<u32>() + size_of::<u64>()*2; // 44 bytes
+                let mut lvs: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves);
+                for _ in 0..num_leaves {
+                    if map.len() < off + leaf_rec_size { return None; }
+                    let key_min = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
+                    let key_max = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
+                    let slope = f32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
+                    let intercept = f32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
+                    let epsilon = u32::from_le_bytes(map[off..off+4].try_into().ok()?); off += 4;
+                    let start = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
+                    let len = u64::from_le_bytes(map[off..off+8].try_into().ok()?); off += 8;
+                    lvs.push(RmiLeafMeta { key_min, key_max, slope, intercept, epsilon, start, len });
+                }
+                // Align to 8-byte boundary before keys
+                let pad_bytes = (8 - (off % 8)) & 7; if map.len() < off + pad_bytes { return None; } off += pad_bytes;
+                let keys_off = off;
+                let keys_bytes = count.checked_mul(size_of::<u64>())?; if map.len() < off + keys_bytes { return None; } off += keys_bytes;
+                let offs_off = off;
+                let offs_bytes = count.checked_mul(size_of::<u64>())?; if map.len() < off + offs_bytes + 8 { return None; } off += offs_bytes;
+                // checksum
+                let sum_read = u64::from_le_bytes(map[off..off+8].try_into().ok()?);
+                use xxhash_rust::xxh3::Xxh3;
+                let mut hasher = Xxh3::new(); hasher.update(&map[..off]); let sum_calc = hasher.digest();
+                if sum_calc != sum_read { return None; }
+                // Decide zero-copy vs owned based on alignment
+                let aligned = (keys_off % std::mem::align_of::<u64>() == 0) && (offs_off % std::mem::align_of::<u64>() == 0);
+                let backing = if aligned {
+                    RmiBacking::Mmap { mmap: map, keys_off, offs_off, count }
+                } else {
+                    // Fallback: copy into owned vecs if somehow misaligned
+                    let mut sorted_keys: Vec<u64> = Vec::with_capacity(count);
+                    for chunk in (&map[keys_off..keys_off+keys_bytes]).chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(chunk); sorted_keys.push(u64::from_le_bytes(a)); }
+                    let mut sorted_offsets: Vec<u64> = Vec::with_capacity(count);
+                    for chunk in (&map[offs_off..offs_off+offs_bytes]).chunks_exact(8) { let mut a=[0u8;8]; a.copy_from_slice(chunk); sorted_offsets.push(u64::from_le_bytes(a)); }
+                    RmiBacking::Owned { sorted_keys, sorted_offsets }
+                };
+                // metrics
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
+                if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+                for leaf in &lvs { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
+                return Some(Self { delta: BTreeMap::new(), leaves: lvs, backing });
             }
-            off += keys_bytes;
-            // offsets
-            let offs_bytes = count.checked_mul(size_of::<u64>())?;
-            if map.len() < off + offs_bytes + 8 { return None; }
-            let mut sorted_offsets_local = Vec::with_capacity(count);
-            for chunk in map[off..off+offs_bytes].chunks_exact(8) {
-                let mut a = [0u8; 8];
-                a.copy_from_slice(chunk);
-                sorted_offsets_local.push(u64::from_le_bytes(a));
-            }
-            off += offs_bytes;
-            // checksum at end (verify)
-            if map.len() < off + 8 { return None; }
-            let sum_read = u64::from_le_bytes(map[off..off+8].try_into().ok()?);
-            // recompute checksum on prior bytes
-            use xxhash_rust::xxh3::Xxh3;
-            let mut hasher = Xxh3::new();
-            hasher.update(&map[..off]);
-            let sum_calc = hasher.digest();
-            if sum_calc != sum_read { return None; }
-            // Metrics
-            crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
-            crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
-            if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
-            for leaf in &lvs { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
-            return Some(Self {
-                delta: BTreeMap::new(),
-                leaves: lvs,
-                sorted_keys: sorted_keys_local,
-                sorted_offsets: sorted_offsets_local,
-                mmap: Some(map),
-            });
-        } else {
-            return None;
+            _ => return None,
         }
     }
 
     // --- new delta + predict APIs used by PrimaryIndex ---
-    pub fn insert_delta(&mut self, key: u64, offset: u64) {
-        self.delta.insert(key, offset);
-    }
-
-    pub fn delta_get(&self, key: &u64) -> Option<u64> {
-        self.delta.get(key).copied()
-    }
+    pub fn insert_delta(&mut self, key: u64, offset: u64) { self.delta.insert(key, offset); }
+    pub fn delta_get(&self, key: &u64) -> Option<u64> { self.delta.get(key).copied() }
 
     fn find_leaf_index(&self, key: u64) -> Option<usize> {
         if self.leaves.is_empty() { return None; }
@@ -399,27 +398,22 @@ impl RmiIndex {
     }
 
     pub fn predict_get(&self, key: &u64) -> Option<u64> {
-        if self.sorted_keys.is_empty() { return None; }
+        let keys = self.keys();
+        if keys.is_empty() { return None; }
         let li = self.find_leaf_index(*key)?;
         let leaf = &self.leaves[li];
         let (mut lo, mut hi) = self.predict_window(leaf, *key);
         if lo > hi { return None; }
-        // clamp within array bounds just in case
-        let max_idx = self.sorted_keys.len().saturating_sub(1);
-        lo = lo.min(max_idx);
-        hi = hi.min(max_idx);
-        // binary search within [lo, hi]
-        let mut l = lo;
-        let mut r = hi;
+        let max_idx = keys.len().saturating_sub(1);
+        lo = lo.min(max_idx); hi = hi.min(max_idx);
+        let mut l = lo; let mut r = hi;
+        let offs = self.offs();
         while l <= r {
             let m = l + ((r - l) >> 1);
-            match self.sorted_keys[m].cmp(key) {
+            match keys[m].cmp(key) {
                 std::cmp::Ordering::Less => l = m + 1,
-                std::cmp::Ordering::Greater => {
-                    if m == 0 { break; }
-                    r = m - 1;
-                }
-                std::cmp::Ordering::Equal => return Some(self.sorted_offsets[m]),
+                std::cmp::Ordering::Greater => { if m == 0 { break; } r = m - 1; }
+                std::cmp::Ordering::Equal => return Some(offs[m]),
             }
         }
         None
