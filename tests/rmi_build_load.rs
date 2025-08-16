@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "learned-index")]
 #[tokio::test]
-asyn c fn rmi_build_and_load_lookup_works() {
+async fn rmi_build_and_load_lookup_works() {
     let dir = tempdir().unwrap();
     let path = dir.path().to_path_buf();
 
