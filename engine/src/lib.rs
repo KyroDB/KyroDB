@@ -425,6 +425,48 @@ impl PersistentEventLog {
         (past, rx)
     }
 
+    /// Write minimal manifest with next_offset and active files.
+    pub async fn write_manifest(&self) {
+        // detect RMI header version if present
+        let rmi_path = self.data_dir.join("index-rmi.bin");
+        let mut rmi_ver: Option<u8> = None;
+        if let Ok(mut f) = std::fs::File::open(&rmi_path) {
+            let mut magic = [0u8; 8];
+            if f.read_exact(&mut magic).is_ok() && &magic == b"KYRO_RMI" {
+                let mut ver = [0u8; 1];
+                if f.read_exact(&mut ver).is_ok() { rmi_ver = Some(ver[0]); }
+            }
+        }
+        let last_compaction_ts = chrono::Utc::now().timestamp(); // approximate; refined when compacting
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "version": env!("CARGO_PKG_VERSION"),
+            "next_offset": self.get_offset().await,
+            "snapshot": "snapshot.bin",
+            "snapshot_bytes": std::fs::metadata(self.data_dir.join("snapshot.bin")).map(|m| m.len()).unwrap_or(0),
+            "wal_segments": self.current_wal_segments(),
+            "wal_total_bytes": self.wal_size_bytes(),
+            "rmi": "index-rmi.bin",
+            "rmi_header_version": rmi_ver,
+            "last_compaction_ts": last_compaction_ts,
+            "ts": chrono::Utc::now().timestamp()
+        });
+        let tmp = self.data_dir.join("manifest.tmp");
+        if let Ok(mut f) = File::create(&tmp) {
+            let _ = writeln!(f, "{}", manifest);
+            let _ = f.sync_all();
+            let _ = std::fs::rename(&tmp, self.manifest_path());
+            let _ = fsync_dir(&self.data_dir);
+        }
+        // update gauges
+        metrics::WAL_SIZE_BYTES.set(self.wal_size_bytes() as f64);
+        metrics::SNAPSHOT_SIZE_BYTES.set(std::fs::metadata(self.data_dir.join("snapshot.bin")).map(|m| m.len()).unwrap_or(0) as f64);
+        // mirror index size to general gauge if available
+        if rmi_ver.is_some() {
+            metrics::INDEX_SIZE_BYTES.set(metrics::RMI_INDEX_SIZE_BYTES.get());
+        }
+    }
+
     /// Force-write a full snapshot to disk.
     pub async fn snapshot(&self) -> Result<()> {
         let timer = metrics::SNAPSHOT_LATENCY_SECONDS.start_timer();
@@ -524,6 +566,9 @@ impl PersistentEventLog {
         self.write_manifest().await;
         let after_bytes = Self::wal_total_bytes(&self.data_dir);
         let after_segments = Self::list_wal_segments(&self.data_dir).len();
+        // observe compaction bytes processed/saved
+        metrics::COMPACTION_BYTES_PROCESSED.observe(before_bytes as f64);
+        metrics::COMPACTION_BYTES_SAVED.observe(before_bytes.saturating_sub(after_bytes) as f64);
         Ok(CompactionStats {
             before_bytes,
             after_bytes,
@@ -561,30 +606,10 @@ impl PersistentEventLog {
             .collect()
     }
 
-    /// Write minimal manifest with next_offset and active files.
-    pub async fn write_manifest(&self) {
-        let manifest = serde_json::json!({
-            "next_offset": self.get_offset().await,
-            "snapshot": "snapshot.bin",
-            "wal_segments": self.current_wal_segments(),
-            "wal_total_bytes": self.wal_size_bytes(),
-            "rmi": "index-rmi.bin",
-            "ts": chrono::Utc::now().timestamp()
-        });
-        let tmp = self.data_dir.join("manifest.tmp");
-        if let Ok(mut f) = File::create(&tmp) {
-            let _ = writeln!(f, "{}", manifest);
-            let _ = f.sync_all();
-            let _ = std::fs::rename(&tmp, self.manifest_path());
-            let _ = fsync_dir(&self.data_dir);
-        }
-    }
-
-    #[cfg(feature = "learned-index")]
-    /// Swap the in-memory primary index (e.g., after RMI rebuild).
-    pub async fn swap_primary_index(&self, new_index: index::PrimaryIndex) {
-        let mut idx = self.index.write().await;
-        *idx = new_index;
+    /// Configure WAL rotation: segment size threshold and max segments retained.
+    pub async fn configure_wal_rotation(&self, segment_bytes: Option<u64>, max_segments: usize) {
+        *self.wal_segment_bytes.write().await = segment_bytes;
+        *self.wal_max_segments.write().await = max_segments.max(1);
     }
 
     async fn rotate_wal_if_needed(&self) {
@@ -624,12 +649,6 @@ impl PersistentEventLog {
             // update manifest after rotation
             self.write_manifest().await;
         }
-    }
-
-    /// Configure WAL rotation: segment size threshold and max segments retained.
-    pub async fn configure_wal_rotation(&self, segment_bytes: Option<u64>, max_segments: usize) {
-        *self.wal_segment_bytes.write().await = segment_bytes;
-        *self.wal_max_segments.write().await = max_segments.max(1);
     }
 }
 

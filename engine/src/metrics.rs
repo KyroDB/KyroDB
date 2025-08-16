@@ -32,6 +32,14 @@ pub static SNAPSHOT_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_snapshot_latency_seconds")
 });
 
+// New: snapshot size bytes gauge
+pub static SNAPSHOT_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_snapshot_size_bytes",
+        "Size of the current snapshot file in bytes"
+    ).expect("register kyrodb_snapshot_size_bytes")
+});
+
 pub static SSE_LAGGED_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_sse_lagged_total",
@@ -47,6 +55,14 @@ pub static WAL_CRC_ERRORS_TOTAL: Lazy<Counter> = Lazy::new(|| {
         "Total number of WAL frames dropped due to CRC error"
     )
     .expect("register kyrodb_wal_crc_errors_total")
+});
+
+// New: WAL size bytes gauge
+pub static WAL_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_wal_size_bytes",
+        "Total size of WAL segments in bytes"
+    ).expect("register kyrodb_wal_size_bytes")
 });
 
 // New: Compactions
@@ -67,6 +83,23 @@ pub static COMPACTION_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_compaction_duration_seconds")
 });
 
+// New: Compaction bytes processed/saved histograms
+pub static COMPACTION_BYTES_PROCESSED: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_compaction_bytes_processed",
+        "Bytes scanned/processed during compaction"
+    ).buckets(vec![1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_compaction_bytes_processed")
+});
+
+pub static COMPACTION_BYTES_SAVED: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_compaction_bytes_saved",
+        "Bytes reduced/saved by compaction"
+    ).buckets(vec![1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_compaction_bytes_saved")
+});
+
 // New: RMI hits/misses (only incremented when learned-index feature is active)
 pub static RMI_HITS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
@@ -82,6 +115,14 @@ pub static RMI_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
         "Total number of RMI index misses"
     )
     .expect("register kyrodb_rmi_misses_total")
+});
+
+// New: RMI hit rate gauge
+pub static RMI_HIT_RATE: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_hit_rate",
+        "Instantaneous RMI hit rate computed as hits/(hits+misses)"
+    ).expect("register kyrodb_rmi_hit_rate")
 });
 
 // New: RMI lookup latency histogram
@@ -117,6 +158,14 @@ pub static RMI_INDEX_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
         "kyrodb_rmi_index_size_bytes",
         "Size of the RMI file on disk"
     ).expect("register kyrodb_rmi_index_size_bytes")
+});
+
+// New: general index size gauge (mirrors RMI size for now)
+pub static INDEX_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_index_size_bytes",
+        "Size of the primary index on disk"
+    ).expect("register kyrodb_index_size_bytes")
 });
 
 pub static RMI_EPSILON_MAX: Lazy<Gauge> = Lazy::new(|| {

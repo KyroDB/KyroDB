@@ -239,6 +239,7 @@ impl RmiIndex {
                 }
                 // metrics
                 crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as f64);
                 crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
                 if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
                 for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
@@ -295,6 +296,7 @@ impl RmiIndex {
                 if sum_calc != sum_read { return None; }
                 // metrics
                 crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as f64);
                 crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
                 if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
                 for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
@@ -352,6 +354,7 @@ impl RmiIndex {
                 };
                 // metrics
                 crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as f64);
                 crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
                 if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
                 for leaf in &lvs { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
@@ -451,12 +454,18 @@ impl PrimaryIndex {
             PrimaryIndex::Rmi(r) => {
                 if let Some(v) = r.delta_get(key) {
                     crate::metrics::RMI_HITS_TOTAL.inc();
+                    let h = crate::metrics::RMI_HITS_TOTAL.get();
+                    let m = crate::metrics::RMI_MISSES_TOTAL.get();
+                    let t = h + m; if t > 0.0 { crate::metrics::RMI_HIT_RATE.set(h / t); }
                     Some(v)
                 } else {
                     let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
                     let res = r.predict_get(key);
                     timer.observe_duration();
                     if res.is_some() { crate::metrics::RMI_HITS_TOTAL.inc(); } else { crate::metrics::RMI_MISSES_TOTAL.inc(); }
+                    let h = crate::metrics::RMI_HITS_TOTAL.get();
+                    let m = crate::metrics::RMI_MISSES_TOTAL.get();
+                    let t = h + m; if t > 0.0 { crate::metrics::RMI_HIT_RATE.set(h / t); }
                     res
                 }
             }
