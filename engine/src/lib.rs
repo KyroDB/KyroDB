@@ -495,6 +495,13 @@ impl PersistentEventLog {
             let _ = fsync_dir(&self.data_dir);
         }
     }
+
+    #[cfg(feature = "learned-index")]
+    /// Swap the in-memory primary index (e.g., after RMI rebuild).
+    pub async fn swap_primary_index(&self, new_index: index::PrimaryIndex) {
+        let mut idx = self.index.write().await;
+        *idx = new_index;
+    }
 }
 
 #[cfg(test)]

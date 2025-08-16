@@ -8,6 +8,10 @@ license = "Apache-2.0"
 name = "kyrodb_engine"
 path = "src/lib.rs"
 
+[[bin]]
+name = "kyrodb-engine"
+path = "src/main.rs"
+
 [features]
 learned-index = []
 ann-hnsw = ["dep:hora"]

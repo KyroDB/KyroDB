@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
-use kyrodb_engine::PersistentEventLog;
+use kyrodb_engine as engine_crate;
+use engine_crate::PersistentEventLog;
 use std::sync::Arc;
 use tokio::signal; // still used in SSE handling
 use uuid::Uuid;
@@ -52,7 +53,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let log = Arc::new(kyrodb_engine::PersistentEventLog::open(std::path::Path::new(&cli.data_dir)).await.unwrap());
+    let log = Arc::new(engine_crate::PersistentEventLog::open(std::path::Path::new(&cli.data_dir)).await.unwrap());
 
     match cli.cmd {
         Commands::Serve {
@@ -150,7 +151,7 @@ async fn main() -> Result<()> {
                             // Build tmp
                             let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
                             let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
-                            if let Err(e) = kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs) {
+                            if let Err(e) = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs) {
                                 eprintln!("❌ RMI rebuild write failed: {}", e);
                                 continue;
                             }
@@ -163,9 +164,8 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             // Reload and swap
-                            if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
-                                let mut idx = rebuild_log.index.write().await;
-                                *idx = kyrodb_engine::index::PrimaryIndex::Rmi(rmi);
+                            if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
+                                rebuild_log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
                                 last_built = cur;
                                 println!("✅ RMI rebuilt and swapped (appended={}, ratio={:.3})", appended, ratio);
                             } else {
@@ -366,7 +366,7 @@ async fn main() -> Result<()> {
 
             // Metrics endpoint
             let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
-                let text = kyrodb_engine::metrics::render();
+                let text = engine_crate::metrics::render();
                 warp::reply::with_header(text, "Content-Type", "text/plain; version=0.0.4")
             });
 
@@ -406,7 +406,7 @@ async fn main() -> Result<()> {
                             tmp.push("index-rmi.tmp");
                             let mut dst = std::path::PathBuf::from(&data_dir);
                             dst.push("index-rmi.bin");
-                            let ok = kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
+                            let ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
                                 && std::fs::rename(&tmp, &dst).is_ok();
                             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                                 "ok": ok,

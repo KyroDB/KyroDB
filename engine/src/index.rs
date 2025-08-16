@@ -153,10 +153,8 @@ impl RmiIndex {
         for o in &offs { f.write_all(&o.to_le_bytes())?; }
         // checksum (xxh3_64 over all previous bytes)
         use xxhash_rust::xxh3::Xxh3;
-        use std::io::Seek;
-        use std::io::SeekFrom;
         f.flush()?;
-        let mut all = std::fs::File::open(path)?;
+        let all = std::fs::File::open(path)?;
         let len_before = all.metadata()?.len();
         let mut hasher = Xxh3::new();
         {
@@ -273,7 +271,6 @@ impl RmiIndex {
             use std::slice;
             let file = std::fs::File::open(path).ok()?;
             let map = unsafe { memmap2::MmapOptions::new().map(&file).ok()? };
-            let ptr = map.as_ptr();
             let mut off = 0usize;
             // magic
             if map.len() < 8 { return None; }
@@ -287,7 +284,7 @@ impl RmiIndex {
             if map.len() < off + 8 { return None; }
             let count = u64::from_le_bytes(map[off..off+8].try_into().ok()?) as usize; off += 8;
             // leaves
-            let leaf_rec_size = size_of::<u64>()*2 + size_of::<f32>()*2 + size_of::<u32>() + size_of::<u64>()*2; // 8+8+4+4+4+8+8 = 44 but we align to packed layout via explicit reads
+            let _leaf_rec_size = size_of::<u64>()*2 + size_of::<f32>()*2 + size_of::<u32>() + size_of::<u64>()*2; // packed length reference
             let mut lvs: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves);
             for _ in 0..num_leaves {
                 if map.len() < off + 8*2 + 4*3 + 8*2 { return None; }
@@ -326,6 +323,74 @@ impl RmiIndex {
         } else {
             return None;
         }
+    }
+
+    // --- new delta + predict APIs used by PrimaryIndex ---
+    pub fn insert_delta(&mut self, key: u64, offset: u64) {
+        self.delta.insert(key, offset);
+    }
+
+    pub fn delta_get(&self, key: &u64) -> Option<u64> {
+        self.delta.get(key).copied()
+    }
+
+    fn find_leaf_index(&self, key: u64) -> Option<usize> {
+        if self.leaves.is_empty() { return None; }
+        // quick reject if outside global range
+        if key < self.leaves.first()?.key_min || key > self.leaves.last()?.key_max { return None; }
+        let mut lo: isize = 0;
+        let mut hi: isize = (self.leaves.len() as isize) - 1;
+        while lo <= hi {
+            let mid = lo + ((hi - lo) >> 1);
+            let leaf = &self.leaves[mid as usize];
+            if key < leaf.key_min {
+                hi = mid - 1;
+            } else if key > leaf.key_max {
+                lo = mid + 1;
+            } else {
+                return Some(mid as usize);
+            }
+        }
+        None
+    }
+
+    fn predict_window(&self, leaf: &RmiLeafMeta, key: u64) -> (usize, usize) {
+        if leaf.len == 0 { return (leaf.start as usize, leaf.start as usize); }
+        let pred = leaf.slope as f64 * (key as f64) + leaf.intercept as f64;
+        let center = pred.round() as i64;
+        let start = leaf.start as i64;
+        let end = (leaf.start + leaf.len - 1) as i64;
+        let eps = leaf.epsilon as i64;
+        let lo = std::cmp::max(start, center - eps) as usize;
+        let hi = std::cmp::min(end, center + eps) as usize;
+        (lo, hi)
+    }
+
+    pub fn predict_get(&self, key: &u64) -> Option<u64> {
+        if self.sorted_keys.is_empty() { return None; }
+        let li = self.find_leaf_index(*key)?;
+        let leaf = &self.leaves[li];
+        let (mut lo, mut hi) = self.predict_window(leaf, *key);
+        if lo > hi { return None; }
+        // clamp within array bounds just in case
+        let max_idx = self.sorted_keys.len().saturating_sub(1);
+        lo = lo.min(max_idx);
+        hi = hi.min(max_idx);
+        // binary search within [lo, hi]
+        let mut l = lo;
+        let mut r = hi;
+        while l <= r {
+            let m = l + ((r - l) >> 1);
+            match self.sorted_keys[m].cmp(key) {
+                std::cmp::Ordering::Less => l = m + 1,
+                std::cmp::Ordering::Greater => {
+                    if m == 0 { break; }
+                    r = m - 1;
+                }
+                std::cmp::Ordering::Equal => return Some(self.sorted_offsets[m]),
+            }
+        }
+        None
     }
 }
 
