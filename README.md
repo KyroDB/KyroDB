@@ -168,4 +168,4 @@ Apache-2.0
 
 ## Contact / Community
 
-Open an issue for design discussions; label PRs that are experimental with `experimental`. For fast feedback ping @vatskishan03 on GitHub or Twitter.
+Open an issue for design discussions; label PRs that are experimental with `experimental`. For fast feedback ping @vatskishan03 on GitHub and Twitter(kishanvats03).
