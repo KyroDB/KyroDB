@@ -16,3 +16,14 @@ urlencoding = "2"
 hdrhistogram = "7"
 csv = "1"
 indicatif = "0.17"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+kyrodb_engine = { path = "../engine", package = "engine" }
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+
+[[bench]]
+name = "kv_index"
+harness = false

@@ -346,6 +346,29 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // Fast lookup path: GET /lookup_raw?key=123 -> 204 if found, 404 if not
+            let lookup_raw_log = log.clone();
+            let lookup_raw = warp::path("lookup_raw")
+                .and(warp::get())
+                .and(warp::query::<std::collections::HashMap<String, String>>())
+                .and_then(move |q: std::collections::HashMap<String, String>| {
+                    let log = lookup_raw_log.clone();
+                    async move {
+                        if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
+                            if log.lookup_key(k).await.is_some() {
+                                return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    "",
+                                    warp::http::StatusCode::NO_CONTENT,
+                                ));
+                            }
+                        }
+                        Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            "",
+                            warp::http::StatusCode::NOT_FOUND,
+                        ))
+                    }
+                });
+
             // POST /sql  { sql: "INSERT ..." | "SELECT ..." }
             let sql_log = log.clone();
             let sql_route = warp::path("sql")
@@ -533,6 +556,7 @@ async fn main() -> Result<()> {
             let offset_route = auth.clone().and(offset_route).map(|(), r| r);
             let put_route = auth.clone().and(put_route).map(|(), r| r);
             let lookup_route = auth.clone().and(lookup_route).map(|(), r| r);
+            let lookup_raw = auth.clone().and(lookup_raw).map(|(), r| r);
             let sql_route = auth.clone().and(sql_route).map(|(), r| r);
             let vector_insert = auth.clone().and(vector_insert).map(|(), r| r);
             let vector_search = auth.clone().and(vector_search).map(|(), r| r);
@@ -549,6 +573,7 @@ async fn main() -> Result<()> {
                 .or(offset_route)
                 .or(put_route)
                 .or(lookup_route)
+                .or(lookup_raw)
                 .or(sql_route)
                 .or(vector_insert)
                 .or(vector_search)

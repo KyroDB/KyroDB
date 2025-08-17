@@ -51,12 +51,15 @@ struct OffsetResp { offset: u64 }
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let mut client_builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10));
-    let client = client_builder.build()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
 
     // Helper to attach auth header if provided
     let auth_header = args.auth_token.as_ref().map(|t| format!("Bearer {}", t));
+
+    // Wait for server health
+    wait_for_health(&client, &args.base, auth_header.as_deref()).await?;
 
     // 1) Bulk load N keys
     println!("[load] inserting {} keys", args.load_n);
@@ -83,15 +86,16 @@ async fn main() -> Result<()> {
     while let Some(_res) = join.join_next().await {}
     pb.finish_with_message("load done");
 
-    // 2) Trigger RMI build
+    // 2) Trigger RMI build and wait until loaded
     println!("[build] POST /rmi/build");
     {
         let mut req = client.post(format!("{}/rmi/build", args.base));
         if let Some(h) = auth_header.as_ref() { req = req.header("Authorization", h); }
-        let _ = req.send().await?;
+        if let Err(e) = req.send().await { eprintln!("warn: rmi/build failed: {}", e); }
     }
+    wait_for_rmi_loaded(&client, &args.base, auth_header.as_deref()).await?;
 
-    // 3) Read-heavy workload and measure latency
+    // 3) Read-heavy workload and measure latency (lookup_raw)
     println!("[read] running {}s, {} concurrency, dist={}", args.read_seconds, args.read_concurrency, args.dist);
     let deadline = Instant::now() + Duration::from_secs(args.read_seconds);
     let hist = Arc::new(tokio::sync::Mutex::new(Histogram::<u64>::new(3)?));
@@ -109,10 +113,8 @@ async fn main() -> Result<()> {
         let h = hist.clone();
         let key = match &zipf {
             Some(z) => {
-                // Zipf::sample returns f64 in [1, N]; convert to 0-based u64 safely
                 let s = z.sample(&mut rng);
-                let idx = if s < 1.0 { 0 } else { (s as u64).saturating_sub(1) };
-                idx
+                if s < 1.0 { 0 } else { (s as u64).saturating_sub(1) }
             },
             None => rng.gen_range(0..args.load_n as u64),
         };
@@ -120,7 +122,7 @@ async fn main() -> Result<()> {
         set.spawn(async move {
             let _g = permit;
             let t0 = Instant::now();
-            let url = format!("{}/lookup?key={}", base, key);
+            let url = format!("{}/lookup_raw?key={}", base, key);
             let mut req = client.get(url);
             if let Some(h) = auth.as_ref() { req = req.header("Authorization", h); }
             let _ = req.send().await;
@@ -152,10 +154,39 @@ async fn main() -> Result<()> {
     let wal_bytes = grep_metric(&text, "kyrodb_wal_size_bytes");
     let snap_bytes = grep_metric(&text, "kyrodb_snapshot_size_bytes");
     let hit_rate = grep_metric(&text, "kyrodb_rmi_hit_rate");
-    let probe_p50 = grep_hist_sum_or_zero(&text, "kyrodb_rmi_probe_len");
-    println!("wal_bytes={} snapshot_bytes={} rmi_hit_rate={} probe_len_hist_sum={}", wal_bytes, snap_bytes, hit_rate, probe_p50);
+    let probe_sum = grep_hist_sum_or_zero(&text, "kyrodb_rmi_probe_len");
+    let probe_cnt = grep_hist_count_or_zero(&text, "kyrodb_rmi_probe_len");
+    let probe_avg = if probe_cnt > 0.0 { probe_sum / probe_cnt } else { 0.0 };
+    println!("wal_bytes={} snapshot_bytes={} rmi_hit_rate={} avg_probe_len={}", wal_bytes, snap_bytes, hit_rate, probe_avg);
 
     Ok(())
+}
+
+async fn wait_for_health(client: &reqwest::Client, base: &str, auth: Option<&str>) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        let mut req = client.get(format!("{}/health", base));
+        if let Some(h) = auth { req = req.header("Authorization", h); }
+        if let Ok(resp) = req.send().await { if resp.status().is_success() { return Ok(()); } }
+        tries += 1;
+        if tries > 120 { anyhow::bail!("server not healthy after timeout"); }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_rmi_loaded(client: &reqwest::Client, base: &str, auth: Option<&str>) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        let mut req = client.get(format!("{}/metrics", base));
+        if let Some(h) = auth { req = req.header("Authorization", h); }
+        if let Ok(resp) = req.send().await { if let Ok(text) = resp.text().await {
+            let leaves = grep_metric(&text, "kyrodb_rmi_index_leaves");
+            if leaves > 0.0 { return Ok(()); }
+        }}
+        tries += 1;
+        if tries > 240 { anyhow::bail!("rmi not loaded after timeout"); }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn grep_metric(text: &str, name: &str) -> f64 {
@@ -169,9 +200,20 @@ fn grep_metric(text: &str, name: &str) -> f64 {
     0.0
 }
 
-// naive helper to get histogram sample sum if exported in Prom text format
 fn grep_hist_sum_or_zero(text: &str, base: &str) -> f64 {
     let target = format!("{}_sum", base);
+    for line in text.lines() {
+        if line.starts_with(&target) {
+            if let Some(val) = line.split_whitespace().nth(1) {
+                if let Ok(f) = val.parse::<f64>() { return f; }
+            }
+        }
+    }
+    0.0
+}
+
+fn grep_hist_count_or_zero(text: &str, base: &str) -> f64 {
+    let target = format!("{}_count", base);
     for line in text.lines() {
         if line.starts_with(&target) {
             if let Some(val) = line.split_whitespace().nth(1) {
