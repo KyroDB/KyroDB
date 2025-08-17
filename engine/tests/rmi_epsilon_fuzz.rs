@@ -15,7 +15,7 @@ async fn build_and_check(dist_keys: Vec<u64>) {
     let pairs = log.collect_key_offset_pairs().await;
     let tmp = path.join("index-rmi.tmp");
     let dst = path.join("index-rmi.bin");
-    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
+    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs, 1024).unwrap();
     std::fs::rename(&tmp, &dst).unwrap();
     drop(log);
 

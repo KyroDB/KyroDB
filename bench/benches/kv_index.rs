@@ -37,7 +37,8 @@ fn bench_rmi_predict_get(c: &mut Criterion) {
                 let pairs = log.collect_key_offset_pairs().await;
                 let tmp = dir.path().join("index-rmi.tmp");
                 let dst = dir.path().join("index-rmi.bin");
-                engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
+                let leaf_target = 1024usize;
+                engine::index::RmiIndex::write_from_pairs(&tmp, &pairs, leaf_target).unwrap();
                 std::fs::rename(&tmp, &dst).unwrap();
                 if let Some(rmi) = engine::index::RmiIndex::load_from_file(&dst) {
                     log.swap_primary_index(engine::index::PrimaryIndex::Rmi(rmi)).await;

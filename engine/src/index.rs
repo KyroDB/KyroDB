@@ -89,7 +89,7 @@ impl RmiIndex {
     }
 
     /// Build per-leaf linear models and epsilon bounds from sorted pairs and write v4 format with checksum.
-    pub fn write_from_pairs(path: &std::path::Path, pairs: &[(u64, u64)]) -> std::io::Result<()> {
+    pub fn write_from_pairs(path: &std::path::Path, pairs: &[(u64, u64)], leaf_target: usize) -> std::io::Result<()> {
         use std::io::Write;
         // sort by key
         let mut buf: Vec<(u64, u64)> = pairs.to_vec();
@@ -97,7 +97,7 @@ impl RmiIndex {
         let n = buf.len();
         let total_keys = n as u64;
         // choose number of leaves
-        let target_leaf = 1024usize; // aim ~1k keys per leaf
+        let target_leaf = leaf_target.max(1); // aim ~leaf_target keys per leaf
         let num_leaves = std::cmp::max(1, (n + target_leaf - 1) / target_leaf) as u32;
         let mut leaves: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves as usize);
         // build keys, offsets arrays

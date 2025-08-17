@@ -4,15 +4,12 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
 use kyrodb_engine as engine_crate;
-use engine_crate::PersistentEventLog;
 use std::sync::Arc;
-use tokio::signal; // still used in SSE handling
-use uuid::Uuid;
 use warp::Filter;
 mod sql;
 
 #[derive(Parser)]
-#[command(name = "kyrodb-engine", about = "KyroDB Engine")] 
+#[command(name = "kyrodb-engine", about = "KyroDB Engine")]
 struct Cli {
     /// Directory for data files (snapshots + WAL)
     #[arg(short, long, default_value = "./data")]
@@ -47,12 +44,21 @@ enum Commands {
         /// Rebuild RMI when delta/total ratio exceeds R (0.0-1.0)
         #[arg(long)]
         rmi_rebuild_ratio: Option<f64>,
+        /// RMI leaf target (keys per leaf)
+        #[arg(long, default_value_t = 1024)]
+        rmi_leaf_target: usize,
         /// WAL rotation: per-segment max bytes
         #[arg(long)]
         wal_segment_bytes: Option<u64>,
         /// WAL retention: max segments to keep
         #[arg(long, default_value_t = 8)]
         wal_max_segments: usize,
+        /// HTTP workers (SO_REUSEPORT), 1 = single listener
+        #[arg(long, default_value_t = 1)]
+        workers: usize,
+        /// Enable HTTP request logging
+        #[arg(long, default_value_t = false)]
+        log_http: bool,
     },
 }
 
@@ -71,8 +77,11 @@ async fn main() -> Result<()> {
             wal_max_bytes,
             rmi_rebuild_appends,
             rmi_rebuild_ratio,
+            rmi_leaf_target,
             wal_segment_bytes,
             wal_max_segments,
+            workers,
+            log_http,
         } => {
             // Configure WAL rotation if requested
             if wal_segment_bytes.is_some() || wal_max_segments > 0 {
@@ -149,6 +158,7 @@ async fn main() -> Result<()> {
                 let rebuild_log = log.clone();
                 let app_thresh = rmi_rebuild_appends.unwrap_or(0);
                 let ratio_thresh = rmi_rebuild_ratio.unwrap_or(0.0);
+                let leaf_target = rmi_leaf_target;
                 tokio::spawn(async move {
                     let mut last_built = rebuild_log.get_offset().await;
                     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -156,31 +166,24 @@ async fn main() -> Result<()> {
                         interval.tick().await;
                         let cur = rebuild_log.get_offset().await;
                         let appended = cur.saturating_sub(last_built);
-                        // compute ratio ~ delta/total keys
-                        let pairs = rebuild_log.collect_key_offset_pairs().await; // latest map
+                        let pairs = rebuild_log.collect_key_offset_pairs().await;
                         let distinct = pairs.len() as u64;
                         let ratio = if distinct == 0 { 0.0 } else { appended as f64 / distinct as f64 };
                         if (app_thresh > 0 && appended >= app_thresh) || (ratio_thresh > 0.0 && ratio >= ratio_thresh) {
-                            // Build tmp
                             let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
                             let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
                             let rebuild_timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-                            if let Err(e) = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs) {
+                            if let Err(e) = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs, leaf_target) {
                                 eprintln!("❌ RMI rebuild write failed: {}", e);
-                                // record duration even on failure to get observability
                                 rebuild_timer.observe_duration();
                                 continue;
                             }
-                            // fsync tmp, rename
-                            if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-                                let _ = f.sync_all();
-                            }
+                            if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
                             if let Err(e) = std::fs::rename(&tmp, &dst) {
                                 eprintln!("❌ RMI rename failed: {}", e);
                                 rebuild_timer.observe_duration();
                                 continue;
                             }
-                            // Reload and swap
                             if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
                                 rebuild_log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
                                 last_built = cur;
@@ -196,110 +199,6 @@ async fn main() -> Result<()> {
                 });
             }
 
-            let append_log = log.clone();
-            let append_route = warp::path("append")
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = append_log.clone();
-                    async move {
-                        let payload = body["payload"]
-                            .as_str()
-                            .unwrap_or("")
-                            .as_bytes()
-                            .to_vec();
-                        let offset = log.append(Uuid::new_v4(), payload).await.unwrap();
-                        Ok::<_, warp::Rejection>(
-                            warp::reply::json(&serde_json::json!({ "offset": offset })),
-                        )
-                    }
-                });
-
-            // --- NEW: Health check endpoint ----------------------------------------------------
-            let health_route = warp::path("health")
-                .and(warp::get())
-                .map(|| warp::reply::json(&serde_json::json!({ "status": "ok" })));
-
-            // --- NEW: Snapshot trigger endpoint -----------------------------------------------
-            let snapshot_log = log.clone();
-            let snapshot_route = warp::path("snapshot")
-                .and(warp::post())
-                .and_then(move || {
-                    let log = snapshot_log.clone();
-                    async move {
-                        if let Err(e) = log.snapshot().await {
-                            eprintln!("❌ Snapshot failed: {}", e);
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            ));
-                        }
-                        Ok::<_, warp::Rejection>(
-                            warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
-                                warp::http::StatusCode::OK,
-                            ),
-                        )
-                    }
-                });
-
-            // --- NEW: Compaction endpoint -----------------------------------------------------
-            let compact_log = log.clone();
-            let compact_route = warp::path("compact")
-                .and(warp::post())
-                .and_then(move || {
-                    let log = compact_log.clone();
-                    async move {
-                        match log.compact_keep_latest_and_snapshot_stats().await {
-                            Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "compact": "ok", "stats": stats })),
-                                warp::http::StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            )),
-                        }
-                    }
-                });
-
-            // --- NEW: Offset endpoint ---------------------------------------------------------
-            let offset_log = log.clone();
-            let offset_route = warp::path("offset")
-                .and(warp::get())
-                .and_then(move || {
-                    let log = offset_log.clone();
-                    async move {
-                        let off = log.get_offset().await;
-                        Ok::<_, warp::Rejection>(
-                            warp::reply::json(&serde_json::json!({ "offset": off })),
-                        )
-                    }
-                });
-
-            let replay_log = log.clone();
-            let replay_route = warp::path("replay")
-                .and(warp::get())
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = replay_log.clone();
-                    async move {
-                        let start = q.get("start").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let end = q.get("end").and_then(|s| s.parse().ok());
-                        let evs = log.replay(start, end).await;
-                        let resp: Vec<_> = evs
-                            .into_iter()
-                            .map(|e| {
-                                serde_json::json!({
-                                    "offset": e.offset,
-                                    "payload": String::from_utf8_lossy(&e.payload)
-                                })
-                            })
-                            .collect();
-                        Ok::<_, warp::Rejection>(warp::reply::json(&resp))
-                    }
-                });
-
             // KV PUT: POST /put { key: u64, value: string }
             let put_log = log.clone();
             let put_route = warp::path("put")
@@ -310,12 +209,12 @@ async fn main() -> Result<()> {
                     async move {
                         let key = body["key"].as_u64().unwrap_or(0);
                         let value = body["value"].as_str().unwrap_or("").as_bytes().to_vec();
-                        let off = log.append_kv(Uuid::new_v4(), key, value).await.unwrap();
+                        let off = log.append_kv(uuid::Uuid::new_v4(), key, value).await.unwrap();
                         Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({ "offset": off })))
                     }
                 });
 
-            // Simple lookup by key: GET /lookup?key=123
+            // Simple lookup by key: GET /lookup?key=123 (fast offset fetch + value)
             let lookup_log = log.clone();
             let lookup_route = warp::path("lookup")
                 .and(warp::get())
@@ -324,17 +223,7 @@ async fn main() -> Result<()> {
                     let log = lookup_log.clone();
                     async move {
                         if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
-                            if let Some(offset) = log.lookup_key(k).await {
-                                let evs = log.replay(offset, Some(offset + 1)).await;
-                                if let Some(ev) = evs.into_iter().next() {
-                                    if let Ok(rec) = bincode::deserialize::<kyrodb_engine::Record>(&ev.payload) {
-                                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                                            "key": rec.key,
-                                            "value": String::from_utf8_lossy(&rec.value)
-                                        })));
-                                    }
-                                }
-                            } else if let Some((_, rec)) = log.find_key_scan(k).await {
+                            if let Some((_off, rec)) = log.find_key_scan(k).await {
                                 return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                                     "key": rec.key,
                                     "value": String::from_utf8_lossy(&rec.value)
@@ -435,6 +324,7 @@ async fn main() -> Result<()> {
             let rmi_build = {
                 let data_dir = cli.data_dir.clone();
                 let build_log = log.clone();
+                let leaf_target = rmi_leaf_target;
                 warp::path!("rmi" / "build")
                     .and(warp::post())
                     .and_then(move || {
@@ -447,7 +337,7 @@ async fn main() -> Result<()> {
                             let mut dst = std::path::PathBuf::from(&data_dir);
                             dst.push("index-rmi.bin");
                             let timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-                            let ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
+                            let ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs, leaf_target).is_ok()
                                 && std::fs::rename(&tmp, &dst).is_ok();
                             if ok { engine_crate::metrics::RMI_REBUILDS_TOTAL.inc(); }
                             timer.observe_duration();
@@ -474,42 +364,88 @@ async fn main() -> Result<()> {
                     })
             };
 
-            let subscribe_log = log.clone();
-            let subscribe_route = warp::path("subscribe")
+            // --- NEW: Health check endpoint ----------------------------------------------------
+            let health_route = warp::path("health")
+                .and(warp::get())
+                .map(|| warp::reply::json(&serde_json::json!({ "status": "ok" })));
+
+            // --- NEW: Snapshot trigger endpoint -----------------------------------------------
+            let snapshot_log = log.clone();
+            let snapshot_route = warp::path("snapshot")
+                .and(warp::post())
+                .and_then(move || {
+                    let log = snapshot_log.clone();
+                    async move {
+                        if let Err(e) = log.snapshot().await {
+                            eprintln!("❌ Snapshot failed: {}", e);
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            ));
+                        }
+                        Ok::<_, warp::Rejection>(
+                            warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
+                                warp::http::StatusCode::OK,
+                            ),
+                        )
+                    }
+                });
+
+            // --- NEW: Compaction endpoint -----------------------------------------------------
+            let compact_log = log.clone();
+            let compact_route = warp::path("compact")
+                .and(warp::post())
+                .and_then(move || {
+                    let log = compact_log.clone();
+                    async move {
+                        match log.compact_keep_latest_and_snapshot_stats().await {
+                            Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "compact": "ok", "stats": stats })),
+                                warp::http::StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        }
+                    }
+                });
+
+            // --- NEW: Offset endpoint ---------------------------------------------------------
+            let offset_log = log.clone();
+            let offset_route = warp::path("offset")
+                .and(warp::get())
+                .and_then(move || {
+                    let log = offset_log.clone();
+                    async move {
+                        let off = log.get_offset().await;
+                        Ok::<_, warp::Rejection>(
+                            warp::reply::json(&serde_json::json!({ "offset": off })),
+                        )
+                    }
+                });
+
+            let replay_log = log.clone();
+            let replay_route = warp::path("replay")
                 .and(warp::get())
                 .and(warp::query::<std::collections::HashMap<String, String>>())
                 .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = subscribe_log.clone();
+                    let log = replay_log.clone();
                     async move {
-                        let from = q.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let (past, rx) = log.subscribe(from).await;
-
-                        // Create an SSE stream of past + live events
-                        let past_stream = futures::stream::iter(
-                            past.into_iter().map(Ok::<_, std::convert::Infallible>),
-                        );
-                        let live_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
-                            .filter_map(|res| async move {
-                                match res {
-                                    Ok(v) => Some(v),
-                                    Err(_) => {
-                                        kyrodb_engine::metrics::inc_sse_lagged();
-                                        None
-                                    }
-                                }
+                        let start = q.get("start").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let end = q.get("end").and_then(|s| s.parse().ok());
+                        let evs = log.replay(start, end).await;
+                        let resp: Vec<_> = evs
+                            .into_iter()
+                            .map(|e| {
+                                serde_json::json!({
+                                    "offset": e.offset,
+                                    "payload": String::from_utf8_lossy(&e.payload)
+                                })
                             })
-                            .map(Ok);
-                        let combined = past_stream.chain(live_stream).map(|e| {
-                            let event = e.unwrap(); // Should be infallible
-                            Ok::<_, warp::Error>(warp::sse::Event::default()
-                                .data(
-                                    serde_json::json!({"offset": event.offset, "payload": String::from_utf8_lossy(&event.payload)})
-                                        .to_string(),
-                                ))
-                        });
-                        Ok::<_, warp::Rejection>(warp::sse::reply(
-                            warp::sse::keep_alive().stream(combined),
-                        ))
+                            .collect();
+                        Ok::<_, warp::Rejection>(warp::reply::json(&resp))
                     }
                 });
 
@@ -549,9 +485,6 @@ async fn main() -> Result<()> {
                 });
 
             // Apply auth to protected routes
-            let append_route = auth.clone().and(append_route).map(|(), r| r);
-            let replay_route = auth.clone().and(replay_route).map(|(), r| r);
-            let subscribe_route = auth.clone().and(subscribe_route).map(|(), r| r);
             let snapshot_route = auth.clone().and(snapshot_route).map(|(), r| r);
             let offset_route = auth.clone().and(offset_route).map(|(), r| r);
             let put_route = auth.clone().and(put_route).map(|(), r| r);
@@ -564,41 +497,64 @@ async fn main() -> Result<()> {
             let compact_route = auth.clone().and(compact_route).map(|(), r| r);
 
             // Compose routes
-            let routes = health_route
-                .or(metrics_route)
-                .or(append_route)
-                .or(replay_route)
-                .or(subscribe_route)
-                .or(snapshot_route)
-                .or(offset_route)
-                .or(put_route)
-                .or(lookup_route)
-                .or(lookup_raw)
-                .or(sql_route)
-                .or(vector_insert)
-                .or(vector_search)
-                .or(rmi_build)
-                .or(compact_route)
-                .recover(|rej: warp::Rejection| async move {
-                    use warp::http::StatusCode;
-                    if rej.find::<Unauthorized>().is_some() {
-                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
-                            StatusCode::UNAUTHORIZED,
-                        ))
-                    } else {
-                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error":"not found"})),
-                            StatusCode::NOT_FOUND,
-                        ))
-                    }
-                })
-                .with(warp::log("kyrodb"));
+            let routes = {
+                let mut r = health_route
+                    .or(metrics_route)
+                    .or(snapshot_route)
+                    .or(offset_route)
+                    .or(put_route)
+                    .or(lookup_route)
+                    .or(lookup_raw)
+                    .or(sql_route)
+                    .or(vector_insert)
+                    .or(vector_search)
+                    .or(rmi_build)
+                    .or(compact_route)
+                    .recover(|rej: warp::Rejection| async move {
+                        use warp::http::StatusCode;
+                        if rej.find::<Unauthorized>().is_some() {
+                            Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
+                                StatusCode::UNAUTHORIZED,
+                            ))
+                        } else {
+                            Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({"error":"not found"})),
+                                StatusCode::NOT_FOUND,
+                            ))
+                        }
+                    });
+                if log_http { r = r.with(warp::log("kyrodb")); }
+                r
+            };
 
-            println!("🚀 Starting server at http://{}:{}", host, port);
-            warp::serve(routes)
-                .run((host.parse::<std::net::IpAddr>()?, port))
-                .await;
+            // Start server with optional SO_REUSEPORT workers
+            let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
+            if workers <= 1 {
+                println!("🚀 Starting server at http://{}:{} (1 worker)", host, port);
+                warp::serve(routes).run(addr).await;
+            } else {
+                println!("🚀 Starting server at http://{}:{} ({} workers)", host, port, workers);
+                use socket2::{Socket, Domain, Type, Protocol};
+                let mut handles = Vec::new();
+                for _ in 0..workers {
+                    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+                    socket.set_reuse_address(true)?;
+                    #[cfg(target_os = "macos")]
+                    socket.set_reuse_port(true)?;
+                    socket.bind(&addr.into())?;
+                    socket.listen(1024)?;
+                    socket.set_nonblocking(true)?;
+                    let std_listener: std::net::TcpListener = socket.into();
+                    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+                    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                    let svc = routes.clone();
+                    handles.push(tokio::spawn(async move {
+                        warp::serve(svc).run_incoming(incoming).await;
+                    }));
+                }
+                for h in handles { let _ = h.await; }
+            }
         }
     }
 

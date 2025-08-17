@@ -12,7 +12,7 @@ async fn rmi_crash_during_swap_startup_ignores_tmp() {
     // Simulate crashed swap: write tmp but do not rename
     let pairs = log.collect_key_offset_pairs().await;
     let tmp = path.join("index-rmi.tmp");
-    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
+    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs, 1024).unwrap();
     drop(log);
 
     // Startup should ignore tmp and have no RMI index loaded (falls back to BTree)
