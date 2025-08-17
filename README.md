@@ -140,3 +140,45 @@ Observability:
 ## ADRs
 
 - `docs/adr/0001-rmi-learned-index.md` updated with current bounded probe and file headers (v2/v3/v4).
+
+---
+
+## Bench (scripted)
+
+Build bench runner
+
+```bash
+cargo build -p bench --release
+```
+
+Start engine (release)
+
+```bash
+RUST_LOG=info cargo run -p engine --release -- serve 127.0.0.1 3030 \
+  --wal-segment-bytes 67108864 --wal-max-segments 8 \
+  --rmi-rebuild-appends 100000 --rmi-rebuild-ratio 0.25
+```
+
+Run workload (uniform or zipf)
+
+```bash
+# uniform, 1M keys, 64B values, 64 readers for 60s
+./target/release/bench \
+  --base http://127.0.0.1:3030 \
+  --load-n 1000000 \
+  --val-bytes 64 \
+  --load-concurrency 64 \
+  --read-concurrency 128 \
+  --read-seconds 60 \
+  --dist uniform \
+  --out-csv bench_uniform.csv
+
+# zipf
+./target/release/bench --load-n 1000000 --dist zipf --zipf-theta 1.1 --out-csv bench_zipf.csv
+```
+
+Outputs
+- CSV with latency percentiles (us) for 50/90/95/99/99.9.
+- Logs p50/p95/p99, WAL and snapshot sizes, RMI hit rate.
+
+Note: ensure `--features learned-index` are enabled for the engine build if not default.
