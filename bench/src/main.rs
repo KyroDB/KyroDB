@@ -13,6 +13,9 @@ struct Args {
     /// Engine base URL
     #[arg(long, default_value = "http://127.0.0.1:3030")]
     base: String,
+    /// Optional bearer token for protected endpoints
+    #[arg(long)]
+    auth_token: Option<String>,
     /// Total keys to load
     #[arg(long, default_value_t = 1_000_0)]
     load_n: usize,
@@ -48,9 +51,12 @@ struct OffsetResp { offset: u64 }
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let mut client_builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10));
+    let client = client_builder.build()?;
+
+    // Helper to attach auth header if provided
+    let auth_header = args.auth_token.as_ref().map(|t| format!("Bearer {}", t));
 
     // 1) Bulk load N keys
     println!("[load] inserting {} keys", args.load_n);
@@ -63,15 +69,15 @@ async fn main() -> Result<()> {
         let client = client.clone();
         let base = args.base.clone();
         let val = vec![b'x'; args.val_bytes];
+        let auth = auth_header.clone();
+        let pb2 = pb.clone();
         join.spawn(async move {
             let _g = permit;
             let body = serde_json::json!({"key": i as u64, "value": String::from_utf8_lossy(&val)});
-            let _ = client
-                .post(format!("{}/put", base))
-                .json(&body)
-                .send()
-                .await;
-            pb.inc(1);
+            let mut req = client.post(format!("{}/put", base)).json(&body);
+            if let Some(h) = auth.as_ref() { req = req.header("Authorization", h); }
+            let _ = req.send().await;
+            pb2.inc(1);
         });
     }
     while let Some(_res) = join.join_next().await {}
@@ -79,7 +85,11 @@ async fn main() -> Result<()> {
 
     // 2) Trigger RMI build
     println!("[build] POST /rmi/build");
-    let _ = client.post(format!("{}/rmi/build", args.base)).send().await?;
+    {
+        let mut req = client.post(format!("{}/rmi/build", args.base));
+        if let Some(h) = auth_header.as_ref() { req = req.header("Authorization", h); }
+        let _ = req.send().await?;
+    }
 
     // 3) Read-heavy workload and measure latency
     println!("[read] running {}s, {} concurrency, dist={}", args.read_seconds, args.read_concurrency, args.dist);
@@ -98,14 +108,22 @@ async fn main() -> Result<()> {
         let base = args.base.clone();
         let h = hist.clone();
         let key = match &zipf {
-            Some(z) => (z.sample(&mut rng) - 1) as u64, // Zipf 1..N
+            Some(z) => {
+                // Zipf::sample returns f64 in [1, N]; convert to 0-based u64 safely
+                let s = z.sample(&mut rng);
+                let idx = if s < 1.0 { 0 } else { (s as u64).saturating_sub(1) };
+                idx
+            },
             None => rng.gen_range(0..args.load_n as u64),
         };
+        let auth = auth_header.clone();
         set.spawn(async move {
             let _g = permit;
             let t0 = Instant::now();
             let url = format!("{}/lookup?key={}", base, key);
-            let _ = client.get(url).send().await;
+            let mut req = client.get(url);
+            if let Some(h) = auth.as_ref() { req = req.header("Authorization", h); }
+            let _ = req.send().await;
             let us = t0.elapsed().as_micros() as u64;
             let mut lock = h.lock().await;
             let _ = lock.record(us);
@@ -128,11 +146,14 @@ async fn main() -> Result<()> {
     wtr.flush()?;
 
     // 5) Scrape a few metrics and append
-    let text = client.get(format!("{}/metrics", args.base)).send().await?.text().await?;
+    let mut req = client.get(format!("{}/metrics", args.base));
+    if let Some(h) = auth_header.as_ref() { req = req.header("Authorization", h); }
+    let text = req.send().await?.text().await?;
     let wal_bytes = grep_metric(&text, "kyrodb_wal_size_bytes");
     let snap_bytes = grep_metric(&text, "kyrodb_snapshot_size_bytes");
     let hit_rate = grep_metric(&text, "kyrodb_rmi_hit_rate");
-    println!("wal_bytes={} snapshot_bytes={} rmi_hit_rate={}", wal_bytes, snap_bytes, hit_rate);
+    let probe_p50 = grep_hist_sum_or_zero(&text, "kyrodb_rmi_probe_len");
+    println!("wal_bytes={} snapshot_bytes={} rmi_hit_rate={} probe_len_hist_sum={}", wal_bytes, snap_bytes, hit_rate, probe_p50);
 
     Ok(())
 }
@@ -140,6 +161,19 @@ async fn main() -> Result<()> {
 fn grep_metric(text: &str, name: &str) -> f64 {
     for line in text.lines() {
         if line.starts_with(name) {
+            if let Some(val) = line.split_whitespace().nth(1) {
+                if let Ok(f) = val.parse::<f64>() { return f; }
+            }
+        }
+    }
+    0.0
+}
+
+// naive helper to get histogram sample sum if exported in Prom text format
+fn grep_hist_sum_or_zero(text: &str, base: &str) -> f64 {
+    let target = format!("{}_sum", base);
+    for line in text.lines() {
+        if line.starts_with(&target) {
             if let Some(val) = line.split_whitespace().nth(1) {
                 if let Ok(f) = val.parse::<f64>() { return f; }
             }

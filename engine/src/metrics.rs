@@ -192,6 +192,25 @@ pub static RMI_REBUILD_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_rmi_rebuild_duration_seconds")
 });
 
+// New: RMI probe length histogram (iterations inside bounded search)
+pub static RMI_PROBE_LEN: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_rmi_probe_len",
+        "Number of probe steps taken by RMI bounded search",
+    )
+    .buckets(vec![1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_rmi_probe_len")
+});
+
+// New: RMI mispredicts total (predicted window missed a present key)
+pub static RMI_MISPREDICTS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_rmi_mispredicts_total",
+        "Total number of times the predicted window did not include the true key position"
+    )
+    .expect("register kyrodb_rmi_mispredicts_total")
+});
+
 pub fn inc_sse_lagged() { SSE_LAGGED_TOTAL.inc(); }
 
 pub fn render() -> String {

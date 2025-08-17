@@ -688,6 +688,12 @@ impl PersistentEventLog {
             self.write_manifest().await;
         }
     }
+
+    /// Swap the primary index (e.g., after an RMI rebuild). Safe under write lock.
+    pub async fn swap_primary_index(&self, new_index: index::PrimaryIndex) {
+        let mut w = self.index.write().await;
+        *w = new_index;
+    }
 }
 
 #[cfg(test)]

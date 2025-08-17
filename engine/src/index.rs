@@ -411,14 +411,22 @@ impl RmiIndex {
         lo = lo.min(max_idx); hi = hi.min(max_idx);
         let mut l = lo; let mut r = hi;
         let offs = self.offs();
+        let mut probes: u32 = 0;
         while l <= r {
+            probes += 1;
             let m = l + ((r - l) >> 1);
             match keys[m].cmp(key) {
                 std::cmp::Ordering::Less => l = m + 1,
                 std::cmp::Ordering::Greater => { if m == 0 { break; } r = m - 1; }
-                std::cmp::Ordering::Equal => return Some(offs[m]),
+                std::cmp::Ordering::Equal => {
+                    crate::metrics::RMI_PROBE_LEN.observe(probes as f64);
+                    return Some(offs[m]);
+                }
             }
         }
+        // bounded search failed; record probes and mispredict
+        crate::metrics::RMI_PROBE_LEN.observe(probes as f64);
+        crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
         None
     }
 }
