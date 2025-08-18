@@ -16,6 +16,29 @@ This repository is intentionally **narrow**: the primary goal is producing a **p
 
 ---
 
+## Performance Optimizations
+
+KyroDB includes several optimizations for sub-100µs lookup performance:
+
+**Engine-level optimizations:**
+- Fast in-memory offset→Record cache for O(1) record retrieval
+- WAL block cache reduces disk I/O for recent segments  
+- Synchronous lookup methods bypass async overhead for benchmarks
+- Memory-mapped snapshots for zero-copy reads
+
+**HTTP optimizations:**
+- `/lookup_fast/{key}` endpoint returns binary offset (8 bytes) 
+- `/lookup_raw?key=N` returns 204/404 without JSON overhead
+- Optional auth bypass for benchmarking endpoints
+- Pre-parsed path parameters avoid query string parsing
+
+**Benchmark targets:**
+- Sub-100µs engine-level lookups (Criterion benchmarks)
+- Sub-1ms HTTP lookups for local traffic
+- Apples-to-apples RMI vs B-Tree comparisons
+
+---
+
 ## Scope (what this repo contains now)
 
 **IN SCOPE**

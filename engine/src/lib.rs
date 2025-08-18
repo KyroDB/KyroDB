@@ -62,12 +62,21 @@ pub struct CompactionStats {
     pub keys_retained: usize,
 }
 
+/// WAL block for efficient caching of segments
+#[derive(Clone)]
+struct WalBlock {
+    segment_id: u32,
+    data: Vec<u8>,
+}
+
 /// Manages direct access to data sources (snapshot, WAL) with caching.
 struct DataSource {
     // An mmap of the snapshot file for fast, zero-copy reads.
     snapshot_mmap: Option<Mmap>,
     // An LRU cache for recently accessed WAL records to reduce disk I/O.
     wal_cache: Arc<RwLock<LruCache<u64, Record>>>,
+    // Block cache for WAL segments (reduces file I/O)
+    wal_block_cache: Arc<RwLock<LruCache<u32, WalBlock>>>,
     data_dir: PathBuf,
 }
 
@@ -83,7 +92,26 @@ impl DataSource {
         Self {
             snapshot_mmap: mmap,
             wal_cache: Arc::new(RwLock::new(LruCache::new(std::num::NonZeroUsize::new(65536).unwrap()))),
+            wal_block_cache: Arc::new(RwLock::new(LruCache::new(std::num::NonZeroUsize::new(32).unwrap()))),
             data_dir,
+        }
+    }
+
+    /// Load entire WAL segment into cache for faster random access
+    async fn load_wal_segment(&self, segment_id: u32) -> Option<WalBlock> {
+        // Check cache first
+        if let Some(block) = self.wal_block_cache.write().await.get(&segment_id) {
+            return Some(block.clone());
+        }
+
+        // Load from disk
+        let path = PersistentEventLog::wal_segment_path(&self.data_dir, segment_id);
+        if let Ok(data) = std::fs::read(&path) {
+            let block = WalBlock { segment_id, data };
+            self.wal_block_cache.write().await.put(segment_id, block.clone());
+            Some(block)
+        } else {
+            None
         }
     }
 
@@ -109,18 +137,18 @@ impl DataSource {
             }
         }
 
-        // 3. Fallback to scanning WAL files on disk (slow path)
-        for (_, path) in PersistentEventLog::list_wal_segments(&self.data_dir) {
-            if let Ok(mut file) = File::open(path) {
-                let mut rdr = BufReader::new(&mut file);
+        // 3. Fallback to scanning WAL files using block cache (fast path)
+        for (segment_id, _) in PersistentEventLog::list_wal_segments(&self.data_dir) {
+            if let Some(block) = self.load_wal_segment(segment_id).await {
+                let mut cursor = std::io::Cursor::new(&block.data);
                 loop {
                     let mut len_buf = [0u8; 4];
-                    if rdr.read_exact(&mut len_buf).is_err() { break; }
+                    if cursor.read_exact(&mut len_buf).is_err() { break; }
                     let len = u32::from_le_bytes(len_buf) as usize;
                     let mut buf = vec![0u8; len];
-                    if rdr.read_exact(&mut buf).is_err() { break; }
+                    if cursor.read_exact(&mut buf).is_err() { break; }
                     let mut crc_buf = [0u8; 4];
-                    if rdr.read_exact(&mut crc_buf).is_err() { break; }
+                    if cursor.read_exact(&mut crc_buf).is_err() { break; }
                     
                     if let Ok(event) = bincode::deserialize::<Event>(&buf) {
                         if event.offset == offset {
@@ -149,6 +177,8 @@ pub struct PersistentEventLog {
     index:    Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
     next_offset: Arc<RwLock<u64>>,              // monotonic sequence (not tied to vec length)
     data_source: Arc<RwLock<DataSource>>,       // wrapped in RwLock to allow reload on snapshot
+    // NEW: Fast in-memory offset→Record map for full get() hot path
+    records_by_offset: Arc<RwLock<std::collections::HashMap<u64, Record>>>,
     // current WAL segment index for rotation
     wal_seg_index: Arc<RwLock<u32>>,
     // rotation config
@@ -284,13 +314,15 @@ impl PersistentEventLog {
         // 4) Setup broadcast channel
         let (tx, _) = broadcast::channel(1_024);
 
-        // 5) Build index from recovered events
+        // 5) Build index from recovered events and populate offset→Record map
         let mut idx = index::PrimaryIndex::new_btree();
         let mut max_off = 0u64;
+        let mut by_offset: std::collections::HashMap<u64, Record> = std::collections::HashMap::new();
         for ev in &events {
             if ev.offset > max_off { max_off = ev.offset; }
             if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
                 idx.insert(rec.key, ev.offset);
+                by_offset.insert(ev.offset, rec);
             }
         }
         let mut next = if events.is_empty() { 0 } else { max_off.saturating_add(1) };
@@ -382,6 +414,7 @@ impl PersistentEventLog {
             index:   Arc::new(RwLock::new(idx)),
             next_offset: Arc::new(RwLock::new(next)),
             data_source,
+            records_by_offset: Arc::new(RwLock::new(by_offset)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
             wal_max_segments: Arc::new(RwLock::new(8)),
@@ -442,10 +475,12 @@ impl PersistentEventLog {
         write.push(event.clone());
         drop(write);
 
-        // Update index if payload is Record
+        // Update index and in-memory offset map if payload is Record
         if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
             let mut idx = self.index.write().await;
             idx.insert(rec.key, event.offset);
+            drop(idx);
+            self.records_by_offset.write().await.insert(event.offset, rec);
         }
 
         // Broadcast to subscribers
@@ -476,10 +511,36 @@ impl PersistentEventLog {
         idx.get(&key)
     }
 
+    /// Fast synchronous lookup for benchmarking (bypasses async overhead)
+    pub fn lookup_key_sync(&self, key: u64) -> Option<u64> {
+        // This is safe for benchmarks where we control access patterns
+        if let Ok(idx) = self.index.try_read() {
+            idx.get(&key)
+        } else {
+            None
+        }
+    }
+
+    /// Fast synchronous get with offset→Record cache (minimal overhead)
+    pub fn get_sync(&self, key: u64) -> Option<Record> {
+        let offset = self.lookup_key_sync(key)?;
+        // Fast-path: in-memory offset→Record map
+        if let Ok(records) = self.records_by_offset.try_read() {
+            records.get(&offset).cloned()
+        } else {
+            None
+        }
+    }
+
     /// Fetches a full record by key, using the index to find the offset first.
     /// This is the primary high-performance read path.
     pub async fn get(&self, key: u64) -> Option<Record> {
         let offset = self.lookup_key(key).await?;
+        // Fast-path: in-memory offset→Record map
+        if let Some(rec) = self.records_by_offset.read().await.get(&offset).cloned() {
+            return Some(rec);
+        }
+        // Fallback: DataSource path (mmap/WAL scan)
         let ds = self.data_source.read().await;
         ds.fetch_record_by_offset(offset).await
     }
@@ -740,6 +801,16 @@ impl PersistentEventLog {
             for ev in &compacted {
                 if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
                     idx.insert(rec.key, ev.offset);
+                }
+            }
+        }
+        // 3b) Rebuild offset→Record map from compacted state
+        {
+            let mut by_off = self.records_by_offset.write().await;
+            by_off.clear();
+            for ev in &compacted {
+                if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                    by_off.insert(ev.offset, rec);
                 }
             }
         }
