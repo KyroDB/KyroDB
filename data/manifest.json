@@ -1,0 +1,1 @@
+{"last_compaction_ts":null,"next_offset":1351634,"rmi":"index-rmi.bin","rmi_header_version":4,"schema":1,"snapshot":"snapshot.bin","snapshot_bytes":0,"ts":1755437243,"version":"0.1.0","wal_segments":["wal.0000","wal.bin","wal.0001","wal.0002"],"wal_total_bytes":134218291}

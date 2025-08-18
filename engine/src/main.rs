@@ -6,6 +6,7 @@ use futures::stream::StreamExt;
 use kyrodb_engine as engine_crate;
 use std::sync::Arc;
 use warp::Filter;
+use uuid::Uuid;
 mod sql;
 
 #[derive(Parser)]
@@ -178,17 +179,21 @@ async fn main() -> Result<()> {
                                 rebuild_timer.observe_duration();
                                 continue;
                             }
+                            // fsync tmp, then atomic rename, then fsync directory to persist metadata
                             if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
                             if let Err(e) = std::fs::rename(&tmp, &dst) {
                                 eprintln!("❌ RMI rename failed: {}", e);
                                 rebuild_timer.observe_duration();
                                 continue;
                             }
+                            if let Ok(dirf) = std::fs::File::open(&data_dir) { let _ = dirf.sync_all(); }
                             if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
                                 rebuild_log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
                                 last_built = cur;
                                 engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                                 rebuild_timer.observe_duration();
+                                // Update manifest to commit the new index epoch/checksum
+                                rebuild_log.write_manifest().await;
                                 println!("✅ RMI rebuilt and swapped (appended={}, ratio={:.3})", appended, ratio);
                             } else {
                                 eprintln!("❌ RMI reload failed after rebuild");
@@ -246,13 +251,13 @@ async fn main() -> Result<()> {
                         if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
                             if log.lookup_key(k).await.is_some() {
                                 return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    "",
+                                    warp::reply(),
                                     warp::http::StatusCode::NO_CONTENT,
                                 ));
                             }
                         }
                         Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            "",
+                            warp::reply(),
                             warp::http::StatusCode::NOT_FOUND,
                         ))
                     }
@@ -337,9 +342,23 @@ async fn main() -> Result<()> {
                             let mut dst = std::path::PathBuf::from(&data_dir);
                             dst.push("index-rmi.bin");
                             let timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-                            let ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs, leaf_target).is_ok()
-                                && std::fs::rename(&tmp, &dst).is_ok();
-                            if ok { engine_crate::metrics::RMI_REBUILDS_TOTAL.inc(); }
+                            let mut ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs, leaf_target).is_ok();
+                            // fsync tmp file
+                            if ok { if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); } }
+                            // atomic rename and fsync dir
+                            if ok { ok = std::fs::rename(&tmp, &dst).is_ok(); }
+                            if ok { if let Ok(dirf) = std::fs::File::open(&data_dir) { let _ = dirf.sync_all(); } }
+                            // load and swap index into hot path
+                            if ok {
+                                if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
+                                    log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
+                                    engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
+                                    // update manifest to commit the new index
+                                    log.write_manifest().await;
+                                } else {
+                                    ok = false;
+                                }
+                            }
                             timer.observe_duration();
                             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                                 "ok": ok,
@@ -498,7 +517,7 @@ async fn main() -> Result<()> {
 
             // Compose routes
             let routes = {
-                let mut r = health_route
+                let base = health_route
                     .or(metrics_route)
                     .or(snapshot_route)
                     .or(offset_route)
@@ -524,15 +543,18 @@ async fn main() -> Result<()> {
                             ))
                         }
                     });
-                if log_http { r = r.with(warp::log("kyrodb")); }
-                r
+                base.boxed()
             };
-
+            
             // Start server with optional SO_REUSEPORT workers
             let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
             if workers <= 1 {
                 println!("🚀 Starting server at http://{}:{} (1 worker)", host, port);
-                warp::serve(routes).run(addr).await;
+                if log_http {
+                    warp::serve(routes.clone().with(warp::log("kyrodb"))).run(addr).await;
+                } else {
+                    warp::serve(routes.clone()).run(addr).await;
+                }
             } else {
                 println!("🚀 Starting server at http://{}:{} ({} workers)", host, port, workers);
                 use socket2::{Socket, Domain, Type, Protocol};
@@ -548,9 +570,13 @@ async fn main() -> Result<()> {
                     let std_listener: std::net::TcpListener = socket.into();
                     let listener = tokio::net::TcpListener::from_std(std_listener)?;
                     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-                    let svc = routes.clone();
+                    let svc_routes = routes.clone();
                     handles.push(tokio::spawn(async move {
-                        warp::serve(svc).run_incoming(incoming).await;
+                        if log_http {
+                            warp::serve(svc_routes.with(warp::log("kyrodb"))).run_incoming(incoming).await;
+                        } else {
+                            warp::serve(svc_routes).run_incoming(incoming).await;
+                        }
                     }));
                 }
                 for h in handles { let _ = h.await; }

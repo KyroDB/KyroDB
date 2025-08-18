@@ -148,7 +148,7 @@ pub struct PersistentEventLog {
     tx:       broadcast::Sender<Event>,
     index:    Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
     next_offset: Arc<RwLock<u64>>,              // monotonic sequence (not tied to vec length)
-    data_source: Arc<DataSource>,
+    data_source: Arc<RwLock<DataSource>>,       // wrapped in RwLock to allow reload on snapshot
     // current WAL segment index for rotation
     wal_seg_index: Arc<RwLock<u32>>,
     // rotation config
@@ -173,6 +173,8 @@ struct ManifestFile {
     rmi: String,
     #[serde(default)]
     rmi_header_version: Option<u8>,
+    #[serde(default)]
+    rmi_checksum: Option<u64>,
     #[serde(default)]
     last_compaction_ts: Option<i64>,
     ts: i64,
@@ -214,7 +216,7 @@ impl PersistentEventLog {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
 
-        let data_source = Arc::new(DataSource::new(data_dir.clone()));
+        let data_source = Arc::new(RwLock::new(DataSource::new(data_dir.clone())));
         let snap_path = data_dir.join("snapshot.bin");
 
         // bincode options with a safety limit (16 MiB) to avoid huge allocations on corrupt/legacy files
@@ -313,17 +315,36 @@ impl PersistentEventLog {
                             if !m.rmi.is_empty() {
                                 let rmi_path = data_dir.join(&m.rmi);
                                 if rmi_path.exists() {
-                                    // Basic check: does header version in manifest match file?
+                                    // Basic checks: header version (if provided) and checksum (if provided)
+                                    let mut header_ok = true;
+                                    let mut checksum_ok = true;
                                     if let Some(hdr_ver) = m.rmi_header_version {
                                         if let Ok(mut f) = File::open(&rmi_path) {
                                             let mut magic = [0u8; 8];
                                             let mut ver_buf = [0u8; 1];
-                                            if f.read_exact(&mut magic).is_ok() && &magic == b"KYRO_RMI" && f.read_exact(&mut ver_buf).is_ok() && ver_buf[0] == hdr_ver {
-                                                rmi_path_from_manifest = Some(rmi_path);
-                                            } else {
-                                                eprintln!("⚠️ manifest RMI header version mismatch for {}; ignoring", m.rmi);
+                                            if f.read_exact(&mut magic).is_err() || &magic != b"KYRO_RMI" || f.read_exact(&mut ver_buf).is_err() || ver_buf[0] != hdr_ver {
+                                                header_ok = false;
                                             }
                                         }
+                                    }
+                                    if let Some(manifest_sum) = m.rmi_checksum {
+                                        if let Ok(mut f) = File::open(&rmi_path) {
+                                            use std::io::{Seek, SeekFrom};
+                                            if let Ok(sz) = f.metadata().map(|mm| mm.len()) {
+                                                if sz >= 8 && f.seek(SeekFrom::End(-8)).is_ok() {
+                                                    let mut sum_buf = [0u8; 8];
+                                                    if f.read_exact(&mut sum_buf).is_ok() {
+                                                        let file_sum = u64::from_le_bytes(sum_buf);
+                                                        if file_sum != manifest_sum { checksum_ok = false; }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if header_ok && checksum_ok {
+                                        rmi_path_from_manifest = Some(rmi_path);
+                                    } else {
+                                        eprintln!("⚠️ manifest RMI validation failed for {}; ignoring", m.rmi);
                                     }
                                 }
                             }
@@ -459,7 +480,8 @@ impl PersistentEventLog {
     /// This is the primary high-performance read path.
     pub async fn get(&self, key: u64) -> Option<Record> {
         let offset = self.lookup_key(key).await?;
-        self.data_source.fetch_record_by_offset(offset).await
+        let ds = self.data_source.read().await;
+        ds.fetch_record_by_offset(offset).await
     }
 
     /// Fallback: scan the log to find the first event matching key, returning (offset, Record)
@@ -578,11 +600,20 @@ impl PersistentEventLog {
         // detect RMI header version if present
         let rmi_path = self.data_dir.join("index-rmi.bin");
         let mut rmi_ver: Option<u8> = None;
+        let mut rmi_sum: Option<u64> = None;
         if let Ok(mut f) = std::fs::File::open(&rmi_path) {
             let mut magic = [0u8; 8];
             if f.read_exact(&mut magic).is_ok() && &magic == b"KYRO_RMI" {
                 let mut ver = [0u8; 1];
                 if f.read_exact(&mut ver).is_ok() { rmi_ver = Some(ver[0]); }
+                // best-effort read of trailing checksum
+                use std::io::{Seek, SeekFrom};
+                if let Ok(sz) = f.metadata().map(|m| m.len()) {
+                    if sz >= 8 && f.seek(SeekFrom::End(-8)).is_ok() {
+                        let mut sb = [0u8; 8];
+                        if f.read_exact(&mut sb).is_ok() { rmi_sum = Some(u64::from_le_bytes(sb)); }
+                    }
+                }
             }
         }
         let last_compaction_ts = *self.last_compaction_ts.read().await;
@@ -596,6 +627,7 @@ impl PersistentEventLog {
             "wal_total_bytes": self.wal_size_bytes(),
             "rmi": "index-rmi.bin",
             "rmi_header_version": rmi_ver,
+            "rmi_checksum": rmi_sum,
             "last_compaction_ts": last_compaction_ts,
             "ts": chrono::Utc::now().timestamp()
         });
@@ -607,11 +639,14 @@ impl PersistentEventLog {
             let _ = fsync_dir(&self.data_dir);
         }
         // update gauges
-        metrics::WAL_SIZE_BYTES.set(self.wal_size_bytes() as f64);
-        metrics::SNAPSHOT_SIZE_BYTES.set(std::fs::metadata(self.data_dir.join("snapshot.bin")).map(|m| m.len()).unwrap_or(0) as f64);
+        metrics::WAL_SIZE_BYTES.set(self.wal_size_bytes() as i64);
+        metrics::SNAPSHOT_SIZE_BYTES.set(std::fs::metadata(self.data_dir.join("snapshot.bin")).map(|m| m.len()).unwrap_or(0) as i64);
         // mirror index size to general gauge if available
         if rmi_ver.is_some() {
-            metrics::INDEX_SIZE_BYTES.set(metrics::RMI_INDEX_SIZE_BYTES.get());
+            #[cfg(feature = "learned-index")]
+            {
+                metrics::INDEX_SIZE_BYTES.set(metrics::RMI_INDEX_SIZE_BYTES.get());
+            }
         }
     }
 
@@ -663,7 +698,7 @@ impl PersistentEventLog {
         fsync_dir(&self.data_dir).ok();
 
         // Reload the data source to mmap the new snapshot
-        self.data_source = Arc::new(DataSource::new(self.data_dir.clone()));
+        *self.data_source.write().await = DataSource::new(self.data_dir.clone());
 
         metrics::SNAPSHOTS_TOTAL.inc();
         timer.observe_duration();

@@ -129,6 +129,12 @@ Observability:
 - `kyrodb_rmi_epsilon` histogram and `kyrodb_rmi_epsilon_max`
 - `kyrodb_rmi_rebuilds_total`, `kyrodb_rmi_rebuild_duration_seconds`
 
+### Manifest semantics (commit point)
+
+- The manifest (`data/manifest.json`) is the external commit point for the index and data files.
+- On startup, the engine consults the manifest first to select and validate the RMI: header version and trailing checksum are checked before loading.
+- RMI rebuilds write `index-rmi.tmp`, fsync the file, atomically rename to `index-rmi.bin`, fsync the directory, then update the manifest (with header version and checksum) and fsync the directory again.
+
 ---
 
 ## Security
@@ -195,3 +201,13 @@ cargo bench -p bench --bench kv_index -- --verbose
 # Tip: disable default features if you only want to test one index type
 # cargo bench -p bench --bench kv_index --no-default-features --features "kyrodb-engine/learned-index"
 ```
+
+### Benchmark methodology (reproducible)
+
+- Build in release mode, and disable background rebuilds for fair comparisons:
+  - Engine: `--rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0`
+- Pin to a consistent environment (same machine, idle, performance governor if applicable).
+- Warm up the engine (load and one pass over keys) before measuring.
+- Use HTTP-free Criterion benches for raw get() latency: `cargo bench -p bench --bench kv_index -- --verbose`.
+- Record RMI and cache effectiveness via metrics:
+  - `kyrodb_rmi_hit_rate`, `kyrodb_rmi_probe_len`, `kyrodb_cache_hits_total`, `kyrodb_cache_misses_total`.

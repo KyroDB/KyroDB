@@ -1,5 +1,6 @@
 use once_cell::sync::Lazy;
 use prometheus::{register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge};
+use prometheus::{TextEncoder, Encoder};
 
 pub static APPENDS_TOTAL: Lazy<IntCounter> = Lazy::new(|| register_int_counter!("kyrodb_appends_total", "Total appends").unwrap());
 pub static APPEND_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| register_histogram!("kyrodb_append_latency_seconds", "Append latency").unwrap());
@@ -41,8 +42,6 @@ pub static RMI_REBUILD_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| register
 pub static RMI_PROBE_LEN: Lazy<Histogram> = Lazy::new(|| register_histogram!("kyrodb_rmi_probe_len", "Number of probe steps taken by RMI bounded search").unwrap());
 #[cfg(feature = "learned-index")]
 pub static RMI_MISPREDICTS_TOTAL: Lazy<IntCounter> = Lazy::new(|| register_int_counter!("kyrodb_rmi_mispredicts_total", "Total number of RMI mispredicts").unwrap());
-
-pub fn inc_sse_lagged() { SSE_LAGGED_TOTAL.inc(); }
 
 pub fn render() -> String {
     let mut buf = Vec::new();
