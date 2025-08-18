@@ -35,5 +35,5 @@ Thumbs.db
 node_modules/*
 
 docs/TODO.md
-experimental.md
-expermental.md
+experimental.local.md
+bench_quick.csv
