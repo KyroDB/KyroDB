@@ -160,7 +160,7 @@ cargo build -p bench --release
 Start engine (release, no background rebuilds for fair comparison)
 
 ```bash
-RUST_LOG=info cargo run -p engine --release --features "learned-index" -- serve 127.0.0.1:3030 \
+RUST_LOG=info cargo run -p engine --release --features "learned-index" -- serve 127.0.0.1 3030 \
   --wal-segment-bytes 67108864 --wal-max-segments 8 \
   --rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0
 ```
@@ -185,9 +185,14 @@ Run workload (uniform or zipf)
 
 Outputs
 - CSV with latency percentiles (us) for 50/90/95/99/99.9.
-- Logs p50/p95/p99, WAL and snapshot sizes, RMI hit rate.
+- Logs p50/p95/p99, WAL and snapshot sizes, RMI hit rate, and avg RMI probe length scraped from metrics.
 
-Note: ensure `--features learned-index` are enabled for the engine build if not default.
+Fair-benchmark checklist
+- Use raw route: the bench tool hits `/lookup_raw` (204/404 only) to avoid JSON overhead.
+- Freeze index: set `--rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0`, or run `POST /rmi/build` after load, then measure.
+- Warm up: load and perform a pass before measuring; keep server logs quiet and CPU steady.
+- Compare apples-to-apples: same dataset, concurrency, duration, and machine.
+- Monitor probe behavior: scrape `kyrodb_rmi_probe_len_{sum,count}` and keep average small by tuning leaf size (ε) via `--rmi-leaf-target`.
 
 ---
 ## In-Process Microbenchmarks (Criterion)
@@ -195,11 +200,11 @@ Note: ensure `--features learned-index` are enabled for the engine build if not 
 For raw, HTTP-free performance measurement, use the Criterion benchmarks.
 
 ```bash
-# Run all benches (BTree and RMI)
-cargo bench -p bench --bench kv_index -- --verbose
+# Run BTree-only
+cargo bench -p bench --bench kv_index
 
-# Tip: disable default features if you only want to test one index type
-# cargo bench -p bench --bench kv_index --no-default-features --features "kyrodb-engine/learned-index"
+# Run RMI too (enable bench feature forwarding to engine)
+cargo bench -p bench --bench kv_index --features learned-index -- --verbose
 ```
 
 ### Benchmark methodology (reproducible)
@@ -208,6 +213,6 @@ cargo bench -p bench --bench kv_index -- --verbose
   - Engine: `--rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0`
 - Pin to a consistent environment (same machine, idle, performance governor if applicable).
 - Warm up the engine (load and one pass over keys) before measuring.
-- Use HTTP-free Criterion benches for raw get() latency: `cargo bench -p bench --bench kv_index -- --verbose`.
+- Use HTTP-free Criterion benches for raw index lookup latency.
 - Record RMI and cache effectiveness via metrics:
   - `kyrodb_rmi_hit_rate`, `kyrodb_rmi_probe_len`, `kyrodb_cache_hits_total`, `kyrodb_cache_misses_total`.
