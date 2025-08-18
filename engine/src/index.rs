@@ -61,6 +61,8 @@ pub struct RmiIndex {
 
 #[cfg(feature = "learned-index")]
 const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
+#[cfg(feature = "learned-index")]
+const RMI_PROBE_WINDOW_MAX: u32 = 512;
 
 #[cfg(feature = "learned-index")]
 impl RmiIndex {
@@ -405,6 +407,14 @@ impl RmiIndex {
         if keys.is_empty() { return None; }
         let li = self.find_leaf_index(*key)?;
         let leaf = &self.leaves[li];
+
+        // Enforce W_max probe cap. If a leaf's error bound is too wide,
+        // we fail fast instead of scanning a huge slice.
+        if (leaf.epsilon * 2 + 1) > RMI_PROBE_WINDOW_MAX {
+            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
+            return None;
+        }
+
         let (mut lo, mut hi) = self.predict_window(leaf, *key);
         if lo > hi { return None; }
         let max_idx = keys.len().saturating_sub(1);
