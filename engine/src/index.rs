@@ -240,10 +240,10 @@ impl RmiIndex {
                     leaves.push(RmiLeafMeta { key_min: *sorted_keys.first().unwrap(), key_max: *sorted_keys.last().unwrap(), slope: 0.0, intercept: 0.0, epsilon, start: 0, len: count as u64 });
                 }
                 // metrics
-                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
-                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as f64);
-                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
-                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as i64);
+                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as i64);
+                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as i64);
+                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as i64); }
                 for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
                 return Some(Self { delta: BTreeMap::new(), leaves, backing: RmiBacking::Owned { sorted_keys, sorted_offsets } });
             }
@@ -297,10 +297,10 @@ impl RmiIndex {
                 let sum_calc = hasher.digest();
                 if sum_calc != sum_read { return None; }
                 // metrics
-                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
-                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as f64);
-                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
-                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as i64);
+                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as i64);
+                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as i64);
+                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as i64); }
                 for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
                 return Some(Self { delta: BTreeMap::new(), leaves, backing: RmiBacking::Owned { sorted_keys, sorted_offsets } });
             }
@@ -355,10 +355,10 @@ impl RmiIndex {
                     RmiBacking::Owned { sorted_keys, sorted_offsets }
                 };
                 // metrics
-                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
-                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as f64);
-                crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
-                if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as i64);
+                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as i64);
+                crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as i64);
+                if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as i64); }
                 for leaf in &lvs { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
                 return Some(Self { delta: BTreeMap::new(), leaves: lvs, backing });
             }
@@ -474,7 +474,7 @@ impl PrimaryIndex {
                     crate::metrics::RMI_HITS_TOTAL.inc();
                     let h = crate::metrics::RMI_HITS_TOTAL.get();
                     let m = crate::metrics::RMI_MISSES_TOTAL.get();
-                    let t = h + m; if t > 0.0 { crate::metrics::RMI_HIT_RATE.set(h / t); }
+                    let t = (h + m) as f64; if t > 0.0 { crate::metrics::RMI_HIT_RATE.set(h as f64 / t); }
                     Some(v)
                 } else {
                     let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
@@ -483,7 +483,7 @@ impl PrimaryIndex {
                     if res.is_some() { crate::metrics::RMI_HITS_TOTAL.inc(); } else { crate::metrics::RMI_MISSES_TOTAL.inc(); }
                     let h = crate::metrics::RMI_HITS_TOTAL.get();
                     let m = crate::metrics::RMI_MISSES_TOTAL.get();
-                    let t = h + m; if t > 0.0 { crate::metrics::RMI_HIT_RATE.set(h / t); }
+                    let t = (h + m) as f64; if t > 0.0 { crate::metrics::RMI_HIT_RATE.set(h as f64 / t); }
                     res
                 }
             }

@@ -3,6 +3,10 @@ name = "bench"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Enable RMI benches by enabling the engine's learned-index feature
+learned-index = ["kyrodb_engine/learned-index"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

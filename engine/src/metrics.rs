@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use prometheus::{register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge};
+use prometheus::{register_histogram, register_int_counter, register_int_gauge, register_gauge, Histogram, IntCounter, IntGauge, Gauge};
 use prometheus::{TextEncoder, Encoder};
 
 pub static APPENDS_TOTAL: Lazy<IntCounter> = Lazy::new(|| register_int_counter!("kyrodb_appends_total", "Total appends").unwrap());
@@ -22,7 +22,7 @@ pub static RMI_HITS_TOTAL: Lazy<IntCounter> = Lazy::new(|| register_int_counter!
 #[cfg(feature = "learned-index")]
 pub static RMI_MISSES_TOTAL: Lazy<IntCounter> = Lazy::new(|| register_int_counter!("kyrodb_rmi_misses_total", "Total RMI misses").unwrap());
 #[cfg(feature = "learned-index")]
-pub static RMI_HIT_RATE: Lazy<IntGauge> = Lazy::new(|| register_int_gauge!("kyrodb_rmi_hit_rate", "Instantaneous RMI hit rate").unwrap());
+pub static RMI_HIT_RATE: Lazy<Gauge> = Lazy::new(|| register_gauge!("kyrodb_rmi_hit_rate", "Instantaneous RMI hit rate").unwrap());
 #[cfg(feature = "learned-index")]
 pub static RMI_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| register_histogram!("kyrodb_rmi_lookup_latency_seconds", "RMI lookup latency").unwrap());
 #[cfg(feature = "learned-index")]
