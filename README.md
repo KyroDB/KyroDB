@@ -151,12 +151,12 @@ Build bench runner
 cargo build -p bench --release
 ```
 
-Start engine (release)
+Start engine (release, no background rebuilds for fair comparison)
 
 ```bash
-RUST_LOG=info cargo run -p engine --release -- serve 127.0.0.1 3030 \
+RUST_LOG=info cargo run -p engine --release --features "learned-index" -- serve 127.0.0.1:3030 \
   --wal-segment-bytes 67108864 --wal-max-segments 8 \
-  --rmi-rebuild-appends 100000 --rmi-rebuild-ratio 0.25
+  --rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0
 ```
 
 Run workload (uniform or zipf)
@@ -182,3 +182,16 @@ Outputs
 - Logs p50/p95/p99, WAL and snapshot sizes, RMI hit rate.
 
 Note: ensure `--features learned-index` are enabled for the engine build if not default.
+
+---
+## In-Process Microbenchmarks (Criterion)
+
+For raw, HTTP-free performance measurement, use the Criterion benchmarks.
+
+```bash
+# Run all benches (BTree and RMI)
+cargo bench -p bench --bench kv_index -- --verbose
+
+# Tip: disable default features if you only want to test one index type
+# cargo bench -p bench --bench kv_index --no-default-features --features "kyrodb-engine/learned-index"
+```
