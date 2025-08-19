@@ -1,120 +1,36 @@
-//! Chaos tests for WAL block cache under concurrent access
-
-use kyrodb_engine::PersistentEventLog;
-use std::sync::Arc;
-use tempfile::tempdir;
-use tokio::time::{sleep, Duration};
-use uuid::Uuid;
-
+#[cfg(feature = "learned-index")]
 #[tokio::test]
-async fn test_concurrent_wal_cache_access() {
-    let dir = tempdir().unwrap();
-    let log = Arc::new(PersistentEventLog::open(dir.path()).await.unwrap());
+async fn rmi_crash_between_index_and_manifest_keeps_old_index_until_manifest_committed() {
+    use uuid::Uuid;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let log = kyrodb_engine::PersistentEventLog::open(&path).await.unwrap();
 
-    // Configure small WAL segments to force rotation
-    log.configure_wal_rotation(Some(1024), 3).await;
-
-    // Spawn multiple writers to stress WAL rotation and caching
-    let mut handles = Vec::new();
-    for writer_id in 0..5 {
-        let log_clone = log.clone();
-        let handle = tokio::spawn(async move {
-            for i in 0..100 {
-                let key = writer_id * 1000 + i;
-                let value = format!("writer_{}_item_{}", writer_id, i).into_bytes();
-                let _ = log_clone.append_kv(Uuid::new_v4(), key, value).await;
-                if i % 10 == 0 {
-                    sleep(Duration::from_millis(1)).await; // Allow rotation
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    // Concurrent readers during writes
-    for reader_id in 0..3 {
-        let log_clone = log.clone();
-        let handle = tokio::spawn(async move {
-            for i in 0..50 {
-                let key = reader_id * 100 + i;
-                let _ = log_clone.get(key).await;
-                sleep(Duration::from_millis(2)).await;
-            }
-        });
-        handles.push(handle);
-    }
-
-    // Wait for all operations
-    for handle in handles {
-        handle.await.unwrap();
-    }
-
-    // Verify data integrity
-    for writer_id in 0..5 {
-        for i in 0..100 {
-            let key = writer_id * 1000 + i;
-            if let Some(record) = log.get(key).await {
-                let expected = format!("writer_{}_item_{}", writer_id, i);
-                assert_eq!(record.value, expected.as_bytes());
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_cache_eviction_during_compaction() {
-    let dir = tempdir().unwrap();
-    let log = PersistentEventLog::open(dir.path()).await.unwrap();
-
-    // Fill with data
-    for i in 0..1000u64 {
-        let _ = log.append_kv(Uuid::new_v4(), i, vec![i as u8; 8]).await.unwrap();
-    }
-
-    // Start concurrent readers
-    let log_arc = Arc::new(log);
-    let reader_log = log_arc.clone();
-    let reader_handle = tokio::spawn(async move {
-        for _ in 0..100 {
-            for i in 0..100 {
-                let _ = reader_log.get(i).await;
-            }
-            sleep(Duration::from_millis(1)).await;
-        }
-    });
-
-    // Trigger compaction while reading
-    sleep(Duration::from_millis(10)).await;
-    let _ = log_arc.compact_keep_latest_and_snapshot().await;
-
-    reader_handle.await.unwrap();
-
-    // Verify all data still accessible after compaction
-    for i in 0..1000u64 {
-        assert!(log_arc.get(i).await.is_some(), "Key {} missing after compaction", i);
-    }
-}
-
-#[tokio::test]
-async fn test_manifest_corruption_recovery() {
-    let dir = tempdir().unwrap();
-    let log = PersistentEventLog::open(dir.path()).await.unwrap();
-
-    // Add some data
-    for i in 0..100u64 {
-        let _ = log.append_kv(Uuid::new_v4(), i, vec![i as u8; 8]).await.unwrap();
-    }
+    // Seed data and snapshot
+    for i in 0..10_000u64 { let _ = log.append_kv(Uuid::new_v4(), i, vec![1u8]).await.unwrap(); }
     log.snapshot().await.unwrap();
+    drop(log);
 
-    // Corrupt the manifest
-    let manifest_path = dir.path().join("manifest.json");
-    std::fs::write(&manifest_path, "corrupted json data").unwrap();
-
-    // Should recover gracefully with B-Tree fallback
-    let log2 = PersistentEventLog::open(dir.path()).await.unwrap();
-    
-    // Data should still be accessible
-    for i in 0..100u64 {
-        assert!(log2.get(i).await.is_some(), "Key {} not recovered after manifest corruption", i);
+    // Write a manifest pointing to no RMI initially
+    {
+        let log = kyrodb_engine::PersistentEventLog::open(&path).await.unwrap();
+        log.write_manifest().await;
     }
+
+    // Simulate background rebuild: rename index to final name, but CRASH before manifest rename
+    let pairs;
+    {
+        let log = kyrodb_engine::PersistentEventLog::open(&path).await.unwrap();
+        pairs = log.collect_key_offset_pairs().await;
+    }
+    let tmp = path.join("index-rmi.tmp");
+    let dst = path.join("index-rmi.bin");
+    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
+    std::fs::rename(&tmp, &dst).unwrap();
+    // crash here (no manifest update)
+
+    // Restart: engine should only load RMI if manifest references it
+    let log2 = kyrodb_engine::PersistentEventLog::open(&path).await.unwrap();
+    // Since manifest was not updated to point at index-rmi.bin yet, we must still be able to lookup via BTree
+    assert!(log2.lookup_key(42).await.is_some());
 }

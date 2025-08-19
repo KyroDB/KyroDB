@@ -10,9 +10,6 @@ use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write, Read};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
-use lru::LruCache;
-use memmap2::Mmap;
-
 pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
@@ -62,111 +59,6 @@ pub struct CompactionStats {
     pub keys_retained: usize,
 }
 
-/// WAL block for efficient caching of segments
-#[derive(Clone)]
-struct WalBlock {
-    segment_id: u32,
-    data: Vec<u8>,
-}
-
-/// Manages direct access to data sources (snapshot, WAL) with caching.
-struct DataSource {
-    // An mmap of the snapshot file for fast, zero-copy reads.
-    snapshot_mmap: Option<Mmap>,
-    // An LRU cache for recently accessed WAL records to reduce disk I/O.
-    wal_cache: Arc<RwLock<LruCache<u64, Record>>>,
-    // Block cache for WAL segments (reduces file I/O)
-    wal_block_cache: Arc<RwLock<LruCache<u32, WalBlock>>>,
-    data_dir: PathBuf,
-}
-
-impl DataSource {
-    fn new(data_dir: PathBuf) -> Self {
-        let snapshot_path = data_dir.join("snapshot.bin");
-        let mmap = if snapshot_path.exists() {
-            File::open(&snapshot_path).ok().and_then(|f| unsafe { Mmap::map(&f).ok() })
-        } else {
-            None
-        };
-
-        Self {
-            snapshot_mmap: mmap,
-            wal_cache: Arc::new(RwLock::new(LruCache::new(std::num::NonZeroUsize::new(65536).unwrap()))),
-            wal_block_cache: Arc::new(RwLock::new(LruCache::new(std::num::NonZeroUsize::new(32).unwrap()))),
-            data_dir,
-        }
-    }
-
-    /// Load entire WAL segment into cache for faster random access
-    async fn load_wal_segment(&self, segment_id: u32) -> Option<WalBlock> {
-        // Check cache first
-        if let Some(block) = self.wal_block_cache.write().await.get(&segment_id) {
-            return Some(block.clone());
-        }
-
-        // Load from disk
-        let path = PersistentEventLog::wal_segment_path(&self.data_dir, segment_id);
-        if let Ok(data) = std::fs::read(&path) {
-            let block = WalBlock { segment_id, data };
-            self.wal_block_cache.write().await.put(segment_id, block.clone());
-            Some(block)
-        } else {
-            None
-        }
-    }
-
-    /// Fetches a record by its offset, using the cache and mmap-ed snapshot.
-    async fn fetch_record_by_offset(&self, offset: u64) -> Option<Record> {
-        // 1. Check WAL cache first
-        if let Some(rec) = self.wal_cache.write().await.get(&offset) {
-            metrics::CACHE_HITS_TOTAL.inc();
-            return Some(rec.clone());
-        }
-        metrics::CACHE_MISSES_TOTAL.inc();
-
-        // 2. Try to find in mmap-ed snapshot by scanning
-        if let Some(mmap) = &self.snapshot_mmap {
-            let bopt = bincode::options().with_limit(16 * 1024 * 1024);
-            let mut cursor = std::io::Cursor::new(&mmap[..]);
-            if let Ok(events) = bopt.deserialize_from::<_, Vec<Event>>(&mut cursor) {
-                if let Some(event) = events.iter().find(|e| e.offset == offset) {
-                    if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
-                        return Some(rec);
-                    }
-                }
-            }
-        }
-
-        // 3. Fallback to scanning WAL files using block cache (fast path)
-        for (segment_id, _) in PersistentEventLog::list_wal_segments(&self.data_dir) {
-            if let Some(block) = self.load_wal_segment(segment_id).await {
-                let mut cursor = std::io::Cursor::new(&block.data);
-                loop {
-                    let mut len_buf = [0u8; 4];
-                    if cursor.read_exact(&mut len_buf).is_err() { break; }
-                    let len = u32::from_le_bytes(len_buf) as usize;
-                    let mut buf = vec![0u8; len];
-                    if cursor.read_exact(&mut buf).is_err() { break; }
-                    let mut crc_buf = [0u8; 4];
-                    if cursor.read_exact(&mut crc_buf).is_err() { break; }
-                    
-                    if let Ok(event) = bincode::deserialize::<Event>(&buf) {
-                        if event.offset == offset {
-                            if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
-                                self.wal_cache.write().await.put(offset, rec.clone());
-                                return Some(rec);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        None
-    }
-}
-
-
 /// WAL‑and‑Snapshot durable log with broadcast for live tailing
 #[derive(Clone)]
 pub struct PersistentEventLog {
@@ -176,38 +68,13 @@ pub struct PersistentEventLog {
     tx:       broadcast::Sender<Event>,
     index:    Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
     next_offset: Arc<RwLock<u64>>,              // monotonic sequence (not tied to vec length)
-    data_source: Arc<RwLock<DataSource>>,       // wrapped in RwLock to allow reload on snapshot
-    // NEW: Fast in-memory offset→Record map for full get() hot path
-    records_by_offset: Arc<RwLock<std::collections::HashMap<u64, Record>>>,
     // current WAL segment index for rotation
     wal_seg_index: Arc<RwLock<u32>>,
     // rotation config
     wal_segment_bytes: Arc<RwLock<Option<u64>>>,
     wal_max_segments: Arc<RwLock<usize>>,
-    // Track last compaction timestamp precisely (seconds since epoch). Only updated on compaction.
-    last_compaction_ts: Arc<RwLock<Option<i64>>>,
     #[cfg(feature = "ann-hnsw")]
     ann:      Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
-}
-
-// Strict manifest view used at startup
-#[derive(Debug, Deserialize)]
-struct ManifestFile {
-    schema: u64,
-    version: String,
-    next_offset: u64,
-    snapshot: String,
-    snapshot_bytes: u64,
-    wal_segments: Vec<String>,
-    wal_total_bytes: u64,
-    rmi: String,
-    #[serde(default)]
-    rmi_header_version: Option<u8>,
-    #[serde(default)]
-    rmi_checksum: Option<u64>,
-    #[serde(default)]
-    last_compaction_ts: Option<i64>,
-    ts: i64,
 }
 
 impl PersistentEventLog {
@@ -246,7 +113,6 @@ impl PersistentEventLog {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
 
-        let data_source = Arc::new(RwLock::new(DataSource::new(data_dir.clone())));
         let snap_path = data_dir.join("snapshot.bin");
 
         // bincode options with a safety limit (16 MiB) to avoid huge allocations on corrupt/legacy files
@@ -314,95 +180,46 @@ impl PersistentEventLog {
         // 4) Setup broadcast channel
         let (tx, _) = broadcast::channel(1_024);
 
-        // 5) Build index from recovered events and populate offset→Record map
+        // 5) Build index from recovered events
         let mut idx = index::PrimaryIndex::new_btree();
         let mut max_off = 0u64;
-        let mut by_offset: std::collections::HashMap<u64, Record> = std::collections::HashMap::new();
         for ev in &events {
             if ev.offset > max_off { max_off = ev.offset; }
             if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
                 idx.insert(rec.key, ev.offset);
-                by_offset.insert(ev.offset, rec);
             }
         }
         let mut next = if events.is_empty() { 0 } else { max_off.saturating_add(1) };
 
-        // If learned-index feature is enabled, check manifest for a valid RMI to load
-        #[cfg(feature = "learned-index")]
-        let mut rmi_path_from_manifest: Option<PathBuf> = None;
+        // Remove unconditional RMI load by file existence; we'll defer to manifest below
+        // #[cfg(feature = "learned-index")]
+        // {
+        //     let rmi_path = data_dir.join("index-rmi.bin");
+        //     if rmi_path.exists() {
+        //         if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
+        //             idx = index::PrimaryIndex::Rmi(rmi);
+        //         }
+        //     }
+        // }
 
-        // 6) Read manifest with strict validation; seed next_offset and last_compaction_ts when valid
-        let mut last_compaction_ts_opt: Option<i64> = None;
+        // 6) Read manifest (best-effort) to seed next_offset and paths, and (if enabled) commit RMI selection
         let manifest_path = data_dir.join("manifest.json");
         if manifest_path.exists() {
-            match std::fs::read_to_string(&manifest_path) {
-                Ok(text) => match serde_json::from_str::<ManifestFile>(&text) {
-                    Ok(m) => {
-                        if m.schema == 1 {
-                            // seed next_offset conservatively (never go backwards)
-                            if m.next_offset > next { next = m.next_offset; }
-                            last_compaction_ts_opt = m.last_compaction_ts;
-
-                            #[cfg(feature = "learned-index")]
-                            if !m.rmi.is_empty() {
-                                let rmi_path = data_dir.join(&m.rmi);
-                                if rmi_path.exists() {
-                                    // Basic checks: header version (if provided) and checksum (if provided)
-                                    let mut header_ok = true;
-                                    let mut checksum_ok = true;
-                                    if let Some(hdr_ver) = m.rmi_header_version {
-                                        if let Ok(mut f) = File::open(&rmi_path) {
-                                            let mut magic = [0u8; 8];
-                                            let mut ver_buf = [0u8; 1];
-                                            if f.read_exact(&mut magic).is_err() || &magic != b"KYRO_RMI" || f.read_exact(&mut ver_buf).is_err() || ver_buf[0] != hdr_ver {
-                                                header_ok = false;
-                                            }
-                                        }
-                                    }
-                                    if let Some(manifest_sum) = m.rmi_checksum {
-                                        if let Ok(mut f) = File::open(&rmi_path) {
-                                            use std::io::{Seek, SeekFrom};
-                                            if let Ok(sz) = f.metadata().map(|mm| mm.len()) {
-                                                if sz >= 8 && f.seek(SeekFrom::End(-8)).is_ok() {
-                                                    let mut sum_buf = [0u8; 8];
-                                                    if f.read_exact(&mut sum_buf).is_ok() {
-                                                        let file_sum = u64::from_le_bytes(sum_buf);
-                                                        if file_sum != manifest_sum { checksum_ok = false; }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if header_ok && checksum_ok {
-                                        rmi_path_from_manifest = Some(rmi_path);
-                                    } else {
-                                        eprintln!("⚠️ manifest RMI validation failed for {}; ignoring", m.rmi);
-                                    }
-                                }
+            if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(n) = j.get("next_offset").and_then(|v| v.as_u64()) {
+                        if n > next { next = n; }
+                    }
+                    #[cfg(feature = "learned-index")]
+                    if let Some(rmi_name) = j.get("rmi").and_then(|v| v.as_str()) {
+                        let rmi_path = data_dir.join(rmi_name);
+                        if rmi_path.exists() {
+                            if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
+                                idx = index::PrimaryIndex::Rmi(rmi);
                             }
-                        } else {
-                            eprintln!("⚠️  manifest schema {} unsupported; ignoring manifest", m.schema);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("⚠️  failed to parse manifest.json strictly: {}; ignoring manifest", e);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("⚠️  failed to read manifest.json: {}; ignoring manifest", e);
                 }
-            }
-        }
-
-        // If learned-index feature is enabled and a valid RMI was found via manifest, load it.
-        // Otherwise, startup continues with the default BTree index.
-        #[cfg(feature = "learned-index")]
-        if let Some(rmi_path) = rmi_path_from_manifest {
-            if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
-                idx = index::PrimaryIndex::Rmi(rmi);
-                println!("✅ Loaded RMI from manifest: {}", rmi_path.display());
-            } else {
-                eprintln!("❌ Failed to load RMI from manifest path: {}", rmi_path.display());
             }
         }
 
@@ -413,12 +230,9 @@ impl PersistentEventLog {
             tx,
             index:   Arc::new(RwLock::new(idx)),
             next_offset: Arc::new(RwLock::new(next)),
-            data_source,
-            records_by_offset: Arc::new(RwLock::new(by_offset)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
             wal_max_segments: Arc::new(RwLock::new(8)),
-            last_compaction_ts: Arc::new(RwLock::new(last_compaction_ts_opt)),
             #[cfg(feature = "ann-hnsw")]
             ann:     Arc::new(RwLock::new(None)),
         };
@@ -475,12 +289,10 @@ impl PersistentEventLog {
         write.push(event.clone());
         drop(write);
 
-        // Update index and in-memory offset map if payload is Record
+        // Update index if payload is Record
         if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
             let mut idx = self.index.write().await;
             idx.insert(rec.key, event.offset);
-            drop(idx);
-            self.records_by_offset.write().await.insert(event.offset, rec);
         }
 
         // Broadcast to subscribers
@@ -509,40 +321,6 @@ impl PersistentEventLog {
     pub async fn lookup_key(&self, key: u64) -> Option<u64> {
         let idx = self.index.read().await;
         idx.get(&key)
-    }
-
-    /// Fast synchronous lookup for benchmarking (bypasses async overhead)
-    pub fn lookup_key_sync(&self, key: u64) -> Option<u64> {
-        // This is safe for benchmarks where we control access patterns
-        if let Ok(idx) = self.index.try_read() {
-            idx.get(&key)
-        } else {
-            None
-        }
-    }
-
-    /// Fast synchronous get with offset→Record cache (minimal overhead)
-    pub fn get_sync(&self, key: u64) -> Option<Record> {
-        let offset = self.lookup_key_sync(key)?;
-        // Fast-path: in-memory offset→Record map
-        if let Ok(records) = self.records_by_offset.try_read() {
-            records.get(&offset).cloned()
-        } else {
-            None
-        }
-    }
-
-    /// Fetches a full record by key, using the index to find the offset first.
-    /// This is the primary high-performance read path.
-    pub async fn get(&self, key: u64) -> Option<Record> {
-        let offset = self.lookup_key(key).await?;
-        // Fast-path: in-memory offset→Record map
-        if let Some(rec) = self.records_by_offset.read().await.get(&offset).cloned() {
-            return Some(rec);
-        }
-        // Fallback: DataSource path (mmap/WAL scan)
-        let ds = self.data_source.read().await;
-        ds.fetch_record_by_offset(offset).await
     }
 
     /// Fallback: scan the log to find the first event matching key, returning (offset, Record)
@@ -656,61 +434,6 @@ impl PersistentEventLog {
         (past, rx)
     }
 
-    /// Write minimal manifest with next_offset and active files.
-    pub async fn write_manifest(&self) {
-        // detect RMI header version if present
-        let rmi_path = self.data_dir.join("index-rmi.bin");
-        let mut rmi_ver: Option<u8> = None;
-        let mut rmi_sum: Option<u64> = None;
-        if let Ok(mut f) = std::fs::File::open(&rmi_path) {
-            let mut magic = [0u8; 8];
-            if f.read_exact(&mut magic).is_ok() && &magic == b"KYRO_RMI" {
-                let mut ver = [0u8; 1];
-                if f.read_exact(&mut ver).is_ok() { rmi_ver = Some(ver[0]); }
-                // best-effort read of trailing checksum
-                use std::io::{Seek, SeekFrom};
-                if let Ok(sz) = f.metadata().map(|m| m.len()) {
-                    if sz >= 8 && f.seek(SeekFrom::End(-8)).is_ok() {
-                        let mut sb = [0u8; 8];
-                        if f.read_exact(&mut sb).is_ok() { rmi_sum = Some(u64::from_le_bytes(sb)); }
-                    }
-                }
-            }
-        }
-        let last_compaction_ts = *self.last_compaction_ts.read().await;
-        let manifest = serde_json::json!({
-            "schema": 1,
-            "version": env!("CARGO_PKG_VERSION"),
-            "next_offset": self.get_offset().await,
-            "snapshot": "snapshot.bin",
-            "snapshot_bytes": std::fs::metadata(self.data_dir.join("snapshot.bin")).map(|m| m.len()).unwrap_or(0),
-            "wal_segments": self.current_wal_segments(),
-            "wal_total_bytes": self.wal_size_bytes(),
-            "rmi": "index-rmi.bin",
-            "rmi_header_version": rmi_ver,
-            "rmi_checksum": rmi_sum,
-            "last_compaction_ts": last_compaction_ts,
-            "ts": chrono::Utc::now().timestamp()
-        });
-        let tmp = self.data_dir.join("manifest.tmp");
-        if let Ok(mut f) = File::create(&tmp) {
-            let _ = writeln!(f, "{}", manifest);
-            let _ = f.sync_all();
-            let _ = std::fs::rename(&tmp, self.manifest_path());
-            let _ = fsync_dir(&self.data_dir);
-        }
-        // update gauges
-        metrics::WAL_SIZE_BYTES.set(self.wal_size_bytes() as i64);
-        metrics::SNAPSHOT_SIZE_BYTES.set(std::fs::metadata(self.data_dir.join("snapshot.bin")).map(|m| m.len()).unwrap_or(0) as i64);
-        // mirror index size to general gauge if available
-        if rmi_ver.is_some() {
-            #[cfg(feature = "learned-index")]
-            {
-                metrics::INDEX_SIZE_BYTES.set(metrics::RMI_INDEX_SIZE_BYTES.get());
-            }
-        }
-    }
-
     /// Force-write a full snapshot to disk.
     pub async fn snapshot(&self) -> Result<()> {
         let timer = metrics::SNAPSHOT_LATENCY_SECONDS.start_timer();
@@ -758,9 +481,6 @@ impl PersistentEventLog {
         // And fsync directory to persist metadata updates
         fsync_dir(&self.data_dir).ok();
 
-        // Reload the data source to mmap the new snapshot
-        *self.data_source.write().await = DataSource::new(self.data_dir.clone());
-
         metrics::SNAPSHOTS_TOTAL.inc();
         timer.observe_duration();
         // Update manifest after snapshot
@@ -804,32 +524,15 @@ impl PersistentEventLog {
                 }
             }
         }
-        // 3b) Rebuild offset→Record map from compacted state
-        {
-            let mut by_off = self.records_by_offset.write().await;
-            by_off.clear();
-            for ev in &compacted {
-                if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
-                    by_off.insert(ev.offset, rec);
-                }
-            }
-        }
 
         // 4) Persist snapshot of compacted state and reset WAL segments
         self.snapshot().await?;
         metrics::COMPACTIONS_TOTAL.inc();
         timer.observe_duration();
-        // Mark precise compaction time and write manifest
-        {
-            let mut tsw = self.last_compaction_ts.write().await;
-            *tsw = Some(Utc::now().timestamp());
-        }
+        // Update manifest after compaction
         self.write_manifest().await;
         let after_bytes = Self::wal_total_bytes(&self.data_dir);
         let after_segments = Self::list_wal_segments(&self.data_dir).len();
-        // observe compaction bytes processed/saved
-        metrics::COMPACTION_BYTES_PROCESSED.observe(before_bytes as f64);
-        metrics::COMPACTION_BYTES_SAVED.observe(before_bytes.saturating_sub(after_bytes) as f64);
         Ok(CompactionStats {
             before_bytes,
             after_bytes,
@@ -867,10 +570,30 @@ impl PersistentEventLog {
             .collect()
     }
 
-    /// Configure WAL rotation: segment size threshold and max segments retained.
-    pub async fn configure_wal_rotation(&self, segment_bytes: Option<u64>, max_segments: usize) {
-        *self.wal_segment_bytes.write().await = segment_bytes;
-        *self.wal_max_segments.write().await = max_segments.max(1);
+    /// Write minimal manifest with next_offset and active files.
+    pub async fn write_manifest(&self) {
+        let manifest = serde_json::json!({
+            "next_offset": self.get_offset().await,
+            "snapshot": "snapshot.bin",
+            "wal_segments": self.current_wal_segments(),
+            "wal_total_bytes": self.wal_size_bytes(),
+            "rmi": "index-rmi.bin",
+            "ts": chrono::Utc::now().timestamp()
+        });
+        let tmp = self.data_dir.join("manifest.tmp");
+        if let Ok(mut f) = File::create(&tmp) {
+            let _ = writeln!(f, "{}", manifest);
+            let _ = f.sync_all();
+            let _ = std::fs::rename(&tmp, self.manifest_path());
+            let _ = fsync_dir(&self.data_dir);
+        }
+    }
+
+    #[cfg(feature = "learned-index")]
+    /// Swap the in-memory primary index (e.g., after RMI rebuild).
+    pub async fn swap_primary_index(&self, new_index: index::PrimaryIndex) {
+        let mut idx = self.index.write().await;
+        *idx = new_index;
     }
 
     async fn rotate_wal_if_needed(&self) {
@@ -912,10 +635,10 @@ impl PersistentEventLog {
         }
     }
 
-    /// Swap the primary index (e.g., after an RMI rebuild). Safe under write lock.
-    pub async fn swap_primary_index(&self, new_index: index::PrimaryIndex) {
-        let mut w = self.index.write().await;
-        *w = new_index;
+    /// Configure WAL rotation: segment size threshold and max segments retained.
+    pub async fn configure_wal_rotation(&self, segment_bytes: Option<u64>, max_segments: usize) {
+        *self.wal_segment_bytes.write().await = segment_bytes;
+        *self.wal_max_segments.write().await = max_segments.max(1);
     }
 }
 

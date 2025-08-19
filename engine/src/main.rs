@@ -4,13 +4,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
 use kyrodb_engine as engine_crate;
+use engine_crate::PersistentEventLog;
 use std::sync::Arc;
-use warp::Filter;
+use tokio::signal; // still used in SSE handling
 use uuid::Uuid;
+use warp::Filter;
 mod sql;
 
 #[derive(Parser)]
-#[command(name = "kyrodb-engine", about = "KyroDB Engine")]
+#[command(name = "kyrodb-engine", about = "KyroDB Engine")] 
 struct Cli {
     /// Directory for data files (snapshots + WAL)
     #[arg(short, long, default_value = "./data")]
@@ -45,21 +47,12 @@ enum Commands {
         /// Rebuild RMI when delta/total ratio exceeds R (0.0-1.0)
         #[arg(long)]
         rmi_rebuild_ratio: Option<f64>,
-        /// RMI leaf target (keys per leaf)
-        #[arg(long, default_value_t = 1024)]
-        rmi_leaf_target: usize,
         /// WAL rotation: per-segment max bytes
         #[arg(long)]
         wal_segment_bytes: Option<u64>,
         /// WAL retention: max segments to keep
         #[arg(long, default_value_t = 8)]
         wal_max_segments: usize,
-        /// HTTP workers (SO_REUSEPORT), 1 = single listener
-        #[arg(long, default_value_t = 1)]
-        workers: usize,
-        /// Enable HTTP request logging
-        #[arg(long, default_value_t = false)]
-        log_http: bool,
     },
 }
 
@@ -78,11 +71,8 @@ async fn main() -> Result<()> {
             wal_max_bytes,
             rmi_rebuild_appends,
             rmi_rebuild_ratio,
-            rmi_leaf_target,
             wal_segment_bytes,
             wal_max_segments,
-            workers,
-            log_http,
         } => {
             // Configure WAL rotation if requested
             if wal_segment_bytes.is_some() || wal_max_segments > 0 {
@@ -159,7 +149,6 @@ async fn main() -> Result<()> {
                 let rebuild_log = log.clone();
                 let app_thresh = rmi_rebuild_appends.unwrap_or(0);
                 let ratio_thresh = rmi_rebuild_ratio.unwrap_or(0.0);
-                let leaf_target = rmi_leaf_target;
                 tokio::spawn(async move {
                     let mut last_built = rebuild_log.get_offset().await;
                     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -174,27 +163,28 @@ async fn main() -> Result<()> {
                             let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
                             let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
                             let rebuild_timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-                            if let Err(e) = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs, leaf_target) {
-                                eprintln!("❌ RMI rebuild write failed: {}", e);
-                                rebuild_timer.observe_duration();
-                                continue;
-                            }
-                            // fsync tmp, then atomic rename, then fsync directory to persist metadata
+                            // Write index on blocking thread
+                            let pairs_clone = pairs.clone();
+                            let tmp_clone = tmp.clone();
+                            let write_res = tokio::task::spawn_blocking(move || engine_crate::index::RmiIndex::write_from_pairs(&tmp_clone, &pairs_clone)).await;
+                            if let Ok(Err(e)) = write_res { eprintln!("❌ RMI rebuild write failed: {}", e); rebuild_timer.observe_duration(); continue; }
+                            if write_res.is_err() { eprintln!("❌ RMI rebuild task panicked"); rebuild_timer.observe_duration(); continue; }
+                            // fsync tmp then rename
                             if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
                             if let Err(e) = std::fs::rename(&tmp, &dst) {
                                 eprintln!("❌ RMI rename failed: {}", e);
                                 rebuild_timer.observe_duration();
                                 continue;
                             }
-                            if let Ok(dirf) = std::fs::File::open(&data_dir) { let _ = dirf.sync_all(); }
+                            // Reload and swap
                             if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
                                 rebuild_log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
                                 last_built = cur;
                                 engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                                 rebuild_timer.observe_duration();
-                                // Update manifest to commit the new index epoch/checksum
+                                // Commit manifest LAST via library API
                                 rebuild_log.write_manifest().await;
-                                println!("✅ RMI rebuilt and swapped (appended={}, ratio={:.3})", appended, ratio);
+                                println!("✅ RMI rebuilt, swapped, and manifest committed (appended={}, ratio={:.3})", appended, ratio);
                             } else {
                                 eprintln!("❌ RMI reload failed after rebuild");
                                 rebuild_timer.observe_duration();
@@ -204,184 +194,68 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // KV PUT: POST /put { key: u64, value: string }
-            let put_log = log.clone();
-            let put_route = warp::path("put")
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = put_log.clone();
-                    async move {
-                        let key = body["key"].as_u64().unwrap_or(0);
-                        let value = body["value"].as_str().unwrap_or("").as_bytes().to_vec();
-                        let off = log.append_kv(uuid::Uuid::new_v4(), key, value).await.unwrap();
-                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({ "offset": off })))
-                    }
-                });
-
-            // Simple lookup by key: GET /lookup?key=123 (fast offset fetch + value)
-            let lookup_log = log.clone();
-            let lookup_route = warp::path("lookup")
-                .and(warp::get())
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = lookup_log.clone();
-                    async move {
-                        if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
-                            if let Some((_off, rec)) = log.find_key_scan(k).await {
-                                return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                                    "key": rec.key,
-                                    "value": String::from_utf8_lossy(&rec.value)
-                                })));
-                            }
-                        }
-                        let not_found = serde_json::json!({"error":"not found"});
-                        Ok::<_, warp::Rejection>(warp::reply::json(&not_found))
-                    }
-                });
-
-            // Fast lookup path: GET /lookup_raw?key=123 -> 204 if found, 404 if not
-            let lookup_raw_log = log.clone();
+            // --- Fast lookup endpoints (HTTP hot path) ---------------------------------------
+            let raw_log = log.clone();
             let lookup_raw = warp::path("lookup_raw")
                 .and(warp::get())
                 .and(warp::query::<std::collections::HashMap<String, String>>())
                 .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = lookup_raw_log.clone();
+                    let log = raw_log.clone();
                     async move {
+                        use warp::http::{Response, StatusCode};
                         if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
                             if log.lookup_key(k).await.is_some() {
-                                return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    warp::reply(),
-                                    warp::http::StatusCode::NO_CONTENT,
-                                ));
+                                let resp = Response::builder().status(StatusCode::NO_CONTENT).body("")
+                                    .map_err(|_| warp::reject::reject())?;
+                                return Ok::<_, warp::Rejection>(resp);
                             }
                         }
-                        Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply(),
-                            warp::http::StatusCode::NOT_FOUND,
-                        ))
+                        let resp = Response::builder().status(StatusCode::NOT_FOUND).body("")
+                            .map_err(|_| warp::reject::reject())?;
+                        Ok::<_, warp::Rejection>(resp)
                     }
                 });
 
-            // POST /sql  { sql: "INSERT ..." | "SELECT ..." }
-            let sql_log = log.clone();
-            let sql_route = warp::path("sql")
+            let fast_log = log.clone();
+            let lookup_fast = warp::path!("lookup_fast" / u64)
+                .and(warp::get())
+                .and_then(move |k: u64| {
+                    let log = fast_log.clone();
+                    async move {
+                        use warp::http::{Response, StatusCode};
+                        if let Some(off) = log.lookup_key(k).await {
+                            let body = off.to_le_bytes().to_vec();
+                            let resp = Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/octet-stream")
+                                .body(body)
+                                .map_err(|_| warp::reject::reject())?;
+                            return Ok::<_, warp::Rejection>(resp);
+                        }
+                        let resp = Response::builder().status(StatusCode::NOT_FOUND).body(Vec::new())
+                            .map_err(|_| warp::reject::reject())?;
+                        Ok::<_, warp::Rejection>(resp)
+                    }
+                });
+
+            let append_log = log.clone();
+            let append_route = warp::path("append")
                 .and(warp::post())
                 .and(warp::body::json())
                 .and_then(move |body: serde_json::Value| {
-                    let log = sql_log.clone();
+                    let log = append_log.clone();
                     async move {
-                        let stmt = body["sql"].as_str().unwrap_or("");
-                        match sql::execute_sql(&log, stmt).await {
-                            Ok(sql::SqlResponse::Ack { offset }) => Ok::<_, warp::Rejection>(
-                                warp::reply::json(&serde_json::json!({"ack": {"offset": offset}})),
-                            ),
-                            Ok(sql::SqlResponse::Rows(rows)) => {
-                                let resp: Vec<_> = rows.into_iter().map(|(k, v)| serde_json::json!({
-                                    "key": k,
-                                    "value": String::from_utf8_lossy(&v)
-                                })).collect();
-                                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
-                            }
-                            Ok(sql::SqlResponse::VecRows(rows)) => {
-                                let resp: Vec<_> = rows.into_iter().map(|(k, d)| serde_json::json!({
-                                    "key": k,
-                                    "dist": d
-                                })).collect();
-                                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
-                            }
-                            Err(e) => {
-                                let err = serde_json::json!({"error": e.to_string()});
-                                Ok::<_, warp::Rejection>(warp::reply::json(&err))
-                            },
-                        }
+                        let payload = body["payload"]
+                            .as_str()
+                            .unwrap_or("")
+                            .as_bytes()
+                            .to_vec();
+                        let offset = log.append(Uuid::new_v4(), payload).await.unwrap();
+                        Ok::<_, warp::Rejection>(
+                            warp::reply::json(&serde_json::json!({ "offset": offset })),
+                        )
                     }
                 });
-
-            // Metrics endpoint
-            let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
-                let text = engine_crate::metrics::render();
-                warp::reply::with_header(text, "Content-Type", "text/plain; version=0.0.4")
-            });
-
-            // Authorization filter (optional)
-            #[derive(Debug)]
-            struct Unauthorized;
-            impl warp::reject::Reject for Unauthorized {}
-            let auth = {
-                let token_opt = auth_token.clone();
-                warp::any()
-                    .and(warp::header::optional::<String>("authorization"))
-                    .and_then(move |hdr: Option<String>| {
-                        let token_opt = token_opt.clone();
-                        async move {
-                            if let Some(expected) = &token_opt {
-                                let ok = hdr.as_deref() == Some(&format!("Bearer {}", expected));
-                                if !ok { return Err(warp::reject::custom(Unauthorized)); }
-                            }
-                            Ok::<(), warp::Rejection>(())
-                        }
-                    })
-            };
-
-            // RMI build: POST /rmi/build  (feature-gated)
-            #[cfg(feature = "learned-index")]
-            let rmi_build = {
-                let data_dir = cli.data_dir.clone();
-                let build_log = log.clone();
-                let leaf_target = rmi_leaf_target;
-                warp::path!("rmi" / "build")
-                    .and(warp::post())
-                    .and_then(move || {
-                        let log = build_log.clone();
-                        let data_dir = data_dir.clone();
-                        async move {
-                            let pairs = log.collect_key_offset_pairs().await;
-                            let mut tmp = std::path::PathBuf::from(&data_dir);
-                            tmp.push("index-rmi.tmp");
-                            let mut dst = std::path::PathBuf::from(&data_dir);
-                            dst.push("index-rmi.bin");
-                            let timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-                            let mut ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs, leaf_target).is_ok();
-                            // fsync tmp file
-                            if ok { if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); } }
-                            // atomic rename and fsync dir
-                            if ok { ok = std::fs::rename(&tmp, &dst).is_ok(); }
-                            if ok { if let Ok(dirf) = std::fs::File::open(&data_dir) { let _ = dirf.sync_all(); } }
-                            // load and swap index into hot path
-                            if ok {
-                                if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
-                                    log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
-                                    engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                                    // update manifest to commit the new index
-                                    log.write_manifest().await;
-                                } else {
-                                    ok = false;
-                                }
-                            }
-                            timer.observe_duration();
-                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                                "ok": ok,
-                                "count": pairs.len()
-                            })))
-                        }
-                    })
-            };
-
-            #[cfg(not(feature = "learned-index"))]
-            let rmi_build = {
-                use warp::http::StatusCode;
-                warp::path!("rmi" / "build")
-                    .and(warp::post())
-                    .map(|| {
-                        warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({
-                                "error": "learned-index feature not enabled"
-                            })),
-                            StatusCode::NOT_IMPLEMENTED,
-                        )
-                    })
-            };
 
             // --- NEW: Health check endpoint ----------------------------------------------------
             let health_route = warp::path("health")
@@ -468,6 +342,196 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // KV PUT: POST /put { key: u64, value: string }
+            let put_log = log.clone();
+            let put_route = warp::path("put")
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = put_log.clone();
+                    async move {
+                        let key = body["key"].as_u64().unwrap_or(0);
+                        let value = body["value"].as_str().unwrap_or("").as_bytes().to_vec();
+                        let off = log.append_kv(Uuid::new_v4(), key, value).await.unwrap();
+                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({ "offset": off })))
+                    }
+                });
+
+            // Simple lookup by key: GET /lookup?key=123
+            let lookup_log = log.clone();
+            let lookup_route = warp::path("lookup")
+                .and(warp::get())
+                .and(warp::query::<std::collections::HashMap<String, String>>())
+                .and_then(move |q: std::collections::HashMap<String, String>| {
+                    let log = lookup_log.clone();
+                    async move {
+                        if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
+                            if let Some(offset) = log.lookup_key(k).await {
+                                let evs = log.replay(offset, Some(offset + 1)).await;
+                                if let Some(ev) = evs.into_iter().next() {
+                                    if let Ok(rec) = bincode::deserialize::<kyrodb_engine::Record>(&ev.payload) {
+                                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                            "key": rec.key,
+                                            "value": String::from_utf8_lossy(&rec.value)
+                                        })));
+                                    }
+                                }
+                            } else if let Some((_, rec)) = log.find_key_scan(k).await {
+                                return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                    "key": rec.key,
+                                    "value": String::from_utf8_lossy(&rec.value)
+                                })));
+                            }
+                        }
+                        let not_found = serde_json::json!({"error":"not found"});
+                        Ok::<_, warp::Rejection>(warp::reply::json(&not_found))
+                    }
+                });
+
+            // POST /sql  { sql: "INSERT ..." | "SELECT ..." }
+            let sql_log = log.clone();
+            let sql_route = warp::path("sql")
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = sql_log.clone();
+                    async move {
+                        let stmt = body["sql"].as_str().unwrap_or("");
+                        match sql::execute_sql(&log, stmt).await {
+                            Ok(sql::SqlResponse::Ack { offset }) => Ok::<_, warp::Rejection>(
+                                warp::reply::json(&serde_json::json!({"ack": {"offset": offset}})),
+                            ),
+                            Ok(sql::SqlResponse::Rows(rows)) => {
+                                let resp: Vec<_> = rows.into_iter().map(|(k, v)| serde_json::json!({
+                                    "key": k,
+                                    "value": String::from_utf8_lossy(&v)
+                                })).collect();
+                                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
+                            }
+                            Ok(sql::SqlResponse::VecRows(rows)) => {
+                                let resp: Vec<_> = rows.into_iter().map(|(k, d)| serde_json::json!({
+                                    "key": k,
+                                    "dist": d
+                                })).collect();
+                                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
+                            }
+                            Err(e) => {
+                                let err = serde_json::json!({"error": e.to_string()});
+                                Ok::<_, warp::Rejection>(warp::reply::json(&err))
+                            },
+                        }
+                    }
+                });
+
+            // Metrics endpoint
+            let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
+                let text = engine_crate::metrics::render();
+                warp::reply::with_header(text, "Content-Type", "text/plain; version=0.0.4")
+            });
+
+            // Authorization filter (optional)
+            #[derive(Debug)]
+            struct Unauthorized;
+            impl warp::reject::Reject for Unauthorized {}
+            let auth = {
+                let token_opt = auth_token.clone();
+                warp::any()
+                    .and(warp::header::optional::<String>("authorization"))
+                    .and_then(move |hdr: Option<String>| {
+                        let token_opt = token_opt.clone();
+                        async move {
+                            if let Some(expected) = &token_opt {
+                                let ok = hdr.as_deref() == Some(&format!("Bearer {}", expected));
+                                if !ok { return Err(warp::reject::custom(Unauthorized)); }
+                            }
+                            Ok::<(), warp::Rejection>(())
+                        }
+                    })
+            };
+
+            // RMI build: POST /rmi/build  (feature-gated)
+            #[cfg(feature = "learned-index")]
+            let rmi_build = {
+                let data_dir = cli.data_dir.clone();
+                let build_log = log.clone();
+                warp::path!("rmi" / "build")
+                    .and(warp::post())
+                    .and_then(move || {
+                        let log = build_log.clone();
+                        let data_dir = data_dir.clone();
+                        async move {
+                            let pairs = log.collect_key_offset_pairs().await;
+                            let mut tmp = std::path::PathBuf::from(&data_dir);
+                            tmp.push("index-rmi.tmp");
+                            let mut dst = std::path::PathBuf::from(&data_dir);
+                            dst.push("index-rmi.bin");
+                            let timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
+                            let ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
+                                && std::fs::rename(&tmp, &dst).is_ok();
+                            if ok { engine_crate::metrics::RMI_REBUILDS_TOTAL.inc(); }
+                            timer.observe_duration();
+                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "ok": ok,
+                                "count": pairs.len()
+                            })))
+                        }
+                    })
+            };
+
+            #[cfg(not(feature = "learned-index"))]
+            let rmi_build = {
+                use warp::http::StatusCode;
+                warp::path!("rmi" / "build")
+                    .and(warp::post())
+                    .map(|| {
+                        warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "learned-index feature not enabled"
+                            })),
+                            StatusCode::NOT_IMPLEMENTED,
+                        )
+                    })
+            };
+
+            let subscribe_log = log.clone();
+            let subscribe_route = warp::path("subscribe")
+                .and(warp::get())
+                .and(warp::query::<std::collections::HashMap<String, String>>())
+                .and_then(move |q: std::collections::HashMap<String, String>| {
+                    let log = subscribe_log.clone();
+                    async move {
+                        let from = q.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let (past, rx) = log.subscribe(from).await;
+
+                        // Create an SSE stream of past + live events
+                        let past_stream = futures::stream::iter(
+                            past.into_iter().map(Ok::<_, std::convert::Infallible>),
+                        );
+                        let live_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+                            .filter_map(|res| async move {
+                                match res {
+                                    Ok(v) => Some(v),
+                                    Err(_) => {
+                                        kyrodb_engine::metrics::inc_sse_lagged();
+                                        None
+                                    }
+                                }
+                            })
+                            .map(Ok);
+                        let combined = past_stream.chain(live_stream).map(|e| {
+                            let event = e.unwrap(); // Should be infallible
+                            Ok::<_, warp::Error>(warp::sse::Event::default()
+                                .data(
+                                    serde_json::json!({"offset": event.offset, "payload": String::from_utf8_lossy(&event.payload)})
+                                        .to_string(),
+                                ))
+                        });
+                        Ok::<_, warp::Rejection>(warp::sse::reply(
+                            warp::sse::keep_alive().stream(combined),
+                        ))
+                    }
+                });
+
             // Vector insert: POST /vector/insert { key: u64, vector: [f32,...] }
             let vec_ins_log = log.clone();
             let vector_insert = warp::path!("vector" / "insert")
@@ -504,83 +568,57 @@ async fn main() -> Result<()> {
                 });
 
             // Apply auth to protected routes
+            let append_route = auth.clone().and(append_route).map(|(), r| r);
+            let replay_route = auth.clone().and(replay_route).map(|(), r| r);
+            let subscribe_route = auth.clone().and(subscribe_route).map(|(), r| r);
             let snapshot_route = auth.clone().and(snapshot_route).map(|(), r| r);
             let offset_route = auth.clone().and(offset_route).map(|(), r| r);
             let put_route = auth.clone().and(put_route).map(|(), r| r);
             let lookup_route = auth.clone().and(lookup_route).map(|(), r| r);
             let lookup_raw = auth.clone().and(lookup_raw).map(|(), r| r);
+            let lookup_fast = auth.clone().and(lookup_fast).map(|(), r| r);
             let sql_route = auth.clone().and(sql_route).map(|(), r| r);
             let vector_insert = auth.clone().and(vector_insert).map(|(), r| r);
             let vector_search = auth.clone().and(vector_search).map(|(), r| r);
             let rmi_build = auth.clone().and(rmi_build).map(|(), r| r);
-            let compact_route = auth.clone().and(compact_route).map(|(), r| r);
 
-            // Compose routes
-            let routes = {
-                let base = health_route
-                    .or(metrics_route)
-                    .or(snapshot_route)
-                    .or(offset_route)
-                    .or(put_route)
-                    .or(lookup_route)
-                    .or(lookup_raw)
-                    .or(sql_route)
-                    .or(vector_insert)
-                    .or(vector_search)
-                    .or(rmi_build)
-                    .or(compact_route)
-                    .recover(|rej: warp::Rejection| async move {
-                        use warp::http::StatusCode;
-                        if rej.find::<Unauthorized>().is_some() {
-                            Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
-                                StatusCode::UNAUTHORIZED,
-                            ))
-                        } else {
-                            Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({"error":"not found"})),
-                                StatusCode::NOT_FOUND,
-                            ))
-                        }
-                    });
-                base.boxed()
-            };
-            
-            // Start server with optional SO_REUSEPORT workers
-            let addr: std::net::SocketAddr = format!("{}:{}", host, port).parse()?;
-            if workers <= 1 {
-                println!("🚀 Starting server at http://{}:{} (1 worker)", host, port);
-                if log_http {
-                    warp::serve(routes.clone().with(warp::log("kyrodb"))).run(addr).await;
-                } else {
-                    warp::serve(routes.clone()).run(addr).await;
-                }
-            } else {
-                println!("🚀 Starting server at http://{}:{} ({} workers)", host, port, workers);
-                use socket2::{Socket, Domain, Type, Protocol};
-                let mut handles = Vec::new();
-                for _ in 0..workers {
-                    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-                    socket.set_reuse_address(true)?;
-                    #[cfg(target_os = "macos")]
-                    socket.set_reuse_port(true)?;
-                    socket.bind(&addr.into())?;
-                    socket.listen(1024)?;
-                    socket.set_nonblocking(true)?;
-                    let std_listener: std::net::TcpListener = socket.into();
-                    let listener = tokio::net::TcpListener::from_std(std_listener)?;
-                    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-                    let svc_routes = routes.clone();
-                    handles.push(tokio::spawn(async move {
-                        if log_http {
-                            warp::serve(svc_routes.with(warp::log("kyrodb"))).run_incoming(incoming).await;
-                        } else {
-                            warp::serve(svc_routes).run_incoming(incoming).await;
-                        }
-                    }));
-                }
-                for h in handles { let _ = h.await; }
-            }
+            // Combine routes
+            let routes = health_route
+                .or(metrics_route)
+                .or(append_route)
+                .or(replay_route)
+                .or(subscribe_route)
+                .or(snapshot_route)
+                .or(offset_route)
+                .or(put_route)
+                .or(lookup_route)
+                .or(lookup_raw)
+                .or(lookup_fast)
+                .or(sql_route)
+                .or(vector_insert)
+                .or(vector_search)
+                .or(rmi_build)
+                .or(compact_route)
+                .recover(|rej: warp::Rejection| async move {
+                    use warp::http::StatusCode;
+                    if rej.find::<Unauthorized>().is_some() {
+                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
+                            StatusCode::UNAUTHORIZED,
+                        ))
+                    } else {
+                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"not found"})),
+                            StatusCode::NOT_FOUND,
+                        ))
+                    }
+                })
+                .with(warp::log("kyrodb"));
+
+            println!("🚀 Starting server at http://{}:{}", host, port);
+            warp::serve(routes)
+                .run((host.parse::<std::net::IpAddr>()?, port))
+                .await;
         }
     }
 

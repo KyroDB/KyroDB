@@ -61,8 +61,6 @@ pub struct RmiIndex {
 
 #[cfg(feature = "learned-index")]
 const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
-#[cfg(feature = "learned-index")]
-const RMI_PROBE_WINDOW_MAX: u32 = 512;
 
 #[cfg(feature = "learned-index")]
 impl RmiIndex {
@@ -91,7 +89,7 @@ impl RmiIndex {
     }
 
     /// Build per-leaf linear models and epsilon bounds from sorted pairs and write v4 format with checksum.
-    pub fn write_from_pairs(path: &std::path::Path, pairs: &[(u64, u64)], leaf_target: usize) -> std::io::Result<()> {
+    pub fn write_from_pairs(path: &std::path::Path, pairs: &[(u64, u64)]) -> std::io::Result<()> {
         use std::io::Write;
         // sort by key
         let mut buf: Vec<(u64, u64)> = pairs.to_vec();
@@ -99,7 +97,7 @@ impl RmiIndex {
         let n = buf.len();
         let total_keys = n as u64;
         // choose number of leaves
-        let target_leaf = leaf_target.max(1); // aim ~leaf_target keys per leaf
+        let target_leaf = 1024usize; // aim ~1k keys per leaf
         let num_leaves = std::cmp::max(1, (n + target_leaf - 1) / target_leaf) as u32;
         let mut leaves: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves as usize);
         // build keys, offsets arrays
@@ -240,10 +238,9 @@ impl RmiIndex {
                     leaves.push(RmiLeafMeta { key_min: *sorted_keys.first().unwrap(), key_max: *sorted_keys.last().unwrap(), slope: 0.0, intercept: 0.0, epsilon, start: 0, len: count as u64 });
                 }
                 // metrics
-                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as i64);
-                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as i64);
-                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as i64);
-                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as i64); }
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
+                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
                 for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
                 return Some(Self { delta: BTreeMap::new(), leaves, backing: RmiBacking::Owned { sorted_keys, sorted_offsets } });
             }
@@ -297,10 +294,9 @@ impl RmiIndex {
                 let sum_calc = hasher.digest();
                 if sum_calc != sum_read { return None; }
                 // metrics
-                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as i64);
-                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as i64);
-                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as i64);
-                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as i64); }
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::RMI_INDEX_LEAVES.set(leaves.len() as f64);
+                if let Some(max) = leaves.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
                 for leaf in &leaves { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
                 return Some(Self { delta: BTreeMap::new(), leaves, backing: RmiBacking::Owned { sorted_keys, sorted_offsets } });
             }
@@ -355,10 +351,9 @@ impl RmiIndex {
                     RmiBacking::Owned { sorted_keys, sorted_offsets }
                 };
                 // metrics
-                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as i64);
-                crate::metrics::INDEX_SIZE_BYTES.set(meta_len as i64);
-                crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as i64);
-                if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as i64); }
+                crate::metrics::RMI_INDEX_SIZE_BYTES.set(meta_len as f64);
+                crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
+                if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
                 for leaf in &lvs { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
                 return Some(Self { delta: BTreeMap::new(), leaves: lvs, backing });
             }
@@ -407,35 +402,26 @@ impl RmiIndex {
         if keys.is_empty() { return None; }
         let li = self.find_leaf_index(*key)?;
         let leaf = &self.leaves[li];
-
-        // Enforce W_max probe cap. If a leaf's error bound is too wide,
-        // we fail fast instead of scanning a huge slice.
-        if (leaf.epsilon * 2 + 1) > RMI_PROBE_WINDOW_MAX {
-            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
-            return None;
-        }
-
         let (mut lo, mut hi) = self.predict_window(leaf, *key);
         if lo > hi { return None; }
         let max_idx = keys.len().saturating_sub(1);
         lo = lo.min(max_idx); hi = hi.min(max_idx);
         let mut l = lo; let mut r = hi;
         let offs = self.offs();
-        let mut probes: u32 = 0;
+        let mut steps: u32 = 0;
         while l <= r {
-            probes += 1;
+            steps += 1;
             let m = l + ((r - l) >> 1);
             match keys[m].cmp(key) {
                 std::cmp::Ordering::Less => l = m + 1,
                 std::cmp::Ordering::Greater => { if m == 0 { break; } r = m - 1; }
                 std::cmp::Ordering::Equal => {
-                    crate::metrics::RMI_PROBE_LEN.observe(probes as f64);
+                    crate::metrics::RMI_PROBE_LEN.observe(steps as f64);
                     return Some(offs[m]);
                 }
             }
         }
-        // bounded search failed; record probes and mispredict
-        crate::metrics::RMI_PROBE_LEN.observe(probes as f64);
+        crate::metrics::RMI_PROBE_LEN.observe(steps as f64);
         crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
         None
     }
@@ -472,18 +458,12 @@ impl PrimaryIndex {
             PrimaryIndex::Rmi(r) => {
                 if let Some(v) = r.delta_get(key) {
                     crate::metrics::RMI_HITS_TOTAL.inc();
-                    let h = crate::metrics::RMI_HITS_TOTAL.get();
-                    let m = crate::metrics::RMI_MISSES_TOTAL.get();
-                    let t = (h + m) as f64; if t > 0.0 { crate::metrics::RMI_HIT_RATE.set(h as f64 / t); }
                     Some(v)
                 } else {
                     let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
                     let res = r.predict_get(key);
                     timer.observe_duration();
                     if res.is_some() { crate::metrics::RMI_HITS_TOTAL.inc(); } else { crate::metrics::RMI_MISSES_TOTAL.inc(); }
-                    let h = crate::metrics::RMI_HITS_TOTAL.get();
-                    let m = crate::metrics::RMI_MISSES_TOTAL.get();
-                    let t = (h + m) as f64; if t > 0.0 { crate::metrics::RMI_HIT_RATE.set(h as f64 / t); }
                     res
                 }
             }

@@ -13,7 +13,7 @@ async fn rmi_rebuild_by_appends_threshold() {
     // Build initial RMI
     let pairs = log.collect_key_offset_pairs().await;
     let tmp = path.join("index-rmi.tmp"); let dst = path.join("index-rmi.bin");
-    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs, 1024).unwrap();
+    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
     std::fs::rename(&tmp, &dst).unwrap();
 
     // Append more than threshold distinct keys
@@ -21,7 +21,7 @@ async fn rmi_rebuild_by_appends_threshold() {
 
     // Manually trigger rebuild logic from main would require running server; instead emulate by writing new file again
     let pairs2 = log.collect_key_offset_pairs().await;
-    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs2, 1024).unwrap();
+    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs2).unwrap();
     std::fs::rename(&tmp, &dst).unwrap();
 
     // Reload and ensure index still answers
