@@ -20,17 +20,9 @@ var rootCmd = &cobra.Command{
 }
 
 var engineAddr string
-var authToken string
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&engineAddr, "engine", "e", "http://localhost:3030", "Engine HTTP address")
-	rootCmd.PersistentFlags().StringVar(&authToken, "auth-token", "", "Authorization token (adds 'Authorization: Bearer <token>')")
-}
-
-func addAuth(req *http.Request) {
-	if authToken != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
-	}
 }
 
 // health command: GET /health
@@ -40,9 +32,7 @@ var healthCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		url := fmt.Sprintf("%s/health", engineAddr)
 		client := http.Client{Timeout: 2 * time.Second}
-		req, _ := http.NewRequest("GET", url, nil)
-		addAuth(req)
-		resp, err := client.Do(req)
+		resp, err := client.Get(url)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
 			os.Exit(1)
@@ -65,9 +55,7 @@ var offsetCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		url := fmt.Sprintf("%s/offset", engineAddr)
 		client := http.Client{Timeout: 2 * time.Second}
-		req, _ := http.NewRequest("GET", url, nil)
-		addAuth(req)
-		resp, err := client.Do(req)
+		resp, err := client.Get(url)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
 			os.Exit(1)
@@ -95,7 +83,6 @@ var snapshotCmd = &cobra.Command{
 		url := fmt.Sprintf("%s/snapshot", engineAddr)
 		client := http.Client{Timeout: 5 * time.Second}
 		req, _ := http.NewRequest("POST", url, nil)
-		addAuth(req)
 		resp, err := client.Do(req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
@@ -112,37 +99,6 @@ var snapshotCmd = &cobra.Command{
 	},
 }
 
-// compact command: POST /compact returns stats
-var compactCmd = &cobra.Command{
-	Use:   "compact",
-	Short: "Run compaction (keep-latest) and snapshot",
-	Run: func(cmd *cobra.Command, args []string) {
-		url := fmt.Sprintf("%s/compact", engineAddr)
-		client := http.Client{Timeout: 30 * time.Second}
-		req, _ := http.NewRequest("POST", url, nil)
-		addAuth(req)
-		resp, err := client.Do(req)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
-			os.Exit(1)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
-			fmt.Printf("⚠️  Engine returned %d: %s\n", resp.StatusCode, body)
-			os.Exit(1)
-		}
-		var out map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			fmt.Fprintf(os.Stderr, "❌ invalid response: %v\n", err)
-			os.Exit(1)
-		}
-		stats := out["stats"]
-		enc, _ := json.MarshalIndent(stats, "", "  ")
-		fmt.Printf("✅ Compaction complete. Stats:\n%s\n", string(enc))
-	},
-}
-
 func main() {
 	// sql command: POST /sql {sql: "..."}
 	sqlCmd := &cobra.Command{
@@ -155,10 +111,7 @@ func main() {
 			payload := map[string]string{"sql": stmt}
 			body, _ := json.Marshal(payload)
 			client := http.Client{Timeout: 5 * time.Second}
-			req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
-			req.Header.Set("content-type", "application/json")
-			addAuth(req)
-			resp, err := client.Do(req)
+			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
 				os.Exit(1)
@@ -177,9 +130,7 @@ func main() {
 		Run: func(cmd *cobra.Command, args []string) {
 			url := fmt.Sprintf("%s/lookup?key=%s", engineAddr, args[0])
 			client := http.Client{Timeout: 2 * time.Second}
-			req, _ := http.NewRequest("GET", url, nil)
-			addAuth(req)
-			resp, err := client.Do(req)
+			resp, err := client.Get(url)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
 				os.Exit(1)
@@ -219,10 +170,7 @@ func main() {
 			payload := map[string]interface{}{"key": key, "vector": vals}
 			body, _ := json.Marshal(payload)
 			client := http.Client{Timeout: 5 * time.Second}
-			req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
-			req.Header.Set("content-type", "application/json")
-			addAuth(req)
-			resp, err := client.Do(req)
+			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
 				os.Exit(1)
@@ -259,10 +207,7 @@ func main() {
 			payload := map[string]interface{}{"query": vals, "k": kVal}
 			body, _ := json.Marshal(payload)
 			client := http.Client{Timeout: 5 * time.Second}
-			req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
-			req.Header.Set("content-type", "application/json")
-			addAuth(req)
-			resp, err := client.Do(req)
+			resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
 				os.Exit(1)
@@ -279,9 +224,8 @@ func main() {
 		Short: "Build the RMI index (if supported)",
 		Run: func(cmd *cobra.Command, args []string) {
 			url := fmt.Sprintf("%s/rmi/build", engineAddr)
-			client := http.Client{Timeout: 30 * time.Second}
+			client := http.Client{Timeout: 10 * time.Second}
 			req, _ := http.NewRequest("POST", url, nil)
-			addAuth(req)
 			resp, err := client.Do(req)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ request failed: %v\n", err)
@@ -293,7 +237,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(healthCmd, offsetCmd, snapshotCmd, compactCmd, sqlCmd, lookupCmd, vecInsertCmd, vecSearchCmd, rmiBuildCmd)
+	rootCmd.AddCommand(healthCmd, offsetCmd, snapshotCmd, sqlCmd, lookupCmd, vecInsertCmd, vecSearchCmd, rmiBuildCmd)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
