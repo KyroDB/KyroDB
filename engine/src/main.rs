@@ -461,14 +461,40 @@ async fn main() -> Result<()> {
                         let data_dir = data_dir.clone();
                         async move {
                             let pairs = log.collect_key_offset_pairs().await;
-                            let mut tmp = std::path::PathBuf::from(&data_dir);
-                            tmp.push("index-rmi.tmp");
-                            let mut dst = std::path::PathBuf::from(&data_dir);
-                            dst.push("index-rmi.bin");
+                            let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
+                            let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
                             let timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-                            let ok = engine_crate::index::RmiIndex::write_from_pairs(&tmp, &pairs).is_ok()
-                                && std::fs::rename(&tmp, &dst).is_ok();
-                            if ok { engine_crate::metrics::RMI_REBUILDS_TOTAL.inc(); }
+
+                            // Write index on a blocking thread to avoid starving the reactor
+                            let pairs_clone = pairs.clone();
+                            let tmp_clone = tmp.clone();
+                            let write_res = tokio::task::spawn_blocking(move || engine_crate::index::RmiIndex::write_from_pairs(&tmp_clone, &pairs_clone)).await;
+                            let mut ok = matches!(write_res, Ok(Ok(())));
+
+                            // fsync tmp then rename -> dst
+                            if ok {
+                                if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+                                    let _ = f.sync_all();
+                                }
+                                if let Err(e) = std::fs::rename(&tmp, &dst) {
+                                    eprintln!("❌ RMI rename failed: {}", e);
+                                    ok = false;
+                                }
+                            }
+
+                            // Reload, swap, and commit manifest LAST
+                            if ok {
+                                if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
+                                    log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
+                                    engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
+                                    // Commit manifest as the external commit point
+                                    log.write_manifest().await;
+                                } else {
+                                    eprintln!("❌ RMI reload failed after rebuild");
+                                    ok = false;
+                                }
+                            }
+
                             timer.observe_duration();
                             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                                 "ok": ok,
