@@ -75,6 +75,10 @@ pub struct PersistentEventLog {
     wal_max_segments: Arc<RwLock<usize>>,
     #[cfg(feature = "ann-hnsw")]
     ann:      Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
+    // --- NEW: snapshot mmap + payload index for direct reads by offset ---
+    snapshot_mmap: Arc<RwLock<Option<memmap2::Mmap>>>,
+    // offset -> (payload_start, payload_len) within snapshot mmap
+    snapshot_payload_index: Arc<RwLock<Option<std::collections::HashMap<u64, (usize, usize)>>>>,
 }
 
 impl PersistentEventLog {
@@ -235,9 +239,64 @@ impl PersistentEventLog {
             wal_max_segments: Arc::new(RwLock::new(8)),
             #[cfg(feature = "ann-hnsw")]
             ann:     Arc::new(RwLock::new(None)),
+            snapshot_mmap: Arc::new(RwLock::new(None)),
+            snapshot_payload_index: Arc::new(RwLock::new(None)),
         };
 
+        // Try to mmap snapshot.data and build index for fast get() access.
+        {
+            let data_path = log.data_dir.join("snapshot.data");
+            if data_path.exists() {
+                if let Ok(file) = File::open(&data_path) {
+                    if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
+                        if let Some(index_map) = Self::build_snapshot_data_index(&mmap) {
+                            *log.snapshot_payload_index.write().await = Some(index_map);
+                            *log.snapshot_mmap.write().await = Some(mmap);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(log)
+    }
+
+    // Parse snapshot.data layout: repeating records of [offset u64][len u64][payload bytes]
+    fn build_snapshot_data_index(m: &memmap2::Mmap) -> Option<std::collections::HashMap<u64, (usize, usize)>> {
+        use std::collections::HashMap;
+        let bytes: &[u8] = &m[..];
+        let mut pos: usize = 0;
+        let mut map: HashMap<u64, (usize, usize)> = HashMap::new();
+        while pos + 16 <= bytes.len() {
+            let off = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
+            let len = u64::from_le_bytes(bytes[pos+8..pos+16].try_into().ok()?) as usize;
+            let start = pos + 16;
+            let end = start.checked_add(len)?;
+            if end > bytes.len() { return None; }
+            map.insert(off, (start, len));
+            pos = end;
+        }
+        Some(map)
+    }
+
+    /// Get the payload bytes for a given logical offset, if present.
+    /// Uses mmap-backed snapshot when possible, with in-memory fallback.
+    pub async fn get(&self, offset: u64) -> Option<Vec<u8>> {
+        // Fast path: read from mmap snapshot if indexed
+        if let Some(ref mmap) = *self.snapshot_mmap.read().await {
+            if let Some(ref idx) = *self.snapshot_payload_index.read().await {
+                if let Some((start, len)) = idx.get(&offset).copied() {
+                    let end = start.saturating_add(len);
+                    if end <= mmap.len() { return Some(mmap[start..end].to_vec()); }
+                }
+            }
+        }
+        // Fallback: search in-memory events
+        let read = self.inner.read().await;
+        if let Some(ev) = read.iter().find(|e| e.offset == offset) {
+            return Some(ev.payload.clone());
+        }
+        None
     }
 
     /// Append (durably) and return its offset.
@@ -449,12 +508,30 @@ impl PersistentEventLog {
             bopt.serialize_into(&mut w, &*read).context("writing snapshot")?;
             w.flush().context("flushing snapshot")?;
             // Ensure snapshot.tmp contents are durable before rename
-            let mut file = w.into_inner().context("snapshot into_inner")?;
+            let file = w.into_inner().context("snapshot into_inner")?;
             file.sync_all().context("fsync snapshot.tmp")?;
         }
 
         std::fs::rename(&tmp, &path).context("renaming snapshot")?;
         // Ensure the rename is durable
+        fsync_dir(&self.data_dir).ok();
+
+        // Also write a contiguous payloads file for mmap-backed direct reads
+        let data_path = self.data_dir.join("snapshot.data");
+        let data_tmp  = self.data_dir.join("snapshot.data.tmp");
+        {
+            let mut f = BufWriter::new(File::create(&data_tmp).context("creating snapshot.data.tmp")?);
+            let read = self.inner.read().await;
+            for ev in read.iter() {
+                let len = ev.payload.len() as u64;
+                f.write_all(&ev.offset.to_le_bytes()).context("write snapshot.data offset")?;
+                f.write_all(&len.to_le_bytes()).context("write snapshot.data len")?;
+                f.write_all(&ev.payload).context("write snapshot.data payload")?;
+            }
+            f.flush().ok();
+            if let Ok(mut inner) = f.into_inner() { let _ = inner.sync_all(); }
+        }
+        std::fs::rename(&data_tmp, &data_path).ok();
         fsync_dir(&self.data_dir).ok();
 
         // After a successful snapshot, reset WAL segments (truncate to a fresh segment)
