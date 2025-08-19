@@ -11,7 +11,10 @@ async fn snapshot_mmap_reader_equivalence() {
     let log = PersistentEventLog::open(&path).await.unwrap();
     let mut offsets = Vec::new();
     for i in 0..500u64 {
-        let off = log.append(Uuid::new_v4(), format!("val-{i}").into_bytes()).await.unwrap();
+        let off = log
+            .append(Uuid::new_v4(), format!("val-{i}").into_bytes())
+            .await
+            .unwrap();
         offsets.push(off);
     }
     log.snapshot().await.unwrap();
@@ -20,9 +23,11 @@ async fn snapshot_mmap_reader_equivalence() {
     let log2 = PersistentEventLog::open(&path).await.unwrap();
 
     // All offsets should be retrievable and match original payloads
-    for i in 0..offsets.len() {
-        let off = offsets[i];
-        let v1 = log2.get(off).await.expect("value present via mmap or memory");
+    for &off in &offsets {
+        let v1 = log2
+            .get(off)
+            .await
+            .expect("value present via mmap or memory");
         // Fallback comparison through replay to fetch the same event
         let evs = log2.replay(off, Some(off + 1)).await;
         let v2 = evs.first().expect("event exists").payload.clone();

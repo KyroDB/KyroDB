@@ -26,8 +26,7 @@ async fn rmi_probe_histogram_and_mispredict_counter_increment() {
     kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
     std::fs::rename(&tmp, &dst).unwrap();
     if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
-        log
-            .swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi))
+        log.swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi))
             .await;
     } else {
         panic!("failed to load RMI");
@@ -48,16 +47,20 @@ async fn rmi_probe_histogram_and_mispredict_counter_increment() {
     let after = prometheus::gather();
 
     // Helpers to read counter/histogram from MetricFamily
-    fn get_counter(fams: &Vec<prometheus::proto::MetricFamily>, name: &str) -> f64 {
+    fn get_counter(fams: &[prometheus::proto::MetricFamily], name: &str) -> f64 {
         fams.iter()
             .find(|mf| mf.get_name() == name)
-            .and_then(|mf| mf.get_metric().get(0).map(|m| m.get_counter().get_value()))
+            .and_then(|mf| mf.get_metric().first().map(|m| m.get_counter().get_value()))
             .unwrap_or(0.0)
     }
-    fn get_hist_count(fams: &Vec<prometheus::proto::MetricFamily>, name: &str) -> u64 {
+    fn get_hist_count(fams: &[prometheus::proto::MetricFamily], name: &str) -> u64 {
         fams.iter()
             .find(|mf| mf.get_name() == name)
-            .and_then(|mf| mf.get_metric().get(0).map(|m| m.get_histogram().get_sample_count()))
+            .and_then(|mf| {
+                mf.get_metric()
+                    .first()
+                    .map(|m| m.get_histogram().get_sample_count())
+            })
             .unwrap_or(0)
     }
 

@@ -1,5 +1,5 @@
-use clap::Parser;
-use base64::Engine; // bring Engine trait into scope
+use base64::Engine;
+use clap::Parser; // bring Engine trait into scope
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -33,7 +33,11 @@ async fn main() {
     for k in 0..args.load_n {
         let v = vec![0u8; args.val_bytes];
         let body = serde_json::json!({"key": k, "value": engine.encode(v)});
-        let _ = client.post(format!("{}/put", args.base)).json(&body).send().await;
+        let _ = client
+            .post(format!("{}/put", args.base))
+            .json(&body)
+            .send()
+            .await;
     }
 
     // Build URLs based on selected endpoint
@@ -58,7 +62,9 @@ async fn main() {
             let start = std::time::Instant::now();
             let mut count = 0u64;
             // Each task owns its own RNG (Send)
-            let mut rng = StdRng::seed_from_u64(0xDEADBEEF ^ (std::time::Instant::now().elapsed().as_nanos() as u64));
+            let mut rng = StdRng::seed_from_u64(
+                0xDEADBEEF ^ (std::time::Instant::now().elapsed().as_nanos() as u64),
+            );
             while start.elapsed().as_secs() < secs {
                 let k = rng.gen_range(0..load_n);
                 let url = make_url(&base, &endpoint, k);
@@ -71,5 +77,9 @@ async fn main() {
 
     let totals = futures::future::join_all(tasks).await;
     let total: u64 = totals.into_iter().filter_map(|r| r.ok()).sum();
-    println!("reads_total={}, rps={}", total, total as f64 / args.read_seconds as f64);
+    println!(
+        "reads_total={}, rps={}",
+        total,
+        total as f64 / args.read_seconds as f64
+    );
 }

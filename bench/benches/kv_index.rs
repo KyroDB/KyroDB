@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use kyrodb_engine as engine;
-use uuid::Uuid;
 use std::sync::Arc;
+use uuid::Uuid;
 
 fn bench_engine_rmi_lookup(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -13,7 +13,10 @@ fn bench_engine_rmi_lookup(c: &mut Criterion) {
         rt.block_on(async move {
             let log = Arc::new(engine::PersistentEventLog::open(&dir).await.unwrap());
             for i in 0..100_000u64 {
-                let _ = log.append_kv(Uuid::new_v4(), i, vec![0u8; 16]).await.unwrap();
+                let _ = log
+                    .append_kv(Uuid::new_v4(), i, vec![0u8; 16])
+                    .await
+                    .unwrap();
             }
             log.snapshot().await.unwrap();
             let pairs = log.collect_key_offset_pairs().await;
@@ -22,7 +25,8 @@ fn bench_engine_rmi_lookup(c: &mut Criterion) {
             engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
             std::fs::rename(&tmp, &dst).unwrap();
             if let Some(rmi) = engine::index::RmiIndex::load_from_file(&dst) {
-                log.swap_primary_index(engine::index::PrimaryIndex::Rmi(rmi)).await;
+                log.swap_primary_index(engine::index::PrimaryIndex::Rmi(rmi))
+                    .await;
             }
             log
         })

@@ -2,11 +2,8 @@ use once_cell::sync::Lazy;
 use prometheus::{Counter, Encoder, Gauge, Histogram, HistogramOpts, TextEncoder};
 
 pub static APPENDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
-    prometheus::register_counter!(
-        "kyrodb_appends_total",
-        "Total number of appends"
-    )
-    .expect("register kyrodb_appends_total")
+    prometheus::register_counter!("kyrodb_appends_total", "Total number of appends")
+        .expect("register kyrodb_appends_total")
 });
 
 pub static APPEND_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
@@ -16,11 +13,8 @@ pub static APPEND_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 });
 
 pub static SNAPSHOTS_TOTAL: Lazy<Counter> = Lazy::new(|| {
-    prometheus::register_counter!(
-        "kyrodb_snapshots_total",
-        "Total snapshots taken"
-    )
-    .expect("register kyrodb_snapshots_total")
+    prometheus::register_counter!("kyrodb_snapshots_total", "Total snapshots taken")
+        .expect("register kyrodb_snapshots_total")
 });
 
 pub static SNAPSHOT_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
@@ -90,7 +84,9 @@ pub static RMI_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
         "kyrodb_rmi_lookup_latency_seconds",
         "RMI lookup latency in seconds",
     )
-    .buckets(vec![0.000_05, 0.000_1, 0.000_2, 0.000_5, 0.001, 0.005, 0.01]);
+    .buckets(vec![
+        0.000_05, 0.000_1, 0.000_2, 0.000_5, 0.001, 0.005, 0.01,
+    ]);
     prometheus::register_histogram!(opts).expect("register kyrodb_rmi_lookup_latency_seconds")
 });
 
@@ -109,21 +105,21 @@ pub static RMI_INDEX_LEAVES: Lazy<Gauge> = Lazy::new(|| {
     prometheus::register_gauge!(
         "kyrodb_rmi_index_leaves",
         "Number of leaves in the loaded RMI"
-    ).expect("register kyrodb_rmi_index_leaves")
+    )
+    .expect("register kyrodb_rmi_index_leaves")
 });
 
 pub static RMI_INDEX_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
     prometheus::register_gauge!(
         "kyrodb_rmi_index_size_bytes",
         "Size of the RMI file on disk"
-    ).expect("register kyrodb_rmi_index_size_bytes")
+    )
+    .expect("register kyrodb_rmi_index_size_bytes")
 });
 
 pub static RMI_EPSILON_MAX: Lazy<Gauge> = Lazy::new(|| {
-    prometheus::register_gauge!(
-        "kyrodb_rmi_epsilon_max",
-        "Maximum epsilon across leaves"
-    ).expect("register kyrodb_rmi_epsilon_max")
+    prometheus::register_gauge!("kyrodb_rmi_epsilon_max", "Maximum epsilon across leaves")
+        .expect("register kyrodb_rmi_epsilon_max")
 });
 
 // New: RMI rebuild metrics
@@ -131,7 +127,8 @@ pub static RMI_REBUILDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_rmi_rebuilds_total",
         "Total number of successful RMI rebuilds"
-    ).expect("register kyrodb_rmi_rebuilds_total")
+    )
+    .expect("register kyrodb_rmi_rebuilds_total")
 });
 
 pub static RMI_REBUILD_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
@@ -148,7 +145,8 @@ pub static RMI_PROBE_LEN: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "kyrodb_rmi_probe_len",
         "Number of steps in bounded binary search per RMI lookup",
-    ).buckets(vec![1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0]);
+    )
+    .buckets(vec![1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0]);
     prometheus::register_histogram!(opts).expect("register kyrodb_rmi_probe_len")
 });
 
@@ -156,10 +154,13 @@ pub static RMI_MISPREDICTS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_rmi_mispredicts_total",
         "Total number of bounded-search misses in RMI"
-    ).expect("register kyrodb_rmi_mispredicts_total")
+    )
+    .expect("register kyrodb_rmi_mispredicts_total")
 });
 
-pub fn inc_sse_lagged() { SSE_LAGGED_TOTAL.inc(); }
+pub fn inc_sse_lagged() {
+    SSE_LAGGED_TOTAL.inc();
+}
 
 pub fn render() -> String {
     let mut buf = Vec::new();

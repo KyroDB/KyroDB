@@ -3,10 +3,9 @@
 use anyhow::{Context, Result};
 use bincode::Options;
 use chrono::Utc;
-use crc32c;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write, Read};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
@@ -14,6 +13,9 @@ pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 pub mod schema;
+
+// Convenient alias to reduce type complexity for the mmap payload index
+type SnapshotIndex = std::collections::HashMap<u64, (usize, usize)>;
 
 // fsync helper for directories (ensure rename/truncate is durable)
 fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
@@ -29,14 +31,14 @@ pub const SCHEMA_VERSION: u8 = 1;
 /// A key-value record stored as event payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    pub key:   u64,
+    pub key: u64,
     pub value: Vec<u8>,
 }
 
 /// A vector record stored as event payload for exact similarity search
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorRecord {
-    pub key:    u64,
+    pub key: u64,
     pub vector: Vec<f32>,
 }
 
@@ -44,7 +46,7 @@ pub struct VectorRecord {
 pub struct Event {
     pub schema_version: u8,
     pub offset: u64,
-    pub timestamp: u64,    // Unix nanos
+    pub timestamp: u64, // Unix nanos
     pub request_id: Uuid,
     pub payload: Vec<u8>,
 }
@@ -62,28 +64,32 @@ pub struct CompactionStats {
 /// WAL‑and‑Snapshot durable log with broadcast for live tailing
 #[derive(Clone)]
 pub struct PersistentEventLog {
-    inner:    Arc<RwLock<Vec<Event>>>,
-    wal:      Arc<RwLock<BufWriter<File>>>,
+    inner: Arc<RwLock<Vec<Event>>>,
+    wal: Arc<RwLock<BufWriter<File>>>,
     data_dir: PathBuf,
-    tx:       broadcast::Sender<Event>,
-    index:    Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
-    next_offset: Arc<RwLock<u64>>,              // monotonic sequence (not tied to vec length)
+    tx: broadcast::Sender<Event>,
+    index: Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
+    next_offset: Arc<RwLock<u64>>,           // monotonic sequence (not tied to vec length)
     // current WAL segment index for rotation
     wal_seg_index: Arc<RwLock<u32>>,
     // rotation config
     wal_segment_bytes: Arc<RwLock<Option<u64>>>,
     wal_max_segments: Arc<RwLock<usize>>,
     #[cfg(feature = "ann-hnsw")]
-    ann:      Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
+    ann: Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
     // --- NEW: snapshot mmap + payload index for direct reads by offset ---
     snapshot_mmap: Arc<RwLock<Option<memmap2::Mmap>>>,
     // offset -> (payload_start, payload_len) within snapshot mmap
-    snapshot_payload_index: Arc<RwLock<Option<std::collections::HashMap<u64, (usize, usize)>>>>,
+    snapshot_payload_index: Arc<RwLock<Option<SnapshotIndex>>>,
 }
 
 impl PersistentEventLog {
-    fn wal_segment_name(idx: u32) -> String { format!("wal.{idx:04}") }
-    fn wal_segment_path(dir: &std::path::Path, idx: u32) -> PathBuf { dir.join(Self::wal_segment_name(idx)) }
+    fn wal_segment_name(idx: u32) -> String {
+        format!("wal.{idx:04}")
+    }
+    fn wal_segment_path(dir: &std::path::Path, idx: u32) -> PathBuf {
+        dir.join(Self::wal_segment_name(idx))
+    }
 
     fn list_wal_segments(dir: &std::path::Path) -> Vec<(u32, PathBuf)> {
         let mut segs: Vec<(u32, PathBuf)> = Vec::new();
@@ -146,23 +152,38 @@ impl PersistentEventLog {
                 .read(true)
                 .open(path)
                 .with_context(|| format!("opening wal segment: {}", path.display()))?;
-            wal_file.seek(SeekFrom::Start(0)).context("seek wal for replay")?;
+            wal_file
+                .seek(SeekFrom::Start(0))
+                .context("seek wal for replay")?;
             let mut rdr = BufReader::new(&wal_file);
             loop {
                 let mut len_buf = [0u8; 4];
-                if let Err(_) = rdr.read_exact(&mut len_buf) { break; }
+                if rdr.read_exact(&mut len_buf).is_err() {
+                    break;
+                }
                 let len = u32::from_le_bytes(len_buf) as usize;
                 let mut buf = vec![0u8; len];
-                if let Err(_) = rdr.read_exact(&mut buf) { break; }
+                if rdr.read_exact(&mut buf).is_err() {
+                    break;
+                }
                 let mut crc_buf = [0u8; 4];
-                if let Err(_) = rdr.read_exact(&mut crc_buf) { break; }
+                if rdr.read_exact(&mut crc_buf).is_err() {
+                    break;
+                }
                 let crc_read = u32::from_le_bytes(crc_buf);
                 let crc_calc = crc32c::crc32c(&buf);
-                if crc_read != crc_calc { crate::metrics::WAL_CRC_ERRORS_TOTAL.inc(); break; }
+                if crc_read != crc_calc {
+                    crate::metrics::WAL_CRC_ERRORS_TOTAL.inc();
+                    break;
+                }
                 match bopt.deserialize::<Event>(&buf) {
                     Ok(ev) => {
-                        if ev.schema_version != SCHEMA_VERSION { continue; }
-                        if ev.offset as usize >= events.len() { events.push(ev); }
+                        if ev.schema_version != SCHEMA_VERSION {
+                            continue;
+                        }
+                        if ev.offset as usize >= events.len() {
+                            events.push(ev);
+                        }
                     }
                     Err(_) => break,
                 }
@@ -188,12 +209,18 @@ impl PersistentEventLog {
         let mut idx = index::PrimaryIndex::new_btree();
         let mut max_off = 0u64;
         for ev in &events {
-            if ev.offset > max_off { max_off = ev.offset; }
+            if ev.offset > max_off {
+                max_off = ev.offset;
+            }
             if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
                 idx.insert(rec.key, ev.offset);
             }
         }
-        let mut next = if events.is_empty() { 0 } else { max_off.saturating_add(1) };
+        let mut next = if events.is_empty() {
+            0
+        } else {
+            max_off.saturating_add(1)
+        };
 
         // Remove unconditional RMI load by file existence; we'll defer to manifest below
         // #[cfg(feature = "learned-index")]
@@ -212,7 +239,9 @@ impl PersistentEventLog {
             if let Ok(text) = std::fs::read_to_string(&manifest_path) {
                 if let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(n) = j.get("next_offset").and_then(|v| v.as_u64()) {
-                        if n > next { next = n; }
+                        if n > next {
+                            next = n;
+                        }
                     }
                     #[cfg(feature = "learned-index")]
                     if let Some(rmi_name) = j.get("rmi").and_then(|v| v.as_str()) {
@@ -228,17 +257,17 @@ impl PersistentEventLog {
         }
 
         let log = Self {
-            inner:    Arc::new(RwLock::new(events)),
+            inner: Arc::new(RwLock::new(events)),
             wal,
             data_dir: data_dir.clone(),
             tx,
-            index:   Arc::new(RwLock::new(idx)),
+            index: Arc::new(RwLock::new(idx)),
             next_offset: Arc::new(RwLock::new(next)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
             wal_max_segments: Arc::new(RwLock::new(8)),
             #[cfg(feature = "ann-hnsw")]
-            ann:     Arc::new(RwLock::new(None)),
+            ann: Arc::new(RwLock::new(None)),
             snapshot_mmap: Arc::new(RwLock::new(None)),
             snapshot_payload_index: Arc::new(RwLock::new(None)),
         };
@@ -262,17 +291,19 @@ impl PersistentEventLog {
     }
 
     // Parse snapshot.data layout: repeating records of [offset u64][len u64][payload bytes]
-    fn build_snapshot_data_index(m: &memmap2::Mmap) -> Option<std::collections::HashMap<u64, (usize, usize)>> {
+    fn build_snapshot_data_index(m: &memmap2::Mmap) -> Option<SnapshotIndex> {
         use std::collections::HashMap;
         let bytes: &[u8] = &m[..];
         let mut pos: usize = 0;
         let mut map: HashMap<u64, (usize, usize)> = HashMap::new();
         while pos + 16 <= bytes.len() {
-            let off = u64::from_le_bytes(bytes[pos..pos+8].try_into().ok()?);
-            let len = u64::from_le_bytes(bytes[pos+8..pos+16].try_into().ok()?) as usize;
+            let off = u64::from_le_bytes(bytes[pos..pos + 8].try_into().ok()?);
+            let len = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().ok()?) as usize;
             let start = pos + 16;
             let end = start.checked_add(len)?;
-            if end > bytes.len() { return None; }
+            if end > bytes.len() {
+                return None;
+            }
             map.insert(off, (start, len));
             pos = end;
         }
@@ -287,7 +318,9 @@ impl PersistentEventLog {
             if let Some(ref idx) = *self.snapshot_payload_index.read().await {
                 if let Some((start, len)) = idx.get(&offset).copied() {
                     let end = start.saturating_add(len);
-                    if end <= mmap.len() { return Some(mmap[start..end].to_vec()); }
+                    if end <= mmap.len() {
+                        return Some(mmap[start..end].to_vec());
+                    }
                 }
             }
         }
@@ -397,12 +430,16 @@ impl PersistentEventLog {
 
     /// Exact L2 search over all VectorRecord events. Returns top-k (key, distance) ascending.
     pub async fn search_vector_l2(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        if k == 0 { return Vec::new(); }
+        if k == 0 {
+            return Vec::new();
+        }
         let read = self.inner.read().await;
         let mut results: Vec<(u64, f32)> = Vec::new();
         for ev in read.iter() {
             if let Ok(vrec) = bincode::deserialize::<VectorRecord>(&ev.payload) {
-                if vrec.vector.len() != query.len() { continue; }
+                if vrec.vector.len() != query.len() {
+                    continue;
+                }
                 let mut dist: f32 = 0.0;
                 for (a, b) in vrec.vector.iter().zip(query.iter()) {
                     let d = a - b;
@@ -484,10 +521,7 @@ impl PersistentEventLog {
 
     /// Subscribe to all events ≥ `from_offset`.  
     /// Returns `(past_events, live_receiver)`.
-    pub async fn subscribe(
-        &self,
-        from_offset: u64,
-    ) -> (Vec<Event>, broadcast::Receiver<Event>) {
+    pub async fn subscribe(&self, from_offset: u64) -> (Vec<Event>, broadcast::Receiver<Event>) {
         let past = self.replay(from_offset, None).await;
         let rx = self.tx.subscribe();
         (past, rx)
@@ -499,13 +533,14 @@ impl PersistentEventLog {
         // bincode options with a safety limit for serialization
         let bopt = bincode::options().with_limit(16 * 1024 * 1024);
         let path = self.data_dir.join("snapshot.bin");
-        let tmp  = self.data_dir.join("snapshot.tmp");
+        let tmp = self.data_dir.join("snapshot.tmp");
 
         {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
             let mut w = BufWriter::new(f);
             let read = self.inner.read().await;
-            bopt.serialize_into(&mut w, &*read).context("writing snapshot")?;
+            bopt.serialize_into(&mut w, &*read)
+                .context("writing snapshot")?;
             w.flush().context("flushing snapshot")?;
             // Ensure snapshot.tmp contents are durable before rename
             let file = w.into_inner().context("snapshot into_inner")?;
@@ -518,18 +553,24 @@ impl PersistentEventLog {
 
         // Also write a contiguous payloads file for mmap-backed direct reads
         let data_path = self.data_dir.join("snapshot.data");
-        let data_tmp  = self.data_dir.join("snapshot.data.tmp");
+        let data_tmp = self.data_dir.join("snapshot.data.tmp");
         {
-            let mut f = BufWriter::new(File::create(&data_tmp).context("creating snapshot.data.tmp")?);
+            let mut f =
+                BufWriter::new(File::create(&data_tmp).context("creating snapshot.data.tmp")?);
             let read = self.inner.read().await;
             for ev in read.iter() {
                 let len = ev.payload.len() as u64;
-                f.write_all(&ev.offset.to_le_bytes()).context("write snapshot.data offset")?;
-                f.write_all(&len.to_le_bytes()).context("write snapshot.data len")?;
-                f.write_all(&ev.payload).context("write snapshot.data payload")?;
+                f.write_all(&ev.offset.to_le_bytes())
+                    .context("write snapshot.data offset")?;
+                f.write_all(&len.to_le_bytes())
+                    .context("write snapshot.data len")?;
+                f.write_all(&ev.payload)
+                    .context("write snapshot.data payload")?;
             }
             f.flush().ok();
-            if let Ok(mut inner) = f.into_inner() { let _ = inner.sync_all(); }
+            if let Ok(inner) = f.into_inner() {
+                let _ = inner.sync_all();
+            }
         }
         std::fs::rename(&data_tmp, &data_path).ok();
         fsync_dir(&self.data_dir).ok();
@@ -578,8 +619,10 @@ impl PersistentEventLog {
             if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
                 // Keep event with the highest offset for this key
                 match latest.get(&rec.key) {
-                    Some((off, _)) if *off >= ev.offset => {},
-                    _ => { latest.insert(rec.key, (ev.offset, ev)); }
+                    Some((off, _)) if *off >= ev.offset => {}
+                    _ => {
+                        latest.insert(rec.key, (ev.offset, ev));
+                    }
                 }
             }
         }
@@ -631,19 +674,30 @@ impl PersistentEventLog {
     }
 
     /// Path to the schema registry JSON file.
-    pub fn registry_path(&self) -> std::path::PathBuf { self.data_dir.join("schema.json") }
+    pub fn registry_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("schema.json")
+    }
 
     /// Current WAL size in bytes (sum of segments).
-    pub fn wal_size_bytes(&self) -> u64 { Self::wal_total_bytes(&self.data_dir) }
+    pub fn wal_size_bytes(&self) -> u64 {
+        Self::wal_total_bytes(&self.data_dir)
+    }
 
     /// Minimal manifest path
-    pub fn manifest_path(&self) -> std::path::PathBuf { self.data_dir.join("manifest.json") }
+    pub fn manifest_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("manifest.json")
+    }
 
     /// List current WAL segments' basenames
     fn current_wal_segments(&self) -> Vec<String> {
         Self::list_wal_segments(&self.data_dir)
             .into_iter()
-            .map(|(_, p)| p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string())
+            .map(|(_, p)| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect()
     }
 
@@ -675,18 +729,29 @@ impl PersistentEventLog {
 
     async fn rotate_wal_if_needed(&self) {
         let seg_bytes = *self.wal_segment_bytes.read().await;
-        let Some(max_seg_bytes) = seg_bytes else { return; };
-        if max_seg_bytes == 0 { return; }
+        let Some(max_seg_bytes) = seg_bytes else {
+            return;
+        };
+        if max_seg_bytes == 0 {
+            return;
+        }
         let cur_idx = *self.wal_seg_index.read().await;
         let cur_path = Self::wal_segment_path(&self.data_dir, cur_idx);
         let cur_size = std::fs::metadata(&cur_path).map(|m| m.len()).unwrap_or(0);
-        if cur_size < max_seg_bytes { return; }
+        if cur_size < max_seg_bytes {
+            return;
+        }
         // rotate
         let mut w = self.wal.write().await;
         let mut seg_idx = self.wal_seg_index.write().await;
         let next_idx = seg_idx.saturating_add(1);
         let next_path = Self::wal_segment_path(&self.data_dir, next_idx);
-        if let Ok(new_file) = OpenOptions::new().write(true).create(true).truncate(true).open(&next_path) {
+        if let Ok(new_file) = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&next_path)
+        {
             *w = BufWriter::new(new_file);
             *seg_idx = next_idx;
             let _ = fsync_dir(&self.data_dir);
@@ -761,23 +826,23 @@ pub mod http_filters {
     use super::*;
     use warp::Filter;
 
-    pub fn compact_route(log: Arc<PersistentEventLog>) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        warp::path("compact")
-            .and(warp::post())
-            .and_then(move || {
-                let log = log.clone();
-                async move {
-                    match log.compact_keep_latest_and_snapshot_stats().await {
-                        Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"compact":"ok","stats":stats})),
-                            warp::http::StatusCode::OK,
-                        )),
-                        Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error": e.to_string()})),
-                            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        )),
-                    }
+    pub fn compact_route(
+        log: Arc<PersistentEventLog>,
+    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
+        warp::path("compact").and(warp::post()).and_then(move || {
+            let log = log.clone();
+            async move {
+                match log.compact_keep_latest_and_snapshot_stats().await {
+                    Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"compact":"ok","stats":stats})),
+                        warp::http::StatusCode::OK,
+                    )),
+                    Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error": e.to_string()})),
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    )),
                 }
-            })
+            }
+        })
     }
 }

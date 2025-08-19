@@ -10,7 +10,9 @@ async fn subscribe_streams_past_and_live_after_restart() {
     // First run: write a few events
     {
         let log = PersistentEventLog::open(&path).await.unwrap();
-        for _ in 0..3 { let _ = log.append(Uuid::new_v4(), b"x".to_vec()).await.unwrap(); }
+        for _ in 0..3 {
+            let _ = log.append(Uuid::new_v4(), b"x".to_vec()).await.unwrap();
+        }
     }
 
     // Second run: subscribe from 0, ensure past delivered, then live gets one more

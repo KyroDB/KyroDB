@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TableKind {
@@ -21,9 +20,13 @@ pub struct SchemaRegistry {
 }
 
 impl SchemaRegistry {
-    pub fn new() -> Self { Self { tables: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            tables: HashMap::new(),
+        }
+    }
 
-    pub fn load(path: &Path) -> Self {
+    pub fn load(path: &std::path::Path) -> Self {
         if path.exists() {
             if let Ok(bytes) = fs::read(path) {
                 if let Ok(reg) = serde_json::from_slice::<SchemaRegistry>(&bytes) {
@@ -34,8 +37,10 @@ impl SchemaRegistry {
         Self::new()
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let bytes = serde_json::to_vec_pretty(self).unwrap_or_default();
         fs::write(path, bytes)
     }
@@ -45,10 +50,16 @@ impl SchemaRegistry {
     }
 
     pub fn get_vectors_dim(&self, name: &str) -> Option<usize> {
-        self.tables.get(name).and_then(|t| match &t.kind { TableKind::Vectors { dim } => Some(*dim), _ => None })
+        self.tables.get(name).and_then(|t| match &t.kind {
+            TableKind::Vectors { dim } => Some(*dim),
+            _ => None,
+        })
     }
 
     pub fn get_default_vectors_dim(&self) -> Option<usize> {
-        self.tables.values().find_map(|t| match &t.kind { TableKind::Vectors { dim } => Some(*dim), _ => None })
+        self.tables.values().find_map(|t| match &t.kind {
+            TableKind::Vectors { dim } => Some(*dim),
+            _ => None,
+        })
     }
 }

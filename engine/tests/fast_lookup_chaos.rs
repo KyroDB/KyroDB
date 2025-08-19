@@ -13,7 +13,10 @@ async fn test_sync_lookup_race_conditions() {
 
     // Populate with test data
     for i in 0..10000u64 {
-        let _ = log.append_kv(Uuid::new_v4(), i, vec![i as u8; 16]).await.unwrap();
+        let _ = log
+            .append_kv(Uuid::new_v4(), i, vec![i as u8; 16])
+            .await
+            .unwrap();
     }
     log.snapshot().await.unwrap();
 
@@ -35,7 +38,9 @@ async fn test_sync_lookup_race_conditions() {
         let log_clone = log.clone();
         let handle = tokio::spawn(async move {
             for i in 10000..10100 {
-                let _ = log_clone.append_kv(Uuid::new_v4(), i, vec![i as u8; 16]).await;
+                let _ = log_clone
+                    .append_kv(Uuid::new_v4(), i, vec![i as u8; 16])
+                    .await;
                 sleep(Duration::from_micros(100)).await;
             }
         });
@@ -49,7 +54,11 @@ async fn test_sync_lookup_race_conditions() {
 
     // Verify data consistency
     for i in 0..10000u64 {
-        assert!(log.lookup_key(i).await.is_some(), "lookup failed for key {}", i);
+        assert!(
+            log.lookup_key(i).await.is_some(),
+            "lookup failed for key {}",
+            i
+        );
     }
 }
 
@@ -61,7 +70,10 @@ async fn test_rmi_rebuild_during_fast_lookups() {
 
     // Initial data
     for i in 0..5000u64 {
-        let _ = log.append_kv(Uuid::new_v4(), i, vec![i as u8; 8]).await.unwrap();
+        let _ = log
+            .append_kv(Uuid::new_v4(), i, vec![i as u8; 8])
+            .await
+            .unwrap();
     }
     log.snapshot().await.unwrap();
 
@@ -72,7 +84,8 @@ async fn test_rmi_rebuild_during_fast_lookups() {
     kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
     std::fs::rename(&tmp, &dst).unwrap();
     if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
-        log.swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi)).await;
+        log.swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi))
+            .await;
     }
 
     // Continuous fast lookups
@@ -89,17 +102,21 @@ async fn test_rmi_rebuild_during_fast_lookups() {
     for _ in 0..3 {
         // Add more data
         for i in 5000..5100 {
-            let _ = log.append_kv(Uuid::new_v4(), i, vec![i as u8; 8]).await.unwrap();
+            let _ = log
+                .append_kv(Uuid::new_v4(), i, vec![i as u8; 8])
+                .await
+                .unwrap();
         }
-        
+
         // Rebuild RMI
         let pairs = log.collect_key_offset_pairs().await;
         kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
         std::fs::rename(&tmp, &dst).unwrap();
         if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
-            log.swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi)).await;
+            log.swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi))
+                .await;
         }
-        
+
         sleep(Duration::from_millis(5)).await;
     }
 
@@ -107,7 +124,11 @@ async fn test_rmi_rebuild_during_fast_lookups() {
 
     // Verify no data loss during rebuilds
     for i in 0..5000u64 {
-        assert!(log.lookup_key(i).await.is_some(), "Lost key {} during RMI rebuilds", i);
+        assert!(
+            log.lookup_key(i).await.is_some(),
+            "Lost key {} during RMI rebuilds",
+            i
+        );
     }
 }
 
@@ -120,7 +141,7 @@ async fn test_memory_pressure_offset_cache() {
     for i in 0..50000u64 {
         let large_value = vec![i as u8; 1024]; // 1KB per record
         let _ = log.append_kv(Uuid::new_v4(), i, large_value).await.unwrap();
-        
+
         // Periodically check memory doesn't explode
         if i % 10000 == 0 {
             // Force some lookups
@@ -132,14 +153,22 @@ async fn test_memory_pressure_offset_cache() {
 
     // Verify all data is still accessible despite large cache
     for i in (0..50000).step_by(1000) {
-        assert!(log.lookup_key(i).await.is_some(), "Lost key {} under memory pressure", i);
+        assert!(
+            log.lookup_key(i).await.is_some(),
+            "Lost key {} under memory pressure",
+            i
+        );
     }
-    
+
     // Compact should clean up and reduce memory usage
     let _ = log.compact_keep_latest_and_snapshot().await; // Allow to fail on size limit
-    
+
     // Verify data still accessible after compaction
     for i in (0..50000).step_by(1000) {
-        assert!(log.lookup_key(i).await.is_some(), "Lost key {} after compaction", i);
+        assert!(
+            log.lookup_key(i).await.is_some(),
+            "Lost key {} after compaction",
+            i
+        );
     }
 }
