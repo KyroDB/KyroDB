@@ -1,0 +1,77 @@
+#[cfg(feature = "learned-index")]
+#[tokio::test]
+async fn rmi_probe_histogram_and_mispredict_counter_increment() {
+    use kyrodb_engine::PersistentEventLog;
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    // Create isolated data dir
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+
+    // Seed KV data and take a snapshot
+    let log = PersistentEventLog::open(path).await.unwrap();
+    for i in 0..10_000u64 {
+        let _ = log
+            .append_kv(Uuid::new_v4(), i * 10, vec![0u8])
+            .await
+            .unwrap();
+    }
+    log.snapshot().await.unwrap();
+
+    // Build RMI and swap it in
+    let pairs = log.collect_key_offset_pairs().await;
+    let tmp = path.join("index-rmi.tmp");
+    let dst = path.join("index-rmi.bin");
+    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
+    std::fs::rename(&tmp, &dst).unwrap();
+    if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
+        log
+            .swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi))
+            .await;
+    } else {
+        panic!("failed to load RMI");
+    }
+
+    // Gather baseline metrics
+    let before = prometheus::gather();
+
+    // Present key lookup (should record probe len, not mispredict)
+    let present_key = 77_770u64; // multiple of 10 within range
+    let _ = log.lookup_key(present_key).await;
+
+    // Missing key lookup (should record probe len and mispredict)
+    let missing_key = 9_999_999_999u64; // way outside seeded keys
+    let _ = log.lookup_key(missing_key).await;
+
+    // Gather after metrics
+    let after = prometheus::gather();
+
+    // Helpers to read counter/histogram from MetricFamily
+    fn get_counter(fams: &Vec<prometheus::proto::MetricFamily>, name: &str) -> f64 {
+        fams.iter()
+            .find(|mf| mf.get_name() == name)
+            .and_then(|mf| mf.get_metric().get(0).map(|m| m.get_counter().get_value()))
+            .unwrap_or(0.0)
+    }
+    fn get_hist_count(fams: &Vec<prometheus::proto::MetricFamily>, name: &str) -> u64 {
+        fams.iter()
+            .find(|mf| mf.get_name() == name)
+            .and_then(|mf| mf.get_metric().get(0).map(|m| m.get_histogram().get_sample_count()))
+            .unwrap_or(0)
+    }
+
+    let probe_before = get_hist_count(&before, "kyrodb_rmi_probe_len");
+    let probe_after = get_hist_count(&after, "kyrodb_rmi_probe_len");
+    assert!(
+        probe_after >= probe_before + 2,
+        "probe histogram should increase by at least 2 (present+missing)"
+    );
+
+    let mis_before = get_counter(&before, "kyrodb_rmi_mispredicts_total");
+    let mis_after = get_counter(&after, "kyrodb_rmi_mispredicts_total");
+    assert!(
+        mis_after >= mis_before + 1.0,
+        "mispredicts should increase by at least 1"
+    );
+}

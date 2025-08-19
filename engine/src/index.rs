@@ -399,11 +399,23 @@ impl RmiIndex {
 
     pub fn predict_get(&self, key: &u64) -> Option<u64> {
         let keys = self.keys();
-        if keys.is_empty() { return None; }
-        let li = self.find_leaf_index(*key)?;
+        if keys.is_empty() { 
+            crate::metrics::RMI_PROBE_LEN.observe(0.0);
+            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
+            return None; 
+        }
+        let Some(li) = self.find_leaf_index(*key) else {
+            crate::metrics::RMI_PROBE_LEN.observe(0.0);
+            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
+            return None;
+        };
         let leaf = &self.leaves[li];
         let (mut lo, mut hi) = self.predict_window(leaf, *key);
-        if lo > hi { return None; }
+        if lo > hi { 
+            crate::metrics::RMI_PROBE_LEN.observe(0.0);
+            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
+            return None; 
+        }
         let max_idx = keys.len().saturating_sub(1);
         lo = lo.min(max_idx); hi = hi.min(max_idx);
         let mut l = lo; let mut r = hi;
