@@ -3,10 +3,11 @@
 use anyhow::{Context, Result};
 use bincode::Options;
 use chrono::Utc;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::{path::PathBuf, sync::Arc};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 pub mod index;
@@ -81,6 +82,8 @@ pub struct PersistentEventLog {
     snapshot_mmap: Arc<RwLock<Option<memmap2::Mmap>>>,
     // offset -> (payload_start, payload_len) within snapshot mmap
     snapshot_payload_index: Arc<RwLock<Option<SnapshotIndex>>>,
+    // Small hot payload cache keyed by offset
+    wal_block_cache: Arc<RwLock<LruCache<u64, Vec<u8>>>>,
 }
 
 impl PersistentEventLog {
@@ -270,6 +273,7 @@ impl PersistentEventLog {
             ann: Arc::new(RwLock::new(None)),
             snapshot_mmap: Arc::new(RwLock::new(None)),
             snapshot_payload_index: Arc::new(RwLock::new(None)),
+            wal_block_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(4096).unwrap()))),
         };
 
         // Try to mmap snapshot.data and build index for fast get() access.
@@ -311,15 +315,21 @@ impl PersistentEventLog {
     }
 
     /// Get the payload bytes for a given logical offset, if present.
-    /// Uses mmap-backed snapshot when possible, with in-memory fallback.
+    /// Uses mmap-backed snapshot when possible, with in-memory/WAL fallback.
     pub async fn get(&self, offset: u64) -> Option<Vec<u8>> {
+        // Cache hit
+        if let Some(bytes) = self.wal_block_cache.write().await.get(&offset).cloned() {
+            return Some(bytes);
+        }
         // Fast path: read from mmap snapshot if indexed
         if let Some(ref mmap) = *self.snapshot_mmap.read().await {
             if let Some(ref idx) = *self.snapshot_payload_index.read().await {
                 if let Some((start, len)) = idx.get(&offset).copied() {
                     let end = start.saturating_add(len);
                     if end <= mmap.len() {
-                        return Some(mmap[start..end].to_vec());
+                        let bytes = mmap[start..end].to_vec();
+                        self.wal_block_cache.write().await.put(offset, bytes.clone());
+                        return Some(bytes);
                     }
                 }
             }
@@ -327,7 +337,9 @@ impl PersistentEventLog {
         // Fallback: search in-memory events
         let read = self.inner.read().await;
         if let Some(ev) = read.iter().find(|e| e.offset == offset) {
-            return Some(ev.payload.clone());
+            let bytes = ev.payload.clone();
+            self.wal_block_cache.write().await.put(offset, bytes.clone());
+            return Some(bytes);
         }
         None
     }

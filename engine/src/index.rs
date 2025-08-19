@@ -121,10 +121,20 @@ impl RmiIndex {
         buf.sort_by_key(|(k, _)| *k);
         let n = buf.len();
         let total_keys = n as u64;
-        // choose number of leaves
-        let target_leaf = 1024usize; // aim ~1k keys per leaf
+        // choose number of leaves (tunable via env)
+        let target_leaf = std::env::var("KYRODB_RMI_TARGET_LEAF")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024usize);
         let num_leaves = (n.div_ceil(target_leaf)) as u32;
         let mut leaves: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves as usize);
+        // epsilon multiplier (tunable via env) to widen windows on skew
+        let eps_mult: f64 = std::env::var("KYRODB_RMI_EPS_MULT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| *v >= 1.0)
+            .unwrap_or(1.0);
         // build keys, offsets arrays
         let mut keys: Vec<u64> = Vec::with_capacity(n);
         let mut offs: Vec<u64> = Vec::with_capacity(n);
@@ -177,6 +187,7 @@ impl RmiIndex {
                     eps = err;
                 }
             }
+            let eps = ((eps as f64) * eps_mult).round() as u32;
             leaves.push(RmiLeafMeta {
                 key_min: slice_keys.first().copied().unwrap(),
                 key_max: slice_keys.last().copied().unwrap(),

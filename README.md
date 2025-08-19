@@ -6,6 +6,17 @@
 
 ---
 
+## Reproducible Benchmarks
+
+See `bench/README.bench.md` for the full workflow to reproduce 1M/10M/50M results, including how to:
+- Build release binaries with the `learned-index` feature
+- Run HTTP bench using raw/fast endpoints and freeze rebuilds for the read phase
+- Run in-process microbenches (RMI vs B-Tree)
+- Capture artifacts to `bench/results/<commit>/` via `bench/scripts/capture.sh`
+- Adjust RMI tuning via env: `KYRODB_RMI_TARGET_LEAF`, `KYRODB_RMI_EPS_MULT`
+
+---
+
 ## Why KyroDB (what we’re solving)
 
 Many systems combine a log + key-value store + index and accept complexity, large memory overhead, or brittle tail latencies. KyroDB’s thesis:
@@ -13,29 +24,6 @@ Many systems combine a log + key-value store + index and accept complexity, larg
 > You can get a smaller, simpler, and faster single-binary KV engine by pairing an immutable WAL + snapshot durability model with a learned primary index (RMI) tuned for real workload distributions.
 
 This repository is intentionally **narrow**: the primary goal is producing a **production-grade KV engine** (durability, compaction, recovery) + **RMI** implementation and reproducible benchmarks that demonstrate the advantages of learned indexes in real workloads.
-
----
-
-## Performance Optimizations
-
-KyroDB includes several optimizations for sub-100µs lookup performance:
-
-**Engine-level optimizations:**
-- Fast in-memory offset→Record cache for O(1) record retrieval
-- WAL block cache reduces disk I/O for recent segments  
-- Synchronous lookup methods bypass async overhead for benchmarks
-- Memory-mapped snapshots for zero-copy reads
-
-**HTTP optimizations:**
-- `/lookup_fast/{key}` endpoint returns binary offset (8 bytes) 
-- `/lookup_raw?key=N` returns 204/404 without JSON overhead
-- Optional auth bypass for benchmarking endpoints
-- Pre-parsed path parameters avoid query string parsing
-
-**Benchmark targets:**
-- Sub-100µs engine-level lookups (Criterion benchmarks)
-- Sub-1ms HTTP lookups for local traffic
-- Apples-to-apples RMI vs B-Tree comparisons
 
 ---
 
@@ -64,178 +52,131 @@ KyroDB includes several optimizations for sub-100µs lookup performance:
 
 Prereqs: Rust toolchain, (optional) Go for `kyrodbctl`.
 
-Run engine (HTTP)
+Build and run engine (HTTP)
 
 ```bash
-cargo run -p engine -- serve 127.0.0.1 3030 \
-  --wal-segment-bytes 67108864 \
-  --wal-max-segments 8 \
-  --rmi-rebuild-appends 100000 \
-  --rmi-rebuild-ratio 0.25 \
-  --auth-token secret123
+# from repo root
+cargo run -p engine -- serve 127.0.0.1 3030
 ```
 
-Build CLI
+Build CLI (optional)
 
 ```bash
-cd orchestrator && go build -o kyrodbctl .
+cd orchestrator
+# build CLI binary in this folder
+go build -o kyrodbctl .
 ```
 
-Admin ops
+Basic admin + KV demo (HTTP)
 
 ```bash
-# health / offset
-./kyrodbctl -e http://127.0.0.1:3030 --auth-token secret123 health
-./kyrodbctl -e http://127.0.0.1:3030 --auth-token secret123 offset
+# health and offset
+./kyrodbctl -e http://127.0.0.1:3030 health
+./kyrodbctl -e http://127.0.0.1:3030 offset
 
-# trigger snapshot
-./kyrodbctl -e http://127.0.0.1:3030 --auth-token secret123 snapshot
+# trigger a snapshot
+./kyrodbctl -e http://127.0.0.1:3030 snapshot
 
-# run compaction (keep-latest) and snapshot; prints stats
-./kyrodbctl -e http://127.0.0.1:3030 --auth-token secret123 compact
-
-# build RMI (feature learned-index enabled); also auto-rebuilds by thresholds
-./kyrodbctl -e http://127.0.0.1:3030 --auth-token secret123 rmi-build
-
-# metrics
-curl -H 'Authorization: Bearer secret123' http://127.0.0.1:3030/metrics | grep kyrodb_
-```
-
-KV demo
-
-```bash
+# KV put via HTTP
 curl -sX POST http://127.0.0.1:3030/put \
   -H 'content-type: application/json' \
-  -H 'Authorization: Bearer secret123' \
   -d '{"key":123,"value":"hello"}'
 
-./kyrodbctl -e http://127.0.0.1:3030 --auth-token secret123 lookup 123
+# KV get via CLI (lookup by key)
+./kyrodbctl -e http://127.0.0.1:3030 lookup 123
+```
+
+Notes:
+- If you start the server with `--auth-token <TOKEN>`, pass `Authorization: Bearer <TOKEN>` headers in your HTTP requests; the CLI will add a flag for this soon.
+- Release build: `cargo build -p engine --release` (binary at `target/release/engine`).
+
+---
+
+## Protocol decision (current)
+
+- Data plane: HTTP/JSON for Put/Get (temporary while iterating).
+- Control plane: HTTP/JSON endpoints for `/health`, `/metrics` (Prometheus), `/snapshot`, `/offset`, and `/rmi/build`.
+
+gRPC for the data plane is planned (see Roadmap) but not implemented yet.
+
+---
+
+## Architecture (high level)
+
+- **PersistentEventLog (WAL)** — append-only records with configurable fsync.
+- **Snapshotter** — write new snapshot → atomic rename/swap → truncate WAL.
+- **In-memory delta** — fast recent writes map checked before probing index.
+- **RMI (learned index)** — builder and on-disk format under active development; read path will predict approximate position and do a bounded last-mile probe.
+- **Compactor** — will build new snapshots with latest values and reclaim WAL space.
+
+Simplified flow (current):
+
+```
+Client -> HTTP -> WAL.append -> mem-delta -> background snapshot
+                 \-> Get -> mem-delta -> (future: RMI predict) -> last-mile probe -> disk
 ```
 
 ---
 
-## Compaction and WAL rotation
+## What’s implemented (current status)
 
-- Endpoint: `POST /compact` — performs keep-latest compaction, writes a fresh snapshot, resets WAL segments, and returns stats:
-  - before_bytes, after_bytes, segments_removed, segments_active, keys_retained
-- Auto triggers:
-  - `--snapshot-every-n-appends N` compacts when N new events since last snapshot.
-  - `--wal-max-bytes SIZE` compacts when total WAL bytes exceed SIZE.
-- WAL rotation & retention:
-  - `--wal-segment-bytes SIZE` rotates to `wal.000N` when current segment exceeds SIZE.
-  - `--wal-max-segments K` retains at most K segments (oldest removed after rotation).
-
-Metrics:
-- `kyrodb_compaction_duration_seconds`, `kyrodb_compactions_total`
-- `kyrodb_compaction_bytes_processed`, `kyrodb_compaction_bytes_saved`
-- `kyrodb_wal_size_bytes`, `kyrodb_snapshot_size_bytes`
+- WAL append + recovery ✅
+- Snapshot + atomic swap ✅
+- Cold start recovery (snapshot load + WAL replay) ✅
+- In-memory delta and baseline read path ✅
+- RMI scaffolding (admin build endpoint; on-disk loader WIP) ⚠️ in progress
+- Compaction (keep-latest) ⚠️ planned
+- Basic HTTP API + `kyrodbctl` for admin ✅
 
 ---
 
-## RMI: format, bounded probe, and rebuild
+## Benchmarks (how we’ll present claims)
 
-- File: `data/index-rmi.bin` with header magic `KYRO_RMI` and versions:
-  - v2: legacy, no checksum.
-  - v3: adds xxh3_64 checksum.
-  - v4: mmap-friendly, 8-byte alignment padding, xxh3_64 checksum; zero-copy read when aligned.
-- Lookup path:
-  - Check in-memory delta first (recent writes).
-  - Predict leaf and position; bounded binary search within `[pred-ε, pred+ε]` window.
-  - On hit/miss, metrics update: `kyrodb_rmi_hits_total`, `kyrodb_rmi_misses_total`, and `kyrodb_rmi_hit_rate`.
-- Rebuild options:
-  - Background thresholds: `--rmi-rebuild-appends N`, `--rmi-rebuild-ratio R` (delta/total).
-  - Manual: `POST /rmi/build` or `./kyrodbctl rmi-build`.
-  - Atomic swap: write `index-rmi.tmp` → fsync → rename to `index-rmi.bin`.
+Bench scripts and results will live in `/bench`. The README will only present **reproducible benchmarks** with exact hardware and commit hashes. Primary comparisons: RMI vs a baseline B-Tree/rocks-like indexing on point-lookup workloads across uniform and Zipfian keys.
 
-Observability:
-- `kyrodb_rmi_index_size_bytes`, `kyrodb_index_size_bytes` (mirror), `kyrodb_rmi_index_leaves`
-- `kyrodb_rmi_epsilon` histogram and `kyrodb_rmi_epsilon_max`
-- `kyrodb_rmi_rebuilds_total`, `kyrodb_rmi_rebuild_duration_seconds`
+Example claim format (to be populated when results are published):
 
-### Manifest semantics (commit point)
+> On N keys (V-byte values) on machine X with SSD: RMI p99 read latency = X ms vs B-Tree p99 = Y ms (exact bench scripts and CSV in /bench/results).
 
-- The manifest (`data/manifest.json`) is the external commit point for the index and data files.
-- On startup, the engine consults the manifest first to select and validate the RMI: header version and trailing checksum are checked before loading.
-- RMI rebuilds write `index-rmi.tmp`, fsync the file, atomically rename to `index-rmi.bin`, fsync the directory, then update the manifest (with header version and checksum) and fsync the directory again.
+Until the CSVs and run scripts are in the repo, treat any numbers as provisional.
 
 ---
 
-## Security
+## Roadmap (focus: KV + RMI)
 
-- Optional bearer auth: start engine with `--auth-token TOKEN`. The CLI adds the header when `--auth-token` is provided.
+**Short-term (now)**
+
+- Harden WAL + snapshot atomicity and crash tests (fuzz/CI).
+- Finalize RMI file layout (mmap-friendly) + versioning.
+- Implement compaction + WAL truncation service.
+- Publish reproducible benches for 10M and 50M keys.
+
+**Mid-term**
+
+- gRPC data-plane for Put/Get/Subscribe.
+- Perf polish (prefetch, packed layouts), reduce probe tail latencies, autoswitch rebuild heuristics.
+- Deliver Docker image + reproducible bench workflow.
+
+**Long-term (after core is stable)**
+
+- Consider range queries, optional supplemental B-Tree fallback, replication model, and selective vector features (as an experimental plugin).
+
+---
+
+## How to help / contribute
+
+- Open issues with proposed changes and include tests (unit, property) when possible.
+- When touching WAL/snapshot/RMI code paths, include regression/bench evidence.
+- Share bench CSVs in `/bench/results/<your-name>` with machine specs for comparison.
 
 ---
 
-## ADRs
+## License
 
-- `docs/adr/0001-rmi-learned-index.md` updated with current bounded probe and file headers (v2/v3/v4).
-
----
-
-## Bench (scripted)
-
-Build bench runner
-
-```bash
-cargo build -p bench --release
-```
-
-Start engine (release, no background rebuilds for fair comparison)
-
-```bash
-RUST_LOG=info cargo run -p engine --release --features "learned-index" -- serve 127.0.0.1 3030 \
-  --wal-segment-bytes 67108864 --wal-max-segments 8 \
-  --rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0
-```
-
-Run workload (uniform or zipf)
-
-```bash
-# uniform, 1M keys, 64B values, 64 readers for 60s
-./target/release/bench \
-  --base http://127.0.0.1:3030 \
-  --load-n 1000000 \
-  --val-bytes 64 \
-  --load-concurrency 64 \
-  --read-concurrency 128 \
-  --read-seconds 60 \
-  --dist uniform \
-  --out-csv bench_uniform.csv
-
-# zipf
-./target/release/bench --load-n 1000000 --dist zipf --zipf-theta 1.1 --out-csv bench_zipf.csv
-```
-
-Outputs
-- CSV with latency percentiles (us) for 50/90/95/99/99.9.
-- Logs p50/p95/p99, WAL and snapshot sizes, RMI hit rate, and avg RMI probe length scraped from metrics.
-
-Fair-benchmark checklist
-- Use raw route: the bench tool hits `/lookup_raw` (204/404 only) to avoid JSON overhead.
-- Freeze index: set `--rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0`, or run `POST /rmi/build` after load, then measure.
-- Warm up: load and perform a pass before measuring; keep server logs quiet and CPU steady.
-- Compare apples-to-apples: same dataset, concurrency, duration, and machine.
-- Monitor probe behavior: scrape `kyrodb_rmi_probe_len_{sum,count}` and keep average small by tuning leaf size (ε) via `--rmi-leaf-target`.
+Apache-2.0
 
 ---
-## In-Process Microbenchmarks (Criterion)
 
-For raw, HTTP-free performance measurement, use the Criterion benchmarks.
+## Contact / Community
 
-```bash
-# Run BTree-only
-cargo bench -p bench --bench kv_index
-
-# Run RMI too (enable bench feature forwarding to engine)
-cargo bench -p bench --bench kv_index --features learned-index -- --verbose
-```
-
-### Benchmark methodology (reproducible)
-
-- Build in release mode, and disable background rebuilds for fair comparisons:
-  - Engine: `--rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0`
-- Pin to a consistent environment (same machine, idle, performance governor if applicable).
-- Warm up the engine (load and one pass over keys) before measuring.
-- Use HTTP-free Criterion benches for raw index lookup latency.
-- Record RMI and cache effectiveness via metrics:
-  - `kyrodb_rmi_hit_rate`, `kyrodb_rmi_probe_len`, `kyrodb_cache_hits_total`, `kyrodb_cache_misses_total`.
+Open an issue for design discussions; label PRs that are experimental with `experimental`. For fast feedback ping @vatskishan03 on GitHub and Twitter(kishanvats03).
