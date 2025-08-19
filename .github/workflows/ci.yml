@@ -1,10 +1,60 @@
-name: CI (disabled)
+name: CI
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  noop:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "CI temporarily disabled"
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Format & Clippy
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test engine (learned-index)
+        run: cargo test -p engine --features learned-index -- --nocapture
+
+  bench-smoke:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Criterion microbench (smoke)
+        run: |
+          cargo bench -p bench --bench kv_index -- --sample-size 10 || true
+
+  http-bench-smoke:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build engine & bench
+        run: |
+          cargo build -p engine --release
+          cargo build -p bench --release
+      - name: Run engine server
+        run: |
+          target/release/kyrodb-engine serve 127.0.0.1 3030 --rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0 &
+          echo $! > engine.pid
+          sleep 2
+      - name: HTTP bench (lookup_fast) smoke
+        run: |
+          target/release/bench --base http://127.0.0.1:3030 --endpoint lookup_fast --load-n 10000 --read-concurrency 8 --read-seconds 5 || true
+      - name: Stop engine
+        if: always()
+        run: |
+          kill $(cat engine.pid) || true
