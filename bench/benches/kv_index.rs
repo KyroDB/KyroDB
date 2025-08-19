@@ -1,44 +1,63 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use kyrodb_engine as engine;
 use std::sync::Arc;
 use uuid::Uuid;
 
-fn bench_engine_rmi_lookup(c: &mut Criterion) {
+fn bench_engine_indexes(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // One-time setup outside the timed loop
-    let log: Arc<engine::PersistentEventLog> = {
-        let dir = std::env::temp_dir().join(format!("kyrobench-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+    // Build identical datasets in two separate logs: one will use RMI, one B-Tree
+    let (log_rmi, log_btree) = {
+        let dir_rmi = std::env::temp_dir().join(format!("kyrobench-rmi-{}", Uuid::new_v4()));
+        let dir_bt = std::env::temp_dir().join(format!("kyrobench-bt-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir_rmi).unwrap();
+        std::fs::create_dir_all(&dir_bt).unwrap();
         rt.block_on(async move {
-            let log = Arc::new(engine::PersistentEventLog::open(&dir).await.unwrap());
+            let rmi = Arc::new(engine::PersistentEventLog::open(&dir_rmi).await.unwrap());
+            let bt = Arc::new(engine::PersistentEventLog::open(&dir_bt).await.unwrap());
+
+            // Load the same dataset into both
             for i in 0..100_000u64 {
-                let _ = log
-                    .append_kv(Uuid::new_v4(), i, vec![0u8; 16])
+                let payload = vec![0u8; 16];
+                let _ = rmi
+                    .append_kv(Uuid::new_v4(), i, payload.clone())
+                    .await
+                    .unwrap();
+                let _ = bt
+                    .append_kv(Uuid::new_v4(), i, payload.clone())
                     .await
                     .unwrap();
             }
-            log.snapshot().await.unwrap();
-            let pairs = log.collect_key_offset_pairs().await;
-            let tmp = dir.join("index-rmi.tmp");
-            let dst = dir.join("index-rmi.bin");
+            rmi.snapshot().await.unwrap();
+            bt.snapshot().await.unwrap();
+
+            // Build RMI for the rmi log only
+            let pairs = rmi.collect_key_offset_pairs().await;
+            let tmp = dir_rmi.join("index-rmi.tmp");
+            let dst = dir_rmi.join("index-rmi.bin");
             engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
             std::fs::rename(&tmp, &dst).unwrap();
-            if let Some(rmi) = engine::index::RmiIndex::load_from_file(&dst) {
-                log.swap_primary_index(engine::index::PrimaryIndex::Rmi(rmi))
+            if let Some(rindex) = engine::index::RmiIndex::load_from_file(&dst) {
+                rmi.swap_primary_index(engine::index::PrimaryIndex::Rmi(rindex))
                     .await;
             }
-            log
+
+            // B-Tree stays as default primary
+            (rmi, bt)
         })
     };
 
-    c.bench_function("engine_rmi_lookup_key", |b| {
-        b.to_async(&rt).iter(|| async {
-            let k = 77_777u64;
-            let _ = log.lookup_key(black_box(k)).await;
-        })
-    });
+    let mut group = c.benchmark_group("engine_lookup_key");
+    for (name, handle) in [("rmi", log_rmi), ("btree", log_btree)] {
+        group.bench_function(BenchmarkId::from_parameter(name), |b| {
+            b.to_async(&rt).iter(|| async {
+                let k = 77_777u64;
+                let _ = handle.lookup_key(black_box(k)).await;
+            })
+        });
+    }
+    group.finish();
 }
 
-criterion_group!(benches, bench_engine_rmi_lookup);
+criterion_group!(benches, bench_engine_indexes);
 criterion_main!(benches);

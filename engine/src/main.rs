@@ -680,8 +680,13 @@ async fn main() -> Result<()> {
             let offset_route = auth.clone().and(offset_route).map(|(), r| r);
             let put_route = auth.clone().and(put_route).map(|(), r| r);
             let lookup_route = auth.clone().and(lookup_route).map(|(), r| r);
-            let lookup_raw = auth.clone().and(lookup_raw).map(|(), r| r);
-            let lookup_fast = auth.clone().and(lookup_fast).map(|(), r| r);
+            // For hot-path routes, bypass auth entirely when no token is configured
+            let mut lookup_raw = lookup_raw.boxed();
+            let mut lookup_fast = lookup_fast.boxed();
+            if auth_token.is_some() {
+                lookup_raw = auth.clone().and(lookup_raw).map(|(), r| r).boxed();
+                lookup_fast = auth.clone().and(lookup_fast).map(|(), r| r).boxed();
+            }
             let sql_route = auth.clone().and(sql_route).map(|(), r| r);
             let vector_insert = auth.clone().and(vector_insert).map(|(), r| r);
             let vector_search = auth.clone().and(vector_search).map(|(), r| r);
