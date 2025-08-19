@@ -405,11 +405,9 @@ async fn main() -> Result<()> {
                     async move {
                         if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
                             if let Some(offset) = log.lookup_key(k).await {
-                                let evs = log.replay(offset, Some(offset + 1)).await;
-                                if let Some(ev) = evs.into_iter().next() {
-                                    if let Ok(rec) =
-                                        bincode::deserialize::<kyrodb_engine::Record>(&ev.payload)
-                                    {
+                                // Fetch payload via mmap-backed snapshot (with WAL/memory fallback)
+                                if let Some(bytes) = log.get(offset).await {
+                                    if let Ok(rec) = bincode::deserialize::<kyrodb_engine::Record>(&bytes) {
                                         return Ok::<_, warp::Rejection>(warp::reply::json(
                                             &serde_json::json!({
                                                 "key": rec.key,

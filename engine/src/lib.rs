@@ -575,6 +575,16 @@ impl PersistentEventLog {
         std::fs::rename(&data_tmp, &data_path).ok();
         fsync_dir(&self.data_dir).ok();
 
+        // Refresh mmap + payload index to point at the latest snapshot.data
+        if let Ok(file) = File::open(&data_path) {
+            if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
+                if let Some(index_map) = Self::build_snapshot_data_index(&mmap) {
+                    *self.snapshot_payload_index.write().await = Some(index_map);
+                    *self.snapshot_mmap.write().await = Some(mmap);
+                }
+            }
+        }
+
         // After a successful snapshot, reset WAL segments (truncate to a fresh segment)
         {
             // Close current writer and replace with a fresh segment 0
