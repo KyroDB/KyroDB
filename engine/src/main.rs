@@ -283,6 +283,33 @@ async fn main() -> Result<()> {
                         }
                     });
 
+            let fast_val_log = log.clone();
+            let get_fast = warp::path!("get_fast" / u64)
+                .and(warp::get())
+                .and_then(move |k: u64| {
+                    let log = fast_val_log.clone();
+                    async move {
+                        use warp::http::{Response, StatusCode};
+                        if let Some(off) = log.lookup_key(k).await {
+                            if let Some(bytes) = log.get(off).await {
+                                if let Ok(rec) = bincode::deserialize::<kyrodb_engine::Record>(&bytes) {
+                                    let resp = Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header("Content-Type", "application/octet-stream")
+                                        .body(rec.value)
+                                        .map_err(|_| warp::reject::reject())?;
+                                    return Ok::<_, warp::Rejection>(resp);
+                                }
+                            }
+                        }
+                        let resp = Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Vec::new())
+                            .map_err(|_| warp::reject::reject())?;
+                        Ok::<_, warp::Rejection>(resp)
+                    }
+                });
+
             let append_log = log.clone();
             let append_route = warp::path("append")
                 .and(warp::post())
@@ -674,9 +701,11 @@ async fn main() -> Result<()> {
             // For hot-path routes, bypass auth entirely when no token is configured
             let mut lookup_raw = lookup_raw.boxed();
             let mut lookup_fast = lookup_fast.boxed();
+            let mut get_fast = get_fast.boxed();
             if auth_token.is_some() {
                 lookup_raw = auth.clone().and(lookup_raw).map(|(), r| r).boxed();
                 lookup_fast = auth.clone().and(lookup_fast).map(|(), r| r).boxed();
+                get_fast = auth.clone().and(get_fast).map(|(), r| r).boxed();
             }
             let sql_route = auth.clone().and(sql_route).map(|(), r| r);
             let vector_insert = auth.clone().and(vector_insert).map(|(), r| r);
@@ -695,6 +724,7 @@ async fn main() -> Result<()> {
                 .or(lookup_route)
                 .or(lookup_raw)
                 .or(lookup_fast)
+                .or(get_fast)
                 .or(sql_route)
                 .or(vector_insert)
                 .or(vector_search)
