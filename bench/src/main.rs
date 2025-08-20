@@ -105,7 +105,7 @@ async fn main() {
         warm_tasks.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(0xC0FFEE ^ (i as u64));
             let zipf = if dist == "zipf" {
-                Zipf::new(load_n.max(1), zipf_s).ok()
+                Zipf::new(load_n.max(1) as u64, zipf_s).ok()
             } else { None };
             while Instant::now() < warmup_deadline {
                 let k = if let Some(ref z) = zipf { z.sample(&mut rng) as u64 - 1 } else { rng.gen_range(0..load_n as u64) };
@@ -135,7 +135,7 @@ async fn main() {
         tasks.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(0xDEADBEEF ^ (i as u64));
             let zipf = if dist == "zipf" {
-                Zipf::new(load_n.max(1), zipf_s).ok()
+                Zipf::new(load_n.max(1) as u64, zipf_s).ok()
             } else { None };
             while Instant::now() < deadline {
                 let k = if let Some(ref z) = zipf { z.sample(&mut rng) as u64 - 1 } else { rng.gen_range(0..load_n as u64) };
@@ -164,7 +164,8 @@ async fn main() {
     // Scrape /metrics to compute avg RMI lookup latency and avg probe len if present
     let mut rmi_lookup_avg_us: Option<f64> = None;
     let mut rmi_probe_len_avg: Option<f64> = None;
-    if let Ok(text) = client.get(format!("{}/metrics", args.base)).send().await.and_then(|r| r.text()).await {
+    if let Ok(response) = client.get(format!("{}/metrics", args.base)).send().await {
+        if let Ok(text) = response.text().await {
         let mut sums: HashMap<&str, f64> = HashMap::new();
         let mut counts: HashMap<&str, f64> = HashMap::new();
         for line in text.lines() {
@@ -183,6 +184,7 @@ async fn main() {
         }
         if let (Some(s), Some(c)) = (sums.get("probe"), counts.get("probe")) {
             if *c > 0.0 { rmi_probe_len_avg = Some(*s / *c); }
+        }
         }
     }
 
