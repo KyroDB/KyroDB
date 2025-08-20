@@ -319,8 +319,10 @@ impl PersistentEventLog {
     pub async fn get(&self, offset: u64) -> Option<Vec<u8>> {
         // Cache hit
         if let Some(bytes) = self.wal_block_cache.write().await.get(&offset).cloned() {
+            crate::metrics::WAL_BLOCK_CACHE_HITS_TOTAL.inc();
             return Some(bytes);
         }
+        crate::metrics::WAL_BLOCK_CACHE_MISSES_TOTAL.inc();
         // Fast path: read from mmap snapshot if indexed
         if let Some(ref mmap) = *self.snapshot_mmap.read().await {
             if let Some(ref idx) = *self.snapshot_payload_index.read().await {
@@ -543,7 +545,7 @@ impl PersistentEventLog {
     pub async fn snapshot(&self) -> Result<()> {
         let timer = metrics::SNAPSHOT_LATENCY_SECONDS.start_timer();
         // bincode options with a safety limit for serialization
-        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+        let bincode::Options = bincode::options().with_limit(16 * 1024 * 1024);
         let path = self.data_dir.join("snapshot.bin");
         let tmp = self.data_dir.join("snapshot.tmp");
 
@@ -551,7 +553,8 @@ impl PersistentEventLog {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
             let mut w = BufWriter::new(f);
             let read = self.inner.read().await;
-            bopt.serialize_into(&mut w, &*read)
+            bincode::Options
+                .serialize_into(&mut w, &*read)
                 .context("writing snapshot")?;
             w.flush().context("flushing snapshot")?;
             // Ensure snapshot.tmp contents are durable before rename
@@ -561,7 +564,9 @@ impl PersistentEventLog {
 
         std::fs::rename(&tmp, &path).context("renaming snapshot")?;
         // Ensure the rename is durable
-        fsync_dir(&self.data_dir).context("fsync data dir after snapshot rename").ok();
+        if let Err(e) = fsync_dir(&self.data_dir) {
+            eprintln!("⚠️ fsync data dir after snapshot rename failed: {}", e);
+        }
 
         // Also write a contiguous payloads file for mmap-backed direct reads
         let data_path = self.data_dir.join("snapshot.data");
@@ -584,7 +589,9 @@ impl PersistentEventLog {
             inner.sync_all().context("fsync snapshot.data.tmp")?;
         }
         std::fs::rename(&data_tmp, &data_path).context("rename snapshot.data.tmp")?;
-        fsync_dir(&self.data_dir).context("fsync after snapshot.data rename").ok();
+        if let Err(e) = fsync_dir(&self.data_dir) {
+            eprintln!("⚠️ fsync after snapshot.data rename failed: {}", e);
+        }
 
         // Refresh mmap + payload index to point at the latest snapshot.data
         if let Ok(file) = File::open(&data_path) {
@@ -618,7 +625,9 @@ impl PersistentEventLog {
             *seg_idx = 0;
         }
         // And fsync directory to persist metadata updates
-        fsync_dir(&self.data_dir).context("fsync data dir after wal reset").ok();
+        if let Err(e) = fsync_dir(&self.data_dir) {
+            eprintln!("⚠️ fsync data dir after wal reset failed: {}", e);
+        }
 
         metrics::SNAPSHOTS_TOTAL.inc();
         timer.observe_duration();
@@ -778,7 +787,9 @@ impl PersistentEventLog {
         {
             *w = BufWriter::new(new_file);
             *seg_idx = next_idx;
-            let _ = fsync_dir(&self.data_dir);
+            if let Err(e) = fsync_dir(&self.data_dir) {
+                eprintln!("⚠️ fsync data dir after wal rotate failed: {}", e);
+            }
             drop(w);
             drop(seg_idx);
             // retention
@@ -793,7 +804,9 @@ impl PersistentEventLog {
                             let _ = std::fs::remove_file(path);
                         }
                     }
-                    let _ = fsync_dir(&self.data_dir);
+                    if let Err(e) = fsync_dir(&self.data_dir) {
+                        eprintln!("⚠️ fsync data dir after wal retention failed: {}", e);
+                    }
                 }
             }
             // update manifest after rotation
@@ -801,12 +814,6 @@ impl PersistentEventLog {
                 eprintln!("⚠️ manifest write after rotation failed: {}", e);
             }
         }
-    }
-
-    /// Configure WAL rotation: segment size threshold and max segments retained.
-    pub async fn configure_wal_rotation(&self, segment_bytes: Option<u64>, max_segments: usize) {
-        *self.wal_segment_bytes.write().await = segment_bytes;
-        *self.wal_max_segments.write().await = max_segments.max(1);
     }
 }
 

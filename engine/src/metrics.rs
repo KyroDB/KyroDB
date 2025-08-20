@@ -17,6 +17,8 @@ mod shim {
     pub static SNAPSHOT_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static SSE_LAGGED_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static WAL_CRC_ERRORS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static WAL_BLOCK_CACHE_HITS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static WAL_BLOCK_CACHE_MISSES_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static COMPACTIONS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static COMPACTION_DURATION_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_HITS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
@@ -40,7 +42,7 @@ pub use shim::{
     RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL, RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES,
     RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL, RMI_MISSES_TOTAL, RMI_PROBE_LEN,
     RMI_REBUILD_DURATION_SECONDS, RMI_REBUILDS_TOTAL, SNAPSHOT_LATENCY_SECONDS, SNAPSHOTS_TOTAL,
-    SSE_LAGGED_TOTAL, WAL_CRC_ERRORS_TOTAL, inc_sse_lagged, render,
+    SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL, WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, inc_sse_lagged, render,
 };
 
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -199,6 +201,24 @@ pub static RMI_MISPREDICTS_TOTAL: Lazy<Counter> = Lazy::new(|| {
         "Total number of bounded-search misses in RMI"
     )
     .expect("register kyrodb_rmi_mispredicts_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static WAL_BLOCK_CACHE_HITS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_wal_block_cache_hits_total",
+        "Total number of payload cache hits"
+    )
+    .expect("register kyrodb_wal_block_cache_hits_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static WAL_BLOCK_CACHE_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_wal_block_cache_misses_total",
+        "Total number of payload cache misses"
+    )
+    .expect("register kyrodb_wal_block_cache_misses_total")
 });
 
 pub fn inc_sse_lagged() {
