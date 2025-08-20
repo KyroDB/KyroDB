@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
                                 engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                                 rebuild_timer.observe_duration();
                                 // Commit manifest LAST via library API
-                                rebuild_log.write_manifest().await;
+                                let _ = rebuild_log.write_manifest().await;
                                 println!("✅ RMI rebuilt, swapped, and manifest committed (appended={}, ratio={:.3})", appended, ratio);
                             } else {
                                 eprintln!("❌ RMI reload failed after rebuild");
@@ -320,8 +320,9 @@ async fn main() -> Result<()> {
                         use warp::http::StatusCode;
                         let payload = body["payload"].as_str().unwrap_or("").as_bytes().to_vec();
                         match log.append(Uuid::new_v4(), payload).await {
-                            Ok(offset) => Ok::<_, warp::Rejection>(warp::reply::json(
-                                &serde_json::json!({ "offset": offset }),
+                            Ok(offset) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "offset": offset })),
+                                StatusCode::OK,
                             )),
                             Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
@@ -422,8 +423,9 @@ async fn main() -> Result<()> {
                         let key = body["key"].as_u64().unwrap_or(0);
                         let value = body["value"].as_str().unwrap_or("").as_bytes().to_vec();
                         match log.append_kv(Uuid::new_v4(), key, value).await {
-                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::json(
-                                &serde_json::json!({ "offset": off }),
+                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "offset": off })),
+                                StatusCode::OK,
                             )),
                             Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
@@ -592,7 +594,7 @@ async fn main() -> Result<()> {
                                     .await;
                                     engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                                     // Commit manifest as the external commit point
-                                    log.write_manifest().await;
+                                    let _ = log.write_manifest().await;
                                 } else {
                                     eprintln!("❌ RMI reload failed after rebuild");
                                     ok = false;
@@ -679,8 +681,9 @@ async fn main() -> Result<()> {
                             })
                             .unwrap_or_default();
                         match log.append_vector(Uuid::new_v4(), key, vec).await {
-                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::json(
-                                &serde_json::json!({"offset": off}),
+                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({"offset": off})),
+                                StatusCode::OK,
                             )),
                             Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
@@ -709,7 +712,6 @@ async fn main() -> Result<()> {
             }
             let sql_route = auth.clone().and(sql_route).map(|(), r| r);
             let vector_insert = auth.clone().and(vector_insert).map(|(), r| r);
-            let vector_search = auth.clone().and(vector_search).map(|(), r| r);
             let rmi_build = auth.clone().and(rmi_build).map(|(), r| r);
 
             // Combine routes
@@ -727,7 +729,6 @@ async fn main() -> Result<()> {
                 .or(get_fast)
                 .or(sql_route)
                 .or(vector_insert)
-                .or(vector_search)
                 .or(rmi_build)
                 .or(compact_route)
                 .recover(|rej: warp::Rejection| async move {

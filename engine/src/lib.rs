@@ -760,6 +760,26 @@ impl PersistentEventLog {
         *idx = new_index;
     }
 
+    /// Configure WAL rotation parameters and apply them immediately.
+    pub async fn configure_wal_rotation(
+        &self,
+        segment_bytes: Option<u64>,
+        max_segments: usize,
+    ) {
+        {
+            let mut seg_bytes = self.wal_segment_bytes.write().await;
+            *seg_bytes = segment_bytes;
+        }
+        {
+            let mut max = self.wal_max_segments.write().await;
+            *max = max_segments;
+        }
+        // Attempt a rotation right away if thresholds are exceeded
+        self.rotate_wal_if_needed().await;
+        // Best-effort manifest update reflecting new retention/segments
+        let _ = self.write_manifest().await;
+    }
+
     async fn rotate_wal_if_needed(&self) {
         let seg_bytes = *self.wal_segment_bytes.read().await;
         let Some(max_seg_bytes) = seg_bytes else {

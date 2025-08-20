@@ -51,17 +51,20 @@ pub static APPENDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
         .expect("register kyrodb_appends_total")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static APPEND_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new("kyrodb_append_latency_seconds", "Append latency in seconds")
         .buckets(vec![0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]);
     prometheus::register_histogram!(opts).expect("register kyrodb_append_latency_seconds")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static SNAPSHOTS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!("kyrodb_snapshots_total", "Total snapshots taken")
         .expect("register kyrodb_snapshots_total")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static SNAPSHOT_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "kyrodb_snapshot_latency_seconds",
@@ -71,6 +74,7 @@ pub static SNAPSHOT_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_snapshot_latency_seconds")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static SSE_LAGGED_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_sse_lagged_total",
@@ -80,6 +84,7 @@ pub static SSE_LAGGED_TOTAL: Lazy<Counter> = Lazy::new(|| {
 });
 
 // New: WAL CRC errors
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static WAL_CRC_ERRORS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_wal_crc_errors_total",
@@ -89,6 +94,7 @@ pub static WAL_CRC_ERRORS_TOTAL: Lazy<Counter> = Lazy::new(|| {
 });
 
 // New: Compactions
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static COMPACTIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_compactions_total",
@@ -97,6 +103,7 @@ pub static COMPACTIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_compactions_total")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static COMPACTION_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "kyrodb_compaction_duration_seconds",
@@ -107,6 +114,7 @@ pub static COMPACTION_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 });
 
 // New: RMI hits/misses (only incremented when learned-index feature is active)
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_HITS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_rmi_hits_total",
@@ -115,6 +123,7 @@ pub static RMI_HITS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_rmi_hits_total")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_rmi_misses_total",
@@ -124,6 +133,7 @@ pub static RMI_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
 });
 
 // New: RMI lookup latency histogram
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "kyrodb_rmi_lookup_latency_seconds",
@@ -136,6 +146,7 @@ pub static RMI_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 });
 
 // New: epsilon distribution (recorded as histogram in units of keys)
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_EPSILON_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "kyrodb_rmi_epsilon",
@@ -146,6 +157,7 @@ pub static RMI_EPSILON_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
 });
 
 // New: RMI gauges
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_INDEX_LEAVES: Lazy<Gauge> = Lazy::new(|| {
     prometheus::register_gauge!(
         "kyrodb_rmi_index_leaves",
@@ -154,6 +166,7 @@ pub static RMI_INDEX_LEAVES: Lazy<Gauge> = Lazy::new(|| {
     .expect("register kyrodb_rmi_index_leaves")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_INDEX_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
     prometheus::register_gauge!(
         "kyrodb_rmi_index_size_bytes",
@@ -162,12 +175,14 @@ pub static RMI_INDEX_SIZE_BYTES: Lazy<Gauge> = Lazy::new(|| {
     .expect("register kyrodb_rmi_index_size_bytes")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_EPSILON_MAX: Lazy<Gauge> = Lazy::new(|| {
     prometheus::register_gauge!("kyrodb_rmi_epsilon_max", "Maximum epsilon across leaves")
         .expect("register kyrodb_rmi_epsilon_max")
 });
 
 // New: RMI rebuild metrics
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_REBUILDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_rmi_rebuilds_total",
@@ -176,6 +191,7 @@ pub static RMI_REBUILDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_rmi_rebuilds_total")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_REBUILD_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "kyrodb_rmi_rebuild_duration_seconds",
@@ -186,6 +202,7 @@ pub static RMI_REBUILD_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 });
 
 // New: RMI probe length histogram and mispredict counter
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_PROBE_LEN: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
         "kyrodb_rmi_probe_len",
@@ -195,6 +212,7 @@ pub static RMI_PROBE_LEN: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_rmi_probe_len")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_MISPREDICTS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
         "kyrodb_rmi_mispredicts_total",
@@ -221,10 +239,12 @@ pub static WAL_BLOCK_CACHE_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_wal_block_cache_misses_total")
 });
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub fn inc_sse_lagged() {
     SSE_LAGGED_TOTAL.inc();
 }
 
+#[cfg(not(feature = "bench-no-metrics"))]
 pub fn render() -> String {
     let mut buf = Vec::new();
     let encoder = TextEncoder::new();
