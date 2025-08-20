@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use prometheus::{Counter, Encoder, Gauge, Histogram, HistogramOpts, TextEncoder};
+use prometheus::{Counter, Gauge, Histogram, HistogramOpts};
 
 #[cfg(feature = "bench-no-metrics")]
 mod shim {
@@ -246,6 +246,7 @@ pub fn inc_sse_lagged() {
 
 #[cfg(not(feature = "bench-no-metrics"))]
 pub fn render() -> String {
+    use prometheus::{Encoder, TextEncoder};
     let mut buf = Vec::new();
     let encoder = TextEncoder::new();
     let mf = prometheus::gather();
