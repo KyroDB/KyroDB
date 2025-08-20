@@ -100,7 +100,7 @@ async fn main() {
         let base = args.base.clone();
         let endpoint = args.endpoint.clone();
         let dist = args.dist.clone();
-        let load_n = args.load_n as usize;
+        let load_n = args.load_n as u64;
         let zipf_s = args.zipf_s;
         warm_tasks.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(0xC0FFEE ^ (i as u64));
@@ -108,7 +108,7 @@ async fn main() {
                 Zipf::new(load_n.max(1), zipf_s).ok()
             } else { None };
             while Instant::now() < warmup_deadline {
-                let k = if let Some(ref z) = zipf { z.sample(&mut rng) as u64 - 1 } else { rng.gen_range(0..load_n as u64) };
+                let k = if let Some(ref z) = zipf { z.sample(&mut rng) as u64 - 1 } else { rng.gen_range(0..load_n) };
                 let url = make_url(&base, &endpoint, k);
                 let _ = client.get(url).send().await;
             }
@@ -130,7 +130,7 @@ async fn main() {
         let hist = hist.clone();
         let total = total.clone();
         let dist = args.dist.clone();
-        let load_n = args.load_n as usize;
+        let load_n = args.load_n as u64;
         let zipf_s = args.zipf_s;
         tasks.push(tokio::spawn(async move {
             let mut rng = StdRng::seed_from_u64(0xDEADBEEF ^ (i as u64));
@@ -138,7 +138,7 @@ async fn main() {
                 Zipf::new(load_n.max(1), zipf_s).ok()
             } else { None };
             while Instant::now() < deadline {
-                let k = if let Some(ref z) = zipf { z.sample(&mut rng) as u64 - 1 } else { rng.gen_range(0..load_n as u64) };
+                let k = if let Some(ref z) = zipf { z.sample(&mut rng) as u64 - 1 } else { rng.gen_range(0..load_n) };
                 let url = make_url(&base, &endpoint, k);
                 let t0 = Instant::now();
                 let _ = client.get(url).send().await;
@@ -164,25 +164,27 @@ async fn main() {
     // Scrape /metrics to compute avg RMI lookup latency and avg probe len if present
     let mut rmi_lookup_avg_us: Option<f64> = None;
     let mut rmi_probe_len_avg: Option<f64> = None;
-    if let Ok(text) = client.get(format!("{}/metrics", args.base)).send().await.and_then(|r| r.text()).await {
-        let mut sums: HashMap<&str, f64> = HashMap::new();
-        let mut counts: HashMap<&str, f64> = HashMap::new();
-        for line in text.lines() {
-            if line.starts_with("kyrodb_rmi_lookup_latency_seconds_sum") {
-                if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("lookup", x); } }
-            } else if line.starts_with("kyrodb_rmi_lookup_latency_seconds_count") {
-                if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("lookup", x); } }
-            } else if line.starts_with("kyrodb_rmi_probe_len_sum") {
-                if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("probe", x); } }
-            } else if line.starts_with("kyrodb_rmi_probe_len_count") {
-                if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("probe", x); } }
+    if let Ok(resp) = client.get(format!("{}/metrics", args.base)).send().await {
+        if let Ok(text) = resp.text().await {
+            let mut sums: HashMap<&str, f64> = HashMap::new();
+            let mut counts: HashMap<&str, f64> = HashMap::new();
+            for line in text.lines() {
+                if line.starts_with("kyrodb_rmi_lookup_latency_seconds_sum") {
+                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("lookup", x); } }
+                } else if line.starts_with("kyrodb_rmi_lookup_latency_seconds_count") {
+                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("lookup", x); } }
+                } else if line.starts_with("kyrodb_rmi_probe_len_sum") {
+                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("probe", x); } }
+                } else if line.starts_with("kyrodb_rmi_probe_len_count") {
+                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("probe", x); } }
+                }
             }
-        }
-        if let (Some(s), Some(c)) = (sums.get("lookup"), counts.get("lookup")) {
-            if *c > 0.0 { rmi_lookup_avg_us = Some((*s / *c) * 1_000_000.0); }
-        }
-        if let (Some(s), Some(c)) = (sums.get("probe"), counts.get("probe")) {
-            if *c > 0.0 { rmi_probe_len_avg = Some(*s / *c); }
+            if let (Some(s), Some(c)) = (sums.get("lookup"), counts.get("lookup")) {
+                if *c > 0.0 { rmi_lookup_avg_us = Some((*s / *c) * 1_000_000.0); }
+            }
+            if let (Some(s), Some(c)) = (sums.get("probe"), counts.get("probe")) {
+                if *c > 0.0 { rmi_probe_len_avg = Some(*s / *c); }
+            }
         }
     }
 

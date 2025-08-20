@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use kyrodb_engine::index::{BTreeIndex, RmiIndex};
+use kyrodb_engine::Index; // bring trait into scope for insert/get
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 fn build_pairs(n: usize) -> Vec<(u64, u64)> {
