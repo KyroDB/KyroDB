@@ -16,6 +16,7 @@ path = "src/main.rs"
 learned-index = []
 ann-hnsw = ["dep:hora"]
 http-test = []
+bench-no-metrics = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

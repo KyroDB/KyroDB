@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-kyrodb_engine = { package = "engine", path = "../engine", features = ["learned-index"] }
+kyrodb_engine = { package = "engine", path = "../engine", features = ["learned-index", "bench-no-metrics"] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.5" }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 rand = "0.8"

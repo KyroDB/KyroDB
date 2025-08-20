@@ -1,6 +1,40 @@
 use once_cell::sync::Lazy;
 use prometheus::{Counter, Encoder, Gauge, Histogram, HistogramOpts, TextEncoder};
 
+#[cfg(feature = "bench-no-metrics")]
+mod shim {
+    use super::*;
+    pub struct NoopCounter;
+    impl NoopCounter { pub fn inc(&self) {} }
+    pub struct NoopGauge;
+    impl NoopGauge { pub fn set(&self, _v: f64) {} }
+    pub struct NoopHistogram;
+    impl NoopHistogram { pub fn observe(&self, _v: f64) {} pub fn start_timer(&self) -> NoopTimer { NoopTimer } }
+    pub struct NoopTimer; impl NoopTimer { pub fn observe_duration(&self) {} }
+    pub static APPENDS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static APPEND_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static SNAPSHOTS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static SNAPSHOT_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static SSE_LAGGED_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static WAL_CRC_ERRORS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static COMPACTIONS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static COMPACTION_DURATION_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static RMI_HITS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static RMI_MISSES_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static RMI_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static RMI_EPSILON_HISTOGRAM: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static RMI_INDEX_LEAVES: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static RMI_INDEX_SIZE_BYTES: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static RMI_EPSILON_MAX: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static RMI_REBUILDS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static RMI_REBUILD_DURATION_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static RMI_PROBE_LEN: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static RMI_MISPREDICTS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub fn inc_sse_lagged() {}
+    pub fn render() -> String { String::new() }
+}
+
+#[cfg(not(feature = "bench-no-metrics"))]
 pub static APPENDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!("kyrodb_appends_total", "Total number of appends")
         .expect("register kyrodb_appends_total")

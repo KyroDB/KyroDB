@@ -1,63 +1,53 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use kyrodb_engine as engine;
-use std::sync::Arc;
-use uuid::Uuid;
+use kyrodb_engine::index::{BTreeIndex, RmiIndex};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
-fn bench_engine_indexes(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+fn build_pairs(n: usize) -> Vec<(u64, u64)> {
+    // Monotone keys 0..n with offsets equal to index for simplicity
+    (0..n as u64).map(|k| (k, k)).collect()
+}
 
-    // Build identical datasets in two separate logs: one will use RMI, one B-Tree
-    let (log_rmi, log_btree) = {
-        let dir_rmi = std::env::temp_dir().join(format!("kyrobench-rmi-{}", Uuid::new_v4()));
-        let dir_bt = std::env::temp_dir().join(format!("kyrobench-bt-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir_rmi).unwrap();
-        std::fs::create_dir_all(&dir_bt).unwrap();
-        rt.block_on(async move {
-            let rmi = Arc::new(engine::PersistentEventLog::open(&dir_rmi).await.unwrap());
-            let bt = Arc::new(engine::PersistentEventLog::open(&dir_bt).await.unwrap());
+fn bench_raw_indexes(c: &mut Criterion) {
+    let n = std::env::var("KYRO_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000usize);
 
-            // Load the same dataset into both
-            for i in 0..100_000u64 {
-                let payload = vec![0u8; 16];
-                let _ = rmi
-                    .append_kv(Uuid::new_v4(), i, payload.clone())
-                    .await
-                    .unwrap();
-                let _ = bt
-                    .append_kv(Uuid::new_v4(), i, payload.clone())
-                    .await
-                    .unwrap();
-            }
-            rmi.snapshot().await.unwrap();
-            bt.snapshot().await.unwrap();
+    // Build dataset
+    let pairs = build_pairs(n);
 
-            // Build RMI for the rmi log only
-            let pairs = rmi.collect_key_offset_pairs().await;
-            let tmp = dir_rmi.join("index-rmi.tmp");
-            let dst = dir_rmi.join("index-rmi.bin");
-            engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
-            std::fs::rename(&tmp, &dst).unwrap();
-            if let Some(rindex) = engine::index::RmiIndex::load_from_file(&dst) {
-                rmi.swap_primary_index(engine::index::PrimaryIndex::Rmi(rindex))
-                    .await;
-            }
-
-            // B-Tree stays as default primary
-            (rmi, bt)
-        })
-    };
-
-    let mut group = c.benchmark_group("engine_lookup_key");
-    for (name, handle) in [("rmi", log_rmi), ("btree", log_btree)] {
-        group.bench_function(BenchmarkId::from_parameter(name), |b| {
-            b.to_async(&rt).iter(|| async {
-                let k = 77_777u64;
-                let _ = handle.lookup_key(black_box(k)).await;
-            })
-        });
+    // Build B-Tree index
+    let mut bt = BTreeIndex::new();
+    for (k, o) in &pairs {
+        bt.insert(*k, *o);
     }
+
+    // Build RMI index (owned) via file path then load
+    let dir = tempfile::tempdir().unwrap();
+    let tmp = dir.path().join("index-rmi.tmp");
+    let dst = dir.path().join("index-rmi.bin");
+    RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
+    std::fs::rename(&tmp, &dst).unwrap();
+    let rmi = RmiIndex::load_from_file(&dst).expect("load rmi");
+
+    // Randomized keys per iteration
+    let mut group = c.benchmark_group(format!("raw_index_lookup_n{}", n));
+
+    group.bench_function(BenchmarkId::from_parameter("btree"), |b| {
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
+        b.iter(|| {
+            let k = rng.gen_range(0..n as u64);
+            let _ = black_box(bt.get(&k));
+        })
+    });
+
+    group.bench_function(BenchmarkId::from_parameter("rmi"), |b| {
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
+        b.iter(|| {
+            let k = rng.gen_range(0..n as u64);
+            let _ = black_box(rmi.predict_get(&k));
+        })
+    });
+
     group.finish();
 }
 
-criterion_group!(benches, bench_engine_indexes);
+criterion_group!(benches, bench_raw_indexes);
 criterion_main!(benches);
