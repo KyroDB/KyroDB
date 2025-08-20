@@ -33,6 +33,9 @@ struct Args {
     /// Output CSV path for latency percentiles
     #[clap(long, default_value = "bench_latency.csv")]
     csv_out: String,
+    /// Build RMI before reads (POST /rmi/build)
+    #[clap(long, default_value_t = true)]
+    build_rmi: bool,
 }
 
 #[tokio::main]
@@ -57,6 +60,27 @@ async fn main() {
             .json(&body)
             .send()
             .await;
+    }
+
+    // Optionally trigger RMI rebuild before reads
+    if args.build_rmi {
+        let url = format!("{}/rmi/build", args.base);
+        match client.post(&url).send().await {
+            Ok(resp) => {
+                if resp.status().as_u16() == 501 {
+                    eprintln!("RMI build endpoint not available (server not built with learned-index feature) - aborting.");
+                    return;
+                }
+                if !resp.status().is_success() {
+                    eprintln!("RMI build request failed: {}", resp.status());
+                } else if let Ok(txt) = resp.text().await {
+                    println!("rmi_build_response={}", txt);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to call /rmi/build: {}", e);
+            }
+        }
     }
 
     // Build URLs based on selected endpoint

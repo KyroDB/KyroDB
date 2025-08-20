@@ -545,7 +545,7 @@ impl PersistentEventLog {
     pub async fn snapshot(&self) -> Result<()> {
         let timer = metrics::SNAPSHOT_LATENCY_SECONDS.start_timer();
         // bincode options with a safety limit for serialization
-        let bincode::Options = bincode::options().with_limit(16 * 1024 * 1024);
+        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
         let path = self.data_dir.join("snapshot.bin");
         let tmp = self.data_dir.join("snapshot.tmp");
 
@@ -553,7 +553,7 @@ impl PersistentEventLog {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
             let mut w = BufWriter::new(f);
             let read = self.inner.read().await;
-            bincode::Options
+            bopt
                 .serialize_into(&mut w, &*read)
                 .context("writing snapshot")?;
             w.flush().context("flushing snapshot")?;

@@ -22,11 +22,13 @@ mkdir -p "$OUT"
   env | grep '^KYRODB_' || true
 } > "$OUT/config.txt"
 
-# scrape metrics helper
+# Scrape metrics before
 curl -s "$BASE/metrics" > "$OUT/metrics.prom" || true
 
-# run bench CLI
+# Build benches
 cargo build -p bench --release >/dev/null
+
+# Load+bench with RMI build step
 READ_CONCURRENCY=${READ_CONCURRENCY:-64} \
 READ_SECONDS=${READ_SECONDS:-30} \
 WARMUP_SECONDS=${WARMUP_SECONDS:-5} \
