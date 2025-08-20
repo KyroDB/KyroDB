@@ -34,6 +34,15 @@ mod shim {
     pub fn render() -> String { String::new() }
 }
 
+#[cfg(feature = "bench-no-metrics")]
+pub use shim::{
+    APPEND_LATENCY_SECONDS, APPENDS_TOTAL, COMPACTION_DURATION_SECONDS, COMPACTIONS_TOTAL,
+    RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL, RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES,
+    RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL, RMI_MISSES_TOTAL, RMI_PROBE_LEN,
+    RMI_REBUILD_DURATION_SECONDS, RMI_REBUILDS_TOTAL, SNAPSHOT_LATENCY_SECONDS, SNAPSHOTS_TOTAL,
+    SSE_LAGGED_TOTAL, WAL_CRC_ERRORS_TOTAL, inc_sse_lagged, render,
+};
+
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static APPENDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!("kyrodb_appends_total", "Total number of appends")

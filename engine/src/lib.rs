@@ -561,7 +561,7 @@ impl PersistentEventLog {
 
         std::fs::rename(&tmp, &path).context("renaming snapshot")?;
         // Ensure the rename is durable
-        fsync_dir(&self.data_dir).ok();
+        fsync_dir(&self.data_dir).context("fsync data dir after snapshot rename").ok();
 
         // Also write a contiguous payloads file for mmap-backed direct reads
         let data_path = self.data_dir.join("snapshot.data");
@@ -579,13 +579,12 @@ impl PersistentEventLog {
                 f.write_all(&ev.payload)
                     .context("write snapshot.data payload")?;
             }
-            f.flush().ok();
-            if let Ok(inner) = f.into_inner() {
-                let _ = inner.sync_all();
-            }
+            f.flush().context("flush snapshot.data.tmp")?;
+            let inner = f.into_inner().context("into_inner snapshot.data.tmp")?;
+            inner.sync_all().context("fsync snapshot.data.tmp")?;
         }
-        std::fs::rename(&data_tmp, &data_path).ok();
-        fsync_dir(&self.data_dir).ok();
+        std::fs::rename(&data_tmp, &data_path).context("rename snapshot.data.tmp")?;
+        fsync_dir(&self.data_dir).context("fsync after snapshot.data rename").ok();
 
         // Refresh mmap + payload index to point at the latest snapshot.data
         if let Ok(file) = File::open(&data_path) {
@@ -599,8 +598,6 @@ impl PersistentEventLog {
 
         // After a successful snapshot, reset WAL segments (truncate to a fresh segment)
         {
-            // Close current writer and replace with a fresh segment 0
-            // Remove all existing wal.* files
             let segs = Self::list_wal_segments(&self.data_dir);
             for (_, p) in segs {
                 let _ = std::fs::remove_file(p);
@@ -612,19 +609,21 @@ impl PersistentEventLog {
                 .truncate(true)
                 .open(&seg0)
                 .context("create fresh wal segment after snapshot")?;
-            new_wal.sync_all().ok();
+            new_wal
+                .sync_all()
+                .context("fsync fresh wal segment after snapshot")?;
             let mut wal_writer = self.wal.write().await;
             *wal_writer = BufWriter::new(new_wal);
             let mut seg_idx = self.wal_seg_index.write().await;
             *seg_idx = 0;
         }
         // And fsync directory to persist metadata updates
-        fsync_dir(&self.data_dir).ok();
+        fsync_dir(&self.data_dir).context("fsync data dir after wal reset").ok();
 
         metrics::SNAPSHOTS_TOTAL.inc();
         timer.observe_duration();
         // Update manifest after snapshot
-        self.write_manifest().await;
+        self.write_manifest().await?;
         Ok(())
     }
 
@@ -672,7 +671,7 @@ impl PersistentEventLog {
         metrics::COMPACTIONS_TOTAL.inc();
         timer.observe_duration();
         // Update manifest after compaction
-        self.write_manifest().await;
+        self.write_manifest().await?;
         let after_bytes = Self::wal_total_bytes(&self.data_dir);
         let after_segments = Self::list_wal_segments(&self.data_dir).len();
         Ok(CompactionStats {
@@ -724,7 +723,7 @@ impl PersistentEventLog {
     }
 
     /// Write minimal manifest with next_offset and active files.
-    pub async fn write_manifest(&self) {
+    pub async fn write_manifest(&self) -> Result<()> {
         let manifest = serde_json::json!({
             "next_offset": self.get_offset().await,
             "snapshot": "snapshot.bin",
@@ -734,12 +733,15 @@ impl PersistentEventLog {
             "ts": chrono::Utc::now().timestamp()
         });
         let tmp = self.data_dir.join("manifest.tmp");
-        if let Ok(mut f) = File::create(&tmp) {
-            let _ = writeln!(f, "{}", manifest);
-            let _ = f.sync_all();
-            let _ = std::fs::rename(&tmp, self.manifest_path());
-            let _ = fsync_dir(&self.data_dir);
-        }
+        let mut f = File::create(&tmp).context("create manifest.tmp")?;
+        writeln!(f, "{}", manifest).context("write manifest.tmp")?;
+        f.sync_all().context("fsync manifest.tmp")?;
+        std::fs::rename(&tmp, self.manifest_path()).context("rename manifest.tmp -> manifest.json")?;
+        let _ = fsync_dir(&self.data_dir).map_err(|e| {
+            eprintln!("⚠️ fsync data dir after manifest rename failed: {}", e);
+            e
+        });
+        Ok(())
     }
 
     #[cfg(feature = "learned-index")]
@@ -795,7 +797,9 @@ impl PersistentEventLog {
                 }
             }
             // update manifest after rotation
-            self.write_manifest().await;
+            if let Err(e) = self.write_manifest().await {
+                eprintln!("⚠️ manifest write after rotation failed: {}", e);
+            }
         }
     }
 

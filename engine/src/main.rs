@@ -59,8 +59,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let log = Arc::new(
         engine_crate::PersistentEventLog::open(std::path::Path::new(&cli.data_dir))
-            .await
-            .unwrap(),
+            .await?
     );
 
     match cli.cmd {
@@ -291,11 +290,17 @@ async fn main() -> Result<()> {
                 .and_then(move |body: serde_json::Value| {
                     let log = append_log.clone();
                     async move {
+                        use warp::http::StatusCode;
                         let payload = body["payload"].as_str().unwrap_or("").as_bytes().to_vec();
-                        let offset = log.append(Uuid::new_v4(), payload).await.unwrap();
-                        Ok::<_, warp::Rejection>(warp::reply::json(
-                            &serde_json::json!({ "offset": offset }),
-                        ))
+                        match log.append(Uuid::new_v4(), payload).await {
+                            Ok(offset) => Ok::<_, warp::Rejection>(warp::reply::json(
+                                &serde_json::json!({ "offset": offset }),
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        }
                     }
                 });
 
@@ -386,12 +391,18 @@ async fn main() -> Result<()> {
                 .and_then(move |body: serde_json::Value| {
                     let log = put_log.clone();
                     async move {
+                        use warp::http::StatusCode;
                         let key = body["key"].as_u64().unwrap_or(0);
                         let value = body["value"].as_str().unwrap_or("").as_bytes().to_vec();
-                        let off = log.append_kv(Uuid::new_v4(), key, value).await.unwrap();
-                        Ok::<_, warp::Rejection>(warp::reply::json(
-                            &serde_json::json!({ "offset": off }),
-                        ))
+                        match log.append_kv(Uuid::new_v4(), key, value).await {
+                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::json(
+                                &serde_json::json!({ "offset": off }),
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        }
                     }
                 });
 
@@ -630,6 +641,7 @@ async fn main() -> Result<()> {
                 .and_then(move |body: serde_json::Value| {
                     let log = vec_ins_log.clone();
                     async move {
+                        use warp::http::StatusCode;
                         let key = body["key"].as_u64().unwrap_or(0);
                         let vec: Vec<f32> = body["vector"]
                             .as_array()
@@ -639,36 +651,15 @@ async fn main() -> Result<()> {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let off = log.append_vector(Uuid::new_v4(), key, vec).await.unwrap();
-                        Ok::<_, warp::Rejection>(warp::reply::json(
-                            &serde_json::json!({"offset": off}),
-                        ))
-                    }
-                });
-
-            // Vector search: POST /vector/search { query: [f32,...], k: usize }
-            let vec_search_log = log.clone();
-            let vector_search = warp::path!("vector" / "search")
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = vec_search_log.clone();
-                    async move {
-                        let q: Vec<f32> = body["query"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_f64().map(|x| x as f32))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let k = body["k"].as_u64().unwrap_or(10) as usize;
-                        let res = log.search_vector_l2(&q, k).await;
-                        let out: Vec<_> = res
-                            .into_iter()
-                            .map(|(key, dist)| serde_json::json!({"key": key, "dist": dist}))
-                            .collect();
-                        Ok::<_, warp::Rejection>(warp::reply::json(&out))
+                        match log.append_vector(Uuid::new_v4(), key, vec).await {
+                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::json(
+                                &serde_json::json!({"offset": off}),
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        }
                     }
                 });
 
