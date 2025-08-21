@@ -9,7 +9,7 @@ fn build_pairs(n: usize) -> Vec<(u64, u64)> {
 }
 
 fn bench_raw_indexes(c: &mut Criterion) {
-    let n = std::env::var("KYRO_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000usize);
+    let n = std::env::var("KYRO_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(5_000_000usize);
 
     // Build dataset
     let pairs = build_pairs(n);

@@ -1,56 +1,88 @@
 # ADR-0001: Recursive-Model Index (RMI) for Primary-Key Lookup
 
-Status: Accepted
+Status: Proposed
 Authors: Kishan
 
 ## Context
-We need a high-performance primary-key index for point lookups. The engine uses a WAL + snapshot model; a learned RMI reduces memory and yields predictable tail latencies.
+We need a high-performance primary-key index to support point lookups and range scans. The vision targets a learned index (AI4DB) to reduce memory footprint and improve lookup speed. The current engine already maintains a WAL+snapshot log and a naive `BTreeIndex` for key→offset mapping.
 
 ## Decision
-Adopt a per-leaf linear RMI with bounded last-mile probe and an mmap-friendly on-disk format with versioning and checksum.
+Adopt a two-stage Recursive-Model Index (RMI) for 1-D monotonic keys (u64). Start with read-optimized, offline-trained models, then add incremental maintenance.
 
-## Current Design (v2/v3/v4)
-- Magic: `KYRO_RMI` (8 bytes), then 1-byte version, then 3-byte pad.
-- v2: `[magic][ver=2][pad3][epsilon u32][count u64][keys u64[]][offs u64[]]` (no checksum).
-- v3: `[magic][ver=3][pad3][num_leaves u32][count u64][leaves][keys][offs][checksum u64]`.
-- v4: `[magic][ver=4][pad3][num_leaves u32][count u64][leaves][pad to 8B][keys][offs][checksum u64]`; loaded via mmap with zero-copy when 8-byte aligned. Checksum is xxh3_64 over everything before the footer.
-- Leaves store: `key_min:u64`, `key_max:u64`, `slope:f32`, `intercept:f32`, `epsilon:u32`, `start:u64`, `len:u64`.
+### Model Structure
+- Stage 0 (Root): small MLP or linear model mapping key → leaf-id.
+- Stage 1 (Leaves): per-leaf linear models mapping key → predicted position (offset). Each leaf stores an error bound ε.
+- Search: Use predicted position ± ε to binary search in the log’s in-memory vector or a per-leaf sorted key→offset structure.
 
-## Lookup path
-1) Check delta map (recent writes) first.
-2) Find leaf by key range (binary search over leaf metadata).
-3) Predict index position: `pos = round(slope * key + intercept)`.
-4) Bounded binary search within `[pos-ε, pos+ε]`, clamped to leaf range.
-5) If not found, treat as miss. (Today the HTTP handler may optionally scan as a secondary fallback; there is no B-Tree fallback when the active index is RMI.)
+### Training Pipeline
+- Data: extract `(key, offset)` pairs from recovered events, sorted by key.
+- Offline training (initial): Python notebook using scikit-learn or LightGBM; export weights.
+- On-device format: serialize as compact arrays (f32 coefficients) with per-leaf ε. Persist to `data/index-rmi.bin`.
+- Rebuild triggers: on snapshot, threshold of N appends, or explicit admin command.
 
-## Rebuild & swap
-- Triggers: appends threshold and/or delta/total ratio; manual `POST /rmi/build`.
-- Flow (current): write to `index-rmi.tmp` → fsync → atomic rename to `index-rmi.bin` → load/validate (magic + checksum for v3/v4) → swap active index in memory → update manifest.
-- Planned: epoch-named index files and making the manifest the external commit point for index epoch provenance.
+### Integration Points
+- New `trait LearnedIndex` with `predict(key) -> (leaf_id, pos)` and `bound(key) -> ε`.
+- Adapter implements `Index` trait: `get(key)` performs refined search using (pos, ε).
+- During recovery, if `index-rmi.bin` exists and schema_version matches, load it; else fall back to `BTreeIndex`.
+- Background task: when thresholds are met, (re)train and atomically swap the index.
 
-## File naming and manifest (current)
-- Files: `data/index-rmi.bin` (active), `data/index-rmi.tmp` (build temp).
-- Manifest `manifest.json` includes: `schema`, crate `version`, `next_offset`, `snapshot`, `snapshot_bytes`, `wal_segments`, `wal_total_bytes`, `rmi` (path), `rmi_header_version`, `last_compaction_ts`, `ts`.
-- Startup: manifest is strictly parsed (schema==1) to seed `next_offset` and `last_compaction_ts`; index file is validated separately on load. Invalid manifest or index is ignored (fallback to B-Tree on startup only).
+### Storage Format v1
+- Header: magic bytes `KYRO_RMI\x01`, schema_version (u8), num_leaves (u32).
+- Root model: coefficients (f32[]), bias.
+- Leaves: for each leaf, coefficients (f32[]), bias, epsilon (u32), key-range min/max (u64).
+- Footer: checksum (xxhash64).
 
-## Safety & Recovery
-- On startup, validate magic (must be `KYRO_RMI`), version, and checksum (v3/v4). If invalid, ignore the index and keep B-Tree.
-- v4 loader pads to 8-byte alignment before keys; uses mmap when aligned, copies otherwise (no undefined behavior on unaligned data).
+### API Surface (Rust)
+```rust
+pub trait LearnedIndex {
+    fn predict_leaf(&self, key: u64) -> usize;
+    fn predict_pos(&self, leaf_id: usize, key: u64) -> i64;
+    fn epsilon(&self, leaf_id: usize) -> u64;
+}
 
-## Metrics (implemented)
-- RMI lookups: `kyrodb_rmi_hits_total`, `kyrodb_rmi_misses_total`, `kyrodb_rmi_hit_rate`, `kyrodb_rmi_lookup_latency_seconds`.
-- Model quality: `kyrodb_rmi_epsilon` histogram, `kyrodb_rmi_epsilon_max`, `kyrodb_rmi_index_leaves`.
-- Index size: `kyrodb_rmi_index_size_bytes` and `kyrodb_index_size_bytes` (mirror).
-- Rebuilds: `kyrodb_rmi_rebuilds_total`, `kyrodb_rmi_rebuild_duration_seconds`.
-- Storage: `kyrodb_wal_size_bytes`, `kyrodb_snapshot_size_bytes`, compaction histograms `kyrodb_compaction_bytes_processed` and `kyrodb_compaction_bytes_saved`.
-- Planned: probe-length histogram and mispredict counter.
+pub struct RmiIndex { /* ... */ }
+impl LearnedIndex for RmiIndex { /* ... */ }
 
-## Alternatives
-- PGM/ALEX as future options for ranges or online updates; out of scope for now.
+pub enum PrimaryIndex {
+    BTree(BTreeIndex),
+    Rmi(RmiIndex),
+}
+```
+
+### Update Handling (Phase 1 → Phase 2)
+- Phase 1: Read-optimized. Appends captured in a small delta-structure (BT map). Lookup checks delta first, else consults RMI.
+- Phase 2: Periodic retraining compacts delta. Consider ALEX-style adaptive segments for online updates.
+
+### Failure & Recovery
+- Atomic index swap: write to `index-rmi.tmp`, fsync, rename to `index-rmi.bin`.
+- On startup: validate header + checksum; if invalid, discard and rebuild from log.
+- Maintain compatibility via `SCHEMA_VERSION` gating.
+
+## Alternatives Considered
+- Pure B-Tree: simple and robust, but higher memory and slower cache behavior.
+- PGM Index: good theoretical guarantees; may be adopted later for range scans.
+- ALEX: adaptive learned index with online maintenance; higher implementation complexity initially.
 
 ## Consequences
-- Smaller memory footprint vs classical trees.
-- Tunable ε and leaf sizing trade off write cost and read tail.
+- + Lower memory for large key spaces.
+- + Faster point lookups on skewed/read-heavy workloads.
+- − Requires training pipeline and careful error bounds.
+- − More complex recovery and validation logic.
 
-## Rollout
-- v4 is default for new builds; loader supports v2/v3 for backwards compatibility.
+## Rollout Plan
+1. Implement `PrimaryIndex` enum with `BTreeIndex` default.
+2. Add loader for optional RMI file (guarded by feature flag `learned-index`).
+3. Build offline trainer, produce `index-rmi.bin` from snapshot.
+4. Integrate lookup path; add microbenchmarks.
+5. Add delta maintenance and retraining thresholds.
+
+## Testing
+- Unit tests for serialization/deserialization and bounds.
+- Property tests: ensure key is found within predicted ±ε window.
+- Chaos tests: crash during swap; ensure fallback to B-Tree works.
+
+## Metrics
+- Index memory size, training time, lookup p50/p99 latency, epsilon distribution, hit rate within 1 probe.
+
+## Security & Compliance
+- No PII stored in index files beyond keys; respect data governance when keys map to sensitive entities.

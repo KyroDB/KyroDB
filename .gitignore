@@ -36,4 +36,3 @@ node_modules/*
 
 docs/TODO.md
 experimental.local.md
-bench_quick.csv
