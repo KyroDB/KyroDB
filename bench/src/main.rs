@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use clap::Parser;
 use hdrhistogram::Histogram;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -71,54 +73,47 @@ async fn main() -> Result<()> {
         let permit = sem.clone().acquire_owned().await?;
         let client = client.clone();
         let base = args.base.clone();
-        let endpoint = args.endpoint.clone();
-        let dist = args.dist.clone();
-        let load_n = args.load_n as usize;
-        let zipf_s = args.zipf_s;
-        warm_tasks.push(tokio::spawn(async move {
-            let mut rng = StdRng::seed_from_u64(0xC0FFEE ^ (i as u64));
-            let zipf = if dist == "zipf" {
-                Zipf::new(load_n.max(1), zipf_s).ok()
-            } else { None };
-            while Instant::now() < warmup_deadline {
-                let k = if let Some(ref z) = zipf { z.sample(&mut rng) as u64 - 1 } else { rng.gen_range(0..load_n as u64) };
-                let url = make_url(&base, &endpoint, k);
-                let _ = client.get(url).send().await;
-            }
-        }));
+        let val_bytes = args.val_bytes;
+        join.spawn(async move {
+            let k = i as u64;
+            let url = format!("{}/kv/{}", base, k);
+            let val = vec![0u8; val_bytes];
+            let _ = client.put(url).body(val).send().await;
+            drop(permit);
+        });
+        pb.inc(1);
     }
-    let _ = futures::future::join_all(warm_tasks).await;
+    while let Some(res) = join.join_next().await { let _ = res; }
+    pb.finish_with_message("load done");
 
-    // 3) Read-heavy workload and measure latency (lookup_raw)
+    // 2) Read-heavy workload and measure latency (lookup_raw)
     println!("[read] running {}s, {} concurrency, dist={}", args.read_seconds, args.read_concurrency, args.dist);
     let deadline = Instant::now() + Duration::from_secs(args.read_seconds);
     let hist = Arc::new(tokio::sync::Mutex::new(Histogram::<u64>::new(3)?));
     let sem_r = Arc::new(Semaphore::new(args.read_concurrency));
-    let mut set = JoinSet::new();
-
-    // key generators
-    let mut rng = StdRng::seed_from_u64(args.seed);
-    let zipf = if args.dist == "zipf" { Some(Zipf::new(args.load_n as u64, args.zipf_theta).unwrap()) } else { None };
-
-    while Instant::now() < deadline {
-        let permit = sem_r.clone().acquire_owned().await?;
+    let total = Arc::new(AtomicU64::new(0));
+    let mut join = JoinSet::new();
+    for i in 0..args.read_concurrency {
         let client = client.clone();
         let base = args.base.clone();
-        let endpoint = args.endpoint.clone();
-        let deadline = deadline.clone();
         let hist = hist.clone();
         let total = total.clone();
         let dist = args.dist.clone();
-        let load_n = args.load_n as usize;
-        let zipf_s = args.zipf_s;
-        tasks.push(tokio::spawn(async move {
-            let mut rng = StdRng::seed_from_u64(0xDEADBEEF ^ (i as u64));
+        let load_n = args.load_n;
+        let zipf_theta = args.zipf_theta;
+        let seed = args.seed ^ (i as u64);
+        join.spawn(async move {
+            let mut rng = StdRng::seed_from_u64(seed);
             let zipf = if dist == "zipf" {
-                Zipf::new(load_n.max(1), zipf_s).ok()
+                Some(Zipf::new(load_n as u64, zipf_theta).unwrap())
             } else { None };
             while Instant::now() < deadline {
-                let k = if let Some(ref z) = zipf { z.sample(&mut rng) as u64 - 1 } else { rng.gen_range(0..load_n as u64) };
-                let url = make_url(&base, &endpoint, k);
+                let k = if let Some(ref z) = zipf {
+                    z.sample(&mut rng) as u64 - 1
+                } else {
+                    rng.gen_range(0..load_n as u64)
+                };
+                let url = format!("{}/kv/{}", base, k);
                 let t0 = Instant::now();
                 let _ = client.get(url).send().await;
                 let dt = t0.elapsed();
@@ -126,10 +121,9 @@ async fn main() -> Result<()> {
                 let mut h = hist.lock().await;
                 let _ = h.record(dt.as_nanos() as u64);
             }
-        }));
+        });
     }
-
-    let _ = futures::future::join_all(tasks).await;
+    while let Some(res) = join.join_next().await { let _ = res; }
     let total_reads = total.load(Ordering::Relaxed);
     let elapsed = args.read_seconds as f64;
     let rps = total_reads as f64 / elapsed;
@@ -143,32 +137,34 @@ async fn main() -> Result<()> {
     // Scrape /metrics to compute avg RMI lookup latency and avg probe len if present
     let mut rmi_lookup_avg_us: Option<f64> = None;
     let mut rmi_probe_len_avg: Option<f64> = None;
-    if let Ok(text) = client.get(format!("{}/metrics", args.base)).send().await.and_then(|r| r.text()).await {
-        let mut sums: HashMap<&str, f64> = HashMap::new();
-        let mut counts: HashMap<&str, f64> = HashMap::new();
-        for line in text.lines() {
-            if line.starts_with("kyrodb_rmi_lookup_latency_seconds_sum") {
-                if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("lookup", x); } }
-            } else if line.starts_with("kyrodb_rmi_lookup_latency_seconds_count") {
-                if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("lookup", x); } }
-            } else if line.starts_with("kyrodb_rmi_probe_len_sum") {
-                if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("probe", x); } }
-            } else if line.starts_with("kyrodb_rmi_probe_len_count") {
-                if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("probe", x); } }
+    if let Ok(resp) = client.get(format!("{}/metrics", args.base)).send().await {
+        if let Ok(text) = resp.text().await {
+            let mut sums: HashMap<&str, f64> = HashMap::new();
+            let mut counts: HashMap<&str, f64> = HashMap::new();
+            for line in text.lines() {
+                if line.starts_with("kyrodb_rmi_lookup_latency_seconds_sum") {
+                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("lookup", x); } }
+                } else if line.starts_with("kyrodb_rmi_lookup_latency_seconds_count") {
+                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("lookup", x); } }
+                } else if line.starts_with("kyrodb_rmi_probe_len_sum") {
+                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("probe", x); } }
+                } else if line.starts_with("kyrodb_rmi_probe_len_count") {
+                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("probe", x); } }
+                }
             }
-        }
-        if let (Some(s), Some(c)) = (sums.get("lookup"), counts.get("lookup")) {
-            if *c > 0.0 { rmi_lookup_avg_us = Some((*s / *c) * 1_000_000.0); }
-        }
-        if let (Some(s), Some(c)) = (sums.get("probe"), counts.get("probe")) {
-            if *c > 0.0 { rmi_probe_len_avg = Some(*s / *c); }
+            if let (Some(s), Some(c)) = (sums.get("lookup"), counts.get("lookup")) {
+                if *c > 0.0 { rmi_lookup_avg_us = Some((*s / *c) * 1_000_000.0); }
+            }
+            if let (Some(s), Some(c)) = (sums.get("probe"), counts.get("probe")) {
+                if *c > 0.0 { rmi_probe_len_avg = Some(*s / *c); }
+            }
         }
     }
 
-    let mut csv = String::from("endpoint,dist,reads_total,rps,p50_us,p95_us,p99_us,rmi_lookup_avg_us,rmi_probe_len_avg\n");
+    let mut csv = String::from("base,dist,reads_total,rps,p50_us,p95_us,p99_us,rmi_lookup_avg_us,rmi_probe_len_avg\n");
     csv.push_str(&format!(
         "{},{},{},{:.2},{:.1},{:.1},{:.1},{},{}\n",
-        args.endpoint,
+        args.base,
         args.dist,
         total_reads,
         rps,
@@ -178,7 +174,7 @@ async fn main() -> Result<()> {
         rmi_lookup_avg_us.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "".into()),
         rmi_probe_len_avg.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "".into()),
     ));
-    let _ = std::fs::write(&args.csv_out, csv);
+    let _ = std::fs::write(&args.out_csv, csv);
 
     println!(
         "reads_total={}, rps={:.2}, p50_us={:.1}, p95_us={:.1}, p99_us={:.1}{}{}",
@@ -190,4 +186,20 @@ async fn main() -> Result<()> {
         rmi_lookup_avg_us.map(|v| format!(", rmi_lookup_avg_us={:.1}", v)).unwrap_or_default(),
         rmi_probe_len_avg.map(|v| format!(", rmi_probe_len_avg={:.2}", v)).unwrap_or_default(),
     );
+
+    Ok(())
+}
+
+// Wait for /health endpoint to return 200
+async fn wait_for_health(client: &reqwest::Client, base: &str, auth: Option<&str>) -> Result<()> {
+    let url = format!("{}/health", base);
+    for _ in 0..30 {
+        let mut req = client.get(&url);
+        if let Some(a) = auth { req = req.header("Authorization", a); }
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() { return Ok(()); }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("server not healthy at {}", url)
 }
