@@ -5,7 +5,7 @@
 **One-liner:** KyroDB is a durable, append-only key-value engine with a production-grade learned index (RMI) for ultra-fast point lookups and predictable tail latency.
 
 ---
-
+See visiondocument.md for long term vision for the Database
 ## At a glance
 
 - RMI vs B-Tree point lookup microbench (median):
