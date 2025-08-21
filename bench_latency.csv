@@ -1,2 +1,0 @@
-endpoint,dist,reads_total,rps,p50_us,p95_us,p99_us,rmi_lookup_avg_us,rmi_probe_len_avg
-lookup_fast,uniform,749509,37475.45,127.6,234.6,316.7,,
