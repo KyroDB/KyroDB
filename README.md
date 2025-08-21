@@ -191,15 +191,12 @@ gRPC for the data plane is planned (see Roadmap) but not implemented yet.
 - **PersistentEventLog (WAL)** — append-only records with configurable fsync.
 - **Snapshotter** — write new snapshot → atomic rename/swap → truncate WAL.
 - **In-memory delta** — fast recent writes map checked before probing index.
-- **RMI (learned index)** — builder and on-disk format under active development; read path will predict approximate position and do a bounded last-mile probe.
-- **Compactor** — will build new snapshots with latest values and reclaim WAL space.
+- **RMI (learned index)** — builder + on-disk format implemented; read path predicts position and performs a bounded last‑mile probe (feature‑gated).
 
 Simplified flow (current):
 
-```
-Client -> HTTP -> WAL.append -> mem-delta -> background snapshot
-                 \-> Get -> mem-delta -> (future: RMI predict) -> last-mile probe -> disk
-```
+- Client -> HTTP -> WAL.append -> mem-delta -> background snapshot
+-                  \-> Get -> mem-delta -> (future: RMI predict) -> last-mile probe -> disk
 
 ---
 
@@ -209,8 +206,8 @@ Client -> HTTP -> WAL.append -> mem-delta -> background snapshot
 - Snapshot + atomic swap ✅
 - Cold start recovery (snapshot load + WAL replay) ✅
 - In-memory delta and baseline read path ✅
-- RMI scaffolding (admin build endpoint; on-disk loader WIP) ⚠️ in progress
-- Compaction (keep-latest) ⚠️ planned
+- RMI build + on-disk loader + read path ✅ (feature: `learned-index`)
+- Compaction (keep-latest) ⚠️ planned (MVP: background snapshot + WAL truncation service)
 - Basic HTTP API + `kyrodbctl` for admin ✅
 
 ---
