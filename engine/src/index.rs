@@ -75,6 +75,10 @@ pub struct RmiIndex {
     // 64K router indexed by top-16 bits of key → leaf index (u32::MAX for none)
     router: Box<[u32; 65536]>,
     backing: RmiBacking,
+    // Fast predictor state (not persisted)
+    fx_shift: u32,
+    fx_m: Vec<i128>,   // per-leaf fixed-point slope
+    fx_b: Vec<i64>,    // per-leaf integer intercept
 }
 
 #[cfg(feature = "learned-index")]
@@ -91,6 +95,9 @@ impl RmiIndex {
                 sorted_keys: Vec::new(),
                 sorted_offsets: Vec::new(),
             },
+            fx_shift: 32u32,
+            fx_m: Vec::new(),
+            fx_b: Vec::new(),
         }
     }
 
@@ -131,17 +138,11 @@ impl RmiIndex {
             RmiBacking::Owned { sorted_keys, .. } => sorted_keys[idx],
             RmiBacking::Mmap { mmap, keys_off, .. } => unsafe {
                 let ptr = mmap.as_ptr().add(*keys_off + idx * std::mem::size_of::<u64>()) as *const u64;
-                u64::from_le_bytes(std::ptr::read_unaligned(ptr).to_le_bytes())
+                u64::from_le(std::ptr::read_unaligned(ptr))
             },
-            RmiBacking::MmapAos { mmap, entries_off, entry_stride, off_is_u32, .. } => unsafe {
-                let base = mmap.as_ptr().add(*entries_off + idx * *entry_stride);
-                // layout: key u64 at +0, off at +8 or +8..+16
-                let key_ptr = base as *const u64;
-                if *off_is_u32 {
-                    u64::from_le_bytes(std::ptr::read_unaligned(key_ptr).to_le_bytes())
-                } else {
-                    u64::from_le_bytes(std::ptr::read_unaligned(key_ptr).to_le_bytes())
-                }
+            RmiBacking::MmapAos { mmap, entries_off, entry_stride, .. } => unsafe {
+                let ptr = mmap.as_ptr().add(*entries_off + idx * *entry_stride) as *const u64;
+                u64::from_le(std::ptr::read_unaligned(ptr))
             },
         }
     }
@@ -149,19 +150,17 @@ impl RmiIndex {
     #[inline]
     fn off_at(&self, idx: usize) -> u64 {
         match &self.backing {
-            RmiBacking::Owned { sorted_offsets, .. } => sorted_offsets[idx],
+            RmiBacking::Owned { sorted_offsets, .. } => sortedOffsets[idx],
             RmiBacking::Mmap { mmap, offs_off, .. } => unsafe {
                 let ptr = mmap.as_ptr().add(*offs_off + idx * std::mem::size_of::<u64>()) as *const u64;
-                u64::from_le_bytes(std::ptr::read_unaligned(ptr).to_le_bytes())
+                u64::from_le(std::ptr::read_unaligned(ptr))
             },
             RmiBacking::MmapAos { mmap, entries_off, entry_stride, off_is_u32, .. } => unsafe {
-                let base = mmap.as_ptr().add(*entries_off + idx * *entry_stride);
+                let ptr = mmap.as_ptr().add(*entries_off + idx * *entry_stride + 8);
                 if *off_is_u32 {
-                    let off_ptr = base.add(8) as *const u32;
-                    u32::from_le_bytes(std::ptr::read_unaligned(off_ptr).to_le_bytes()) as u64
+                    u64::from(u32::from_le(std::ptr::read_unaligned(ptr as *const u32)))
                 } else {
-                    let off_ptr = base.add(8) as *const u64;
-                    u64::from_le_bytes(std::ptr::read_unaligned(off_ptr).to_le_bytes())
+                    u64::from_le(std::ptr::read_unaligned(ptr as *const u64))
                 }
             },
         }
@@ -549,6 +548,51 @@ impl RmiIndex {
         while i < len {
             let idx = lo + i; if self.key_at(idx) == key { return Some(idx); }
             i += 1;
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn predict_clamp_fast(&self, leaf_id: usize, key: u64) -> (usize, usize) {
+        // pos = ((m * key) >> SHIFT) + b
+        let m = unsafe { *self.fx_m.get_unchecked(leaf_id) };
+        let b = unsafe { *self.fx_b.get_unchecked(leaf_id) };
+        let eps = unsafe { *self.leaves.get_unchecked(leaf_id) }.epsilon as i64;
+        let start = unsafe { *self.leaves.get_unchecked(leaf_id) }.start as i64;
+        let len = unsafe { *self.leaves.get_unchecked(leaf_id) }.len as i64;
+
+        let pred = (((m * (key as i128)) >> self.fx_shift) as i64) + b;
+        let leaf_lo = start;
+        let leaf_hi = start + len - 1;
+        let mut lo = (pred - eps).clamp(leaf_lo, leaf_hi);
+        let mut hi = (pred + eps).clamp(leaf_lo, leaf_hi);
+        // widen a touch to absorb rounding errors
+        lo = (lo - 1).max(leaf_lo);
+        hi = (hi + 1).min(leaf_hi);
+        (lo as usize, hi as usize)
+    }
+
+    // In predict_get, swap to the fast predictor and keep your SIMD + fallback search:
+    #[inline(always)]
+    pub fn predict_get(&self, key: &u64) -> Option<u64> {
+        if self.count() == 0 { return None; }
+        let leaf_id = {
+            // top-16-bit router
+            let idx = (*key >> 48) as usize;
+            self.router[idx] as usize
+        };
+        let (lo, hi) = self.predict_clamp_fast(leaf_id, *key);
+        self.prefetch_window(lo);
+        // small window SIMD, else binary search:
+        if let Some(v) = self.small_window_probe(*key, lo, hi) { return Some(v); }
+        // Tight binary search
+        let mut l = lo; let mut r = hi;
+        while l <= r {
+            let m = l + ((r - l) >> 1);
+            let km = self.key_at(m);
+            if km < *key { l = m + 1; }
+            else if km > *key { if m == 0 { break; } r = m - 1; }
+            else { return Some(self.off_at(m)); }
         }
         None
     }
