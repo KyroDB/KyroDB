@@ -262,6 +262,26 @@ impl RmiIndex {
         use xxhash_rust::xxh3::Xxh3; f.flush()?; let all = std::fs::File::open(path)?; let len_before = all.metadata()?.len(); let mut hasher = Xxh3::new(); { use std::io::Read; let mut rdr = std::io::BufReader::new(&all); let mut b = vec![0u8; 64 * 1024]; let mut remaining = len_before as usize; while remaining > 0 { let to_read = b.len().min(remaining); rdr.read_exact(&mut b[..to_read])?; hasher.update(&b[..to_read]); remaining -= to_read; } } let sum = hasher.digest(); drop(all); f.write_all(&sum.to_le_bytes())?; f.flush()?; Ok(())
     }
 
+    /// Env-aware writer: defaults to v5 (AoS). Controls:
+    /// - KYRO_RMI_FORMAT = v4 | v5 (default v5)
+    /// - KYRO_RMI_PACK_U32 = 1|true to pack offsets as u32 in v5
+    pub fn write_from_pairs_auto(path: &std::path::Path, pairs: &[(u64, u64)]) -> std::io::Result<()> {
+        let fmt = std::env::var("KYRO_RMI_FORMAT").ok();
+        match fmt.as_deref() {
+            Some("v4") => Self::write_from_pairs(path, pairs),
+            _ => {
+                let pack = std::env::var("KYRO_RMI_PACK_U32")
+                    .ok()
+                    .map(|s| {
+                        let ls = s.to_ascii_lowercase();
+                        ls == "1" || ls == "true" || ls == "yes" || ls == "on"
+                    })
+                    .unwrap_or(false);
+                Self::write_from_pairs_v5(path, pairs, pack)
+            }
+        }
+    }
+
     pub fn load_from_file(path: &std::path::Path) -> Option<Self> {
         use std::io::Read;
         let meta_len = std::fs::metadata(path).ok()?.len();
@@ -401,46 +421,38 @@ impl RmiIndex {
     fn small_window_probe(&self, key: u64, lo: usize, hi: usize) -> Option<u64> {
         let len = hi + 1 - lo;
         if len == 0 { return None; }
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        // x86_64: runtime AVX2 path for SoA and AoS
+        #[cfg(target_arch = "x86_64")]
         unsafe {
-            // SoA vectorized compare when contiguous u64 keys are available
-            if let RmiBacking::Mmap { mmap, keys_off, .. } = &self.backing {
-                let mut i = 0usize;
-                let base = mmap.as_ptr().add(*keys_off) as *const u64;
-                let target = core::arch::x86_64::_mm256_set1_epi64x(key as i64);
-                while i + 4 <= len {
-                    let ptr = base.add(lo + i) as *const core::arch::x86_64::__m256i;
-                    let v = core::arch::x86_64::_mm256_loadu_si256(ptr);
-                    let cmp = core::arch::x86_64::_mm256_cmpeq_epi64(v, target);
-                    let mask = core::arch::x86_64::_mm256_movemask_pd(core::mem::transmute::<_, core::arch::x86_64::__m256d>(cmp));
-                    if mask != 0 {
-                        let tz = mask.trailing_zeros() as usize;
-                        let idx = lo + i + tz;
-                        return Some(self.off_at(idx));
+            if std::arch::is_x86_feature_detected!("avx2") {
+                match &self.backing {
+                    RmiBacking::Mmap { keys_off, .. } => {
+                        if let Some(idx) = self.small_window_probe_soa_avx2(*keys_off, key, lo, len) {
+                            return Some(self.off_at(idx));
+                        }
                     }
-                    i += 4;
+                    RmiBacking::Owned { .. } => {
+                        if let Some(idx) = self.small_window_probe_soa_avx2(0usize, key, lo, len) {
+                            return Some(self.off_at(idx));
+                        }
+                    }
+                    RmiBacking::MmapAos { entries_off, entry_stride, .. } => {
+                        if let Some(idx) = self.small_window_probe_aos_avx2(*entries_off, *entry_stride, key, lo, len) {
+                            return Some(self.off_at(idx));
+                        }
+                    }
                 }
-                for j in i..len { let idx = lo + j; if self.key_at(idx) == key { return Some(self.off_at(idx)); } }
-                return None;
             }
-            if let RmiBacking::Owned { sorted_keys, .. } = &self.backing {
-                let mut i = 0usize;
-                let base = sorted_keys.as_ptr();
-                let target = core::arch::x86_64::_mm256_set1_epi64x(key as i64);
-                while i + 4 <= len {
-                    let ptr = base.add(lo + i) as *const core::arch::x86_64::__m256i;
-                    let v = core::arch::x86_64::_mm256_loadu_si256(ptr);
-                    let cmp = core::arch::x86_64::_mm256_cmpeq_epi64(v, target);
-                    let mask = core::arch::x86_64::_mm256_movemask_pd(core::mem::transmute::<_, core::arch::x86_64::__m256d>(cmp));
-                    if mask != 0 {
-                        let tz = mask.trailing_zeros() as usize;
-                        let idx = lo + i + tz;
+        }
+        // aarch64: optional NEON path (limited benefit for AoS)
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                if let RmiBacking::MmapAos { .. } = &self.backing {
+                    if let Some(idx) = self.small_window_probe_aos_neon(key, lo, len) {
                         return Some(self.off_at(idx));
                     }
-                    i += 4;
                 }
-                for j in i..len { let idx = lo + j; if self.key_at(idx) == key { return Some(self.off_at(idx)); } }
-                return None;
             }
         }
         // Fallback scalar unrolled
@@ -455,82 +467,89 @@ impl RmiIndex {
         None
     }
 
-    // Continue with the existing find_leaf_index, predict_window, debug_* and predict_get implementations
-    fn find_leaf_index(&self, key: u64) -> Option<usize> {
-        if self.leaves.is_empty() { return None; }
-        // O(1) router via high-16 bits
-        let li = self.router[((key >> 48) & 0xFFFF) as usize] as usize;
-        Some(li)
-    }
-
-    fn predict_window(&self, leaf: &RmiLeafMeta, key: u64) -> (usize, usize) {
-        if leaf.len == 0 { return (leaf.start as usize, leaf.start as usize); }
-        let pred = leaf.slope as f64 * (key as f64) + leaf.intercept as f64;
-        let center = pred.round() as i64;
-        let start = leaf.start as i64; let end = (leaf.start + leaf.len - 1) as i64;
-        let eps = leaf.epsilon as i64;
-        let lo = std::cmp::max(start, center - eps) as usize;
-        let hi = std::cmp::min(end, center + eps) as usize;
-        (lo, hi)
-    }
-
-    // Public debug helpers for benchmarks
-    pub fn debug_find_leaf_index(&self, key: u64) -> Option<usize> { self.find_leaf_index(key) }
-    pub fn debug_predict_clamp(&self, key: u64) -> Option<(usize, usize)> {
-        let li = self.find_leaf_index(key)?; let leaf = &self.leaves[li];
-        let (mut lo, mut hi) = self.predict_window(leaf, key);
-        if self.count() == 0 { return None; }
-        let max_idx = self.count() - 1; lo = lo.min(max_idx); hi = hi.min(max_idx); Some((lo, hi))
-    }
-    pub fn debug_probe_only(&self, key: u64, lo: usize, hi: usize) -> Option<u64> {
-        if self.count() == 0 { return None; }
-        let mut l = lo; let mut r = hi;
-        while l <= r {
-            let m = l + ((r - l) >> 1);
-            let km = self.key_at(m);
-            if km < key { l = m + 1; }
-            else if km > key { if m == 0 { break; } r = m - 1; }
-            else { return Some(self.off_at(m)); }
+    // AVX2 helpers
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn small_window_probe_soa_avx2(&self, keys_off: usize, key: u64, lo: usize, len: usize) -> Option<usize> {
+        if let RmiBacking::Mmap { mmap, .. } = &self.backing {
+            let mut i = 0usize;
+            let base = mmap.as_ptr().add(keys_off) as *const u64;
+            let target = core::arch::x86_64::_mm256_set1_epi64x(key as i64);
+            while i + 4 <= len {
+                let ptr = base.add(lo + i) as *const core::arch::x86_64::__m256i;
+                let v = core::arch::x86_64::_mm256_loadu_si256(ptr);
+                let cmp = core::arch::x86_64::_mm256_cmpeq_epi64(v, target);
+                let mask = core::arch::x86_64::_mm256_movemask_pd(core::mem::transmute::<_, core::arch::x86_64::__m256d>(cmp));
+                if mask != 0 { let tz = mask.trailing_zeros() as usize; return Some(lo + i + tz); }
+                i += 4;
+            }
+        }
+        if let RmiBacking::Owned { sorted_keys, .. } = &self.backing {
+            let mut i = 0usize;
+            let base = sorted_keys.as_ptr();
+            let target = core::arch::x86_64::_mm256_set1_epi64x(key as i64);
+            while i + 4 <= len {
+                let ptr = base.add(lo + i) as *const core::arch::x86_64::__m256i;
+                let v = core::arch::x86_64::_mm256_loadu_si256(ptr);
+                let cmp = core::arch::x86_64::_mm256_cmpeq_epi64(v, target);
+                let mask = core::arch::x86_64::_mm256_movemask_pd(core::mem::transmute::<_, core::arch::x86_64::__m256d>(cmp));
+                if mask != 0 { let tz = mask.trailing_zeros() as usize; return Some(lo + i + tz); }
+                i += 4;
+            }
         }
         None
     }
 
-    pub fn predict_get(&self, key: &u64) -> Option<u64> {
-        if self.count() == 0 {
-            crate::metrics::RMI_PROBE_LEN.observe(0.0);
-            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
-            return None;
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn small_window_probe_aos_avx2(&self, entries_off: usize, stride: usize, key: u64, lo: usize, len: usize) -> Option<usize> {
+        if let RmiBacking::MmapAos { mmap, .. } = &self.backing {
+            let base = mmap.as_ptr().add(entries_off) as *const i8;
+            let mut i = 0usize;
+            let target = core::arch::x86_64::_mm256_set1_epi64x(key as i64);
+            while i + 4 <= len {
+                // byte offsets for gather
+                let idx0 = ((lo + i + 0) * stride) as i64;
+                let idx1 = ((lo + i + 1) * stride) as i64;
+                let idx2 = ((lo + i + 2) * stride) as i64;
+                let idx3 = ((lo + i + 3) * stride) as i64;
+                let idx_vec = core::arch::x86_64::_mm256_set_epi64x(idx3, idx2, idx1, idx0);
+                let gathered = core::arch::x86_64::_mm256_i64gather_epi64(base as *const i64, idx_vec, 1);
+                let cmp = core::arch::x86_64::_mm256_cmpeq_epi64(gathered, target);
+                let mask = core::arch::x86_64::_mm256_movemask_pd(core::mem::transmute::<_, core::arch::x86_64::__m256d>(cmp));
+                if mask != 0 {
+                    let tz = mask.trailing_zeros() as usize; // 0..3, maps to lane
+                    return Some(lo + i + tz);
+                }
+                i += 4;
+            }
         }
-        let Some(li) = self.find_leaf_index(*key) else {
-            crate::metrics::RMI_PROBE_LEN.observe(0.0);
-            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
-            return None;
-        };
-        let leaf = &self.leaves[li];
-        let (mut lo, mut hi) = self.predict_window(leaf, *key);
-        if lo > hi { crate::metrics::RMI_PROBE_LEN.observe(0.0); crate::metrics::RMI_MISPREDICTS_TOTAL.inc(); return None; }
-        let max_idx = self.count().saturating_sub(1); lo = lo.min(max_idx); hi = hi.min(max_idx);
-        // Prefetch predicted window start
-        self.prefetch_window(lo);
-        let mut steps: u32 = 0;
-        let win = hi + 1 - lo;
-        if win <= 16 {
-            let res = self.small_window_probe(*key, lo, hi);
-            crate::metrics::RMI_PROBE_LEN.observe((steps + win as u32) as f64);
-            return res;
+        None
+    }
+
+    // aarch64 NEON helper (limited: pairwise compare by building vector lanes)
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn small_window_probe_aos_neon(&self, key: u64, lo: usize, len: usize) -> Option<usize> {
+        use core::arch::aarch64::*;
+        let keyv = vdupq_n_u64(key);
+        let mut i = 0usize;
+        while i + 2 <= len {
+            let k0 = self.key_at(lo + i);
+            let k1 = self.key_at(lo + i + 1);
+            let pair = vsetq_lane_u64(k0, vdupq_n_u64(0), 0);
+            let pair = vsetq_lane_u64(k1, pair, 1);
+            let cmp = vceqq_u64(pair, keyv);
+            let m0 = vgetq_lane_u64(cmp, 0);
+            let m1 = vgetq_lane_u64(cmp, 1);
+            if m0 == u64::MAX { return Some(lo + i); }
+            if m1 == u64::MAX { return Some(lo + i + 1); }
+            i += 2;
         }
-        // Branch-minimized binary search
-        let mut l = lo; let mut r = hi;
-        while l <= r {
-            steps += 1;
-            let m = l + ((r - l) >> 1);
-            let km = self.key_at(m);
-            if km < *key { l = m + 1; }
-            else if km > *key { if m == 0 { break; } r = m - 1; }
-            else { crate::metrics::RMI_PROBE_LEN.observe(steps as f64); return Some(self.off_at(m)); }
+        while i < len {
+            let idx = lo + i; if self.key_at(idx) == key { return Some(idx); }
+            i += 1;
         }
-        crate::metrics::RMI_PROBE_LEN.observe(steps as f64);
-        crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
         None
     }
 }

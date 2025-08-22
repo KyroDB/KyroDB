@@ -224,7 +224,7 @@ async fn main() -> Result<()> {
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();
                             let write_res = tokio::task::spawn_blocking(move || {
-                                engine_crate::index::RmiIndex::write_from_pairs(
+                                engine_crate::index::RmiIndex::write_from_pairs_auto(
                                     &tmp_clone,
                                     &pairs_clone,
                                 )
@@ -620,7 +620,7 @@ async fn main() -> Result<()> {
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();
                             let write_res = tokio::task::spawn_blocking(move || {
-                                engine_crate::index::RmiIndex::write_from_pairs(
+                                engine_crate::index::RmiIndex::write_from_pairs_auto(
                                     &tmp_clone,
                                     &pairs_clone,
                                 )
