@@ -17,6 +17,10 @@ learned-index = []
 ann-hnsw = ["dep:hora"]
 http-test = []
 bench-no-metrics = []
+# Optional CPU/SIMD build toggles
+simd-avx2 = []
+simd-avx512 = []
+cpu-native = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

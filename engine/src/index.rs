@@ -70,15 +70,25 @@ enum RmiBacking {
 pub struct RmiIndex {
     // Delta map: keys appended after last build
     delta: BTreeMap<u64, u64>,
-    // Model-backed snapshot view
+    // Original leaf vec for diagnostics/testing
     leaves: Vec<RmiLeafMeta>,
-    // 64K router indexed by top-16 bits of key → leaf index (u32::MAX for none)
-    router: Box<[u32; 65536]>,
+    // Router: dynamic size 2^router_bits
+    router: Vec<u32>,
+    router_bits: u8,
+    // Backing for key/offset arrays
     backing: RmiBacking,
     // Fast predictor state (not persisted)
     fx_shift: u32,
     fx_m: Vec<i128>,   // per-leaf fixed-point slope
     fx_b: Vec<i64>,    // per-leaf integer intercept
+    // SoA leaf metadata for hot path
+    leaf_key_min: Vec<u64>,
+    leaf_key_max: Vec<u64>,
+    leaf_slope: Vec<f32>,
+    leaf_intercept: Vec<f32>,
+    leaf_epsilon: Vec<u32>,
+    leaf_start: Vec<u64>,
+    leaf_len: Vec<u64>,
 }
 
 #[cfg(feature = "learned-index")]
@@ -87,10 +97,16 @@ const RMI_MAGIC: [u8; 8] = *b"KYRO_RMI";
 #[cfg(feature = "learned-index")]
 impl RmiIndex {
     pub fn new() -> Self {
+        let bits = std::env::var("KYRODB_RMI_ROUTER_BITS")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .map(|b| b.clamp(8, 24))
+            .unwrap_or(16);
         Self {
             delta: BTreeMap::new(),
             leaves: Vec::new(),
-            router: Box::new([u32::MAX; 65536]),
+            router: vec![u32::MAX; 1usize << bits],
+            router_bits: bits,
             backing: RmiBacking::Owned {
                 sorted_keys: Vec::new(),
                 sorted_offsets: Vec::new(),
@@ -98,28 +114,44 @@ impl RmiIndex {
             fx_shift: 32u32,
             fx_m: Vec::new(),
             fx_b: Vec::new(),
+            leaf_key_min: Vec::new(),
+            leaf_key_max: Vec::new(),
+            leaf_slope: Vec::new(),
+            leaf_intercept: Vec::new(),
+            leaf_epsilon: Vec::new(),
+            leaf_start: Vec::new(),
+            leaf_len: Vec::new(),
         }
     }
 
-    // Build router from leaves
-    fn build_router(leaves: &[RmiLeafMeta]) -> Box<[u32; 65536]> {
-        let mut r = Box::new([u32::MAX; 65536]);
+    // Build router from leaves, using top router_bits of key
+    fn build_router(leaves: &[RmiLeafMeta], bits: u8) -> Vec<u32> {
+        let size = 1usize << bits;
+        let mut r = vec![u32::MAX; size];
         if leaves.is_empty() { return r; }
+        let shift = 64 - bits as u32;
         for (i, leaf) in leaves.iter().enumerate() {
-            let lo = (leaf.key_min >> 48) as usize;
-            let hi = (leaf.key_max >> 48) as usize;
-            for idx in lo..=hi { r[idx] = i as u32; }
+            let lo = (leaf.key_min >> shift) as usize;
+            let hi = (leaf.key_max >> shift) as usize;
+            let end = hi.min(size - 1);
+            for idx in lo..=end { r[idx] = i as u32; }
         }
         // Fill holes by carrying nearest previous leaf, then forward fill
         let mut last = 0u32;
-        for i in 0..65536 {
+        for i in 0..size {
             if r[i] == u32::MAX { r[i] = last; } else { last = r[i]; }
         }
         let mut last = *r.last().unwrap();
-        for i in (0..65536).rev() {
+        for i in (0..size).rev() {
             if r[i] == u32::MAX { r[i] = last; } else { last = r[i]; }
         }
         r
+    }
+
+    #[inline]
+    fn router_index(&self, key: u64) -> usize {
+        let shift = 64 - self.router_bits as u32;
+        ((key >> shift) & ((1u64 << self.router_bits) - 1)) as usize
     }
 
     // --- helpers unified across backings ---
@@ -150,7 +182,7 @@ impl RmiIndex {
     #[inline]
     fn off_at(&self, idx: usize) -> u64 {
         match &self.backing {
-            RmiBacking::Owned { sorted_offsets, .. } => sortedOffsets[idx],
+            RmiBacking::Owned { sorted_offsets, .. } => sorted_offsets[idx],
             RmiBacking::Mmap { mmap, offs_off, .. } => unsafe {
                 let ptr = mmap.as_ptr().add(*offs_off + idx * std::mem::size_of::<u64>()) as *const u64;
                 u64::from_le(std::ptr::read_unaligned(ptr))
@@ -287,6 +319,7 @@ impl RmiIndex {
         let mut f = std::fs::File::open(path).ok()?;
         let mut magic = [0u8; 8]; f.read_exact(&mut magic).ok()?; if magic != RMI_MAGIC { return None; }
         let mut ver = [0u8; 1]; f.read_exact(&mut ver).ok()?; let version = ver[0]; let mut pad = [0u8; 3]; let _ = f.read_exact(&mut pad);
+        let bits = std::env::var("KYRODB_RMI_ROUTER_BITS").ok().and_then(|s| s.parse::<u8>().ok()).map(|b| b.clamp(8, 24)).unwrap_or(16);
         match version {
             4 => {
                 // v4: mmap zero-copy capable with checksum verify and alignment padding
@@ -336,8 +369,58 @@ impl RmiIndex {
                 crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
                 if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
                 for leaf in &lvs { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
-                let router = Self::build_router(&lvs);
-                return Some(Self { delta: BTreeMap::new(), leaves: lvs, router, backing });
+                let router = Self::build_router(&lvs, bits);
+                // SoA repack + fixed-point
+                let mut leaf_key_min = Vec::with_capacity(lvs.len());
+                let mut leaf_key_max = Vec::with_capacity(lvs.len());
+                let mut leaf_slope = Vec::with_capacity(lvs.len());
+                let mut leaf_intercept = Vec::with_capacity(lvs.len());
+                let mut leaf_epsilon = Vec::with_capacity(lvs.len());
+                let mut leaf_start = Vec::with_capacity(lvs.len());
+                let mut leaf_len = Vec::with_capacity(lvs.len());
+                let mut fx_m = Vec::with_capacity(lvs.len());
+                let mut fx_b = Vec::with_capacity(lvs.len());
+                let fx_shift = 32u32;
+                for leaf in &lvs {
+                    leaf_key_min.push(leaf.key_min);
+                    leaf_key_max.push(leaf.key_max);
+                    leaf_slope.push(leaf.slope);
+                    leaf_intercept.push(leaf.intercept);
+                    leaf_epsilon.push(leaf.epsilon);
+                    leaf_start.push(leaf.start);
+                    leaf_len.push(leaf.len);
+                    let m = (leaf.slope as f64 * ((1u128 << fx_shift) as f64)) as i128;
+                    let b = leaf.intercept.round() as i64;
+                    fx_m.push(m); fx_b.push(b);
+                }
+                // Optional mlock of leaf SoA pages
+                #[cfg(all(unix, not(target_os = "macos")))]
+                unsafe {
+                    if std::env::var("KYRODB_RMI_MLOCK_LEAVES").ok().as_deref() == Some("1") {
+                        use libc::{mlock, munlock};
+                        let ptr = leaf_key_min.as_ptr() as *const _ as *const libc::c_void;
+                        let len_bytes = leaf_len.len().saturating_mul(std::mem::size_of::<u64>());
+                        let _ = mlock(ptr, len_bytes);
+                        let _ = munlock(ptr, len_bytes); // leave it advisory; remove this line to keep locked
+                    }
+                }
+                return Some(Self {
+                    delta: BTreeMap::new(),
+                    leaves: lvs,
+                    router,
+                    router_bits: bits,
+                    backing,
+                    fx_shift,
+                    fx_m,
+                    fx_b,
+                    leaf_key_min,
+                    leaf_key_max,
+                    leaf_slope,
+                    leaf_intercept,
+                    leaf_epsilon,
+                    leaf_start,
+                    leaf_len,
+                });
             }
             5 => {
                 use std::mem::size_of;
@@ -378,51 +461,132 @@ impl RmiIndex {
                 crate::metrics::RMI_INDEX_LEAVES.set(lvs.len() as f64);
                 if let Some(max) = lvs.iter().map(|l| l.epsilon).max() { crate::metrics::RMI_EPSILON_MAX.set(max as f64); }
                 for leaf in &lvs { crate::metrics::RMI_EPSILON_HISTOGRAM.observe(leaf.epsilon as f64); }
-                let router = Self::build_router(&lvs);
+                let router = Self::build_router(&lvs, bits);
+                // SoA repack + fixed-point
+                let mut leaf_key_min = Vec::with_capacity(lvs.len());
+                let mut leaf_key_max = Vec::with_capacity(lvs.len());
+                let mut leaf_slope = Vec::with_capacity(lvs.len());
+                let mut leaf_intercept = Vec::with_capacity(lvs.len());
+                let mut leaf_epsilon = Vec::with_capacity(lvs.len());
+                let mut leaf_start = Vec::with_capacity(lvs.len());
+                let mut leaf_len = Vec::with_capacity(lvs.len());
+                let mut fx_m = Vec::with_capacity(lvs.len());
+                let mut fx_b = Vec::with_capacity(lvs.len());
+                let fx_shift = 32u32;
+                for leaf in &lvs {
+                    leaf_key_min.push(leaf.key_min);
+                    leaf_key_max.push(leaf.key_max);
+                    leaf_slope.push(leaf.slope);
+                    leaf_intercept.push(leaf.intercept);
+                    leaf_epsilon.push(leaf.epsilon);
+                    leaf_start.push(leaf.start);
+                    leaf_len.push(leaf.len);
+                    let m = (leaf.slope as f64 * ((1u128 << fx_shift) as f64)) as i128;
+                    let b = leaf.intercept.round() as i64;
+                    fx_m.push(m); fx_b.push(b);
+                }
+                // Optional mlock of leaf SoA pages
+                #[cfg(all(unix, not(target_os = "macos")))]
+                unsafe {
+                    if std::env::var("KYRODB_RMI_MLOCK_LEAVES").ok().as_deref() == Some("1") {
+                        use libc::{mlock, munlock};
+                        let ptr = leaf_key_min.as_ptr() as *const _ as *const libc::c_void;
+                        let len_bytes = leaf_len.len().saturating_mul(std::mem::size_of::<u64>());
+                        let _ = mlock(ptr, len_bytes);
+                        let _ = munlock(ptr, len_bytes);
+                    }
+                }
                 let backing = RmiBacking::MmapAos { mmap: map, entries_off, count, off_is_u32, entry_stride };
-                return Some(Self { delta: BTreeMap::new(), leaves: lvs, router, backing });
+                return Some(Self {
+                    delta: BTreeMap::new(),
+                    leaves: lvs,
+                    router,
+                    router_bits: bits,
+                    backing,
+                    fx_shift,
+                    fx_m,
+                    fx_b,
+                    leaf_key_min,
+                    leaf_key_max,
+                    leaf_slope,
+                    leaf_intercept,
+                    leaf_epsilon,
+                    leaf_start,
+                    leaf_len,
+                });
             }
             _ => None,
         }
     }
 
-    // --- probe helpers ---
+    // Use SoA predictor data in fast clamp
     #[inline(always)]
-    fn prefetch_window(&self, _idx: usize) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
-        unsafe {
-            use core::arch::x86_64::_mm_prefetch;
-            use core::arch::x86_64::_MM_HINT_T0;
-            match &self.backing {
-                RmiBacking::Mmap { mmap, keys_off, .. } => {
-                    let base = mmap.as_ptr().add(*keys_off + _idx * std::mem::size_of::<u64>()) as *const i8;
-                    _mm_prefetch(base, _MM_HINT_T0);
-                    _mm_prefetch(base.add(64), _MM_HINT_T0);
-                    _mm_prefetch(base.add(128), _MM_HINT_T0);
+    fn predict_clamp_fast(&self, leaf_id: usize, key: u64) -> (usize, usize) {
+        let m = unsafe { *self.fx_m.get_unchecked(leaf_id) };
+        let b = unsafe { *self.fx_b.get_unchecked(leaf_id) };
+        let eps = unsafe { *self.leaf_epsilon.get_unchecked(leaf_id) } as i64;
+        let start = unsafe { *self.leaf_start.get_unchecked(leaf_id) } as i64;
+        let len = unsafe { *self.leaf_len.get_unchecked(leaf_id) } as i64;
+        let pred = (((m * (key as i128)) >> self.fx_shift) as i64) + b;
+        let leaf_lo = start;
+        let leaf_hi = start + len - 1;
+        let mut lo = (pred - eps).clamp(leaf_lo, leaf_hi);
+        let mut hi = (pred + eps).clamp(leaf_lo, leaf_hi);
+        lo = (lo - 1).max(leaf_lo);
+        hi = (hi + 1).min(leaf_hi);
+        (lo as usize, hi as usize)
+    }
+
+    // Router lookup using dynamic bits
+    fn find_leaf_index(&self, key: u64) -> Option<usize> {
+        if self.leaf_len.is_empty() { return None; }
+        Some(self.router[self.router_index(key)] as usize)
+    }
+
+    // AVX-512 paths (runtime detection)
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn small_window_probe_aos_avx512(&self, entries_off: usize, stride: usize, key: u64, lo: usize, len: usize) -> Option<usize> {
+        if let RmiBacking::MmapAos { mmap, .. } = &self.backing {
+            let base = mmap.as_ptr().add(entries_off) as *const i8;
+            let mut i = 0usize;
+            let target = core::arch::x86_64::_mm512_set1_epi64(key as i64);
+            while i + 8 <= len {
+                let idx0 = ((lo + i + 0) * stride) as i64;
+                let idx1 = ((lo + i + 1) * stride) as i64;
+                let idx2 = ((lo + i + 2) * stride) as i64;
+                let idx3 = ((lo + i + 3) * stride) as i64;
+                let idx4 = ((lo + i + 4) * stride) as i64;
+                let idx5 = ((lo + i + 5) * stride) as i64;
+                let idx6 = ((lo + i + 6) * stride) as i64;
+                let idx7 = ((lo + i + 7) * stride) as i64;
+                let idx_vec = core::arch::x86_64::_mm512_set_epi64(idx7, idx6, idx5, idx4, idx3, idx2, idx1, idx0);
+                let gathered = core::arch::x86_64::_mm512_i64gather_epi64(idx_vec, base as *const i8, 1);
+                let cmp = core::arch::x86_64::_mm512_cmpeq_epi64_mask(gathered, target);
+                if cmp != 0 {
+                    let tz = cmp.trailing_zeros() as usize; // lane index 0..7
+                    return Some(lo + i + tz);
                 }
-                RmiBacking::MmapAos { mmap, entries_off, entry_stride, .. } => {
-                    let base = mmap.as_ptr().add(*entries_off + _idx * *entry_stride) as *const i8;
-                    _mm_prefetch(base, _MM_HINT_T0);
-                    _mm_prefetch(base.add(64), _MM_HINT_T0);
-                    _mm_prefetch(base.add(128), _MM_HINT_T0);
-                }
-                RmiBacking::Owned { sorted_keys, .. } => {
-                    let ptr = (sorted_keys.as_ptr() as *const u8).wrapping_add(_idx * std::mem::size_of::<u64>()) as *const i8;
-                    _mm_prefetch(ptr, _MM_HINT_T0);
-                    _mm_prefetch(ptr.add(64), _MM_HINT_T0);
-                    _mm_prefetch(ptr.add(128), _MM_HINT_T0);
-                }
+                i += 8;
             }
         }
+        None
     }
 
     #[inline(always)]
     fn small_window_probe(&self, key: u64, lo: usize, hi: usize) -> Option<u64> {
         let len = hi + 1 - lo;
         if len == 0 { return None; }
-        // x86_64: runtime AVX2 path for SoA and AoS
+        // x86_64: runtime feature detection in descending order
         #[cfg(target_arch = "x86_64")]
         unsafe {
+            if std::arch::is_x86_feature_detected!("avx512f") {
+                if let RmiBacking::MmapAos { entries_off, entry_stride, .. } = &self.backing {
+                    if let Some(idx) = self.small_window_probe_aos_avx512(*entries_off, *entry_stride, key, lo, len) {
+                        return Some(self.off_at(idx));
+                    }
+                }
+            }
             if std::arch::is_x86_feature_detected!("avx2") {
                 match &self.backing {
                     RmiBacking::Mmap { keys_off, .. } => {
@@ -443,7 +607,7 @@ impl RmiIndex {
                 }
             }
         }
-        // aarch64: optional NEON path (limited benefit for AoS)
+        // aarch64 NEON
         #[cfg(target_arch = "aarch64")]
         unsafe {
             if std::arch::is_aarch64_feature_detected!("neon") {
@@ -454,7 +618,7 @@ impl RmiIndex {
                 }
             }
         }
-        // Fallback scalar unrolled
+        // Scalar fallback
         let mut i = 0usize;
         while i < len {
             let idx = lo + i; if self.key_at(idx) == key { return Some(self.off_at(idx)); }
