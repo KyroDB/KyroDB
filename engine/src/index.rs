@@ -694,11 +694,18 @@ impl PrimaryIndex {
 
     pub fn get(&self, key: &u64) -> Option<u64> {
         match self {
-            PrimaryIndex::BTree(b) => b.get(key),
+            PrimaryIndex::BTree(b) => {
+                let res = b.get(key);
+                if res.is_some() {
+                    crate::metrics::BTREE_READS_TOTAL.inc();
+                }
+                res
+            }
             #[cfg(feature = "learned-index")]
             PrimaryIndex::Rmi(r) => {
                 if let Some(v) = r.delta_get(key) {
                     crate::metrics::RMI_HITS_TOTAL.inc();
+                    crate::metrics::RMI_READS_TOTAL.inc();
                     Some(v)
                 } else {
                     let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
@@ -706,6 +713,7 @@ impl PrimaryIndex {
                     timer.observe_duration();
                     if res.is_some() {
                         crate::metrics::RMI_HITS_TOTAL.inc();
+                        crate::metrics::RMI_READS_TOTAL.inc();
                     } else {
                         crate::metrics::RMI_MISSES_TOTAL.inc();
                     }

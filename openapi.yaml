@@ -1,0 +1,78 @@
+openapi: 3.0.3
+info:
+  title: KyroDB API
+  version: 1.0.0
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200': { description: OK }
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        '200': { description: Text exposition }
+  /v1/put:
+    post:
+      summary: Insert or update a key/value
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                key: { type: integer, format: uint64 }
+                value: { type: string }
+              required: [key, value]
+      responses:
+        '200': { description: Acknowledged }
+  /v1/lookup:
+    get:
+      summary: Lookup a key and return JSON value
+      parameters:
+        - in: query
+          name: key
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        '200': { description: Value }
+        '404': { description: Not found }
+  /v1/lookup_fast/{key}:
+    get:
+      summary: Lookup a key and return offset bytes
+      parameters:
+        - in: path
+          name: key
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        '200': { description: Offset bytes }
+        '404': { description: Not found }
+  /v1/get_fast/{key}:
+    get:
+      summary: Lookup a key and return value bytes
+      parameters:
+        - in: path
+          name: key
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        '200': { description: Value bytes }
+        '404': { description: Not found }
+  /v1/snapshot:
+    post:
+      summary: Trigger a snapshot
+      responses:
+        '200': { description: Snapshot started }
+  /v1/offset:
+    get:
+      summary: Current next offset
+      responses:
+        '200': { description: Offset }
+  /v1/rmi/build:
+    post:
+      summary: Build and load the RMI index
+      responses:
+        '200': { description: Build started }

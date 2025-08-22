@@ -24,24 +24,25 @@ cargo run -p engine --features learned-index -- serve 127.0.0.1 3030
 
 # 2) Health and offset
 curl -s http://127.0.0.1:3030/health
-curl -s http://127.0.0.1:3030/offset
+curl -s http://127.0.0.1:3030/v1/offset
 
 # 3) Put/Get (HTTP)
-curl -sX POST http://127.0.0.1:3030/put \
+curl -sX POST http://127.0.0.1:3030/v1/put \
   -H 'content-type: application/json' \
   -d '{"key":123,"value":"hello"}'
 
-curl -s "http://127.0.0.1:3030/lookup?key=123"
+curl -s "http://127.0.0.1:3030/v1/lookup?key=123"
 
 # 4) Optional: build the learned index (RMI)
-curl -sX POST http://127.0.0.1:3030/rmi/build
+curl -sX POST http://127.0.0.1:3030/v1/rmi/build
 
 # 5) Fast data-plane endpoints (for benchmarks)
-curl -s "http://127.0.0.1:3030/lookup_fast/123"      # returns offset bytes
-curl -s "http://127.0.0.1:3030/get_fast/123" | hexdump -C
+curl -s "http://127.0.0.1:3030/v1/lookup_fast/123"      # returns offset bytes
+curl -s "http://127.0.0.1:3030/v1/get_fast/123" | hexdump -C
 ```
 
 Notes
+- API is versioned under `/v1/*`. Metrics stay at `/metrics` for Prometheus scraping.
 - To require auth: start with `--auth-token <TOKEN>` and send `Authorization: Bearer <TOKEN>`.
 - Release build: `cargo build -p engine --release` (binary at `target/release/kyrodb-engine`).
 - Basic CLI (optional): `cd orchestrator && go build -o kyrodbctl .`
@@ -53,9 +54,9 @@ Notes
 See `bench/README.bench.md` for the full workflow. Highlights:
 
 - Build release binaries with features used in papers/blogs:
-  - `learned-index` enables the RMI read path and `/rmi/build`.
+  - `learned-index` enables the RMI read path and `/v1/rmi/build`.
   - `bench-no-metrics` disables Prometheus counters in hot paths for purer numbers.
-- Freeze index during the read phase: build once (`/rmi/build`), then avoid rebuilds.
+- Freeze index during the read phase: build once (`/v1/rmi/build`), then avoid rebuilds.
 - Capture artifacts to `bench/results/<commit>/` via `bench/scripts/capture.sh`.
 - Adjust RMI via env vars: `KYRODB_RMI_TARGET_LEAF`, `KYRODB_RMI_EPS_MULT`.
 
@@ -89,7 +90,7 @@ python comp.py  # writes bench/rmi_vs_btree.png and bench/rmi_vs_btree_data.csv
 Tips for fair numbers
 - Pin CPU, keep system idle, disable turbo scaling if possible.
 - Use `--features bench-no-metrics` when comparing tight hot-paths.
-- Use `--release` and prefer the `lookup_fast`/`get_fast` routes in read tests.
+- Use `--release` and prefer the `/v1/lookup_fast` and `/v1/get_fast` routes in read tests.
 
 ---
 
@@ -119,7 +120,7 @@ This repository is intentionally narrow: the primary goal is producing a product
 - Durable append-only Write-Ahead Log (WAL) with configurable fsync policy.
 - Snapshotter with atomic swap for fast crash recovery.
 - In-memory recent-write delta and a single-node read path.
-- RMI scaffolding and an admin build endpoint; learned-index read path under active development.
+- RMI builder + on-disk loader + read path (feature-gated) — default read path when built.
 - WAL size management via snapshots and truncation hooks.
 - HTTP data plane for Put/Get and HTTP control plane (health, metrics, admin).
 - `kyrodbctl` client for basic admin and dev workflows.
@@ -156,31 +157,32 @@ Basic admin + KV demo (HTTP)
 
 ```bash
 # health and offset
-./kyrodbctl -e http://127.0.0.1:3030 health
-./kyrodbctl -e http://127.0.0.1:3030 offset
+curl -s http://127.0.0.1:3030/health
+curl -s http://127.0.0.1:3030/v1/offset
 
 # trigger a snapshot
-./kyrodbctl -e http://127.0.0.1:3030 snapshot
+curl -sX POST http://127.0.0.1:3030/v1/snapshot
 
 # KV put via HTTP
-curl -sX POST http://127.0.0.1:3030/put \
+curl -sX POST http://127.0.0.1:3030/v1/put \
   -H 'content-type: application/json' \
   -d '{"key":123,"value":"hello"}'
 
-# KV get via CLI (lookup by key)
-./kyrodbctl -e http://127.0.0.1:3030 lookup 123
+# KV get via HTTP
+curl -s "http://127.0.0.1:3030/v1/lookup?key=123"
 ```
 
 Notes:
 - If you start the server with `--auth-token <TOKEN>`, pass `Authorization: Bearer <TOKEN>` headers in your HTTP requests; the CLI will add a flag for this soon.
 - Release build: `cargo build -p engine --release` (binary at `target/release/engine`).
+- Structured logs: set `RUST_LOG=info` (JSON structured logs supported via tracing).
 
 ---
 
 ## Protocol decision (current)
 
-- Data plane: HTTP/JSON for Put/Get (temporary while iterating).
-- Control plane: HTTP/JSON endpoints for `/health`, `/metrics` (Prometheus), `/snapshot`, `/offset`, and `/rmi/build`.
+- Data plane: versioned HTTP/JSON under `/v1/*` for Put/Get and admin.
+- Control plane: Prometheus metrics at `/metrics` (unversioned for scraping).
 
 gRPC for the data plane is planned (see Roadmap) but not implemented yet.
 
@@ -192,11 +194,12 @@ gRPC for the data plane is planned (see Roadmap) but not implemented yet.
 - **Snapshotter** — write new snapshot → atomic rename/swap → truncate WAL.
 - **In-memory delta** — fast recent writes map checked before probing index.
 - **RMI (learned index)** — builder + on-disk format implemented; read path predicts position and performs a bounded last‑mile probe (feature‑gated).
+- **Compactor** — builds new snapshots with latest values and reclaims WAL space.
 
 Simplified flow (current):
 
 - Client -> HTTP -> WAL.append -> mem-delta -> background snapshot
--                  \-> Get -> mem-delta -> (future: RMI predict) -> last-mile probe -> disk
+-                  \-> Get -> mem-delta -> RMI predict -> bounded probe -> disk
 
 ---
 
@@ -207,8 +210,9 @@ Simplified flow (current):
 - Cold start recovery (snapshot load + WAL replay) ✅
 - In-memory delta and baseline read path ✅
 - RMI build + on-disk loader + read path ✅ (feature: `learned-index`)
-- Compaction (keep-latest) ⚠️ planned (MVP: background snapshot + WAL truncation service)
+- Compaction (keep-latest) ✅ (periodic + size-based triggers)
 - Basic HTTP API + `kyrodbctl` for admin ✅
+- Read counters: `kyrodb_rmi_reads_total` vs `kyrodb_btree_reads_total` ✅
 
 ---
 
@@ -221,6 +225,16 @@ Example claim format (to be populated when results are published):
 > On N keys (V-byte values) on machine X with SSD: RMI p99 read latency = X ms vs B-Tree p99 = Y ms (exact bench scripts and CSV in /bench/results).
 
 Until the CSVs and run scripts are in the repo, treat any numbers as provisional.
+
+---
+
+## Ops Guide (quick notes)
+
+- Backups: copy `snapshot.bin`, `snapshot.data`, and `manifest.json` atomically; verify checksums on RMI (`index-rmi.bin`).
+- Restore: place files in data dir and start; WAL will be empty post-snapshot; manifest is the commit point.
+- Compaction: configure via `--compact-interval-secs` and `--compact-when-wal-bytes` or size-based `--wal-max-bytes`.
+- Sizing: set `--wal-segment-bytes` and `--wal-max-segments` for rotation + retention.
+- Metrics: scrape `/metrics`; key series include `kyrodb_appends_total`, `kyrodb_rmi_reads_total`, `kyrodb_btree_reads_total`.
 
 ---
 

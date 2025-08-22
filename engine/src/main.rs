@@ -51,11 +51,22 @@ enum Commands {
         /// WAL retention: max segments to keep
         #[arg(long, default_value_t = 8)]
         wal_max_segments: usize,
+        /// Background compaction every N seconds (0 to disable)
+        #[arg(long, default_value_t = 0)]
+        compact_interval_secs: u64,
+        /// Compact when WAL bytes exceed this threshold (0 to disable)
+        #[arg(long, default_value_t = 0)]
+        compact_when_wal_bytes: u64,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // init structured JSON logs with env-based filter (RUST_LOG)
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).json().init();
+
     let cli = Cli::parse();
     let log = Arc::new(
         engine_crate::PersistentEventLog::open(std::path::Path::new(&cli.data_dir))
@@ -74,6 +85,8 @@ async fn main() -> Result<()> {
             rmi_rebuild_ratio,
             wal_segment_bytes,
             wal_max_segments,
+            compact_interval_secs,
+            compact_when_wal_bytes,
         } => {
             // Silence unused when learned-index feature is disabled
             #[cfg(not(feature = "learned-index"))]
@@ -83,6 +96,57 @@ async fn main() -> Result<()> {
             if wal_segment_bytes.is_some() || wal_max_segments > 0 {
                 log.configure_wal_rotation(wal_segment_bytes, wal_max_segments)
                     .await;
+            }
+
+            // Background, size-based compaction trigger
+            if let Some(maxb) = wal_max_bytes {
+                if maxb > 0 {
+                    let log_for_size = log.clone();
+                    tokio::spawn(async move {
+                        let mut interval =
+                            tokio::time::interval(tokio::time::Duration::from_secs(2));
+                        loop {
+                            interval.tick().await;
+                            let size = log_for_size.wal_size_bytes();
+                            if size >= maxb {
+                                println!(
+                                    "📦 Size-based compaction: wal={} bytes >= {}",
+                                    size, maxb
+                                );
+                                if let Err(e) =
+                                    log_for_size.compact_keep_latest_and_snapshot().await
+                                {
+                                    eprintln!("❌ Size-based compaction failed: {}", e);
+                                } else {
+                                    println!("✅ Size-based compaction complete.");
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Background interval compaction
+            if compact_interval_secs > 0 {
+                let log_for_compact = log.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(
+                        tokio::time::Duration::from_secs(compact_interval_secs),
+                    );
+                    loop {
+                        interval.tick().await;
+                        if compact_when_wal_bytes == 0
+                            || log_for_compact.wal_size_bytes() >= compact_when_wal_bytes
+                        {
+                            if let Err(e) = log_for_compact.compact_keep_latest_and_snapshot().await
+                            {
+                                eprintln!("❌ Interval compaction failed: {}", e);
+                            } else {
+                                println!("✅ Interval compaction complete.");
+                            }
+                        }
+                    }
+                });
             }
 
             if let Some(secs) = auto_snapshot_secs {
@@ -121,33 +185,6 @@ async fn main() -> Result<()> {
                                 } else {
                                     last = cur;
                                     println!("✅ Compaction complete.");
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-
-            if let Some(maxb) = wal_max_bytes {
-                if maxb > 0 {
-                    let log_for_size = log.clone();
-                    tokio::spawn(async move {
-                        let mut interval =
-                            tokio::time::interval(tokio::time::Duration::from_secs(2));
-                        loop {
-                            interval.tick().await;
-                            let size = log_for_size.wal_size_bytes();
-                            if size >= maxb {
-                                println!(
-                                    "📦 Size-based compaction: wal={} bytes >= {}",
-                                    size, maxb
-                                );
-                                if let Err(e) =
-                                    log_for_size.compact_keep_latest_and_snapshot().await
-                                {
-                                    eprintln!("❌ Size-based compaction failed: {}", e);
-                                } else {
-                                    println!("✅ Size-based compaction complete.");
                                 }
                             }
                         }
@@ -232,9 +269,22 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // --- Fast lookup endpoints (HTTP hot path) ---------------------------------------
+            // --- Metrics to count RMI vs BTree reads ---
+            #[cfg(not(feature = "bench-no-metrics"))]
+            let (rmi_reads_counter, btree_reads_counter) = {
+                use prometheus::register_counter;
+                (
+                    register_counter!("kyrodb_rmi_reads_total", "Total reads served by RMI").ok(),
+                    register_counter!("kyrodb_btree_reads_total", "Total reads served by BTree").ok(),
+                )
+            };
+
+            // --- Fast lookup endpoints (HTTP hot path) with versioned prefix -----------------
+            let v1 = warp::path("v1");
+
             let raw_log = log.clone();
-            let lookup_raw = warp::path("lookup_raw")
+            let lookup_raw = v1
+                .and(warp::path("lookup_raw"))
                 .and(warp::get())
                 .and(warp::query::<std::collections::HashMap<String, String>>())
                 .and_then(move |q: std::collections::HashMap<String, String>| {
@@ -259,32 +309,33 @@ async fn main() -> Result<()> {
                 });
 
             let fast_log = log.clone();
-            let lookup_fast =
-                warp::path!("lookup_fast" / u64)
-                    .and(warp::get())
-                    .and_then(move |k: u64| {
-                        let log = fast_log.clone();
-                        async move {
-                            use warp::http::{Response, StatusCode};
-                            if let Some(off) = log.lookup_key(k).await {
-                                let body = off.to_le_bytes().to_vec();
-                                let resp = Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header("Content-Type", "application/octet-stream")
-                                    .body(body)
-                                    .map_err(|_| warp::reject::reject())?;
-                                return Ok::<_, warp::Rejection>(resp);
-                            }
+            let lookup_fast = v1
+                .and(warp::path!("lookup_fast" / u64))
+                .and(warp::get())
+                .and_then(move |k: u64| {
+                    let log = fast_log.clone();
+                    async move {
+                        use warp::http::{Response, StatusCode};
+                        if let Some(off) = log.lookup_key(k).await {
+                            let body = off.to_le_bytes().to_vec();
                             let resp = Response::builder()
-                                .status(StatusCode::NOT_FOUND)
-                                .body(Vec::new())
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/octet-stream")
+                                .body(body)
                                 .map_err(|_| warp::reject::reject())?;
-                            Ok::<_, warp::Rejection>(resp)
+                            return Ok::<_, warp::Rejection>(resp);
                         }
-                    });
+                        let resp = Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Vec::new())
+                            .map_err(|_| warp::reject::reject())?;
+                        Ok::<_, warp::Rejection>(resp)
+                    }
+                });
 
             let fast_val_log = log.clone();
-            let get_fast = warp::path!("get_fast" / u64)
+            let get_fast = v1
+                .and(warp::path!("get_fast" / u64))
                 .and(warp::get())
                 .and_then(move |k: u64| {
                     let log = fast_val_log.clone();
@@ -311,7 +362,8 @@ async fn main() -> Result<()> {
                 });
 
             let append_log = log.clone();
-            let append_route = warp::path("append")
+            let append_route = v1
+                .and(warp::path("append"))
                 .and(warp::post())
                 .and(warp::body::json())
                 .and_then(move |body: serde_json::Value| {
@@ -339,7 +391,7 @@ async fn main() -> Result<()> {
 
             // --- NEW: Snapshot trigger endpoint -----------------------------------------------
             let snapshot_log = log.clone();
-            let snapshot_route = warp::path("snapshot").and(warp::post()).and_then(move || {
+            let snapshot_route = v1.and(warp::path("snapshot")).and(warp::post()).and_then(move || {
                 let log = snapshot_log.clone();
                 async move {
                     if let Err(e) = log.snapshot().await {
@@ -358,7 +410,7 @@ async fn main() -> Result<()> {
 
             // --- NEW: Compaction endpoint -----------------------------------------------------
             let compact_log = log.clone();
-            let compact_route = warp::path("compact").and(warp::post()).and_then(move || {
+            let compact_route = v1.and(warp::path("compact")).and(warp::post()).and_then(move || {
                 let log = compact_log.clone();
                 async move {
                     match log.compact_keep_latest_and_snapshot_stats().await {
@@ -378,7 +430,7 @@ async fn main() -> Result<()> {
 
             // --- NEW: Offset endpoint ---------------------------------------------------------
             let offset_log = log.clone();
-            let offset_route = warp::path("offset").and(warp::get()).and_then(move || {
+            let offset_route = v1.and(warp::path("offset")).and(warp::get()).and_then(move || {
                 let log = offset_log.clone();
                 async move {
                     let off = log.get_offset().await;
@@ -389,7 +441,8 @@ async fn main() -> Result<()> {
             });
 
             let replay_log = log.clone();
-            let replay_route = warp::path("replay")
+            let replay_route = v1
+                .and(warp::path("replay"))
                 .and(warp::get())
                 .and(warp::query::<std::collections::HashMap<String, String>>())
                 .and_then(move |q: std::collections::HashMap<String, String>| {
@@ -411,9 +464,10 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // KV PUT: POST /put { key: u64, value: string }
+            // KV PUT: POST /v1/put { key: u64, value: string }
             let put_log = log.clone();
-            let put_route = warp::path("put")
+            let put_route = v1
+                .and(warp::path("put"))
                 .and(warp::post())
                 .and(warp::body::json())
                 .and_then(move |body: serde_json::Value| {
@@ -435,9 +489,10 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // Simple lookup by key: GET /lookup?key=123
+            // Simple lookup by key: GET /v1/lookup?key=123
             let lookup_log = log.clone();
-            let lookup_route = warp::path("lookup")
+            let lookup_route = v1
+                .and(warp::path("lookup"))
                 .and(warp::get())
                 .and(warp::query::<std::collections::HashMap<String, String>>())
                 .and_then(move |q: std::collections::HashMap<String, String>| {
@@ -470,9 +525,10 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // POST /sql  { sql: "INSERT ..." | "SELECT ..." }
+            // POST /v1/sql  { sql: "INSERT ..." | "SELECT ..." }
             let sql_log = log.clone();
-            let sql_route = warp::path("sql")
+            let sql_route = v1
+                .and(warp::path("sql"))
                 .and(warp::post())
                 .and(warp::body::json())
                 .and_then(move |body: serde_json::Value| {
@@ -515,7 +571,7 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // Metrics endpoint
+            // Metrics endpoint stays unversioned for Prometheus convention
             let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
                 let text = engine_crate::metrics::render();
                 warp::reply::with_header(text, "Content-Type", "text/plain; version=0.0.4")
@@ -543,12 +599,12 @@ async fn main() -> Result<()> {
                     })
             };
 
-            // RMI build: POST /rmi/build  (feature-gated)
+            // RMI build: POST /v1/rmi/build  (feature-gated)
             #[cfg(feature = "learned-index")]
             let rmi_build = {
                 let data_dir = cli.data_dir.clone();
                 let build_log = log.clone();
-                warp::path!("rmi" / "build")
+                v1.and(warp::path!("rmi" / "build"))
                     .and(warp::post())
                     .and_then(move || {
                         let log = build_log.clone();
@@ -613,7 +669,7 @@ async fn main() -> Result<()> {
             #[cfg(not(feature = "learned-index"))]
             let rmi_build = {
                 use warp::http::StatusCode;
-                warp::path!("rmi" / "build").and(warp::post()).map(|| {
+                v1.and(warp::path!("rmi" / "build")).and(warp::post()).map(|| {
                     warp::reply::with_status(
                         warp::reply::json(&serde_json::json!({
                             "error": "learned-index feature not enabled"
@@ -624,7 +680,8 @@ async fn main() -> Result<()> {
             };
 
             let subscribe_log = log.clone();
-            let subscribe_route = warp::path("subscribe")
+            let subscribe_route = v1
+                .and(warp::path("subscribe"))
                 .and(warp::get())
                 .and(warp::query::<std::collections::HashMap<String, String>>())
                 .and_then(move |q: std::collections::HashMap<String, String>| {
@@ -662,9 +719,10 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // Vector insert: POST /vector/insert { key: u64, vector: [f32,...] }
+            // Vector insert: POST /v1/vector/insert { key: u64, vector: [f32,...] }
             let vec_ins_log = log.clone();
-            let vector_insert = warp::path!("vector" / "insert")
+            let vector_insert = v1
+                .and(warp::path!("vector" / "insert"))
                 .and(warp::post())
                 .and(warp::body::json())
                 .and_then(move |body: serde_json::Value| {

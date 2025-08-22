@@ -1,0 +1,32 @@
+name: release
+on:
+  push:
+    tags: ["v*.*.*"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p engine --release --features learned-index
+      - run: cargo build -p bench  --release
+      - name: Upload engine
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/kyrodb-engine
+            target/release/bench
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/kyrodb-engine:${{ github.ref_name }}
+          platforms: linux/amd64,linux/arm64

@@ -30,9 +30,22 @@ Thumbs.db
 
 # Local binaries
 /orchestrator/kyrodbctl
+/orchestrator/ngdbctl
 
-# Node (not used now but harmless)
-node_modules/*
+# Bench/plot artifacts
+bench/*.png
+bench/*.svg
+bench/*.csv
+bench_server.log
 
+# Python
+.venv/
+__pycache__/
+
+# Node leftovers (not used)
+node_modules/
+package-lock.json
+
+# Docs scratch
 docs/TODO.md
 experimental.local.md

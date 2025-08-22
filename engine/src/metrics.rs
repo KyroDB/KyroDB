@@ -32,17 +32,21 @@ mod shim {
     pub static RMI_REBUILD_DURATION_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_PROBE_LEN: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_MISPREDICTS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static RMI_READS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BTREE_READS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub fn inc_sse_lagged() {}
     pub fn render() -> String { String::new() }
 }
 
 #[cfg(feature = "bench-no-metrics")]
 pub use shim::{
-    APPEND_LATENCY_SECONDS, APPENDS_TOTAL, COMPACTION_DURATION_SECONDS, COMPACTIONS_TOTAL,
-    RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL, RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES,
-    RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL, RMI_MISSES_TOTAL, RMI_PROBE_LEN,
-    RMI_REBUILD_DURATION_SECONDS, RMI_REBUILDS_TOTAL, SNAPSHOT_LATENCY_SECONDS, SNAPSHOTS_TOTAL,
-    SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL, WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, inc_sse_lagged, render,
+    APPEND_LATENCY_SECONDS, APPENDS_TOTAL, BTREE_READS_TOTAL, COMPACTION_DURATION_SECONDS,
+    COMPACTIONS_TOTAL, RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL,
+    RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES, RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL,
+    RMI_MISSES_TOTAL, RMI_PROBE_LEN, RMI_READS_TOTAL, RMI_REBUILD_DURATION_SECONDS,
+    RMI_REBUILDS_TOTAL, SNAPSHOT_LATENCY_SECONDS, SNAPSHOTS_TOTAL, SSE_LAGGED_TOTAL,
+    WAL_BLOCK_CACHE_HITS_TOTAL, WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, inc_sse_lagged,
+    render,
 };
 
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -237,6 +241,25 @@ pub static WAL_BLOCK_CACHE_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
         "Total number of payload cache misses"
     )
     .expect("register kyrodb_wal_block_cache_misses_total")
+});
+
+// New: read counters by index type
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_READS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_rmi_reads_total",
+        "Total successful reads served by the RMI index"
+    )
+    .expect("register kyrodb_rmi_reads_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BTREE_READS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_btree_reads_total",
+        "Total successful reads served by the B-Tree index"
+    )
+    .expect("register kyrodb_btree_reads_total")
 });
 
 #[cfg(not(feature = "bench-no-metrics"))]
