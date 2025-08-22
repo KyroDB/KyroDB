@@ -216,17 +216,6 @@ Simplified flow (current):
 
 ---
 
-## Benchmarks (how we’ll present claims)
-
-Bench scripts and results will live in `/bench`. The README will only present reproducible benchmarks with exact hardware and commit hashes. Primary comparisons: RMI vs a baseline B-Tree/rocks-like indexing on point-lookup workloads across uniform and Zipfian keys.
-
-Example claim format (to be populated when results are published):
-
-> On N keys (V-byte values) on machine X with SSD: RMI p99 read latency = X ms vs B-Tree p99 = Y ms (exact bench scripts and CSV in /bench/results).
-
-Until the CSVs and run scripts are in the repo, treat any numbers as provisional.
-
----
 
 ## Ops Guide (quick notes)
 
