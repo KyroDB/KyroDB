@@ -532,6 +532,7 @@ impl RmiIndex {
         let leaf_hi = start + len - 1;
         let mut lo = (pred - eps).clamp(leaf_lo, leaf_hi);
         let mut hi = (pred + eps).clamp(leaf_lo, leaf_hi);
+        // widen a touch to absorb rounding errors
         lo = (lo - 1).max(leaf_lo);
         hi = (hi + 1).min(leaf_hi);
         (lo as usize, hi as usize)
@@ -541,6 +542,36 @@ impl RmiIndex {
     fn find_leaf_index(&self, key: u64) -> Option<usize> {
         if self.leaf_len.is_empty() { return None; }
         Some(self.router[self.router_index(key)] as usize)
+    }
+
+    // --- probe helpers ---
+    #[inline(always)]
+    fn prefetch_window(&self, _idx: usize) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+        unsafe {
+            use core::arch::x86_64::_mm_prefetch;
+            use core::arch::x86_64::_MM_HINT_T0;
+            match &self.backing {
+                RmiBacking::Mmap { mmap, keys_off, .. } => {
+                    let base = mmap.as_ptr().add(*keys_off + _idx * std::mem::size_of::<u64>()) as *const i8;
+                    _mm_prefetch(base, _MM_HINT_T0);
+                    _mm_prefetch(base.add(64), _MM_HINT_T0);
+                    _mm_prefetch(base.add(128), _MM_HINT_T0);
+                }
+                RmiBacking::MmapAos { mmap, entries_off, entry_stride, .. } => {
+                    let base = mmap.as_ptr().add(*entries_off + _idx * *entry_stride) as *const i8;
+                    _mm_prefetch(base, _MM_HINT_T0);
+                    _mm_prefetch(base.add(64), _MM_HINT_T0);
+                    _mm_prefetch(base.add(128), _MM_HINT_T0);
+                }
+                RmiBacking::Owned { sorted_keys, .. } => {
+                    let ptr = (sorted_keys.as_ptr() as *const u8).wrapping_add(_idx * std::mem::size_of::<u64>()) as *const i8;
+                    _mm_prefetch(ptr, _MM_HINT_T0);
+                    _mm_prefetch(ptr.add(64), _MM_HINT_T0);
+                    _mm_prefetch(ptr.add(128), _MM_HINT_T0);
+                }
+            }
+        }
     }
 
     // AVX-512 paths (runtime detection)
@@ -716,40 +747,31 @@ impl RmiIndex {
         None
     }
 
-    #[inline(always)]
-    fn predict_clamp_fast(&self, leaf_id: usize, key: u64) -> (usize, usize) {
-        // pos = ((m * key) >> SHIFT) + b
-        let m = unsafe { *self.fx_m.get_unchecked(leaf_id) };
-        let b = unsafe { *self.fx_b.get_unchecked(leaf_id) };
-        let eps = unsafe { *self.leaves.get_unchecked(leaf_id) }.epsilon as i64;
-        let start = unsafe { *self.leaves.get_unchecked(leaf_id) }.start as i64;
-        let len = unsafe { *self.leaves.get_unchecked(leaf_id) }.len as i64;
+    // Debug helpers for benches
+    #[inline]
+    pub fn debug_find_leaf_index(&self, key: u64) -> Option<usize> {
+        self.find_leaf_index(key)
+    }
 
-        let pred = (((m * (key as i128)) >> self.fx_shift) as i64) + b;
-        let leaf_lo = start;
-        let leaf_hi = start + len - 1;
-        let mut lo = (pred - eps).clamp(leaf_lo, leaf_hi);
-        let mut hi = (pred + eps).clamp(leaf_lo, leaf_hi);
-        // widen a touch to absorb rounding errors
-        lo = (lo - 1).max(leaf_lo);
-        hi = (hi + 1).min(leaf_hi);
-        (lo as usize, hi as usize)
+    #[inline]
+    pub fn debug_predict_clamp(&self, key: u64) -> Option<(usize, usize)> {
+        let leaf = self.find_leaf_index(key)?;
+        Some(self.predict_clamp_fast(leaf, key))
+    }
+
+    #[inline]
+    pub fn debug_probe_only(&self, key: u64, lo: usize, hi: usize) -> Option<u64> {
+        self.small_window_probe(key, lo, hi)
     }
 
     // In predict_get, swap to the fast predictor and keep your SIMD + fallback search:
     #[inline(always)]
     pub fn predict_get(&self, key: &u64) -> Option<u64> {
         if self.count() == 0 { return None; }
-        let leaf_id = {
-            // top-16-bit router
-            let idx = (*key >> 48) as usize;
-            self.router[idx] as usize
-        };
+        let leaf_id = self.find_leaf_index(*key)?;
         let (lo, hi) = self.predict_clamp_fast(leaf_id, *key);
         self.prefetch_window(lo);
-        // small window SIMD, else binary search:
         if let Some(v) = self.small_window_probe(*key, lo, hi) { return Some(v); }
-        // Tight binary search
         let mut l = lo; let mut r = hi;
         while l <= r {
             let m = l + ((r - l) >> 1);
