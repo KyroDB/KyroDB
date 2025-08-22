@@ -592,7 +592,7 @@ impl RmiIndex {
                 let idx6 = ((lo + i + 6) * stride) as i64;
                 let idx7 = ((lo + i + 7) * stride) as i64;
                 let idx_vec = core::arch::x86_64::_mm512_set_epi64(idx7, idx6, idx5, idx4, idx3, idx2, idx1, idx0);
-                let gathered = core::arch::x86_64::_mm512_i64gather_epi64(idx_vec, base as *const i8, 1);
+                let gathered = core::arch::x86_64::_mm512_i64gather_epi64(idx_vec, base as *const i64, 1);
                 let cmp = core::arch::x86_64::_mm512_cmpeq_epi64_mask(gathered, target);
                 if cmp != 0 {
                     let tz = cmp.trailing_zeros() as usize; // lane index 0..7
