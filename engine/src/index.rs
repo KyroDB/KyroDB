@@ -280,37 +280,35 @@ impl RmiIndex {
         use xxhash_rust::xxh3::Xxh3; f.flush()?; let all = std::fs::File::open(path)?; let len_before = all.metadata()?.len(); let mut hasher = Xxh3::new(); { use std::io::Read; let mut rdr = std::io::BufReader::new(&all); let mut buf_h = vec![0u8; 64 * 1024]; let mut remaining = len_before as usize; while remaining > 0 { let to_read = buf_h.len().min(remaining); rdr.read_exact(&mut buf_h[..to_read])?; hasher.update(&buf_h[..to_read]); remaining -= to_read; } } let sum = hasher.digest(); drop(all); f.write_all(&sum.to_le_bytes())?; f.flush()?; Ok(())
     }
 
-    /// v5 writer: interleave entries (key, off) with optional u32 packing; adaptive leaves if configured.
+    // v5 writer: interleave entries (key, off) with optional u32 packing; adaptive leaves if configured.
     pub fn write_from_pairs_v5(path: &std::path::Path, pairs: &[(u64, u64)], pack_u32: bool) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut buf: Vec<(u64, u64)> = pairs.to_vec(); buf.sort_by_key(|(k, _)| *k);
         let n = buf.len(); let total_keys = n as u64; let keys: Vec<u64> = buf.iter().map(|(k, _)| *k).collect();
         let env_max_eps = std::env::var("KYRODB_RMI_MAX_EPS").ok().and_then(|s| s.parse::<u32>().ok());
         let leaves = if let Some(max_eps) = env_max_eps { let min_leaf = std::env::var("KYRODB_RMI_MIN_LEAF").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(256); Self::build_leaves_adaptive(&keys, max_eps, min_leaf) } else { let target_leaf = std::env::var("KYRODB_RMI_TARGET_LEAF").ok().and_then(|s| s.parse::<usize>().ok()).filter(|&v| v > 0).unwrap_or(1024usize); let num_leaves = (n.div_ceil(target_leaf)) as usize; let mut lvs: Vec<RmiLeafMeta> = Vec::with_capacity(num_leaves); for li in 0..num_leaves { let start = (li * n) / num_leaves; let end = (((li + 1) * n) / num_leaves).max(start + 1); let (m, b, eps) = Self::fit_leaf(&keys, start, end); lvs.push(RmiLeafMeta { key_min: keys[start], key_max: keys[end - 1], slope: m, intercept: b, epsilon: eps, start: start as u64, len: (end - start) as u64 }); } lvs };
-        let mut f = std::fs::File::create(path)?; let mut header = Vec::new(); header.extend_from_slice(&RMI_MAGIC); header.push(5u8); header.extend_from_slice(&[0u8; 3]); header.extend_from_slice(&(leaves.len() as u32).to_le_bytes()); header.extend_from_slice(&total_keys.to_le_bytes()); header.push(if pack_u32 { 4u8 } else { 8u8 }); header.extend_from_slice(&[0u8; 7]); f.write_all(&header)?; for leaf in &leaves { f.write_all(&leaf.key_min.to_le_bytes())?; f.write_all(&leaf.key_max.to_le_bytes())?; f.write_all(&leaf.slope.to_le_bytes())?; f.write_all(&leaf.intercept.to_le_bytes())?; f.write_all(&leaf.epsilon.to_le_bytes())?; f.write_all(&leaf.start.to_le_bytes())?; f.write_all(&leaf.len.to_le_bytes())?; }
+        // When pack_u32, still pad to 16 bytes to keep 16-byte stride (better perf)
+        let entry_stride: usize = 16;
+        // write header
+        let mut f = std::fs::File::create(path)?;
+        let mut header = Vec::new(); header.extend_from_slice(&RMI_MAGIC); header.push(5u8); header.extend_from_slice(&[0u8; 3]); header.extend_from_slice(&(leaves.len() as u32).to_le_bytes()); header.extend_from_slice(&total_keys.to_le_bytes()); header.push(if pack_u32 { 4u8 } else { 8u8 }); header.extend_from_slice(&[0u8; 7]); f.write_all(&header)?;
+        for leaf in &leaves { f.write_all(&leaf.key_min.to_le_bytes())?; f.write_all(&leaf.key_max.to_le_bytes())?; f.write_all(&leaf.slope.to_le_bytes())?; f.write_all(&leaf.intercept.to_le_bytes())?; f.write_all(&leaf.epsilon.to_le_bytes())?; f.write_all(&leaf.start.to_le_bytes())?; f.write_all(&leaf.len.to_le_bytes())?; }
         { use std::io::Seek; let pos = f.stream_position()?; let pad = ((8 - (pos % 8)) % 8) as usize; if pad > 0 { f.write_all(&vec![0u8; pad])?; } }
-        if pack_u32 { for (k, o) in &buf { f.write_all(&k.to_le_bytes())?; f.write_all(&(*o as u32).to_le_bytes())?; } } else { for (k, o) in &buf { f.write_all(&k.to_le_bytes())?; f.write_all(&o.to_le_bytes())?; } }
-        use xxhash_rust::xxh3::Xxh3; f.flush()?; let all = std::fs::File::open(path)?; let len_before = all.metadata()?.len(); let mut hasher = Xxh3::new(); { use std::io::Read; let mut rdr = std::io::BufReader::new(&all); let mut b = vec![0u8; 64 * 1024]; let mut remaining = len_before as usize; while remaining > 0 { let to_read = b.len().min(remaining); rdr.read_exact(&mut b[..to_read])?; hasher.update(&b[..to_read]); remaining -= to_read; } } let sum = hasher.digest(); drop(all); f.write_all(&sum.to_le_bytes())?; f.flush()?; Ok(())
-    }
-
-    /// Env-aware writer: defaults to v5 (AoS). Controls:
-    /// - KYRO_RMI_FORMAT = v4 | v5 (default v5)
-    /// - KYRO_RMI_PACK_U32 = 1|true to pack offsets as u32 in v5
-    pub fn write_from_pairs_auto(path: &std::path::Path, pairs: &[(u64, u64)]) -> std::io::Result<()> {
-        let fmt = std::env::var("KYRO_RMI_FORMAT").ok();
-        match fmt.as_deref() {
-            Some("v4") => Self::write_from_pairs(path, pairs),
-            _ => {
-                let pack = std::env::var("KYRO_RMI_PACK_U32")
-                    .ok()
-                    .map(|s| {
-                        let ls = s.to_ascii_lowercase();
-                        ls == "1" || ls == "true" || ls == "yes" || ls == "on"
-                    })
-                    .unwrap_or(false);
-                Self::write_from_pairs_v5(path, pairs, pack)
+        // write entries
+        for &(_k, _off) in &buf {
+            let k_le = _k.to_le();
+            f.write_all(&k_le.to_le_bytes())?;
+            if pack_u32 {
+                let o32 = (_off as u32).to_le_bytes();
+                f.write_all(&o32)?;
+                // pad 4 bytes
+                f.write_all(&0u32.to_le_bytes())?;
+            } else {
+                let o64 = _off.to_le_bytes();
+                f.write_all(&o64)?;
             }
         }
+        use xxhash_rust::xxh3::Xxh3; f.flush()?; let all = std::fs::File::open(path)?; let len_before = all.metadata()?.len(); let mut hasher = Xxh3::new(); { use std::io::Read; let mut rdr = std::io::BufReader::new(&all); let mut b = vec![0u8; 64 * 1024]; let mut remaining = len_before as usize; while remaining > 0 { let to_read = b.len().min(remaining); rdr.read_exact(&mut b[..to_read])?; hasher.update(&b[..to_read]); remaining -= to_read; } } let sum = hasher.digest(); drop(all); f.write_all(&sum.to_le_bytes())?; f.flush()?; Ok(())
     }
 
     pub fn load_from_file(path: &std::path::Path) -> Option<Self> {
