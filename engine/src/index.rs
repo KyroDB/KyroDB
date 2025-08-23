@@ -785,10 +785,12 @@ impl RmiIndex {
     pub fn warm(&self) {
         // 1) Touch router (tiny)
         let r = &self.router;
-        let _ = r[0];
-        let _ = r[(r.len() - 1) / 2];
-        let _ = r[r.len() - 1];
-        // 2) Advise mmap’d regions and pre-touch a sample of keys to fault pages
+        if !r.is_empty() {
+            let _ = r[0];
+            let _ = r[(r.len() - 1) / 2];
+            let _ = r[r.len() - 1];
+        }
+        // 2) Advise mmap’d regions and pre-touch a sample of pages
         match &self.backing {
             RmiBacking::Mmap { mmap, keys_off, offs_off, count } => unsafe {
                 let base = mmap.as_ptr();
@@ -798,15 +800,14 @@ impl RmiIndex {
                     let _ = libc::madvise(base as *mut _, len, libc::MADV_WILLNEED);
                     let _ = libc::madvise(base as *mut _, len, libc::MADV_HUGEPAGE);
                 }
-                // Touch every ~4 KiB page in keys[] and offs[] (bounded cost)
                 let kptr = base.add(*keys_off);
                 let optr = base.add(*offs_off);
-                let step = 4096usize / core::mem::size_of::<u64>();
+                let step = (4096usize / core::mem::size_of::<u64>()).max(1);
                 let n = *count;
                 let mut i = 0usize;
                 while i < n {
-                    core::hint::black_box(std::ptr::read_unaligned(kptr.add(i * 8) as *const u64));
-                    core::hint::black_box(std::ptr::read_unaligned(optr.add(i * 8) as *const u64));
+                    let _ = std::hint::black_box(std::ptr::read_unaligned(kptr.add(i * 8) as *const u64));
+                    let _ = std::hint::black_box(std::ptr::read_unaligned(optr.add(i * 8) as *const u64));
                     i = i.saturating_add(step);
                 }
             },
@@ -818,22 +819,30 @@ impl RmiIndex {
                     let _ = libc::madvise(mmap.as_ptr() as *mut _, len, libc::MADV_WILLNEED);
                     let _ = libc::madvise(mmap.as_ptr() as *mut _, len, libc::MADV_HUGEPAGE);
                 }
-                // Touch every ~4 KiB page in entries
-                let step = 4096usize.max(*entry_stride) / *entry_stride;
+                let step = (4096usize / *entry_stride).max(1);
                 let mut i = 0usize;
                 while i < *count {
-                    core::hint::black_box(std::ptr::read_unaligned(base.add(i * *entry_stride) as *const u64));
+                    let _ = std::hint::black_box(std::ptr::read_unaligned(base.add(i * *entry_stride) as *const u64));
                     i = i.saturating_add(step);
                 }
             },
-            _ => {}
+            RmiBacking::Owned { sorted_keys, sorted_offsets } => {
+                let step = (4096usize / core::mem::size_of::<u64>()).max(1);
+                let n = core::cmp::min(sorted_keys.len(), sorted_offsets.len());
+                let mut i = 0usize;
+                while i < n {
+                    // SAFETY: we clamp i < n and step forward
+                    let _ = std::hint::black_box(unsafe { *sorted_keys.get_unchecked(i) });
+                    let _ = std::hint::black_box(unsafe { *sorted_offsets.get_unchecked(i) });
+                    i = i.saturating_add(step);
+                }
+            }
         }
         // 3) Optionally pre-touch first key of each leaf window (cheap predictor)
         for leaf_id in (0..self.leaves.len()).step_by(64) {
-            let leaf = &self.leaves[leaf_id];
-            let lo = leaf.start as usize;
+            let lo = self.leaves[leaf_id].start as usize;
             if lo < self.count() {
-                let _ = self.key_at(lo);
+                let _ = std::hint::black_box(self.key_at(lo));
             }
         }
     }
@@ -876,15 +885,18 @@ impl PrimaryIndex {
                 if let Some(v) = r.delta_get(key) {
                     crate::metrics::RMI_HITS_TOTAL.inc();
                     crate::metrics::RMI_READS_TOTAL.inc();
-                    Some(v)
-                } else {
-                    let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                    let res = r.predict_get(key);
-                    timer.observe_duration();
-                    if res.is_some() { crate::metrics::RMI_HITS_TOTAL.inc(); crate::metrics::RMI_READS_TOTAL.inc(); }
-                    else { crate::metrics::RMI_MISSES_TOTAL.inc(); }
-                    res
+                    return Some(v);
                 }
+                let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                let res = r.predict_get(key);
+                timer.observe_duration();
+                if res.is_some() {
+                    crate::metrics::RMI_HITS_TOTAL.inc();
+                    crate::metrics::RMI_READS_TOTAL.inc();
+                } else {
+                    crate::metrics::RMI_MISSES_TOTAL.inc();
+                }
+                res
             }
         }
     }
