@@ -182,7 +182,7 @@ impl RmiIndex {
     #[inline]
     fn off_at(&self, idx: usize) -> u64 {
         match &self.backing {
-            RmiBacking::Owned { sorted_offsets, .. } => sorted_offsets[idx],
+            RmiBacking::Owned { sorted_offsets, .. } => sortedOffsets[idx],
             RmiBacking::Mmap { mmap, offs_off, .. } => unsafe {
                 let ptr = mmap.as_ptr().add(*offs_off + idx * std::mem::size_of::<u64>()) as *const u64;
                 u64::from_le(std::ptr::read_unaligned(ptr))
@@ -777,6 +777,55 @@ impl RmiIndex {
             if km < *key { l = m + 1; }
             else if km > *key { if m == 0 { break; } r = m - 1; }
             else { return Some(self.off_at(m)); }
+        }
+        None
+    }
+
+    // AoS small-window probe without gathers; assumes entry_stride == 16
+    #[inline(always)]
+    unsafe fn small_window_probe_aos_scalar(
+        &self,
+        entries_off: usize,
+        entry_stride: usize,
+        key: u64,
+        lo: usize,
+        len: usize,
+    ) -> Option<usize> {
+        if let RmiBacking::MmapAos { mmap, .. } = &self.backing {
+            let base = mmap.as_ptr().add(entries_off);
+            let mut i = 0usize;
+            while i < len {
+                // unroll by 4
+                let idx0 = lo + i + 0;
+                let idx1 = lo + i + 1;
+                let idx2 = lo + i + 2;
+                let idx3 = lo + i + 3;
+
+                let k0 = std::ptr::read_unaligned(base.add(idx0 * entry_stride) as *const u64).to_le();
+                if k0 == key { return Some(idx0); }
+
+                if i + 1 < len {
+                    let k1 = std::ptr::read_unaligned(base.add(idx1 * entry_stride) as *const u64).to_le();
+                    if k1 == key { return Some(idx1); }
+                }
+                if i + 2 < len {
+                    let k2 = std::ptr::read_unaligned(base.add(idx2 * entry_stride) as *const u64).to_le();
+                    if k2 == key { return Some(idx2); }
+                }
+                if i + 3 < len {
+                    let k3 = std::ptr::read_unaligned(base.add(idx3 * entry_stride) as *const u64).to_le();
+                    if k3 == key { return Some(idx3); }
+                }
+
+                // software prefetch ahead
+                #[cfg(all(target_arch = "x86_64"))]
+                core::arch::x86_64::_mm_prefetch(
+                    base.add((lo + i + 8).min(lo + len).saturating_mul(entry_stride)) as *const i8,
+                    core::arch::x86_64::_MM_HINT_T0,
+                );
+
+                i += 4;
+            }
         }
         None
     }
