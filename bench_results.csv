@@ -1,2 +1,2 @@
 base,dist,reads_total,rps,p50_us,p95_us,p99_us,rmi_lookup_avg_us,rmi_probe_len_avg
-http://127.0.0.1:3030,uniform,1926279,32104.65,7872.5,15728.6,18546.7,,
+http://127.0.0.1:3030,uniform,8549938,142498.97,78.2,165.9,245.5,,

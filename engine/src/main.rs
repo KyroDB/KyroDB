@@ -92,6 +92,13 @@ async fn main() -> Result<()> {
             #[cfg(not(feature = "learned-index"))]
             let _ = (rmi_rebuild_appends.as_ref(), rmi_rebuild_ratio.as_ref());
 
+            // Optional warm-on-start: fault-in snapshot and RMI pages before serving
+            if std::env::var("KYRODB_WARM_ON_START").ok().as_deref() == Some("1") {
+                println!("🔥 Warm-on-start enabled; warming data and index pages...");
+                log.warmup().await;
+                println!("🔥 Warm-on-start complete.");
+            }
+
             // Configure WAL rotation if requested
             if wal_segment_bytes.is_some() || wal_max_segments > 0 {
                 log.configure_wal_rotation(wal_segment_bytes, wal_max_segments)

@@ -74,11 +74,15 @@ async fn main() -> Result<()> {
         let client = client.clone();
         let base = args.base.clone();
         let val_bytes = args.val_bytes;
+        let auth = auth_header.clone();
         join.spawn(async move {
             let k = i as u64;
-            let url = format!("{}/kv/{}", base, k);
-            let val = vec![0u8; val_bytes];
-            let _ = client.put(url).body(val).send().await;
+            let url = format!("{}/v1/put", base);
+            let value = "A".repeat(val_bytes);
+            let body = serde_json::json!({ "key": k, "value": value });
+            let mut req = client.post(url).json(&body);
+            if let Some(a) = auth.as_deref() { req = req.header("Authorization", a); }
+            let _ = req.send().await;
             drop(permit);
         });
         pb.inc(1);
@@ -86,7 +90,12 @@ async fn main() -> Result<()> {
     while let Some(res) = join.join_next().await { let _ = res; }
     pb.finish_with_message("load done");
 
-    // 2) Read-heavy workload and measure latency (lookup_raw)
+    // 0) Build RMI then warmup to avoid cold-start artifacts before measuring
+    if let Err(e) = prebuild_and_warm(&client, &args.base, auth_header.as_deref()).await {
+        eprintln!("warn: prebuild/warm step failed: {} (continuing)", e);
+    }
+
+    // 2) Read-heavy workload and measure latency (get_fast)
     println!("[read] running {}s, {} concurrency, dist={}", args.read_seconds, args.read_concurrency, args.dist);
     let deadline = Instant::now() + Duration::from_secs(args.read_seconds);
     let hist = Arc::new(tokio::sync::Mutex::new(Histogram::<u64>::new(3)?));
@@ -113,9 +122,12 @@ async fn main() -> Result<()> {
                 } else {
                     rng.gen_range(0..load_n as u64)
                 };
-                let url = format!("{}/kv/{}", base, k);
+                // Use fast value path to include value fetch cost realistically
+                let url = format!("{}/v1/get_fast/{}", base, k);
+                let mut req = client.get(url);
+                if let Some(a) = auth_header.as_deref() { req = req.header("Authorization", a); }
                 let t0 = Instant::now();
-                let _ = client.get(url).send().await;
+                let _ = req.send().await;
                 let dt = t0.elapsed();
                 total.fetch_add(1, Ordering::Relaxed);
                 let mut h = hist.lock().await;
@@ -202,4 +214,23 @@ async fn wait_for_health(client: &reqwest::Client, base: &str, auth: Option<&str
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     anyhow::bail!("server not healthy at {}", url)
+}
+
+// Prebuild RMI and warm up server for realistic benchmarking
+async fn prebuild_and_warm(client: &reqwest::Client, base: &str, auth: Option<&str>) -> Result<()> {
+    // Try to build RMI index
+    {
+        let url = format!("{}/v1/rmi/build", base);
+        let mut req = client.post(&url);
+        if let Some(a) = auth { req = req.header("Authorization", a); }
+        let _ = req.send().await?; // ignore body; server swaps if ok
+    }
+    // Warmup
+    {
+        let url = format!("{}/v1/warmup", base);
+        let mut req = client.post(&url);
+        if let Some(a) = auth { req = req.header("Authorization", a); }
+        let _ = req.send().await?;
+    }
+    Ok(())
 }
