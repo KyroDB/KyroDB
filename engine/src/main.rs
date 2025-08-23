@@ -751,6 +751,20 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // POST /v1/warmup: fault-in index and snapshot pages, best-effort
+            let warmup = {
+                let log2 = log.clone();
+                v1.and(warp::path("warmup"))
+                    .and(warp::post())
+                    .and_then(move || {
+                        let log = log2.clone();
+                        async move {
+                            log.warmup().await;
+                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"status":"ok"})))
+                        }
+                    })
+            };
+
             // Apply auth to protected routes
             let append_route = auth.clone().and(append_route).map(|(), r| r);
             let replay_route = auth.clone().and(replay_route).map(|(), r| r);
@@ -789,6 +803,7 @@ async fn main() -> Result<()> {
                 .or(vector_insert)
                 .or(rmi_build)
                 .or(compact_route)
+                .or(warmup)
                 .recover(|rej: warp::Rejection| async move {
                     use warp::http::StatusCode;
                     if rej.find::<Unauthorized>().is_some() {

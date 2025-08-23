@@ -835,6 +835,38 @@ impl PersistentEventLog {
             }
         }
     }
+
+    // Warm snapshot payload mmap + primary index (if RMI), best-effort.
+    pub async fn warmup(&self) {
+        // Warm snapshot payload pages (for get())
+        if let Some(ref mmap) = *self.snapshot_mmap.read().await {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let _ = libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_WILLNEED);
+                let _ = libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_HUGEPAGE);
+            }
+            // Touch a page every 4 KiB up to a budget (avoid long stalls)
+            let base = mmap.as_ptr();
+            let len = mmap.len();
+            let budget_pages = 16 * 1024; // ~64 MiB cap
+            let mut touched = 0usize;
+            let mut off = 0usize;
+            while off < len && touched < budget_pages {
+                unsafe { core::hint::black_box(std::ptr::read_volatile(base.add(off))); }
+                off = off.saturating_add(4096);
+                touched += 1;
+            }
+        }
+
+        // Warm primary index if RMI
+        let idx = self.index.read().await;
+        #[cfg(feature = "learned-index")]
+        {
+            if let crate::index::PrimaryIndex::Rmi(rmi) = &*idx {
+                rmi.warm();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
