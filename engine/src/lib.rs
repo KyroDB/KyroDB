@@ -482,8 +482,23 @@ impl PersistentEventLog {
                     if let Some(v) = r.delta_get(&key) {
                         return Some(v);
                     }
-                    if let Some(v) = r.predict_get(&key) {
+                    // Measure RMI lookup latency overall and, if applicable, during rebuild window
+                    let timer_all = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                    #[allow(unused_mut)]
+                    let mut rebuild_timer = None;
+                    #[cfg(not(feature = "bench-no-metrics"))]
+                    if crate::metrics::rmi_rebuild_in_progress() {
+                        rebuild_timer = Some(crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer());
+                    }
+                    let res = r.predict_get(&key);
+                    timer_all.observe_duration();
+                    if let Some(t) = rebuild_timer { t.observe_duration(); }
+                    if let Some(v) = res {
+                        crate::metrics::RMI_HITS_TOTAL.inc();
+                        crate::metrics::RMI_READS_TOTAL.inc();
                         return Some(v);
+                    } else {
+                        crate::metrics::RMI_MISSES_TOTAL.inc();
                     }
                 }
             }
@@ -751,17 +766,25 @@ impl PersistentEventLog {
         let cur_size = std::fs::metadata(&cur_path).map(|m| m.len()).unwrap_or(0);
         if cur_size < max_seg_bytes { return; }
         // rotate
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("wal_before_rotate", |_| { () });
         let mut w = self.wal.write().await;
         let mut seg_idx = self.wal_seg_index.write().await;
         let next_idx = seg_idx.saturating_add(1);
         let next_path = Self::wal_segment_path(&self.data_dir, next_idx);
         if let Ok(new_file) = OpenOptions::new().write(true).create(true).truncate(true).open(&next_path) {
+            #[cfg(feature = "failpoints")]
+            fail::fail_point!("wal_after_open_new_before_switch", |_| { () });
             *w = BufWriter::new(new_file);
+            #[cfg(feature = "failpoints")]
+            fail::fail_point!("wal_after_switch_before_dirsync", |_| { () });
             *seg_idx = next_idx;
             if let Err(e) = fsync_dir(&self.data_dir) { eprintln!("⚠️ fsync data dir after wal rotate failed: {}", e); }
             drop(w); drop(seg_idx);
             #[cfg(feature = "failpoints")]
             fail::fail_point!("wal_after_rotate_before_retention", |_| { () });
+            #[cfg(feature = "failpoints")]
+            fail::fail_point!("wal_before_retention", |_| { () });
             // retention
             let max_keep = *self.wal_max_segments.read().await;
             if max_keep > 0 {
@@ -774,6 +797,8 @@ impl PersistentEventLog {
                     if let Err(e) = fsync_dir(&self.data_dir) { eprintln!("⚠️ fsync data dir after wal retention failed: {}", e); }
                 }
             }
+            #[cfg(feature = "failpoints")]
+            fail::fail_point!("wal_after_retention_before_manifest", |_| { () });
             if let Err(e) = self.write_manifest().await { eprintln!("⚠️ manifest write after rotation failed: {}", e); }
         }
     }
