@@ -88,7 +88,7 @@ This roadmap spans immediate priorities (KV + RMI) to advanced ambitions (distri
 
 **Goal:** Production-grade KV + RMI.
 **Deliverables:** durable WAL, atomic snapshot+manifest, mmap RMI binary and builder, compaction, HTTP data-plane initially; migrate data-plane to gRPC, bench harness, CI fuzz tests.
-**Success:** reproducible benchmarks (10M/50M), recovery invariants proven by tests, preprint draft outlining RMI productionization.
+**Success:** reproducible benchmarks (10M/50M/1B), recovery invariants proven by tests, preprint draft outlining RMI productionization.
 
 ## Phase B — Polish & Research 
 

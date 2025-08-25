@@ -201,6 +201,10 @@ impl RmiIndex {
     // add delta helpers missing after refactor
     pub fn insert_delta(&mut self, key: u64, offset: u64) { self.delta.insert(key, offset); }
     pub fn delta_get(&self, key: &u64) -> Option<u64> { self.delta.get(key).copied() }
+    /// Snapshot current delta updates as pairs for migration/inspection
+    pub fn delta_pairs(&self) -> Vec<(u64, u64)> {
+        self.delta.iter().map(|(k, v)| (*k, *v)).collect()
+    }
 
     // --- common leaf fit helpers (adaptive epsilon) ---
     fn fit_leaf(keys: &[u64], start: usize, end: usize) -> (f32, f32, u32) {

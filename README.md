@@ -38,7 +38,7 @@ Engine microbenchmarks (in-process)
 
 - Compare raw key-lookup latency for RMI vs B-Tree within the engine:
   - Run: `cargo bench -p bench --bench kv_index`
-  - Try multiple scales by setting `KYRO_BENCH_N` (e.g., 1e6, 1e7, 5e7, 3e8):
+  - Try multiple scales by setting `KYRO_BENCH_N` (e.g., 1M, 10M, 50M, 300M):
     - `KYRO_BENCH_N=1000000 cargo bench -p bench --bench kv_index`
     - `KYRO_BENCH_N=10000000 cargo bench -p bench --bench kv_index`
 
@@ -166,6 +166,21 @@ Additional operational notes live in `docs/`.
 Curious about where this is going? See `visiondocument.md` for the broader roadmap: range queries, gRPC data plane, replication, and optional vector/ANN capabilities once the core KV + RMI path is rock solid.
 
 ---
+
+## Current guarantees (Alpha)
+- Single-key atomicity: each PUT is all-or-nothing; GET is atomic per key.
+- Durability: WAL + snapshot with atomic index swap; recovery replays committed records only.
+- Index correctness: RMI predictions are bounded and probed; data correctness does not depend on the model.
+
+Not yet (roadmap)
+- Multi-key transactions (BEGIN/COMMIT/ROLLBACK)
+- Transactional isolation (MVCC/Snapshot Isolation)
+- Replication/distribution
+
+## Durability modes (ops)
+- sync=always: fsync on commit for strongest durability (latency tradeoff)
+- sync=group: group commits within N ms (throughput tradeoff)
+- sync=none: benchmarking only
 
 ## Contributing and License
 

@@ -115,6 +115,7 @@ pub struct PersistentEventLog {
     data_dir: PathBuf,
     tx: broadcast::Sender<Event>,
     index: Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
+    // Replace with epoch-guarded shared pointer for linearizable swaps
     next_offset: Arc<RwLock<u64>>,           // monotonic sequence (not tied to vec length)
     // current WAL segment index for rotation
     wal_seg_index: Arc<RwLock<u32>>,
@@ -310,6 +311,7 @@ impl PersistentEventLog {
             data_dir: data_dir.clone(),
             tx,
             index: Arc::new(RwLock::new(idx)),
+            // TODO: migrate to ArcSwap<index::PrimaryIndex> 
             next_offset: Arc::new(RwLock::new(next)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
@@ -468,10 +470,17 @@ impl PersistentEventLog {
         self.append(request_id, bytes).await
     }
 
-    /// Get offset for a given key if present via index.
+    /// Get offset for a given key if present via index with delta-first semantics.
     pub async fn lookup_key(&self, key: u64) -> Option<u64> {
         let idx = self.index.read().await;
-        idx.get(&key)
+        match &*idx {
+            index::PrimaryIndex::BTree(b) => b.get(&key),
+            #[cfg(feature = "learned-index")]
+            index::PrimaryIndex::Rmi(r) => {
+                if let Some(v) = r.delta_get(&key) { return Some(v); }
+                r.predict_get(&key)
+            }
+        }
     }
 
     /// Fallback: scan the log to find the first event matching key, returning (offset, Record)
@@ -594,6 +603,12 @@ impl PersistentEventLog {
         let path = self.data_dir.join("snapshot.bin");
         let tmp = self.data_dir.join("snapshot.tmp");
 
+        #[cfg(feature = "failpoints")]
+        {
+            fail::fail_point!("snapshot_before_write", |_| {
+                anyhow::bail!("failpoint: snapshot_before_write")
+            });
+        }
         {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
             let mut w = BufWriter::new(f);
@@ -607,6 +622,12 @@ impl PersistentEventLog {
             file.sync_all().context("fsync snapshot.tmp")?;
         }
 
+        #[cfg(feature = "failpoints")]
+        {
+            fail::fail_point!("snapshot_before_rename", |_| {
+                anyhow::bail!("failpoint: snapshot_before_rename")
+            });
+        }
         std::fs::rename(&tmp, &path).context("renaming snapshot")?;
         // Ensure the rename is durable
         if let Err(e) = fsync_dir(&self.data_dir) {
@@ -778,6 +799,12 @@ impl PersistentEventLog {
 
     /// Write minimal manifest with next_offset and active files.
     pub async fn write_manifest(&self) -> Result<()> {
+        #[cfg(feature = "failpoints")]
+        {
+            fail::fail_point!("manifest_before_write", |_| {
+                anyhow::bail!("failpoint: manifest_before_write")
+            });
+        }
         let manifest = serde_json::json!({
             "next_offset": self.get_offset().await,
             "snapshot": "snapshot.bin",
@@ -790,6 +817,12 @@ impl PersistentEventLog {
         let mut f = File::create(&tmp).context("create manifest.tmp")?;
         writeln!(f, "{}", manifest).context("write manifest.tmp")?;
         f.sync_all().context("fsync manifest.tmp")?;
+        #[cfg(feature = "failpoints")]
+        {
+            fail::fail_point!("manifest_before_rename", |_| {
+                anyhow::bail!("failpoint: manifest_before_rename")
+            });
+        }
         std::fs::rename(&tmp, self.manifest_path()).context("rename manifest.tmp -> manifest.json")?;
         let _ = fsync_dir(&self.data_dir).map_err(|e| {
             eprintln!("⚠️ fsync data dir after manifest rename failed: {}", e);
@@ -799,64 +832,48 @@ impl PersistentEventLog {
     }
 
     #[cfg(feature = "learned-index")]
-    /// Swap the in-memory primary index (e.g., after RMI rebuild).
-    pub async fn swap_primary_index(&self, new_index: index::PrimaryIndex) {
-        let mut idx = self.index.write().await;
-        *idx = new_index;
-    }
-
-    /// Configure WAL rotation parameters and apply them immediately.
-    pub async fn configure_wal_rotation(
-        &self,
-        segment_bytes: Option<u64>,
-        max_segments: usize,
-    ) {
-        {
-            let mut seg_bytes = self.wal_segment_bytes.write().await;
-            *seg_bytes = segment_bytes;
+    /// Swap the in-memory primary index (e.g., after RMI rebuild) while preserving delta.
+    pub async fn swap_primary_index(&self, mut new_index: index::PrimaryIndex) {
+        let mut guard = self.index.write().await;
+        match (&*guard, &mut new_index) {
+            (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::Rmi(new_rmi)) => {
+                for (k, v) in old_rmi.delta_pairs() { new_rmi.insert_delta(k, v); }
+            }
+            (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::BTree(btree)) => {
+                for (k, v) in old_rmi.delta_pairs() { btree.insert(k, v); }
+            }
+            _ => {}
         }
-        {
-            let mut max = self.wal_max_segments.write().await;
-            *max = max_segments;
-        }
-        // Attempt a rotation right away if thresholds are exceeded
-        self.rotate_wal_if_needed().await;
-        // Best-effort manifest update reflecting new retention/segments
-        let _ = self.write_manifest().await;
+        *guard = new_index;
     }
+}
 
+impl PersistentEventLog {
+    // Reintroduce wal rotation helper
     async fn rotate_wal_if_needed(&self) {
         let seg_bytes = *self.wal_segment_bytes.read().await;
-        let Some(max_seg_bytes) = seg_bytes else {
-            return;
-        };
-        if max_seg_bytes == 0 {
-            return;
-        }
+        let Some(max_seg_bytes) = seg_bytes else { return; };
+        if max_seg_bytes == 0 { return; }
         let cur_idx = *self.wal_seg_index.read().await;
         let cur_path = Self::wal_segment_path(&self.data_dir, cur_idx);
         let cur_size = std::fs::metadata(&cur_path).map(|m| m.len()).unwrap_or(0);
-        if cur_size < max_seg_bytes {
-            return;
-        }
+        if cur_size < max_seg_bytes { return; }
         // rotate
         let mut w = self.wal.write().await;
         let mut seg_idx = self.wal_seg_index.write().await;
         let next_idx = seg_idx.saturating_add(1);
         let next_path = Self::wal_segment_path(&self.data_dir, next_idx);
-        if let Ok(new_file) = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&next_path)
-        {
+        if let Ok(new_file) = OpenOptions::new().write(true).create(true).truncate(true).open(&next_path) {
             *w = BufWriter::new(new_file);
             *seg_idx = next_idx;
-            if let Err(e) = fsync_dir(&self.data_dir) {
-                eprintln!("⚠️ fsync data dir after wal rotate failed: {}", e);
+            if let Err(e) = fsync_dir(&self.data_dir) { eprintln!("⚠️ fsync data dir after wal rotate failed: {}", e); }
+            drop(w); drop(seg_idx);
+            #[cfg(feature = "failpoints")]
+            {
+                fail::fail_point!("wal_after_rotate_before_retention", |_| {
+                    anyhow::bail!("failpoint: wal_after_rotate_before_retention")
+                });
             }
-            drop(w);
-            drop(seg_idx);
             // retention
             let max_keep = *self.wal_max_segments.read().await;
             if max_keep > 0 {
@@ -864,53 +881,32 @@ impl PersistentEventLog {
                 if segs.len() > max_keep {
                     let to_remove = segs.len() - max_keep;
                     for (idx, path) in segs.drain(..to_remove) {
-                        // don't remove current
-                        if idx != next_idx {
-                            let _ = std::fs::remove_file(path);
-                        }
+                        if idx != next_idx { let _ = std::fs::remove_file(path); }
                     }
-                    if let Err(e) = fsync_dir(&self.data_dir) {
-                        eprintln!("⚠️ fsync data dir after wal retention failed: {}", e);
-                    }
+                    if let Err(e) = fsync_dir(&self.data_dir) { eprintln!("⚠️ fsync data dir after wal retention failed: {}", e); }
                 }
             }
-            // update manifest after rotation
-            if let Err(e) = self.write_manifest().await {
-                eprintln!("⚠️ manifest write after rotation failed: {}", e);
-            }
+            if let Err(e) = self.write_manifest().await { eprintln!("⚠️ manifest write after rotation failed: {}", e); }
         }
     }
+}
 
-    // Warm snapshot payload mmap + primary index (if RMI), best-effort.
-    pub async fn warmup(&self) {
-        // Warm snapshot payload pages (for get())
-        if let Some(ref mmap) = *self.snapshot_mmap.read().await {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                let _ = libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_WILLNEED);
-                let _ = libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_HUGEPAGE);
+// Keep learned-index swap in same impl block as other methods
+impl PersistentEventLog {
+    #[cfg(feature = "learned-index")]
+    /// Swap the in-memory primary index (e.g., after RMI rebuild) while preserving delta.
+    pub async fn swap_primary_index(&self, mut new_index: index::PrimaryIndex) {
+        let mut guard = self.index.write().await;
+        match (&*guard, &mut new_index) {
+            (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::Rmi(new_rmi)) => {
+                for (k, v) in old_rmi.delta_pairs() { new_rmi.insert_delta(k, v); }
             }
-            // Touch a page every 4 KiB up to a budget (avoid long stalls)
-            let base = mmap.as_ptr();
-            let len = mmap.len();
-            let budget_pages = 16 * 1024; // ~64 MiB cap
-            let mut touched = 0usize;
-            let mut off = 0usize;
-            while off < len && touched < budget_pages {
-                unsafe { core::hint::black_box(std::ptr::read_volatile(base.add(off))); }
-                off = off.saturating_add(4096);
-                touched += 1;
+            (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::BTree(btree)) => {
+                for (k, v) in old_rmi.delta_pairs() { btree.insert(k, v); }
             }
+            _ => {}
         }
-
-        // Warm primary index if RMI
-        let idx = self.index.read().await;
-        #[cfg(feature = "learned-index")]
-        {
-            if let crate::index::PrimaryIndex::Rmi(rmi) = &*idx {
-                rmi.warm();
-            }
-        }
+        *guard = new_index;
     }
 }
 
