@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     println!("[read] running {}s, {} concurrency, dist={}", args.read_seconds, args.read_concurrency, args.dist);
     let deadline = Instant::now() + Duration::from_secs(args.read_seconds);
     let hist = Arc::new(tokio::sync::Mutex::new(Histogram::<u64>::new(3)?));
-    let sem_r = Arc::new(Semaphore::new(args.read_concurrency));
+    let _sem_r = Arc::new(Semaphore::new(args.read_concurrency));
     let total = Arc::new(AtomicU64::new(0));
     let mut join = JoinSet::new();
     for i in 0..args.read_concurrency {
@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         let load_n = args.load_n;
         let zipf_theta = args.zipf_theta;
         let seed = args.seed ^ (i as u64);
+        let auth = auth_header.clone();
         join.spawn(async move {
             let mut rng = StdRng::seed_from_u64(seed);
             let zipf = if dist == "zipf" {
@@ -125,7 +126,7 @@ async fn main() -> Result<()> {
                 // Use fast value path to include value fetch cost realistically
                 let url = format!("{}/v1/get_fast/{}", base, k);
                 let mut req = client.get(url);
-                if let Some(a) = auth_header.as_deref() { req = req.header("Authorization", a); }
+                if let Some(a) = auth.as_deref() { req = req.header("Authorization", a); }
                 let t0 = Instant::now();
                 let _ = req.send().await;
                 let dt = t0.elapsed();

@@ -306,6 +306,26 @@ impl RmiIndex {
         use xxhash_rust::xxh3::Xxh3; f.flush()?; let all = std::fs::File::open(path)?; let len_before = all.metadata()?.len(); let mut hasher = Xxh3::new(); { use std::io::Read; let mut rdr = std::io::BufReader::new(&all); let mut b = vec![0u8; 64 * 1024]; let mut remaining = len_before as usize; while remaining > 0 { let to_read = b.len().min(remaining); rdr.read_exact(&mut b[..to_read])?; hasher.update(&b[..to_read]); remaining -= to_read; } } let sum = hasher.digest(); drop(all); f.write_all(&sum.to_le_bytes())?; f.flush()?; Ok(())
     }
 
+    /// Auto-select writer based on env and data:
+    /// - KYRO_RMI_FORMAT: "5"|"v5"|"aos" -> v5 (default), "4"|"v4"|"soa" -> v4
+    /// - KYRO_RMI_PACK_U32: truthy enables u32 packing when offsets fit (ignored for v4)
+    pub fn write_from_pairs_auto(path: &std::path::Path, pairs: &[(u64, u64)]) -> std::io::Result<()> {
+        let fmt = std::env::var("KYRO_RMI_FORMAT").unwrap_or_else(|_| "5".to_string());
+        let fmt_lc = fmt.to_ascii_lowercase();
+        let use_v5 = matches!(fmt_lc.as_str(), "5" | "v5" | "aos" | "aos5" | "aosv5" | "default");
+        if !use_v5 {
+            return Self::write_from_pairs(path, pairs);
+        }
+        let max_off = pairs.iter().map(|&(_, o)| o).max().unwrap_or(0);
+        let pack_env = std::env::var("KYRO_RMI_PACK_U32").ok();
+        let pack_req = pack_env.as_deref().map(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            s == "1" || s == "true" || s == "yes" || s == "y" || s == "on"
+        }).unwrap_or(false);
+        let pack_u32 = pack_req && max_off <= u32::MAX as u64;
+        Self::write_from_pairs_v5(path, pairs, pack_u32)
+    }
+
     pub fn load_from_file(path: &std::path::Path) -> Option<Self> {
         use std::io::Read;
         let meta_len = std::fs::metadata(path).ok()?.len();
