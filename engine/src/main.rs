@@ -9,6 +9,97 @@ use uuid::Uuid;
 use warp::Filter;
 mod sql;
 
+// --- Rate limiting (simple token-bucket per client IP) -----------------------
+use dashmap::DashMap;
+use std::time::Instant;
+
+#[derive(Clone)]
+struct SimpleRateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    buckets: Arc<DashMap<String, (f64, Instant)>>,
+}
+
+impl SimpleRateLimiter {
+    fn new(rps: f64, burst: f64) -> Self {
+        Self {
+            capacity: burst.max(1.0),
+            refill_per_sec: rps.max(0.1),
+            buckets: Arc::new(DashMap::new()),
+        }
+    }
+    fn allow(&self, key: &str, cost: f64) -> bool {
+        let now = Instant::now();
+        let mut entry = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| (self.capacity, now));
+        let (ref mut tokens, ref mut last) = *entry;
+        let elapsed = now.duration_since(*last).as_secs_f64();
+        if elapsed > 0.0 {
+            let new_tokens = (*tokens + elapsed * self.refill_per_sec).min(self.capacity);
+            *tokens = new_tokens;
+            *last = now;
+        }
+        if *tokens >= cost {
+            *tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AdminRateLimited;
+impl warp::reject::Reject for AdminRateLimited {}
+#[derive(Debug)]
+struct DataRateLimited;
+impl warp::reject::Reject for DataRateLimited {}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn mk_rl_filter_admin(
+    limiter: SimpleRateLimiter,
+) -> impl Filter<Extract = ((),), Error = warp::Rejection> + Clone {
+    warp::addr::remote().and_then(move |addr: Option<std::net::SocketAddr>| {
+        let limiter = limiter.clone();
+        async move {
+            let key = addr
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            if limiter.allow(&key, 1.0) {
+                Ok(())
+            } else {
+                Err(warp::reject::custom(AdminRateLimited))
+            }
+        }
+    })
+}
+fn mk_rl_filter_data(
+    limiter: SimpleRateLimiter,
+) -> impl Filter<Extract = ((),), Error = warp::Rejection> + Clone {
+    warp::addr::remote().and_then(move |addr: Option<std::net::SocketAddr>| {
+        let limiter = limiter.clone();
+        async move {
+            let key = addr
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            if limiter.allow(&key, 1.0) {
+                Ok(())
+            } else {
+                Err(warp::reject::custom(DataRateLimited))
+            }
+        }
+    })
+}
+// ---------------------------------------------------------------------------
+
 #[derive(Parser)]
 #[command(name = "kyrodb-engine", about = "KyroDB Engine")]
 struct Cli {
@@ -77,6 +168,17 @@ async fn main() -> Result<()> {
         engine_crate::PersistentEventLog::open(std::path::Path::new(&cli.data_dir))
             .await?
     );
+
+    // --- Rate limiter configs (env tunables) --------------------------------
+    let admin_rps = env_f64("KYRODB_RL_ADMIN_RPS", 2.0);
+    let admin_burst = env_f64("KYRODB_RL_ADMIN_BURST", 5.0);
+    let data_rps = env_f64("KYRODB_RL_DATA_RPS", 5000.0);
+    let data_burst = env_f64("KYRODB_RL_DATA_BURST", 10000.0);
+    let admin_limiter = SimpleRateLimiter::new(admin_rps, admin_burst);
+    let data_limiter = SimpleRateLimiter::new(data_rps, data_burst);
+    let admin_rl = mk_rl_filter_admin(admin_limiter.clone()).boxed();
+    let data_rl = mk_rl_filter_data(data_limiter.clone()).boxed();
+    // ------------------------------------------------------------------------
 
     match cli.cmd {
         Commands::Serve {
@@ -798,6 +900,23 @@ async fn main() -> Result<()> {
             let vector_insert = auth.clone().and(vector_insert).map(|(), r| r);
             let rmi_build = auth.clone().and(rmi_build).map(|(), r| r);
 
+            // --- Attach rate limits ------------------------------------------------------
+            // Admin RL for sensitive operations
+            let snapshot_route = admin_rl.clone().and(snapshot_route).map(|(), r| r);
+            let compact_route = admin_rl.clone().and(compact_route).map(|(), r| r);
+            let rmi_build = admin_rl.clone().and(rmi_build).map(|(), r| r);
+            let warmup = admin_rl.clone().and(warmup).map(|(), r| r);
+            let replay_route = admin_rl.clone().and(replay_route).map(|(), r| r);
+            // Data RL for common read/write paths
+            let put_route = data_rl.clone().and(put_route).map(|(), r| r);
+            let lookup_route = data_rl.clone().and(lookup_route).map(|(), r| r);
+            let lookup_raw = data_rl.clone().and(lookup_raw).map(|(), r| r);
+            let lookup_fast = data_rl.clone().and(lookup_fast).map(|(), r| r);
+            let get_fast = data_rl.clone().and(get_fast).map(|(), r| r);
+            let sql_route = data_rl.clone().and(sql_route).map(|(), r| r);
+            let vector_insert = data_rl.clone().and(vector_insert).map(|(), r| r);
+            // ---------------------------------------------------------------------------
+
             // Combine routes
             let routes = health_route
                 .or(metrics_route)
@@ -832,6 +951,11 @@ async fn main() -> Result<()> {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(
                             warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
                             StatusCode::UNAUTHORIZED,
+                        ))
+                    } else if rej.find::<AdminRateLimited>().is_some() || rej.find::<DataRateLimited>().is_some() {
+                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
+                            StatusCode::TOO_MANY_REQUESTS,
                         ))
                     } else {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(

@@ -296,3 +296,49 @@ Apache-2.0
 ## Contact / Community
 
 Open an issue for design discussions; label PRs that are experimental with `experimental`. For fast feedback ping @vatskishan03 on GitHub and Twitter(kishanvats03).
+
+## TLS and reverse proxy
+
+Run kyrodb-engine behind a TLS reverse proxy. Example: Caddy (automatic HTTPS):
+
+```
+# Caddyfile
+kyro.example.com {
+  reverse_proxy 127.0.0.1:8080
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+  }
+}
+```
+
+Nginx (Let's Encrypt via certbot):
+
+```
+server {
+  listen 443 ssl http2;
+  server_name kyro.example.com;
+  ssl_certificate /etc/letsencrypt/live/kyro.example.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/kyro.example.com/privkey.pem;
+
+  location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+  }
+}
+```
+
+Recommended: bind KyroDB on localhost and expose only via proxy.
+
+## Rate limiting
+
+KyroDB includes simple per-IP token-bucket rate limiting:
+- Admin routes (snapshot, compact, warmup, rmi build, replay): default 2 rps burst 5
+- Data routes (put, lookup, get_fast, sql, vector): default 5000 rps burst 10000
+
+Tune via environment variables:
+- KYRODB_RL_ADMIN_RPS, KYRODB_RL_ADMIN_BURST
+- KYRODB_RL_DATA_RPS, KYRODB_RL_DATA_BURST
+
+429 Too Many Requests is returned when limited. Health and metrics are not limited.
