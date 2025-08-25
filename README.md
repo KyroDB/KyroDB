@@ -78,6 +78,16 @@ Notes for fair numbers
 
 ---
 
+## Testing
+
+- CI test matrix (manual trigger): runs engine tests on Linux and macOS, across feature sets. See `.github/workflows/test-matrix.yml`.
+- Fuzzing: cargo-fuzz targets for WAL and snapshot parsers are wired under `engine/fuzz/`. See `.github/workflows/fuzz.yml` and `docs/TESTING.md`.
+- Concurrency: loom is considered for critical paths; not enabled in CI by default.
+
+See `docs/TESTING.md` for details.
+
+---
+
 ## API (selected)
 
 Data plane (JSON unless noted)

@@ -1,0 +1,21 @@
+name: fuzz
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fuzz-wal-snapshot:
+    name: cargo-fuzz (manual)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Build fuzzers
+        run: |
+          cd engine
+          # break workspace inheritance to avoid workspace build in CI
+          echo "[workspace]" >> fuzz/Cargo.toml
+          cargo fuzz build
+      # Intentionally not running fuzz by default; enable locally or in longer CI jobs

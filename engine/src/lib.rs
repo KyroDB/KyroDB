@@ -26,6 +26,51 @@ fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// Safe parser for a WAL byte stream: [len u32][frame bytes][crc32c u32] repeating.
+/// Returns number of well-formed frames consumed; ignores trailing junk or partial frames.
+/// Intended for fuzzing and defensive parse tests.
+pub fn parse_wal_stream_bytes(mut data: &[u8]) -> usize {
+    let mut ok = 0usize;
+    while data.len() >= 8 {
+        let (len_bytes, rest) = data.split_at(4);
+        let len = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        if rest.len() < len + 4 {
+            break; // partial frame at tail
+        }
+        let (frame, rest2) = rest.split_at(len);
+        let (crc_bytes, rest3) = rest2.split_at(4);
+        let crc_read = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        let crc_calc = crc32c::crc32c(frame);
+        // attempt to deserialize Event, but don't fail the parser on bincode errors
+        let _ = bincode::options().with_limit(16 * 1024 * 1024).deserialize::<Event>(frame);
+        if crc_read == crc_calc {
+            ok = ok.saturating_add(1);
+        }
+        data = rest3;
+    }
+    ok
+}
+
+/// Parse snapshot.data payload index from raw bytes. Same layout as build_snapshot_data_index.
+/// Returns None on structural error (out-of-bounds) to avoid panics.
+pub fn parse_snapshot_data_index_bytes(bytes: &[u8]) -> Option<SnapshotIndex> {
+    use std::collections::HashMap;
+    let mut pos: usize = 0;
+    let mut map: HashMap<u64, (usize, usize)> = HashMap::new();
+    while pos + 16 <= bytes.len() {
+        let off = u64::from_le_bytes(bytes[pos..pos + 8].try_into().ok()?);
+        let len = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().ok()?) as usize;
+        let start = pos + 16;
+        let end = start.checked_add(len)?;
+        if end > bytes.len() {
+            return None;
+        }
+        map.insert(off, (start, len));
+        pos = end;
+    }
+    Some(map)
+}
+
 /// Current on-disk schema version. Increment when Event/Record layout changes.
 pub const SCHEMA_VERSION: u8 = 1;
 

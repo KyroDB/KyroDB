@@ -1,0 +1,31 @@
+name: test-matrix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  engine-tests:
+    name: Engine tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build -p engine --release
+
+      - name: Test (default features)
+        run: cargo test -p engine --all-targets --locked --verbose
+
+      - name: Test (no default features)
+        run: cargo test -p engine --no-default-features --all-targets --locked --verbose
+
+      - name: Test (http-test feature)
+        run: cargo test -p engine --features http-test --all-targets --locked --verbose

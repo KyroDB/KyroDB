@@ -4,6 +4,9 @@ members = [
     "engine",
     "bench",
 ]
+exclude = [
+    "engine/fuzz",
+]
 
 [workspace.dependencies]
 tempfile = "3"

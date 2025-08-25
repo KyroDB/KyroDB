@@ -56,3 +56,9 @@ package-lock.json
 # Docs scratch
 docs/TODO.md
 experimental.local.md
+
+# Fuzzing artifacts
+engine/fuzz/artifacts/
+engine/fuzz/corpus/
+engine/fuzz/coverage/
+engine/fuzz/target/
