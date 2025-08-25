@@ -18,24 +18,41 @@ cargo build -p engine --release --features learned-index
   --rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0
 ```
 - Do not set an auth token so hot routes bypass auth.
+- Optional: warm on start to avoid cold-start tail in measurements:
+```
+KYRODB_WARM_ON_START=1 ./target/release/kyrodb-engine serve 127.0.0.1 3030
+```
 
 ## Load and run HTTP read test
 ```
-# Load N keys with V-byte values, hit lookup_fast (binary) or lookup_raw (204/404)
+# Load N keys with V-byte values, then build RMI and warm up before measuring
 ./target/release/bench \
   --base http://127.0.0.1:3030 \
-  --endpoint lookup_fast \
   --load-n 1000000 \
   --val-bytes 64 \
+  --load-concurrency 64 \
   --read-concurrency 64 \
-  --warmup-seconds 5 \
   --read-seconds 30 \
   --dist uniform \
-  --csv-out bench_latency.csv
+  --out-csv bench_latency.csv
 ```
 - Output shows total reads, RPS, and p50/p95/p99 in microseconds.
 - CSV is written to the provided path; capture.sh stores it under bench/results/<commit>/.
-- Set `--dist zipf --zipf-s 1.1` for skewed workloads.
+- To include skew, use `--dist zipf --zipf-theta 1.1`.
+- Index-only vs full read: `/v1/lookup_fast/{k}` returns offset (index-only), `/v1/get_fast/{k}` returns value bytes (includes storage cost).
+
+## Warm vs Cold
+- Cold starts incur page faults; expect higher first-hit latencies.
+- For steady-state comparisons either:
+  - set `KYRODB_WARM_ON_START=1` at server start, or
+  - call `POST /v1/rmi/build` then `POST /v1/warmup` before measuring, or
+  - include an explicit priming window and only record after warm.
+
+## HTTP status and error codes (fast routes)
+- `GET /v1/lookup_fast/{key}` → 200 with 8 bytes (offset) on hit; 404 on miss.
+- `GET /v1/get_fast/{key}` → 200 with value bytes on hit; 404 on miss.
+- `GET /v1/lookup_raw?key=...` → 204 No Content on hit; 404 on miss.
+- `POST /v1/put` → 200 with `{ offset }` on success; 500 on error.
 
 ## In-process microbench (sub-HTTP)
 ```

@@ -37,8 +37,9 @@ curl -s "http://127.0.0.1:3030/v1/lookup?key=123"
 curl -sX POST http://127.0.0.1:3030/v1/rmi/build
 
 # 5) Fast data-plane endpoints (for benchmarks)
-curl -s "http://127.0.0.1:3030/v1/lookup_fast/123"      # returns offset bytes
-curl -s "http://127.0.0.1:3030/v1/get_fast/123" | hexdump -C
+curl -i "http://127.0.0.1:3030/v1/lookup_fast/123"      # 200 (offset bytes) or 404
+curl -i "http://127.0.0.1:3030/v1/get_fast/123"         # 200 (value) or 404
+curl -i "http://127.0.0.1:3030/v1/lookup_raw?key=123"   # 204 if exists, 404 if not
 ```
 
 Notes
@@ -46,6 +47,32 @@ Notes
 - To require auth: start with `--auth-token <TOKEN>` and send `Authorization: Bearer <TOKEN>`.
 - Release build: `cargo build -p engine --release` (binary at `target/release/kyrodb-engine`).
 - Basic CLI (optional): `cd orchestrator && go build -o kyrodbctl .`
+
+---
+
+## HTTP status semantics (fast routes)
+
+- `POST /v1/put` → 200 with `{ "offset": <u64> }` on success; 500 with `{ "error": ... }` on failure.
+- `GET /v1/lookup_fast/{key}` → 200 with `application/octet-stream` body (8-byte offset) on hit; 404 on miss.
+- `GET /v1/get_fast/{key}` → 200 with value bytes on hit; 404 on miss.
+- `GET /v1/lookup_raw?key=...` → 204 No Content on hit; 404 on miss (offset not returned).
+- `POST /v1/rmi/build` → 200 with `{ ok: bool, count: <usize> }`.
+- `POST /v1/warmup` → 200 with `{ status: "ok" }`.
+
+`GET /v1/lookup?key=...` returns 200 with a JSON object on hit, or 200 with `{ "error": "not found" }` on miss.
+
+---
+
+## Performance methodology and caveats
+
+- Warm vs cold: first queries after start pay OS page-fault costs. For steady-state latency, either:
+  - set `KYRODB_WARM_ON_START=1` before starting the server, or
+  - call `POST /v1/rmi/build` (if needed) then `POST /v1/warmup` prior to measurements, or
+  - let the workload run a brief priming phase before measuring.
+- Distributions: RMI shines for typical key distributions. Our bench supports `--dist uniform|zipf` (`--zipf-theta` in code as `--zipf_theta`). Run both.
+- Concurrency & values: Latency includes network + value read cost on `/v1/get_fast/{k}`. Use `/v1/lookup_fast/{k}` to measure index-only.
+- OS differences: Linux honors MADV_WILLNEED/HUGEPAGE; macOS may show higher first-hit tails.
+- CPU features: SIMD paths are runtime-detected (AVX2/AVX-512 on x86_64; NEON on aarch64); `--release` recommended.
 
 ---
 
@@ -77,20 +104,22 @@ cargo run -p bench --release -- \
   --base http://127.0.0.1:3030 \
   --load-n 10000000 \
   --val-bytes 16 \
-  --concurrency 64 \
+  --load-concurrency 64 \
+  --read-concurrency 64 \
   --read-seconds 30 \
   --dist uniform \
   --out-csv bench/results/${COMMIT}/http_uniform_10m.csv
 
 # 3) Generate plot + CSV for paper-style figures
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt || pip install numpy matplotlib
-python comp.py  # writes bench/rmi_vs_btree.png and bench/rmi_vs_btree_data.csv
+python comp.py  # writes bench/http_uniform_64c_30s.png and SVG
 ```
 
 Tips for fair numbers
+- Label warm vs cold in results; include both when comparing against B-Tree/LSM.
 - Pin CPU, keep system idle, disable turbo scaling if possible.
 - Use `--features bench-no-metrics` when comparing tight hot-paths.
-- Use `--release` and prefer the `/v1/lookup_fast` and `/v1/get_fast` routes in read tests.
+- Prefer the `/v1/lookup_fast` and `/v1/get_fast` routes in read tests.
 
 ---
 
@@ -168,8 +197,10 @@ curl -sX POST http://127.0.0.1:3030/v1/put \
   -H 'content-type: application/json' \
   -d '{"key":123,"value":"hello"}'
 
-# KV get via HTTP
-curl -s "http://127.0.0.1:3030/v1/lookup?key=123"
+# Fast lookups
+curl -i "http://127.0.0.1:3030/v1/lookup_raw?key=123"   # 204/404
+curl -i "http://127.0.0.1:3030/v1/lookup_fast/123"      # 200/404
+curl -i "http://127.0.0.1:3030/v1/get_fast/123"         # 200/404
 ```
 
 Notes:
