@@ -24,9 +24,11 @@ Thumbs.db
 .env.*.local
 
 # Runtime data
-/data/*.bin
+/data/**
+!/data/.gitkeep
 /engine/data/*.bin
-/orchestrator/data/*.bin
+/orchestrator/data/**
+!/orchestrator/data/.gitkeep
 
 # Local binaries
 /orchestrator/kyrodbctl
@@ -45,6 +47,8 @@ __pycache__/
 # Node leftovers (not used)
 node_modules/
 package-lock.json
+/orchestrator/node_modules/
+/orchestrator/package-lock.json
 
 # Docs scratch
 docs/TODO.md
