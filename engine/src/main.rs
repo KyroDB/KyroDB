@@ -322,18 +322,13 @@ async fn main() -> Result<()> {
                         let appended = cur.saturating_sub(last_built);
                         let pairs = rebuild_log.collect_key_offset_pairs().await;
                         let distinct = pairs.len() as u64;
-                        let ratio = if distinct == 0 {
-                            0.0
-                        } else {
-                            appended as f64 / distinct as f64
-                        };
-                        if (app_thresh > 0 && appended >= app_thresh)
-                            || (ratio_thresh > 0.0 && ratio >= ratio_thresh)
-                        {
+                        let ratio = if distinct == 0 { 0.0 } else { appended as f64 / distinct as f64 };
+                        if (app_thresh > 0 && appended >= app_thresh) || (ratio_thresh > 0.0 && ratio >= ratio_thresh) {
                             let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
                             let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
                             let rebuild_timer =
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
+                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
                             // Write index on blocking thread
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();
@@ -344,40 +339,19 @@ async fn main() -> Result<()> {
                                 )
                             })
                             .await;
-                            if let Ok(Err(e)) = write_res {
-                                eprintln!("❌ RMI rebuild write failed: {}", e);
-                                rebuild_timer.observe_duration();
-                                continue;
-                            }
-                            if write_res.is_err() {
-                                eprintln!("❌ RMI rebuild task panicked");
-                                rebuild_timer.observe_duration();
-                                continue;
-                            }
-                            // fsync tmp then rename
-                            if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-                                let _ = f.sync_all();
-                            }
-                            if let Err(e) = std::fs::rename(&tmp, &dst) {
-                                eprintln!("❌ RMI rename failed: {}", e);
-                                rebuild_timer.observe_duration();
-                                continue;
-                            }
-                            // Reload and swap
+                            if let Ok(Err(e)) = write_res { eprintln!("❌ RMI rebuild write failed: {}", e); rebuild_timer.observe_duration(); engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0); continue; }
+                            if write_res.is_err() { eprintln!("❌ RMI rebuild task panicked"); rebuild_timer.observe_duration(); engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0); continue; }
+                            if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
+                            if let Err(e) = std::fs::rename(&tmp, &dst) { eprintln!("❌ RMI rename failed: {}", e); rebuild_timer.observe_duration(); engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0); continue; }
                             if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
-                                rebuild_log
-                                    .swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi))
-                                    .await;
+                                rebuild_log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
                                 last_built = cur;
                                 engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                                 rebuild_timer.observe_duration();
-                                // Commit manifest LAST via library API
                                 let _ = rebuild_log.write_manifest().await;
                                 println!("✅ RMI rebuilt, swapped, and manifest committed (appended={}, ratio={:.3})", appended, ratio);
-                            } else {
-                                eprintln!("❌ RMI reload failed after rebuild");
-                                rebuild_timer.observe_duration();
-                            }
+                            } else { eprintln!("❌ RMI reload failed after rebuild"); rebuild_timer.observe_duration(); }
+                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
                         }
                     }
                 });
@@ -385,7 +359,7 @@ async fn main() -> Result<()> {
 
             // --- Metrics to count RMI vs BTree reads ---
             #[cfg(not(feature = "bench-no-metrics"))]
-            let (rmi_reads_counter, btree_reads_counter) = {
+            let (_rmi_reads_counter, _btree_reads_counter) = {
                 use prometheus::register_counter;
                 (
                     register_counter!("kyrodb_rmi_reads_total", "Total reads served by RMI").ok(),
@@ -727,50 +701,28 @@ async fn main() -> Result<()> {
                             let pairs = log.collect_key_offset_pairs().await;
                             let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
                             let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
-                            let timer =
-                                engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-
+                            let timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
+                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
                             // Write index on a blocking thread to avoid starving the reactor
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();
                             let write_res = tokio::task::spawn_blocking(move || {
-                                engine_crate::index::RmiIndex::write_from_pairs_auto(
-                                    &tmp_clone,
-                                    &pairs_clone,
-                                )
+                                engine_crate::index::RmiIndex::write_from_pairs_auto(&tmp_clone, &pairs_clone)
                             })
                             .await;
                             let mut ok = matches!(write_res, Ok(Ok(())));
-
-                            // fsync tmp then rename -> dst
                             if ok {
-                                if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-                                    let _ = f.sync_all();
-                                }
-                                if let Err(e) = std::fs::rename(&tmp, &dst) {
-                                    eprintln!("❌ RMI rename failed: {}", e);
-                                    ok = false;
-                                }
+                                if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
+                                if let Err(e) = std::fs::rename(&tmp, &dst) { eprintln!("❌ RMI rename failed: {}", e); ok = false; }
                             }
-
-                            // Reload, swap, and commit manifest LAST
                             if ok {
-                                if let Some(rmi) =
-                                    engine_crate::index::RmiIndex::load_from_file(&dst)
-                                {
-                                    log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(
-                                        rmi,
-                                    ))
-                                    .await;
+                                if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
+                                    log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
                                     engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                                    // Commit manifest as the external commit point
                                     let _ = log.write_manifest().await;
-                                } else {
-                                    eprintln!("❌ RMI reload failed after rebuild");
-                                    ok = false;
-                                }
+                                } else { eprintln!("❌ RMI reload failed after rebuild"); ok = false; }
                             }
-
+                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
                             timer.observe_duration();
                             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                                 "ok": ok,

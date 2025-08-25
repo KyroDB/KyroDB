@@ -38,3 +38,24 @@ async fn manifest_fail_before_rename_recoverable() {
     fail::remove("manifest_before_rename");
     log.write_manifest().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn wal_rotate_fail_between_rotate_and_retention_is_safe() {
+    let _sc = fail::FailScenario::setup();
+    let dir = tempdir().unwrap();
+    let log = PersistentEventLog::open(dir.path()).await.unwrap();
+    // Small segments and low retention
+    log.set_wal_rotation(Some(1_024), 2).await;
+    // Seed to force rotation
+    seed(&log, 200).await;
+    // Arm failpoint just after rotate and before retention cleanup
+    fail::cfg("wal_after_rotate_before_retention", "return").unwrap();
+    // Append to trigger rotate path again
+    for i in 0..100u64 { let _ = log.append_kv(Uuid::new_v4(), 10_000 + i, vec![0u8; 64]).await.unwrap(); }
+    // Drop and reopen (simulate crash)
+    drop(log);
+    fail::remove("wal_after_rotate_before_retention");
+    let log2 = PersistentEventLog::open(dir.path()).await.unwrap();
+    // Data should still be recoverable
+    for i in 0..200 { assert!(log2.lookup_key(i).await.is_some()); }
+}

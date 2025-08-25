@@ -82,9 +82,13 @@ pub struct RmiIndex {
     fx_m: Vec<i128>,   // per-leaf fixed-point slope
     fx_b: Vec<i64>,    // per-leaf integer intercept
     // SoA leaf metadata for hot path
+    #[allow(dead_code)]
     leaf_key_min: Vec<u64>,
+    #[allow(dead_code)]
     leaf_key_max: Vec<u64>,
+    #[allow(dead_code)]
     leaf_slope: Vec<f32>,
+    #[allow(dead_code)]
     leaf_intercept: Vec<f32>,
     leaf_epsilon: Vec<u32>,
     leaf_start: Vec<u64>,
@@ -829,11 +833,11 @@ impl RmiIndex {
         match &self.backing {
             RmiBacking::Mmap { mmap, keys_off, offs_off, count } => unsafe {
                 let base = mmap.as_ptr();
-                let len = mmap.len();
+                let _len = mmap.len();
                 #[cfg(target_os = "linux")]
                 {
-                    let _ = libc::madvise(base as *mut _, len, libc::MADV_WILLNEED);
-                    let _ = libc::madvise(base as *mut _, len, libc::MADV_HUGEPAGE);
+                    let _ = libc::madvise(base as *mut _, mmap.len(), libc::MADV_WILLNEED);
+                    let _ = libc::madvise(base as *mut _, mmap.len(), libc::MADV_HUGEPAGE);
                 }
                 let kptr = base.add(*keys_off);
                 let optr = base.add(*offs_off);
@@ -848,11 +852,11 @@ impl RmiIndex {
             },
             RmiBacking::MmapAos { mmap, entries_off, entry_stride, count, .. } => unsafe {
                 let base = mmap.as_ptr().add(*entries_off);
-                let len = mmap.len();
+                let _len = mmap.len();
                 #[cfg(target_os = "linux")]
                 {
-                    let _ = libc::madvise(mmap.as_ptr() as *mut _, len, libc::MADV_WILLNEED);
-                    let _ = libc::madvise(mmap.as_ptr() as *mut _, len, libc::MADV_HUGEPAGE);
+                    let _ = libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_WILLNEED);
+                    let _ = libc::madvise(mmap.as_ptr() as *mut _, mmap.len(), libc::MADV_HUGEPAGE);
                 }
                 let step = (4096usize / *entry_stride).max(1);
                 let mut i = 0usize;

@@ -489,6 +489,7 @@ impl PersistentEventLog {
             }
         }
         // Correctness fallback: linear scan for latest record
+        crate::metrics::LOOKUP_FALLBACK_SCAN_TOTAL.inc();
         if let Some((off, _rec)) = self.find_key_scan(key).await {
             return Some(off);
         }

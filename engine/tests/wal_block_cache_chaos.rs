@@ -20,7 +20,7 @@ async fn rmi_crash_between_index_and_manifest_keeps_old_index_until_manifest_com
         let log = kyrodb_engine::PersistentEventLog::open(&path)
             .await
             .unwrap();
-        log.write_manifest().await;
+        let _ = log.write_manifest().await;
     }
 
     // Simulate background rebuild: rename index to final name, but CRASH before manifest rename

@@ -34,6 +34,8 @@ mod shim {
     pub static RMI_MISPREDICTS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static RMI_READS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static BTREE_READS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static LOOKUP_FALLBACK_SCAN_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static RMI_REBUILD_IN_PROGRESS: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
     pub fn inc_sse_lagged() {}
     pub fn render() -> String { String::new() }
 }
@@ -41,12 +43,12 @@ mod shim {
 #[cfg(feature = "bench-no-metrics")]
 pub use shim::{
     APPEND_LATENCY_SECONDS, APPENDS_TOTAL, BTREE_READS_TOTAL, COMPACTION_DURATION_SECONDS,
-    COMPACTIONS_TOTAL, RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL,
-    RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES, RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL,
-    RMI_MISSES_TOTAL, RMI_PROBE_LEN, RMI_READS_TOTAL, RMI_REBUILD_DURATION_SECONDS,
-    RMI_REBUILDS_TOTAL, SNAPSHOT_LATENCY_SECONDS, SNAPSHOTS_TOTAL, SSE_LAGGED_TOTAL,
-    WAL_BLOCK_CACHE_HITS_TOTAL, WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, inc_sse_lagged,
-    render,
+    COMPACTIONS_TOTAL, LOOKUP_FALLBACK_SCAN_TOTAL, RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX,
+    RMI_HITS_TOTAL, RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES, RMI_LOOKUP_LATENCY_SECONDS,
+    RMI_MISPREDICTS_TOTAL, RMI_MISSES_TOTAL, RMI_PROBE_LEN, RMI_READS_TOTAL,
+    RMI_REBUILD_DURATION_SECONDS, RMI_REBUILDS_TOTAL, RMI_REBUILD_IN_PROGRESS,
+    SNAPSHOT_LATENCY_SECONDS, SNAPSHOTS_TOTAL, SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL,
+    WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, inc_sse_lagged, render,
 };
 
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -260,6 +262,24 @@ pub static BTREE_READS_TOTAL: Lazy<Counter> = Lazy::new(|| {
         "Total successful reads served by the B-Tree index"
     )
     .expect("register kyrodb_btree_reads_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static LOOKUP_FALLBACK_SCAN_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_lookup_fallback_scan_total",
+        "Total number of times we fell back to linear scan after RMI miss"
+    )
+    .expect("register kyrodb_lookup_fallback_scan_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_REBUILD_IN_PROGRESS: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_rebuild_in_progress",
+        "Gauge set to 1.0 while a background RMI rebuild is running"
+    )
+    .expect("register kyrodb_rmi_rebuild_in_progress")
 });
 
 #[cfg(not(feature = "bench-no-metrics"))]
