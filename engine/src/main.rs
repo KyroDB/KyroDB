@@ -67,6 +67,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).json().init();
 
+    // Build info stamp
+    let build_commit: &str = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+    let build_features: &str = option_env!("CARGO_FEATURES").unwrap_or("");
+    tracing::info!(commit = build_commit, features = build_features, "build_info");
+
     let cli = Cli::parse();
     let log = Arc::new(
         engine_crate::PersistentEventLog::open(std::path::Path::new(&cli.data_dir))
@@ -811,6 +816,16 @@ async fn main() -> Result<()> {
                 .or(rmi_build)
                 .or(compact_route)
                 .or(warmup)
+                .or(warp::path("build_info").and(warp::get()).map({
+                    let commit = build_commit;
+                    let features = build_features;
+                    move || {
+                        warp::reply::json(&serde_json::json!({
+                            "commit": commit,
+                            "features": features,
+                        }))
+                    }
+                }))
                 .recover(|rej: warp::Rejection| async move {
                     use warp::http::StatusCode;
                     if rej.find::<Unauthorized>().is_some() {
@@ -827,7 +842,22 @@ async fn main() -> Result<()> {
                 })
                 .with(warp::log("kyrodb"));
 
-            println!("🚀 Starting server at http://{}:{}", host, port);
+            // start server
+            tracing::info!(
+                "Starting kyrodb-engine on {}:{} (commit={}, features={})",
+                host,
+                port,
+                build_commit,
+                build_features
+            );
+
+            println!(
+                "🚀 Starting server at http://{}:{} (commit={}, features={})",
+                host,
+                port,
+                build_commit,
+                build_features
+            );
             warp::serve(routes)
                 .run((host.parse::<std::net::IpAddr>()?, port))
                 .await;

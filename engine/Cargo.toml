@@ -3,6 +3,7 @@ name = "engine"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+build = "build.rs"
 
 [lib]
 name = "kyrodb_engine"
@@ -13,6 +14,8 @@ name = "kyrodb-engine"
 path = "src/main.rs"
 
 [features]
+# Enable learned-index by default for consistent release binaries
+default = ["learned-index"]
 learned-index = []
 ann-hnsw = ["dep:hora"]
 http-test = []
