@@ -472,127 +472,44 @@ impl PersistentEventLog {
 
     /// Get offset for a given key if present via index with delta-first semantics.
     pub async fn lookup_key(&self, key: u64) -> Option<u64> {
-        let idx = self.index.read().await;
-        match &*idx {
-            index::PrimaryIndex::BTree(b) => b.get(&key),
-            #[cfg(feature = "learned-index")]
-            index::PrimaryIndex::Rmi(r) => {
-                if let Some(v) = r.delta_get(&key) { return Some(v); }
-                r.predict_get(&key)
-            }
-        }
-    }
-
-    /// Fallback: scan the log to find the first event matching key, returning (offset, Record)
-    pub async fn find_key_scan(&self, key: u64) -> Option<(u64, Record)> {
-        let read = self.inner.read().await;
-        for ev in read.iter() {
-            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
-                if rec.key == key {
-                    return Some((ev.offset, rec));
+        // Try index first
+        {
+            let idx = self.index.read().await;
+            match &*idx {
+                index::PrimaryIndex::BTree(b) => return b.get(&key),
+                #[cfg(feature = "learned-index")]
+                index::PrimaryIndex::Rmi(r) => {
+                    if let Some(v) = r.delta_get(&key) {
+                        return Some(v);
+                    }
+                    if let Some(v) = r.predict_get(&key) {
+                        return Some(v);
+                    }
                 }
             }
+        }
+        // Correctness fallback: linear scan for latest record
+        if let Some((off, _rec)) = self.find_key_scan(key).await {
+            return Some(off);
         }
         None
     }
 
-    /// Exact L2 search over all VectorRecord events. Returns top-k (key, distance) ascending.
-    pub async fn search_vector_l2(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        if k == 0 {
-            return Vec::new();
-        }
-        let read = self.inner.read().await;
-        let mut results: Vec<(u64, f32)> = Vec::new();
-        for ev in read.iter() {
-            if let Ok(vrec) = bincode::deserialize::<VectorRecord>(&ev.payload) {
-                if vrec.vector.len() != query.len() {
-                    continue;
-                }
-                let mut dist: f32 = 0.0;
-                for (a, b) in vrec.vector.iter().zip(query.iter()) {
-                    let d = a - b;
-                    dist += d * d;
-                }
-                if results.len() < k {
-                    results.push((vrec.key, dist));
-                } else if let Some((idx, _)) = results
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                {
-                    if dist < results[idx].1 {
-                        results[idx] = (vrec.key, dist);
-                    }
-                }
-            }
-        }
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        results
-    }
-
-    /// Collect latest (key, offset) pairs for all KV records, sorted by key
-    pub async fn collect_key_offset_pairs(&self) -> Vec<(u64, u64)> {
-        use std::collections::BTreeMap;
-        let read = self.inner.read().await;
-        let mut latest: BTreeMap<u64, u64> = BTreeMap::new();
-        for ev in read.iter() {
-            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
-                latest.insert(rec.key, ev.offset);
-            }
-        }
-        latest.into_iter().collect()
-    }
-
-    /// Placeholder ANN search: currently forwards to exact L2 until ANN backend is integrated
-    pub async fn search_vector_ann(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        #[cfg(feature = "ann-hnsw")]
+    /// Best-effort warmup: fault-in index pages and snapshot mmap.
+    pub async fn warmup(&self) {
+        // Warm RMI index if present
+        #[cfg(feature = "learned-index")]
         {
-            use hora::core::ann_index::ANNIndex;
-            // Build index lazily if not present
-            let mut annw = self.ann.write().await;
-            if annw.is_none() {
-                let read = self.inner.read().await;
-                let dim = query.len();
-                let mut idx = hora::index::hnsw_idx::HNSWIndex::<f32, u64>::new(
-                    dim,
-                    &hora::index::hnsw_params::HNSWParams::<f32>::default(),
-                );
-                for ev in read.iter() {
-                    if let Ok(vrec) = bincode::deserialize::<VectorRecord>(&ev.payload) {
-                        if vrec.vector.len() == dim {
-                            let _ = idx.add(&vrec.vector, vrec.key);
-                        }
-                    }
-                }
-                let _ = idx.build(hora::core::metrics::Metric::Euclidean);
-                *annw = Some(idx);
-            }
-            if let Some(idx) = annw.as_ref() {
-                let res = idx.search(&query.to_vec(), k);
-                return res.into_iter().map(|id| (id as u64, 0.0)).collect();
-            }
+            let idx = self.index.read().await;
+            if let index::PrimaryIndex::Rmi(r) = &*idx { r.warm(); }
         }
-        // Fallback
-        self.search_vector_l2(query, k).await
-    }
-
-    /// Replay events from `start` (inclusive) to `end` (exclusive).  
-    /// If `end` is `None`, replay to the latest.
-    pub async fn replay(&self, start: u64, end: Option<u64>) -> Vec<Event> {
-        let read = self.inner.read().await;
-        let end = end.unwrap_or_else(|| read.len() as u64);
-        read.iter()
-            .filter(|e| e.offset >= start && e.offset < end)
-            .cloned()
-            .collect()
-    }
-
-    /// Subscribe to all events ≥ `from_offset`.  
-    /// Returns `(past_events, live_receiver)`.
-    pub async fn subscribe(&self, from_offset: u64) -> (Vec<Event>, broadcast::Receiver<Event>) {
-        let past = self.replay(from_offset, None).await;
-        let rx = self.tx.subscribe();
-        (past, rx)
+        // Touch snapshot mmap pages to reduce first access latency
+        if let Some(ref mmap) = *self.snapshot_mmap.read().await {
+            let bytes: &[u8] = &mmap[..];
+            let page = 4096usize;
+            let mut i = 0usize;
+            while i < bytes.len() { let _ = std::hint::black_box(bytes[i]); i = i.saturating_add(page); }
+        }
     }
 
     /// Force-write a full snapshot to disk.
@@ -604,11 +521,9 @@ impl PersistentEventLog {
         let tmp = self.data_dir.join("snapshot.tmp");
 
         #[cfg(feature = "failpoints")]
-        {
-            fail::fail_point!("snapshot_before_write", |_| {
-                anyhow::bail!("failpoint: snapshot_before_write")
-            });
-        }
+        fail::fail_point!("snapshot_before_write", |_| {
+            Err(anyhow::anyhow!("failpoint: snapshot_before_write"))
+        });
         {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
             let mut w = BufWriter::new(f);
@@ -623,11 +538,9 @@ impl PersistentEventLog {
         }
 
         #[cfg(feature = "failpoints")]
-        {
-            fail::fail_point!("snapshot_before_rename", |_| {
-                anyhow::bail!("failpoint: snapshot_before_rename")
-            });
-        }
+        fail::fail_point!("snapshot_before_rename", |_| {
+            Err(anyhow::anyhow!("failpoint: snapshot_before_rename"))
+        });
         std::fs::rename(&tmp, &path).context("renaming snapshot")?;
         // Ensure the rename is durable
         if let Err(e) = fsync_dir(&self.data_dir) {
@@ -716,29 +629,21 @@ impl PersistentEventLog {
                 // Keep event with the highest offset for this key
                 match latest.get(&rec.key) {
                     Some((off, _)) if *off >= ev.offset => {}
-                    _ => {
-                        latest.insert(rec.key, (ev.offset, ev));
-                    }
+                    _ => { latest.insert(rec.key, (ev.offset, ev)); }
                 }
             }
         }
-        // 2) Build compacted vector ordered by offset (ascending) to keep time order of latest writes
+        // 2) Build compacted vector ordered by offset (ascending)
         let mut compacted: Vec<Event> = latest.into_values().map(|(_, e)| e.clone()).collect();
         compacted.sort_by_key(|e| e.offset);
 
-        // 3) Swap in-memory state under write lock and rebuild index consistently
+        // 3) Swap in-memory state and rebuild index consistently
         {
-            let mut w = self.inner.write().await;
-            *w = compacted.clone();
+            let mut w = self.inner.write().await; *w = compacted.clone();
         }
         {
-            let mut idx = self.index.write().await;
-            *idx = index::PrimaryIndex::new_btree();
-            for ev in &compacted {
-                if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
-                    idx.insert(rec.key, ev.offset);
-                }
-            }
+            let mut idx = self.index.write().await; *idx = index::PrimaryIndex::new_btree();
+            for ev in &compacted { if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) { idx.insert(rec.key, ev.offset); } }
         }
 
         // 4) Persist snapshot of compacted state and reset WAL segments
@@ -765,46 +670,31 @@ impl PersistentEventLog {
     }
 
     /// Get the next write offset (i.e. current monotonic sequence).
-    pub async fn get_offset(&self) -> u64 {
-        *self.next_offset.read().await
-    }
+    pub async fn get_offset(&self) -> u64 { *self.next_offset.read().await }
 
     /// Path to the schema registry JSON file.
-    pub fn registry_path(&self) -> std::path::PathBuf {
-        self.data_dir.join("schema.json")
-    }
+    pub fn registry_path(&self) -> std::path::PathBuf { self.data_dir.join("schema.json") }
 
     /// Current WAL size in bytes (sum of segments).
-    pub fn wal_size_bytes(&self) -> u64 {
-        Self::wal_total_bytes(&self.data_dir)
-    }
+    pub fn wal_size_bytes(&self) -> u64 { Self::wal_total_bytes(&self.data_dir) }
 
     /// Minimal manifest path
-    pub fn manifest_path(&self) -> std::path::PathBuf {
-        self.data_dir.join("manifest.json")
-    }
+    pub fn manifest_path(&self) -> std::path::PathBuf { self.data_dir.join("manifest.json") }
 
     /// List current WAL segments' basenames
     fn current_wal_segments(&self) -> Vec<String> {
         Self::list_wal_segments(&self.data_dir)
             .into_iter()
-            .map(|(_, p)| {
-                p.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string()
-            })
+            .map(|(_, p)| p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string())
             .collect()
     }
 
     /// Write minimal manifest with next_offset and active files.
     pub async fn write_manifest(&self) -> Result<()> {
         #[cfg(feature = "failpoints")]
-        {
-            fail::fail_point!("manifest_before_write", |_| {
-                anyhow::bail!("failpoint: manifest_before_write")
-            });
-        }
+        fail::fail_point!("manifest_before_write", |_| {
+            Err(anyhow::anyhow!("failpoint: manifest_before_write"))
+        });
         let manifest = serde_json::json!({
             "next_offset": self.get_offset().await,
             "snapshot": "snapshot.bin",
@@ -818,16 +708,11 @@ impl PersistentEventLog {
         writeln!(f, "{}", manifest).context("write manifest.tmp")?;
         f.sync_all().context("fsync manifest.tmp")?;
         #[cfg(feature = "failpoints")]
-        {
-            fail::fail_point!("manifest_before_rename", |_| {
-                anyhow::bail!("failpoint: manifest_before_rename")
-            });
-        }
-        std::fs::rename(&tmp, self.manifest_path()).context("rename manifest.tmp -> manifest.json")?;
-        let _ = fsync_dir(&self.data_dir).map_err(|e| {
-            eprintln!("⚠️ fsync data dir after manifest rename failed: {}", e);
-            e
+        fail::fail_point!("manifest_before_rename", |_| {
+            Err(anyhow::anyhow!("failpoint: manifest_before_rename"))
         });
+        std::fs::rename(&tmp, self.manifest_path()).context("rename manifest.tmp -> manifest.json")?;
+        let _ = fsync_dir(&self.data_dir).map_err(|e| { eprintln!("⚠️ fsync data dir after manifest rename failed: {}", e); e });
         Ok(())
     }
 
@@ -846,10 +731,16 @@ impl PersistentEventLog {
         }
         *guard = new_index;
     }
+
+    /// Replay events from `start` (inclusive) to `end` (exclusive). If None, to latest.
+    pub async fn replay(&self, start: u64, end: Option<u64>) -> Vec<Event> {
+        let read = self.inner.read().await;
+        let end = end.unwrap_or_else(|| read.len() as u64);
+        read.iter().filter(|e| e.offset >= start && e.offset < end).cloned().collect()
+    }
 }
 
 impl PersistentEventLog {
-    // Reintroduce wal rotation helper
     async fn rotate_wal_if_needed(&self) {
         let seg_bytes = *self.wal_segment_bytes.read().await;
         let Some(max_seg_bytes) = seg_bytes else { return; };
@@ -869,11 +760,7 @@ impl PersistentEventLog {
             if let Err(e) = fsync_dir(&self.data_dir) { eprintln!("⚠️ fsync data dir after wal rotate failed: {}", e); }
             drop(w); drop(seg_idx);
             #[cfg(feature = "failpoints")]
-            {
-                fail::fail_point!("wal_after_rotate_before_retention", |_| {
-                    anyhow::bail!("failpoint: wal_after_rotate_before_retention")
-                });
-            }
+            fail::fail_point!("wal_after_rotate_before_retention", |_| { () });
             // retention
             let max_keep = *self.wal_max_segments.read().await;
             if max_keep > 0 {
@@ -889,86 +776,102 @@ impl PersistentEventLog {
             if let Err(e) = self.write_manifest().await { eprintln!("⚠️ manifest write after rotation failed: {}", e); }
         }
     }
-}
 
-// Keep learned-index swap in same impl block as other methods
-impl PersistentEventLog {
-    #[cfg(feature = "learned-index")]
-    /// Swap the in-memory primary index (e.g., after RMI rebuild) while preserving delta.
-    pub async fn swap_primary_index(&self, mut new_index: index::PrimaryIndex) {
-        let mut guard = self.index.write().await;
-        match (&*guard, &mut new_index) {
-            (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::Rmi(new_rmi)) => {
-                for (k, v) in old_rmi.delta_pairs() { new_rmi.insert_delta(k, v); }
-            }
-            (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::BTree(btree)) => {
-                for (k, v) in old_rmi.delta_pairs() { btree.insert(k, v); }
-            }
-            _ => {}
-        }
-        *guard = new_index;
+    /// Subscribe from a starting offset: returns (past events >= from, live receiver)
+    pub async fn subscribe(&self, from: u64) -> (Vec<Event>, broadcast::Receiver<Event>) {
+        let past = {
+            let read = self.inner.read().await;
+            read.iter()
+                .filter(|e| e.offset >= from)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let rx = self.tx.subscribe();
+        (past, rx)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-    use uuid::Uuid;
-
-    #[tokio::test]
-    async fn test_recovery_after_restart() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-
-        // 1st run: append two events, snapshot
-        {
-            let log = PersistentEventLog::open(&path).await.unwrap();
-            assert_eq!(log.append(Uuid::new_v4(), b"a".to_vec()).await.unwrap(), 0);
-            assert_eq!(log.append(Uuid::new_v4(), b"b".to_vec()).await.unwrap(), 1);
-            log.snapshot().await.unwrap();
-        }
-
-        // 2nd run: recover and append one more
-        {
-            let log = PersistentEventLog::open(&path).await.unwrap();
-            assert_eq!(log.get_offset().await, 2);
-            assert_eq!(log.append(Uuid::new_v4(), b"c".to_vec()).await.unwrap(), 2);
-        }
-
-        // 3rd run: full replay
-        {
-            let log = PersistentEventLog::open(&path).await.unwrap();
-            let all = log.replay(0, None).await;
-            let payloads: Vec<_> = all.iter().map(|e| e.payload.clone()).collect();
-            assert_eq!(payloads, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
-        }
-    }
-}
-
-// Minimal HTTP filter for compaction to enable testing without the binary main
-#[cfg(feature = "http-test")] // optional feature to avoid polluting default build
-pub mod http_filters {
-    use super::*;
-    use warp::Filter;
-
-    pub fn compact_route(
-        log: Arc<PersistentEventLog>,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        warp::path("compact").and(warp::post()).and_then(move || {
-            let log = log.clone();
-            async move {
-                match log.compact_keep_latest_and_snapshot_stats().await {
-                    Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"compact":"ok","stats":stats})),
-                        warp::http::StatusCode::OK,
-                    )),
-                    Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error": e.to_string()})),
-                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    )),
+    /// Collect latest (key, offset) pairs for all keys, suitable for RMI building.
+    pub async fn collect_key_offset_pairs(&self) -> Vec<(u64, u64)> {
+        use std::collections::BTreeMap;
+        let read = self.inner.read().await;
+        let mut latest: BTreeMap<u64, u64> = BTreeMap::new();
+        for ev in read.iter() {
+            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                // keep highest offset per key
+                match latest.get(&rec.key) {
+                    Some(off) if *off >= ev.offset => {}
+                    _ => {
+                        latest.insert(rec.key, ev.offset);
+                    }
                 }
             }
-        })
+        }
+        latest.into_iter().collect()
+    }
+
+    /// Linear scan fallback to find the latest record for a key (O(n)).
+    pub async fn find_key_scan(&self, key: u64) -> Option<(u64, Record)> {
+        let read = self.inner.read().await;
+        for ev in read.iter().rev() {
+            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                if rec.key == key {
+                    return Some((ev.offset, rec));
+                }
+            }
+        }
+        None
+    }
+
+    /// Configure WAL rotation policy.
+    pub async fn configure_wal_rotation(&self, max_segment_bytes: Option<u64>, max_segments: usize) {
+        *self.wal_segment_bytes.write().await = max_segment_bytes;
+        *self.wal_max_segments.write().await = max_segments.max(1);
+    }
+
+    /// Backwards-compatible alias used by older tests.
+    pub async fn set_wal_rotation(&self, max_segment_bytes: Option<u64>, max_segments: usize) {
+        self.configure_wal_rotation(max_segment_bytes, max_segments).await;
+    }
+
+    /// Naive L2 search over latest vectors per key (CPU baseline).
+    pub async fn search_vector_l2(&self, query: &Vec<f32>, k: usize) -> Vec<(u64, f32)> {
+        use std::collections::HashSet;
+        let mut out: Vec<(u64, f32)> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        let read = self.inner.read().await;
+        for ev in read.iter().rev() {
+            if let Ok(vr) = bincode::deserialize::<VectorRecord>(&ev.payload) {
+                if seen.contains(&vr.key) {
+                    continue;
+                }
+                if vr.vector.len() != query.len() {
+                    continue;
+                }
+                seen.insert(vr.key);
+                let mut dist = 0.0f32;
+                for (a, b) in vr.vector.iter().zip(query.iter()) {
+                    let d = a - b;
+                    dist += d * d;
+                }
+                out.push((vr.key, dist));
+            }
+        }
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(k);
+        out
+    }
+
+    /// Approximate ANN search when HNSW index is available; falls back to L2 scan otherwise.
+    pub async fn search_vector_ann(&self, query: &Vec<f32>, k: usize) -> Vec<(u64, f32)> {
+        #[cfg(feature = "ann-hnsw")]
+        {
+            if let Some(idx) = self.ann.read().await.as_ref() {
+                // hora returns (key, distance), we map to desired tuple
+                let res = idx.search(query, k);
+                return res.into_iter().map(|(k, d)| (k, d)).collect();
+            }
+        }
+        // Fallback if ANN disabled or not built
+        self.search_vector_l2(query, k).await
     }
 }

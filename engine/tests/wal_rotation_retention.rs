@@ -9,7 +9,7 @@ async fn wal_rotation_and_retention_enforced() {
         .unwrap();
 
     // Configure small segment size and retain only 2 segments
-    log.configure_wal_rotation(Some(2_000), 2).await; // ~2KB per segment
+    log.set_wal_rotation(Some(2_000), 2).await; // ~2KB per segment
 
     // Write enough to rotate a few times
     for i in 0..2_000u64 {

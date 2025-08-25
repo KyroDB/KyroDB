@@ -321,7 +321,7 @@ impl RmiIndex {
             return Self::write_from_pairs(path, pairs);
         }
         let max_off = pairs.iter().map(|&(_, o)| o).max().unwrap_or(0);
-        let pack_env = std::env::var("KYRO_RMI_PACK_U32").ok();
+        let pack_env = std::env::var("KYRODB_RMI_PACK_U32").ok();
         let pack_req = pack_env.as_deref().map(|s| {
             let s = s.trim().to_ascii_lowercase();
             s == "1" || s == "true" || s == "yes" || s == "y" || s == "on"
@@ -793,15 +793,26 @@ impl RmiIndex {
         let leaf_id = self.find_leaf_index(*key)?;
         let (lo, hi) = self.predict_clamp_fast(leaf_id, *key);
         self.prefetch_window(lo);
-        if let Some(v) = self.small_window_probe(*key, lo, hi) { return Some(v); }
-        let mut l = lo; let mut r = hi;
+        if let Some(v) = self.small_window_probe(*key, lo, hi) {
+            // Record a short probe length (SIMD found within window)
+            crate::metrics::RMI_PROBE_LEN.observe(1.0);
+            return Some(v);
+        }
+        let mut l = lo; let mut r = hi; let mut steps: u32 = 0;
         while l <= r {
+            steps = steps.saturating_add(1);
             let m = l + ((r - l) >> 1);
             let km = self.key_at(m);
             if km < *key { l = m + 1; }
             else if km > *key { if m == 0 { break; } r = m - 1; }
-            else { return Some(self.off_at(m)); }
+            else {
+                crate::metrics::RMI_PROBE_LEN.observe(steps as f64);
+                return Some(self.off_at(m));
+            }
         }
+        // Miss inside predicted window counts as a mispredict
+        crate::metrics::RMI_PROBE_LEN.observe(steps.max(1) as f64);
+        crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
         None
     }
 

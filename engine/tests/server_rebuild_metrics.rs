@@ -38,7 +38,7 @@ async fn server_background_rebuild_emits_metrics() {
     let client = reqwest::Client::new();
     for i in 0..60u64 {
         let body = serde_json::json!({"key": i, "value": format!("v{}", i)});
-        let url = format!("http://127.0.0.1:{}/put", port);
+        let url = format!("http://127.0.0.1:{}/v1/put", port);
         let res = client.post(url).json(&body).send().await.unwrap();
         assert!(res.status().is_success());
     }
