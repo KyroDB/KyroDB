@@ -45,6 +45,9 @@ struct Args {
     /// CSV output path for latency histogram percentiles
     #[arg(long, default_value = "bench_results.csv")]
     out_csv: String,
+    /// Label for regime: warm|cold (used in outputs); when 'warm', prebuild+warm runs
+    #[arg(long, default_value = "warm")]
+    regime: String,
 }
 
 #[derive(Deserialize)]
@@ -91,8 +94,12 @@ async fn main() -> Result<()> {
     pb.finish_with_message("load done");
 
     // 0) Build RMI then warmup to avoid cold-start artifacts before measuring
-    if let Err(e) = prebuild_and_warm(&client, &args.base, auth_header.as_deref()).await {
-        eprintln!("warn: prebuild/warm step failed: {} (continuing)", e);
+    if args.regime.to_ascii_lowercase() == "warm" {
+        if let Err(e) = prebuild_and_warm(&client, &args.base, auth_header.as_deref()).await {
+            eprintln!("warn: prebuild/warm step failed: {} (continuing)", e);
+        }
+    } else {
+        eprintln!("info: regime='{}' — skipping prebuild/warm stage", args.regime);
     }
 
     // 2) Read-heavy workload and measure latency (get_fast)
@@ -146,6 +153,7 @@ async fn main() -> Result<()> {
     let p50 = hist.value_at_quantile(0.50) as f64 / 1000.0;
     let p95 = hist.value_at_quantile(0.95) as f64 / 1000.0;
     let p99 = hist.value_at_quantile(0.99) as f64 / 1000.0;
+    let p999 = hist.value_at_quantile(0.999) as f64 / 1000.0;
 
     // Scrape /metrics to compute avg RMI lookup latency and avg probe len if present
     let mut rmi_lookup_avg_us: Option<f64> = None;
@@ -174,28 +182,32 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut csv = String::from("base,dist,reads_total,rps,p50_us,p95_us,p99_us,rmi_lookup_avg_us,rmi_probe_len_avg\n");
+    let mut csv = String::from("base,dist,regime,reads_total,rps,p50_us,p95_us,p99_us,p999_us,rmi_lookup_avg_us,rmi_probe_len_avg\n");
     csv.push_str(&format!(
-        "{},{},{},{:.2},{:.1},{:.1},{:.1},{},{}\n",
+        "{},{},{},{},{:.2},{:.1},{:.1},{:.1},{:.1},{},{}\n",
         args.base,
         args.dist,
+        args.regime,
         total_reads,
         rps,
         p50,
         p95,
         p99,
+        p999,
         rmi_lookup_avg_us.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "".into()),
         rmi_probe_len_avg.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "".into()),
     ));
     let _ = std::fs::write(&args.out_csv, csv);
 
     println!(
-        "reads_total={}, rps={:.2}, p50_us={:.1}, p95_us={:.1}, p99_us={:.1}{}{}",
+        "regime={}, reads_total={}, rps={:.2}, p50_us={:.1}, p95_us={:.1}, p99_us={:.1}, p999_us={:.1}{}{}",
+        args.regime,
         total_reads,
         rps,
         p50,
         p95,
         p99,
+        p999,
         rmi_lookup_avg_us.map(|v| format!(", rmi_lookup_avg_us={:.1}", v)).unwrap_or_default(),
         rmi_probe_len_avg.map(|v| format!(", rmi_probe_len_avg={:.2}", v)).unwrap_or_default(),
     );
