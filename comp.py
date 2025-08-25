@@ -1,124 +1,106 @@
 # RMI vs B-Tree: Raw key lookup latency by dataset size (engine, in-process)
 
+import numpy as np
+import matplotlib.pyplot as plt
 
+plt.style.use('seaborn-v0_8-whitegrid')
 
-# import numpy as np
-# import matplotlib.pyplot as plt
+# Dataset sizes
+N = np.array([1_000_000, 10_000_000, 50_000_000, 100_000_000, 300_000_000], dtype=float)
+x_labels = ["1M", "10M", "50M", "100M", "300M"]
 
-# plt.style.use('seaborn-v0_8-whitegrid')
+# Latencies in ns: [low, median, high]
+btree = np.array([
+    [262.19, 264.70, 267.01],
+    [549.69, 556.46, 563.92],
+    [857.66, 874.82, 892.34],
+    [898.32, 913.88, 927.44],
+    [1011.3, 1021.7, 1031.5],  # 1.0113–1.0315 µs → ns
+])
 
-# # Dataset sizes
-# N = np.array([1_000_000, 10_000_000, 50_000_000, 100_000_000, 300_000_000], dtype=float)
-# x_labels = ["1M", "10M", "50M", "100M", "300M"]
+rmi = np.array([
+    [104.50, 107.02, 109.15],
+    [221.22, 221.50, 221.81],
+    [266.43, 267.51, 268.66],
+    [283.76, 286.09, 288.62],
+    [391.10, 395.58, 400.07],
+])
 
-# # Latencies in ns: [low, median, high]
-# btree = np.array([
-#     [262.19, 264.70, 267.01],
-#     [549.69, 556.46, 563.92],
-#     [857.66, 874.82, 892.34],
-#     [898.32, 913.88, 927.44],
-#     [1011.3, 1021.7, 1031.5],  # 1.0113–1.0315 µs → ns
-# ])
+# Extract medians and bounds
+btree_med = btree[:, 1]
+btree_low = btree[:, 0]
+btree_high = btree[:, 2]
+btree_err = np.vstack([btree_med - btree_low, btree_high - btree_med])
 
-# rmi = np.array([
-#     [104.50, 107.02, 109.15],
-#     [221.22, 221.50, 221.81],
-#     [266.43, 267.51, 268.66],
-#     [283.76, 286.09, 288.62],
-#     [391.10, 395.58, 400.07],
-# ])
+rmi_med = rmi[:, 1]
+rmi_low = rmi[:, 0]
+rmi_high = rmi[:, 2]
+rmi_err = np.array([rmi_med - rmi_low, rmi_high - rmi_med])
 
-# # Extract medians and bounds
-# btree_med = btree[:, 1]
-# btree_low = btree[:, 0]
-# btree_high = btree[:, 2]
-# btree_err = np.vstack([btree_med - btree_low, btree_high - btree_med])
+# Speedup (btree / rmi) using medians
+speedup = btree_med / rmi_med
 
-# rmi_med = rmi[:, 1]
-# rmi_low = rmi[:, 0]
-# rmi_high = rmi[:, 2]
-# rmi_err = np.array([rmi_med - rmi_low, rmi_high - rmi_med])
+fig, ax = plt.subplots(figsize=(9.5, 5.5), dpi=160)
 
-# # Speedup (btree / rmi) using medians
-# speedup = btree_med / rmi_med
+# Use evenly spaced positions instead of a log scale for visual separation
+positions = np.arange(len(N))
+ax.set_xticks(positions)
+ax.set_xticklabels(x_labels)
 
-# fig, ax = plt.subplots(figsize=(9.5, 5.5), dpi=160)
+# Plot with error bars using positions
+c_btree = "#1f77b4"
+c_rmi = "#d62728"
 
-# # Use evenly spaced positions instead of a log scale for visual separation
-# positions = np.arange(len(N))
-# ax.set_xticks(positions)
-# ax.set_xticklabels(x_labels)
+btree_plot = ax.errorbar(
+    positions, btree_med, yerr=btree_err, fmt='-o', color=c_btree, capsize=4, lw=2,
+    markersize=6, label='B-Tree (median ± range)'
+)
+rmi_plot = ax.errorbar(
+    positions, rmi_med, yerr=rmi_err, fmt='-s', color=c_rmi, capsize=4, lw=2,
+    markersize=6, label='RMI (median ± range)'
+)
 
-# # Plot with error bars using positions
-# c_btree = "#1f77b4"
-# c_rmi = "#d62728"
+ax.set_ylabel("Lookup latency (ns, lower is better)")
+ax.set_xlabel("Dataset size (unique keys)")
+ax.set_title("RMI vs B-Tree: Raw key lookup latency by dataset size")
 
-# btree_plot = ax.errorbar(
-#     positions, btree_med, yerr=btree_err, fmt='-o', color=c_btree, capsize=4, lw=2,
-#     markersize=6, label='B-Tree (median ± range)'
-# )
-# rmi_plot = ax.errorbar(
-#     positions, rmi_med, yerr=rmi_err, fmt='-s', color=c_rmi, capsize=4, lw=2,
-#     markersize=6, label='RMI (median ± range)'
-# )
+# Secondary axis for speedup
+ax2 = ax.twinx()
+ax2.plot(positions, speedup, '--^', color="#444444", lw=1.5, markersize=6, label='Speedup (B-Tree / RMI)')
+ax2.set_ylabel("Speedup (×)")
 
-# ax.set_ylabel("Lookup latency (ns, lower is better)")
-# ax.set_xlabel("Dataset size (unique keys)")
-# ax.set_title("RMI vs B-Tree: Raw key lookup latency by dataset size")
+# Annotate latency near points
+for x, y in zip(positions, btree_med):
+    ax.annotate(f"{y:.0f} ns", (x, y), textcoords="offset points", xytext=(0, 10), ha='center',
+                fontsize=9, color="#333333", bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#dddddd", alpha=0.8))
+for x, y in zip(positions, rmi_med):
+    ax.annotate(f"{y:.0f} ns", (x, y), textcoords="offset points", xytext=(0, 10), ha='center',
+                fontsize=9, color="#333333", bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#dddddd", alpha=0.8))
 
-# # Secondary axis for speedup
-# ax2 = ax.twinx()
-# ax2.plot(positions, speedup, '--^', color="#444444", lw=1.5, markersize=6, label='Speedup (B-Tree / RMI)')
-# ax2.set_ylabel("Speedup (×)")
+# Annotate speedup
+for x, s in zip(positions, speedup):
+    ax2.annotate(f"×{s:.2f}", (x, s), textcoords="offset points", xytext=(0, -18), ha='center',
+                 fontsize=9, color="#333333", bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#dddddd", alpha=0.8))
 
-# # Annotate B-Tree latency near its points
-# for x, y in zip(positions, btree_med):
-#     ax.annotate(f"{y:.0f} ns", (x, y),
-#                 textcoords="offset points", xytext=(0, 10), ha='center',
-#                 fontsize=9, color="#333333",
-#                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#dddddd", alpha=0.8))
+# Limits
+ymin = 0
+ymax = max(rmi_high.max(), btree_high.max()) * 1.15
+ax.set_ylim(ymin, ymax)
 
-# # Annotate RMI latency near its points
-# for x, y in zip(positions, rmi_med):
-#     ax.annotate(f"{y:.0f} ns", (x, y),
-#                 textcoords="offset points", xytext=(0, 10), ha='center',
-#                 fontsize=9, color="#333333",
-#                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#dddddd", alpha=0.8))
+# Legend across axes
+lines1, labels1 = ax.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', frameon=True)
 
-# # Annotate speedup near its own data points on the secondary axis
-# for x, s in zip(positions, speedup):
-#     ax2.annotate(f"×{s:.2f}", (x, s),
-#                  textcoords="offset points", xytext=(0, -18), ha='center',
-#                  fontsize=9, color="#333333",
-#                  bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#dddddd", alpha=0.8))
+fig.tight_layout()
 
-
-# # Nice y-limits
-# ymin = 0
-# ymax = max(rmi_high.max(), btree_high.max()) * 1.15
-# ax.set_ylim(ymin, ymax)
-
-# # Legend handling across both axes
-# lines1, labels1 = ax.get_legend_handles_labels()
-# lines2, labels2 = ax2.get_legend_handles_labels()
-# ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', frameon=True)
-
-
-
-# fig.tight_layout()
-
-# # Save outputs
-# out_png = "/Users/kishan/Desktop/Codes/Project/ProjectKyro/bench/rmi_vs_btree.png"
-# out_svg = "/Users/kishan/Desktop/Codes/Project/ProjectKyro/bench/rmi_vs_btree.svg"
-# plt.savefig(out_png, bbox_inches='tight')
-# plt.savefig(out_svg, bbox_inches='tight')
-# print(f"Saved {out_png}")
-# print(f"Saved {out_svg}")
-
-# # Also print a quick table
-# print("\nSpeedup (B-Tree / RMI, medians):")
-# for lbl, s in zip(x_labels, speedup):
-#     print(f"{lbl}: ×{s:.2f}")
+# Save outputs
+out_png = "/Users/kishan/Desktop/Codes/Project/ProjectKyro/bench/rmi_vs_btree.png"
+out_svg = "/Users/kishan/Desktop/Codes/Project/ProjectKyro/bench/rmi_vs_btree.svg"
+plt.savefig(out_png, bbox_inches='tight')
+plt.savefig(out_svg, bbox_inches='tight')
+print(f"Saved {out_png}")
+print(f"Saved {out_svg}")
 
 
 

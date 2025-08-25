@@ -8,7 +8,6 @@ KyroDB is a durable, append-only key-value engine with a production-grade learne
 - WAL + snapshot durability, fast recovery, compaction controls
 - Simple HTTP API under /v1, Prometheus metrics at /metrics, build info at /build_info
 
-For an even shorter guide, see README-SHORT.md.
 
 ---
 
@@ -30,6 +29,52 @@ Warm start (avoids cold-page tails)
 
 - Auto: set env `KYRODB_WARM_ON_START=1` before starting
 - Manual: `POST /v1/rmi/build` (if needed) then `POST /v1/warmup`
+
+---
+
+## Benchmarks
+
+Engine microbenchmarks (in-process)
+
+- Compare raw key-lookup latency for RMI vs B-Tree within the engine:
+  - Run: `cargo bench -p bench --bench kv_index`
+  - Try multiple scales by setting `KYRO_BENCH_N` (e.g., 1e6, 1e7, 5e7, 3e8):
+    - `KYRO_BENCH_N=1000000 cargo bench -p bench --bench kv_index`
+    - `KYRO_BENCH_N=10000000 cargo bench -p bench --bench kv_index`
+
+HTTP workload benchmark (end-to-end)
+
+- Start engine (release): `target/release/kyrodb-engine serve 127.0.0.1 8080`
+- Load + read, export CSV:
+```
+COMMIT=$(git rev-parse --short HEAD)
+cargo run -p bench --release -- \
+  --base http://127.0.0.1:8080 \
+  --load-n 10000000 \
+  --val-bytes 64 \
+  --load-concurrency 64 \
+  --read-concurrency 64 \
+  --read-seconds 30 \
+  --dist uniform \
+  --out-csv bench/results/${COMMIT}/http_uniform_10m.csv
+```
+- Generate plots: `source .venv/bin/activate || python3 -m venv .venv && source .venv/bin/activate; pip install -r requirements.txt; python comp.py`
+
+Headline results (example data)
+
+- RMI vs B-Tree (engine, lookup latency by dataset size). RMI is consistently faster with tighter tails due to an O(1) model prediction followed by a tiny bounded scan:
+
+![RMI vs B-Tree](bench/rmi_vs_btree.png)
+
+- HTTP read benchmark (uniform distribution, 64 concurrency, 30s, 64B values). Shows stable throughput and sub-2.2ms p99 across 1M–50M keys on our test box. Use `/v1/lookup_fast/{k}` for index-only numbers or `/v1/get_fast/{k}` to include value reads:
+
+![HTTP uniform 64c 30s](bench/http_uniform_64c_30s.png)
+
+Notes for fair numbers
+- Warm the system (env `KYRODB_WARM_ON_START=1` or call `/v1/warmup`).
+- Prefer release builds and keep the machine quiet.
+- Consider `--features bench-no-metrics` to remove counter overheads.
+- See `bench/README.bench.md` for full methodology.
 
 ---
 
@@ -55,46 +100,6 @@ Auth: start the server with `--auth-token <TOKEN>` and send `Authorization: Bear
 
 ---
 
-## Performance notes
-
-- Warm vs cold: first queries pay OS page-fault costs. Prefer warm runs (env `KYRODB_WARM_ON_START=1` or call `/v1/warmup`).
-- SIMD: runtime-detected (AVX2/AVX-512 on x86_64; NEON/scalar fallback). Use `--release`.
-- Index-only vs full read: use `/v1/lookup_fast/{k}` for index-only; `/v1/get_fast/{k}` includes value read.
-
----
-
-## Benchmarks
-
-Reproducible HTTP workload bench and plots live under `bench/`. See `bench/README.bench.md`.
-
-Typical flow
-
-1) Start engine (release, learned-index default)
-
-2) Load and read with bench client, export CSV:
-
-```
-COMMIT=$(git rev-parse --short HEAD)
-cargo run -p bench --release -- \
-  --base http://127.0.0.1:8080 \
-  --load-n 10000000 \
-  --val-bytes 16 \
-  --load-concurrency 64 \
-  --read-concurrency 64 \
-  --read-seconds 30 \
-  --dist uniform \
-  --out-csv bench/results/${COMMIT}/http_uniform_10m.csv
-```
-
-3) Generate plots:
-
-```
-python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt || pip install numpy matplotlib
-python comp.py
-```
-
----
-
 ## Operations
 
 - Metrics: scrape `/metrics`
@@ -102,9 +107,9 @@ python comp.py
   - Admin routes default 2 rps, burst 5
   - Data routes default 5000 rps, burst 10000
   - Tune via env: `KYRODB_RL_ADMIN_RPS`, `KYRODB_RL_ADMIN_BURST`, `KYRODB_RL_DATA_RPS`, `KYRODB_RL_DATA_BURST`
-- TLS: run behind a reverse proxy. Examples:
+- TLS via reverse proxy: if you need HTTPS, run behind a web server like Caddy or Nginx that terminates TLS and forwards to KyroDB on localhost. Example snippets are included for convenience; you can skip this if you don’t need HTTPS.
 
-Caddy
+Caddy (simple automatic HTTPS)
 
 ```
 # Caddyfile
@@ -116,7 +121,7 @@ kyro.example.com {
 }
 ```
 
-Nginx
+Nginx (manual TLS via certbot)
 
 ```
 server {
@@ -146,9 +151,15 @@ Additional operational notes live in `docs/`.
 
 ---
 
+## Vision
+
+Curious about where this is going? See `visiondocument.md` for the broader roadmap: range queries, gRPC data plane, replication, and optional vector/ANN capabilities once the core KV + RMI path is rock solid.
+
+---
+
 ## Contributing and License
 
 - Contributions welcome. Include tests for WAL/snapshot/RMI changes.
 - License: Apache-2.0
 
-Contact: open an issue; for quicker feedback ping @vatskishan03.
+Contact: open an issue; for quicker feedback ping @vatskishan03 or on Twitter(@kishanvats03)
