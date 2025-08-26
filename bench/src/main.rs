@@ -1,13 +1,16 @@
 use anyhow::Result;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use clap::Parser;
 use hdrhistogram::Histogram;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rand_distr::{Distribution, Zipf};
 use serde::Deserialize;
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::{sync::Semaphore, task::JoinSet};
 
 #[derive(Parser, Debug, Clone)]
@@ -50,8 +53,11 @@ struct Args {
     regime: String,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
-struct OffsetResp { offset: u64 }
+struct OffsetResp {
+    offset: u64,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -69,7 +75,10 @@ async fn main() -> Result<()> {
     // 1) Bulk load N keys
     println!("[load] inserting {} keys", args.load_n);
     let pb = ProgressBar::new(args.load_n as u64);
-    pb.set_style(ProgressStyle::with_template("{spinner} {msg} {bar:40.cyan/blue} {pos}/{len}")?.progress_chars("##-"));
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} {msg} {bar:40.cyan/blue} {pos}/{len}")?
+            .progress_chars("##-"),
+    );
     let sem = Arc::new(Semaphore::new(args.load_concurrency));
     let mut join = JoinSet::new();
     for i in 0..args.load_n {
@@ -84,26 +93,36 @@ async fn main() -> Result<()> {
             let value = "A".repeat(val_bytes);
             let body = serde_json::json!({ "key": k, "value": value });
             let mut req = client.post(url).json(&body);
-            if let Some(a) = auth.as_deref() { req = req.header("Authorization", a); }
+            if let Some(a) = auth.as_deref() {
+                req = req.header("Authorization", a);
+            }
             let _ = req.send().await;
             drop(permit);
         });
         pb.inc(1);
     }
-    while let Some(res) = join.join_next().await { let _ = res; }
+    while let Some(res) = join.join_next().await {
+        let _ = res;
+    }
     pb.finish_with_message("load done");
 
     // 0) Build RMI then warmup to avoid cold-start artifacts before measuring
-    if args.regime.to_ascii_lowercase() == "warm" {
+    if args.regime.eq_ignore_ascii_case("warm") {
         if let Err(e) = prebuild_and_warm(&client, &args.base, auth_header.as_deref()).await {
             eprintln!("warn: prebuild/warm step failed: {} (continuing)", e);
         }
     } else {
-        eprintln!("info: regime='{}' — skipping prebuild/warm stage", args.regime);
+        eprintln!(
+            "info: regime='{}' — skipping prebuild/warm stage",
+            args.regime
+        );
     }
 
     // 2) Read-heavy workload and measure latency (get_fast)
-    println!("[read] running {}s, {} concurrency, dist={}", args.read_seconds, args.read_concurrency, args.dist);
+    println!(
+        "[read] running {}s, {} concurrency, dist={}",
+        args.read_seconds, args.read_concurrency, args.dist
+    );
     let deadline = Instant::now() + Duration::from_secs(args.read_seconds);
     let hist = Arc::new(tokio::sync::Mutex::new(Histogram::<u64>::new(3)?));
     let _sem_r = Arc::new(Semaphore::new(args.read_concurrency));
@@ -123,7 +142,9 @@ async fn main() -> Result<()> {
             let mut rng = StdRng::seed_from_u64(seed);
             let zipf = if dist == "zipf" {
                 Some(Zipf::new(load_n as u64, zipf_theta).unwrap())
-            } else { None };
+            } else {
+                None
+            };
             while Instant::now() < deadline {
                 let k = if let Some(ref z) = zipf {
                     z.sample(&mut rng) as u64 - 1
@@ -133,7 +154,9 @@ async fn main() -> Result<()> {
                 // Use fast value path to include value fetch cost realistically
                 let url = format!("{}/v1/get_fast/{}", base, k);
                 let mut req = client.get(url);
-                if let Some(a) = auth.as_deref() { req = req.header("Authorization", a); }
+                if let Some(a) = auth.as_deref() {
+                    req = req.header("Authorization", a);
+                }
                 let t0 = Instant::now();
                 let _ = req.send().await;
                 let dt = t0.elapsed();
@@ -143,7 +166,9 @@ async fn main() -> Result<()> {
             }
         });
     }
-    while let Some(res) = join.join_next().await { let _ = res; }
+    while let Some(res) = join.join_next().await {
+        let _ = res;
+    }
     let total_reads = total.load(Ordering::Relaxed);
     let elapsed = args.read_seconds as f64;
     let rps = total_reads as f64 / elapsed;
@@ -164,20 +189,40 @@ async fn main() -> Result<()> {
             let mut counts: HashMap<&str, f64> = HashMap::new();
             for line in text.lines() {
                 if line.starts_with("kyrodb_rmi_lookup_latency_seconds_sum") {
-                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("lookup", x); } }
+                    if let Some(v) = line.split_whitespace().nth(1) {
+                        if let Ok(x) = v.parse::<f64>() {
+                            sums.insert("lookup", x);
+                        }
+                    }
                 } else if line.starts_with("kyrodb_rmi_lookup_latency_seconds_count") {
-                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("lookup", x); } }
+                    if let Some(v) = line.split_whitespace().nth(1) {
+                        if let Ok(x) = v.parse::<f64>() {
+                            counts.insert("lookup", x);
+                        }
+                    }
                 } else if line.starts_with("kyrodb_rmi_probe_len_sum") {
-                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { sums.insert("probe", x); } }
+                    if let Some(v) = line.split_whitespace().nth(1) {
+                        if let Ok(x) = v.parse::<f64>() {
+                            sums.insert("probe", x);
+                        }
+                    }
                 } else if line.starts_with("kyrodb_rmi_probe_len_count") {
-                    if let Some(v) = line.split_whitespace().nth(1) { if let Ok(x) = v.parse::<f64>() { counts.insert("probe", x); } }
+                    if let Some(v) = line.split_whitespace().nth(1) {
+                        if let Ok(x) = v.parse::<f64>() {
+                            counts.insert("probe", x);
+                        }
+                    }
                 }
             }
             if let (Some(s), Some(c)) = (sums.get("lookup"), counts.get("lookup")) {
-                if *c > 0.0 { rmi_lookup_avg_us = Some((*s / *c) * 1_000_000.0); }
+                if *c > 0.0 {
+                    rmi_lookup_avg_us = Some((*s / *c) * 1_000_000.0);
+                }
             }
             if let (Some(s), Some(c)) = (sums.get("probe"), counts.get("probe")) {
-                if *c > 0.0 { rmi_probe_len_avg = Some(*s / *c); }
+                if *c > 0.0 {
+                    rmi_probe_len_avg = Some(*s / *c);
+                }
             }
         }
     }
@@ -194,8 +239,12 @@ async fn main() -> Result<()> {
         p95,
         p99,
         p999,
-        rmi_lookup_avg_us.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "".into()),
-        rmi_probe_len_avg.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "".into()),
+        rmi_lookup_avg_us
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "".into()),
+        rmi_probe_len_avg
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "".into()),
     ));
     let _ = std::fs::write(&args.out_csv, csv);
 
@@ -220,9 +269,13 @@ async fn wait_for_health(client: &reqwest::Client, base: &str, auth: Option<&str
     let url = format!("{}/health", base);
     for _ in 0..30 {
         let mut req = client.get(&url);
-        if let Some(a) = auth { req = req.header("Authorization", a); }
+        if let Some(a) = auth {
+            req = req.header("Authorization", a);
+        }
         if let Ok(resp) = req.send().await {
-            if resp.status().is_success() { return Ok(()); }
+            if resp.status().is_success() {
+                return Ok(());
+            }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -235,21 +288,27 @@ async fn prebuild_and_warm(client: &reqwest::Client, base: &str, auth: Option<&s
     {
         let url = format!("{}/v1/snapshot", base);
         let mut req = client.post(&url);
-        if let Some(a) = auth { req = req.header("Authorization", a); }
+        if let Some(a) = auth {
+            req = req.header("Authorization", a);
+        }
         let _ = req.send().await?; // ignore body
     }
     // Build RMI index (optional if already built)
     {
         let url = format!("{}/v1/rmi/build", base);
         let mut req = client.post(&url);
-        if let Some(a) = auth { req = req.header("Authorization", a); }
+        if let Some(a) = auth {
+            req = req.header("Authorization", a);
+        }
         let _ = req.send().await?;
     }
     // Warmup
     {
         let url = format!("{}/v1/warmup", base);
         let mut req = client.post(&url);
-        if let Some(a) = auth { req = req.header("Authorization", a); }
+        if let Some(a) = auth {
+            req = req.header("Authorization", a);
+        }
         let _ = req.send().await?;
     }
     Ok(())

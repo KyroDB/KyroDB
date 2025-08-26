@@ -3,12 +3,16 @@ use std::process::Command;
 fn main() {
     // Best-effort Git commit (works in git checkouts; falls back to "unknown" in archives/CI)
     let commit = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"]) 
+        .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
-        .and_then(|o| if o.status.success() {
-            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-        } else { None })
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_COMMIT_HASH={}", commit);
 
@@ -17,7 +21,11 @@ fn main() {
         .filter_map(|(k, v)| {
             if k.starts_with("CARGO_FEATURE_") && v == "1" {
                 // Normalize: CARGO_FEATURE_SOME_FEATURE -> "some-feature"
-                Some(k["CARGO_FEATURE_".len()..].to_ascii_lowercase().replace('_', "-"))
+                Some(
+                    k["CARGO_FEATURE_".len()..]
+                        .to_ascii_lowercase()
+                        .replace('_', "-"),
+                )
             } else {
                 None
             }

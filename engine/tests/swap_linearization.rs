@@ -11,7 +11,9 @@ async fn rmi_swap_preserves_visibility_of_recent_writes() {
     let log = PersistentEventLog::open(dir.path()).await.unwrap();
 
     // Seed some keys
-    for k in 0..100u64 { let _ = log.append_kv(Uuid::new_v4(), k, vec![1]).await.unwrap(); }
+    for k in 0..100u64 {
+        let _ = log.append_kv(Uuid::new_v4(), k, vec![1]).await.unwrap();
+    }
 
     // Force learned index selection by writing a small RMI file and swapping it in
     // Collect pairs from current state

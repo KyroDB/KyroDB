@@ -6,12 +6,27 @@ use prometheus::{Counter, Gauge, Histogram, HistogramOpts};
 mod shim {
     use super::*;
     pub struct NoopCounter;
-    impl NoopCounter { pub fn inc(&self) {} }
+    impl NoopCounter {
+        pub fn inc(&self) {}
+    }
     pub struct NoopGauge;
-    impl NoopGauge { pub fn set(&self, _v: f64) {} pub fn get(&self) -> f64 { 0.0 } }
+    impl NoopGauge {
+        pub fn set(&self, _v: f64) {}
+        pub fn get(&self) -> f64 {
+            0.0
+        }
+    }
     pub struct NoopHistogram;
-    impl NoopHistogram { pub fn observe(&self, _v: f64) {} pub fn start_timer(&self) -> NoopTimer { NoopTimer } }
-    pub struct NoopTimer; impl NoopTimer { pub fn observe_duration(&self) {} }
+    impl NoopHistogram {
+        pub fn observe(&self, _v: f64) {}
+        pub fn start_timer(&self) -> NoopTimer {
+            NoopTimer
+        }
+    }
+    pub struct NoopTimer;
+    impl NoopTimer {
+        pub fn observe_duration(&self) {}
+    }
     pub static APPENDS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static APPEND_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static SNAPSHOTS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
@@ -25,7 +40,8 @@ mod shim {
     pub static RMI_HITS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static RMI_MISSES_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static RMI_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
-    pub static RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS: Lazy<NoopHistogram> =
+        Lazy::new(|| NoopHistogram);
     pub static RMI_EPSILON_HISTOGRAM: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_INDEX_LEAVES: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
     pub static RMI_INDEX_SIZE_BYTES: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
@@ -39,19 +55,24 @@ mod shim {
     pub static LOOKUP_FALLBACK_SCAN_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static RMI_REBUILD_IN_PROGRESS: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
     pub fn inc_sse_lagged() {}
-    pub fn render() -> String { String::new() }
-    pub fn rmi_rebuild_in_progress() -> bool { RMI_REBUILD_IN_PROGRESS.get() > 0.5 }
+    pub fn render() -> String {
+        String::new()
+    }
+    pub fn rmi_rebuild_in_progress() -> bool {
+        RMI_REBUILD_IN_PROGRESS.get() > 0.5
+    }
 }
 
 #[cfg(feature = "bench-no-metrics")]
 pub use shim::{
-    APPEND_LATENCY_SECONDS, APPENDS_TOTAL, BTREE_READS_TOTAL, COMPACTION_DURATION_SECONDS,
-    COMPACTIONS_TOTAL, LOOKUP_FALLBACK_SCAN_TOTAL, RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX,
-    RMI_HITS_TOTAL, RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES, RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS,
-    RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL, RMI_MISSES_TOTAL, RMI_PROBE_LEN, RMI_READS_TOTAL,
-    RMI_REBUILD_DURATION_SECONDS, RMI_REBUILDS_TOTAL, RMI_REBUILD_IN_PROGRESS,
-    SNAPSHOT_LATENCY_SECONDS, SNAPSHOTS_TOTAL, SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL,
-    WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, inc_sse_lagged, render, rmi_rebuild_in_progress,
+    inc_sse_lagged, render, rmi_rebuild_in_progress, APPENDS_TOTAL, APPEND_LATENCY_SECONDS,
+    BTREE_READS_TOTAL, COMPACTIONS_TOTAL, COMPACTION_DURATION_SECONDS, LOOKUP_FALLBACK_SCAN_TOTAL,
+    RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL, RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES,
+    RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS, RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL,
+    RMI_MISSES_TOTAL, RMI_PROBE_LEN, RMI_READS_TOTAL, RMI_REBUILDS_TOTAL,
+    RMI_REBUILD_DURATION_SECONDS, RMI_REBUILD_IN_PROGRESS, SNAPSHOTS_TOTAL,
+    SNAPSHOT_LATENCY_SECONDS, SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL,
+    WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL,
 };
 
 #[cfg(not(feature = "bench-no-metrics"))]

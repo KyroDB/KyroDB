@@ -27,7 +27,12 @@ async fn background_compaction_shrinks_wal_and_preserves_reads() {
 
     let after = log.wal_size_bytes();
     assert!(after <= stats.after_bytes);
-    assert!(after < before, "wal did not shrink, before={} after={}", before, after);
+    assert!(
+        after < before,
+        "wal did not shrink, before={} after={}",
+        before,
+        after
+    );
 
     // Latest values survive
     for k in 0..100u64 {

@@ -17,11 +17,25 @@ struct ModelState {
 }
 
 impl ModelState {
-    fn write_snapshot_tmp(&mut self) { self.snapshot_tmp = true; }
-    fn commit_snapshot(&mut self) { if self.snapshot_tmp { self.snapshot_committed = true; } }
-    fn write_manifest_tmp(&mut self) { self.manifest_tmp = true; }
-    fn commit_manifest(&mut self) { if self.manifest_tmp { self.manifest_committed = true; } }
-    fn rotate_wal(&mut self) { self.wal_rotated = true; }
+    fn write_snapshot_tmp(&mut self) {
+        self.snapshot_tmp = true;
+    }
+    fn commit_snapshot(&mut self) {
+        if self.snapshot_tmp {
+            self.snapshot_committed = true;
+        }
+    }
+    fn write_manifest_tmp(&mut self) {
+        self.manifest_tmp = true;
+    }
+    fn commit_manifest(&mut self) {
+        if self.manifest_tmp {
+            self.manifest_committed = true;
+        }
+    }
+    fn rotate_wal(&mut self) {
+        self.wal_rotated = true;
+    }
 }
 
 #[test]
@@ -56,7 +70,10 @@ fn model_snapshot_manifest_rotation_ordering() {
         // Safety properties: manifest must not be committed unless snapshot is committed.
         let s = st.lock().unwrap();
         if s.manifest_committed {
-            assert!(s.snapshot_committed, "manifest committed before snapshot committed");
+            assert!(
+                s.snapshot_committed,
+                "manifest committed before snapshot committed"
+            );
         }
         // WAL rotation can happen independently, but after rotation a manifest rewrite is expected in real system.
     });
