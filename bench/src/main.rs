@@ -231,12 +231,19 @@ async fn wait_for_health(client: &reqwest::Client, base: &str, auth: Option<&str
 
 // Prebuild RMI and warm up server for realistic benchmarking
 async fn prebuild_and_warm(client: &reqwest::Client, base: &str, auth: Option<&str>) -> Result<()> {
-    // Try to build RMI index
+    // Take a snapshot so snapshot.data exists and mmap index is built (fast get by offset)
+    {
+        let url = format!("{}/v1/snapshot", base);
+        let mut req = client.post(&url);
+        if let Some(a) = auth { req = req.header("Authorization", a); }
+        let _ = req.send().await?; // ignore body
+    }
+    // Build RMI index (optional if already built)
     {
         let url = format!("{}/v1/rmi/build", base);
         let mut req = client.post(&url);
         if let Some(a) = auth { req = req.header("Authorization", a); }
-        let _ = req.send().await?; // ignore body; server swaps if ok
+        let _ = req.send().await?;
     }
     // Warmup
     {

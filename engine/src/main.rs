@@ -915,8 +915,18 @@ async fn main() -> Result<()> {
                             StatusCode::NOT_FOUND,
                         ))
                     }
-                })
-                .with(warp::log("kyrodb"));
+                });
+
+            // Conditional per-request logging: use no-op filter when disabled, else warp::log("kyrodb")
+            let log_filter = if std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1") {
+                // No-op filter with Error = Rejection so it type-checks for .with(...)
+                warp::any()
+                    .and_then(|| async { Ok::<(), warp::Rejection>(()) })
+                    .boxed()
+            } else {
+                warp::log("kyrodb").boxed()
+            };
+            let routes = routes.with(log_filter);
 
             // start server
             tracing::info!(
@@ -926,7 +936,7 @@ async fn main() -> Result<()> {
                 build_commit,
                 build_features
             );
-
+            
             println!(
                 "🚀 Starting server at http://{}:{} (commit={}, features={})",
                 host,

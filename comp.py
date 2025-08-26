@@ -2,6 +2,8 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+from pathlib import Path
 
 plt.style.use('seaborn-v0_8-whitegrid')
 
@@ -94,11 +96,14 @@ ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left', frameon=True)
 
 fig.tight_layout()
 
-# Save outputs
-out_png = "/Users/kishan/Desktop/Codes/Project/ProjectKyro/bench/rmi_vs_btree.png"
-out_svg = "/Users/kishan/Desktop/Codes/Project/ProjectKyro/bench/rmi_vs_btree.svg"
-plt.savefig(out_png, bbox_inches='tight')
-plt.savefig(out_svg, bbox_inches='tight')
+# Save outputs (relative to repo root)
+REPO_ROOT = Path(__file__).resolve().parent
+BENCH_DIR = REPO_ROOT / "bench"
+BENCH_DIR.mkdir(parents=True, exist_ok=True)
+out_png = BENCH_DIR / "rmi_vs_btree.png"
+out_svg = BENCH_DIR / "rmi_vs_btree.svg"
+plt.savefig(str(out_png), bbox_inches='tight')
+plt.savefig(str(out_svg), bbox_inches='tight')
 print(f"Saved {out_png}")
 print(f"Saved {out_svg}")
 
@@ -175,11 +180,11 @@ ax2.set_ylim(0, max(p99_us)*1.25)
 
 fig.tight_layout()
 
-# Save outputs
-out_png = "/Users/kishan/Desktop/Codes/Project/ProjectKyro/bench/http_uniform_64c_30s.png"
-out_svg = "/Users/kishan/Desktop/Codes/Project/ProjectKyro/bench/http_uniform_64c_30s.svg"
-plt.savefig(out_png, bbox_inches='tight')
-plt.savefig(out_svg, bbox_inches='tight')
+# Save outputs (relative to repo root)
+out_png = BENCH_DIR / "http_uniform_64c_30s.png"
+out_svg = BENCH_DIR / "http_uniform_64c_30s.svg"
+plt.savefig(str(out_png), bbox_inches='tight')
+plt.savefig(str(out_svg), bbox_inches='tight')
 print(f"Saved {out_png}")
 print(f"Saved {out_svg}")
 

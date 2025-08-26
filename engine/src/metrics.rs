@@ -1,4 +1,5 @@
 use once_cell::sync::Lazy;
+#[cfg(not(feature = "bench-no-metrics"))]
 use prometheus::{Counter, Gauge, Histogram, HistogramOpts};
 
 #[cfg(feature = "bench-no-metrics")]

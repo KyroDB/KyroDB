@@ -484,15 +484,14 @@ impl PersistentEventLog {
                     }
                     // Measure RMI lookup latency overall and, if applicable, during rebuild window
                     let timer_all = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                    #[allow(unused_mut)]
-                    let mut rebuild_timer = None;
                     #[cfg(not(feature = "bench-no-metrics"))]
-                    if crate::metrics::rmi_rebuild_in_progress() {
-                        rebuild_timer = Some(crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer());
-                    }
+                    let rebuild_timer_opt = if crate::metrics::rmi_rebuild_in_progress() {
+                        Some(crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer())
+                    } else { None };
                     let res = r.predict_get(&key);
                     timer_all.observe_duration();
-                    if let Some(t) = rebuild_timer { t.observe_duration(); }
+                    #[cfg(not(feature = "bench-no-metrics"))]
+                    if let Some(t) = rebuild_timer_opt { t.observe_duration(); }
                     if let Some(v) = res {
                         crate::metrics::RMI_HITS_TOTAL.inc();
                         crate::metrics::RMI_READS_TOTAL.inc();
@@ -531,11 +530,11 @@ impl PersistentEventLog {
     /// Force-write a full snapshot to disk.
     pub async fn snapshot(&self) -> Result<()> {
         let timer = metrics::SNAPSHOT_LATENCY_SECONDS.start_timer();
-        // bincode options with a safety limit for serialization
-        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+        // bincode options for serialization; no artificial size limit for full snapshots
+        let bopt = bincode::options();
         let path = self.data_dir.join("snapshot.bin");
         let tmp = self.data_dir.join("snapshot.tmp");
-
+        
         #[cfg(feature = "failpoints")]
         fail::fail_point!("snapshot_before_write", |_| {
             Err(anyhow::anyhow!("failpoint: snapshot_before_write"))

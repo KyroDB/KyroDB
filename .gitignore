@@ -33,6 +33,7 @@ Thumbs.db
 # Local binaries
 /orchestrator/kyrodbctl
 /orchestrator/ngdbctl
+/orchestrator/orchestrator
 
 # Bench/plot artifacts
 bench/*.png

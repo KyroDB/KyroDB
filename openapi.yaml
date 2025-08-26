@@ -13,6 +13,16 @@ paths:
       summary: Prometheus metrics
       responses:
         '200': { description: Text exposition }
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200': { description: OK }
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        '200': { description: Text exposition }
   /v1/put:
     post:
       summary: Insert or update a key/value
@@ -28,6 +38,11 @@ paths:
               required: [key, value]
       responses:
         '200': { description: Acknowledged }
+  /v1/replay:
+    post:
+      summary: Replay WAL into memory without append
+      responses:
+        '200': { description: Replay triggered }
   /v1/lookup:
     get:
       summary: Lookup a key and return JSON value
@@ -38,6 +53,17 @@ paths:
           schema: { type: integer, format: uint64 }
       responses:
         '200': { description: Value }
+        '404': { description: Not found }
+  /v1/lookup_raw:
+    get:
+      summary: Lookup a key and return 204 on hit (no body)
+      parameters:
+        - in: query
+          name: key
+          required: true
+          schema: { type: integer, format: uint64 }
+      responses:
+        '204': { description: Found }
         '404': { description: Not found }
   /v1/lookup_fast/{key}:
     get:
@@ -66,6 +92,11 @@ paths:
       summary: Trigger a snapshot
       responses:
         '200': { description: Snapshot started }
+  /v1/compact:
+    post:
+      summary: Compact WAL (keep latest) and take snapshot
+      responses:
+        '200': { description: Compaction started }
   /v1/offset:
     get:
       summary: Current next offset
@@ -76,3 +107,13 @@ paths:
       summary: Build and load the RMI index
       responses:
         '200': { description: Build started }
+  /v1/warmup:
+    post:
+      summary: Fault-in pages for index and snapshot
+      responses:
+        '200': { description: Warmup complete }
+  /build_info:
+    get:
+      summary: Build info
+      responses:
+        '200': { description: Build info JSON }

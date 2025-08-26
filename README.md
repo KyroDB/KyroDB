@@ -16,14 +16,14 @@ KyroDB is a durable, append-only key-value engine with a production-grade learne
 Prereqs: Rust toolchain. Optional: Go for the CLI in `orchestrator/`.
 
 - Build: `cargo build -p engine --release` (binary: `target/release/kyrodb-engine`)
-- Run: `target/release/kyrodb-engine serve 127.0.0.1 8080`
+- Run: `target/release/kyrodb-engine serve 127.0.0.1 3030`
 
 Basic checks
 
-- Health: `curl -s http://127.0.0.1:8080/health`
-- Offset: `curl -s http://127.0.0.1:8080/v1/offset`
-- Put: `curl -sX POST http://127.0.0.1:8080/v1/put -H 'content-type: application/json' -d '{"key":123,"value":"hello"}'`
-- Get (fast): `curl -i http://127.0.0.1:8080/v1/get_fast/123`
+- Health: `curl -s http://127.0.0.1:3030/health`
+- Offset: `curl -s http://127.0.0.1:3030/v1/offset`
+- Put: `curl -sX POST http://127.0.0.1:3030/v1/put -H 'content-type: application/json' -d '{"key":123,"value":"hello"}'`
+- Get (fast): `curl -i http://127.0.0.1:3030/v1/get_fast/123`
 
 Warm start (avoids cold-page tails)
 
