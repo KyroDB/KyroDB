@@ -992,7 +992,7 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // Per-request logging
+            // Per-request logging; control verbosity via RUST_LOG
             let routes = routes.with(warp::log("kyrodb"));
 
             // start server
