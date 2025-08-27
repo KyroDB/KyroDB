@@ -1,4 +1,4 @@
-# KyroDB — Vision and Architecture (Story Edition)
+# KyroDB — Vision and Architecture 
 
 Status: living document. Grounded in today’s single‑node KV + RMI engine; points the way to a broader data platform.
 
