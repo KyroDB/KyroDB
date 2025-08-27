@@ -1,43 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Quick single-run capture script using the bench binary (warm regime)
+# Usage: capture.sh [N_KEYS] [VAL_BYTES] [DIST]
+#   N_KEYS    default: 1000000
+#   VAL_BYTES default: 64
+#   DIST      default: uniform (or zipf)
+
+ROOT_DIR=$(git rev-parse --show-toplevel)
+cd "$ROOT_DIR"
+
 N_KEYS=${1:-1000000}
 VAL_BYTES=${2:-64}
 DIST=${3:-uniform}
 BASE=${BASE:-http://127.0.0.1:3030}
+AUTH_TOKEN=${AUTH_TOKEN:-}
 COMMIT=$(git rev-parse --short HEAD)
-OUT=bench/results/${COMMIT}
+OUT="bench/results/${COMMIT}/quick"
+READ_CONCURRENCY=${READ_CONCURRENCY:-64}
+READ_SECONDS=${READ_SECONDS:-30}
+
 mkdir -p "$OUT"
 
-# capture config
+# Capture config
 {
   echo "commit=$COMMIT"
   echo "n_keys=$N_KEYS"
   echo "val_bytes=$VAL_BYTES"
-  echo "endpoint=lookup_fast"
   echo "dist=$DIST"
-  echo "concurrency=${READ_CONCURRENCY:-64}"
-  echo "warmup_seconds=${WARMUP_SECONDS:-5}"
-  echo "duration=${READ_SECONDS:-30}"
+  echo "concurrency=$READ_CONCURRENCY"
+  echo "duration=$READ_SECONDS"
+  echo "base=$BASE"
+  [[ -n "$AUTH_TOKEN" ]] && echo "auth_token=***" || true
   env | grep '^KYRODB_' || true
 } > "$OUT/config.txt"
 
 # Scrape metrics before
-curl -s "$BASE/metrics" > "$OUT/metrics.prom" || true
+curl -s "$BASE/metrics" > "$OUT/metrics.before.prom" || true
 
-# Build benches
+# Build bench
 cargo build -p bench --release >/dev/null
 
-# Load+bench with RMI build step
-READ_CONCURRENCY=${READ_CONCURRENCY:-64} \
-READ_SECONDS=${READ_SECONDS:-30} \
-WARMUP_SECONDS=${WARMUP_SECONDS:-5} \
-  target/release/bench --base "$BASE" --endpoint lookup_fast \
-  --load-n "$N_KEYS" --val-bytes "$VAL_BYTES" \
-  --read-concurrency "$READ_CONCURRENCY" --warmup-seconds "$WARMUP_SECONDS" --read-seconds "$READ_SECONDS" \
-  --dist "$DIST" --csv-out "$OUT/latency.csv" | tee "$OUT/bench.out"
+# Build args
+ARGS=(
+  --base "$BASE"
+  --load-n "$N_KEYS"
+  --val-bytes "$VAL_BYTES"
+  --read-concurrency "$READ_CONCURRENCY"
+  --read-seconds "$READ_SECONDS"
+  --dist "$DIST"
+  --out-csv "$OUT/bench_results.csv"
+  --regime warm
+)
+if [[ -n "$AUTH_TOKEN" ]]; then
+  ARGS+=(--auth-token "$AUTH_TOKEN")
+fi
 
-# re-scrape metrics after run
+# Run bench (warm regime triggers snapshot + RMI build + warmup)
+set -x
+ "$ROOT_DIR/target/release/bench" "${ARGS[@]}" | tee "$OUT/bench.out"
+set +x
+
+# Scrape metrics after
 curl -s "$BASE/metrics" > "$OUT/metrics.after.prom" || true
 
 echo "Saved artifacts to $OUT"
