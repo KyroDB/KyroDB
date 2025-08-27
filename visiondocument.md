@@ -1,10 +1,10 @@
-# KyroDB — Vision and Architecture (Story Edition)
+# KyroDB — Vision and Architecture
 
 Status: living document. Grounded in today’s single‑node KV + RMI engine; points the way to a broader data platform.
 
 ---
 
-## The arc of KyroDB (why and where we’re going)
+## Why and Where we’re going
 
 Modern AI applications bolt together many systems: streams, OLTP, vector stores, feature stores, provenance tools, and model infra. It works — until it doesn’t. Incidents cascade, glue code multiplies, and nobody can answer simple questions like “what decision did the model make and why?”
 
