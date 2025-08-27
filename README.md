@@ -44,12 +44,39 @@ Engine microbenchmarks (in-process)
 
 HTTP workload benchmark (end-to-end)
 
-- Start engine (release): `target/release/kyrodb-engine serve 127.0.0.1 8080`
-- Load + read, export CSV:
+- **Quick benchmark**: Start engine and run single test:
+```
+target/release/kyrodb-engine serve 127.0.0.1 3030
+cargo run -p bench --release -- \
+  --base http://127.0.0.1:3030 \
+  --load-n 1000000 \
+  --val-bytes 64 \
+  --read-concurrency 64 \
+  --read-seconds 30 \
+  --dist uniform
+```
+
+- **Large-scale benchmarks** (10M/50M keys with skewed distributions):
+```
+# Run comprehensive benchmark suite
+./bench/scripts/run_large_benchmarks.sh
+
+# Or run specific configurations
+./bench/scripts/run_large_benchmarks.sh check  # Check prerequisites
+./bench/scripts/run_large_benchmarks.sh run    # Run all benchmarks
+./bench/scripts/run_large_benchmarks.sh plots  # Generate plots only
+```
+
+- **Generate comprehensive plots**:
+```
+python3 bench/scripts/generate_plots.py
+```
+
+- **Manual benchmark** (legacy method):
 ```
 COMMIT=$(git rev-parse --short HEAD)
 cargo run -p bench --release -- \
-  --base http://127.0.0.1:8080 \
+  --base http://127.0.0.1:3030 \
   --load-n 10000000 \
   --val-bytes 64 \
   --load-concurrency 64 \
@@ -58,7 +85,6 @@ cargo run -p bench --release -- \
   --dist uniform \
   --out-csv bench/results/${COMMIT}/http_uniform_10m.csv
 ```
-- Generate plots: `source .venv/bin/activate || python3 -m venv .venv && source .venv/bin/activate; pip install -r requirements.txt; python comp.py`
 
 Headline results (example data)
 
@@ -69,6 +95,12 @@ Headline results (example data)
 - HTTP read benchmark (uniform distribution, 64 concurrency, 30s, 64B values). Shows stable throughput and sub-2.2ms p99 across 1M–50M keys on our test box. Use `/v1/lookup_fast/{k}` for index-only numbers or `/v1/get_fast/{k}` to include value reads:
 
 ![HTTP uniform 64c 30s](bench/http_uniform_64c_30s.png)
+
+**Large-scale benchmark results** include:
+- **10M and 50M key benchmarks** with uniform and Zipf distributions (θ=1.1, 1.5)
+- **Comprehensive performance analysis** across scales and distributions
+- **Automated artifact collection** with system information and detailed reports
+- **Interactive plots** showing latency vs throughput trade-offs
 
 Notes for fair numbers
 - Warm the system (env `KYRODB_WARM_ON_START=1` or call `/v1/warmup`).
@@ -158,6 +190,8 @@ Additional operational notes live in `docs/`.
 - In-memory recent-write delta; single-node read path
 - RMI builder/loader with bounded probe; on-disk formats versioned
 - Compaction triggers for WAL space management
+
+**📊 Comprehensive architecture diagrams** including system overview, data flow, RMI structure, and performance characteristics are available in [`visiondocument.md`](visiondocument.md#8-architecture-diagrams).
 
 ---
 
