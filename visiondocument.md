@@ -1,10 +1,10 @@
-# KyroDB — Vision and Architecture
+# KyroDB — Vision and Architecture (Story Edition)
 
 Status: living document. Grounded in today’s single‑node KV + RMI engine; points the way to a broader data platform.
 
 ---
 
-## Why and Where we’re going
+## The arc of KyroDB (why and where we’re going)
 
 Modern AI applications bolt together many systems: streams, OLTP, vector stores, feature stores, provenance tools, and model infra. It works — until it doesn’t. Incidents cascade, glue code multiplies, and nobody can answer simple questions like “what decision did the model make and why?”
 
@@ -55,29 +55,29 @@ graph TB
     RL[Rate limiting]
 
     subgraph Core
-      WAL[Write‑ahead log]
+      WAL[Write-ahead log]
       SNAP[Snapshot manager]
-      RMI[Learned index (RMI)]
-      DELTA[In‑memory delta]
+      RMI[Learned index RMI]
+      DELTA[In-memory delta]
       PCACHE[Payload cache]
     end
 
     subgraph Background
-      B1[Compaction & retention]
+      B1[Compaction and retention]
       B2[RMI rebuild]
       B3[Warmup]
     end
 
     subgraph Observability
-      M[Prometheus /metrics]
-      BI[/build_info]
+      M[Prometheus metrics]
+      BI[build_info]
       LOG[Structured logging]
     end
   end
 
   subgraph Storage
     FS[Local filesystem]
-    MMAP[Memory‑mapped files]
+    MMAP[Memory-mapped files]
   end
 
   C1 --> API
@@ -118,28 +118,29 @@ flowchart TD
   subgraph Write_Path
     P1[PUT key,value] --> P2[Validate]
     P2 --> P3[Append event to WAL]
-    P3 --> P4[Update in‑memory delta]
+    P3 --> P4[Update in-memory delta]
     P4 --> P5[Return offset]
   end
 
   subgraph Read_Path
-    G1[GET key] --> G2[RMI predict + probe]
+    G1[GET key] --> G2[RMI predict and probe]
     G2 --> G3[Resolve offset]
-    G3 --> G4[Fetch via mmap(payload index)]
+    G3 --> G4[Fetch via mmap payload index]
     G4 --> G5{Cache hit?}
     G5 -- Yes --> G7[Return value]
-    G5 -- No --> G6[Insert into payload cache] --> G7
+    G5 -- No --> G6[Insert into payload cache]
+    G6 --> G7[Return value]
     G2 -. miss in snapshot .-> G8[Read from delta]
     G8 --> G7
   end
 
   subgraph Background
-    B0[Heuristics: error, probe len, volume] --> B10[Rebuild RMI]
-    B10 --> B11[Validate + checksum]
-    B11 --> B12[Atomic swap + manifest]
+    B0[Heuristics error probe len volume] --> B10[Rebuild RMI]
+    B10 --> B11[Validate and checksum]
+    B11 --> B12[Atomic swap and manifest]
 
-    B20[Size/age triggers] --> B21[Compact WAL]
-    B21 --> B22[Create snapshot (bin + data)]
+    B20[Size or age triggers] --> B21[Compact WAL]
+    B21 --> B22[Create snapshot bin plus data]
     B22 --> B23[Prune old segments]
   end
 ```
@@ -150,15 +151,15 @@ Notes:
 
 ---
 
-## RMI at a glance (on‑disk and lookup)
+## RMI at a glance (on-disk and lookup)
 
 ```mermaid
 graph TB
-  subgraph On_disk
-    H[Header: magic + version]
-    R[Router table (dynamic bits)]
-    L[Leaf models + metadata (epsilon bounds)]
-    K[Key metadata (ordering/hints)]
+  subgraph "On disk"
+    H[Header magic and version]
+    R[Router table dynamic bits]
+    L[Leaf models and metadata epsilon bounds]
+    K[Key metadata ordering and hints]
     CS[CRC32C checksum]
   end
 
@@ -166,7 +167,7 @@ graph TB
     I[Input key] --> R0[Root predict]
     R0 --> R1[Route to leaf]
     R1 --> L0[Leaf predict]
-    L0 --> B0[Bounded probe (SIMD‑aware)]
+    L0 --> B0[Bounded probe SIMD aware]
     B0 --> O[Offset]
   end
 ```
@@ -286,6 +287,12 @@ Each phase ships measurable artifacts (code, docs, data, plots) and success crit
 
 ---
 
+## Success signals
+
+- Engineering: green CI with fuzz/failpoints; recovery matrix stable.
+- Performance: tail latency improvements on realistic workloads; transparent plots.
+- Research: public preprint + artifact; external reproductions of benchmarks.
+- Adoption: external users running benches and pilots; constructive community.
 
 ---
 
