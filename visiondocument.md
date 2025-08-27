@@ -1,464 +1,300 @@
-# KyroDB — Vision Document (Expanded)
+# KyroDB — Vision and Architecture (Story Edition)
 
-**Status:** Living vision — broad long-term goals while remaining grounded in the short-term KV + RMI focus in the README.
-
-> **Elevator pitch (long-term):** KyroDB aims to be an AI-native database that fuses learned systems and classical database correctness to become a self-optimizing, auditable, and developer-friendly data platform for AI-first applications — from single-node RMI-accelerated KV engines to federated, autonomous database fabrics that natively support model training, inference, provenance, and governance.
+Status: living document. Grounded in today’s single‑node KV + RMI engine; points the way to a broader data platform.
 
 ---
 
-## Current Status 
+## The arc of KyroDB (why and where we’re going)
 
-- Scope: production-grade single-node KV + RMI focus.
-- Transport: HTTP/JSON for both data and control today; gRPC data-plane planned in Phase A.
-- Tooling: kyrodb-engine (server) + kyrodbctl (Go CLI) over HTTP.
-- Vectors/ANN: deferred to later phases; not enabled by default.
-- “Kernel” is an explicit target: near-term work includes defining storage/index traits and swapping index implementations.
+Modern AI applications bolt together many systems: streams, OLTP, vector stores, feature stores, provenance tools, and model infra. It works — until it doesn’t. Incidents cascade, glue code multiplies, and nobody can answer simple questions like “what decision did the model make and why?”
 
----
+KyroDB starts from a simple, durable core and grows into an AI‑native database. We fuse learned systems with classical database correctness. The end goal is a platform that learns from data, optimizes itself, and offers built‑in primitives for provenance and governance — without sacrificing durability or developer ergonomics.
 
-# 1. Vision Summary
-
-KyroDB’s long-term ambition is to blur the lines between data platforms and model infrastructure. The database should not just *store data* — it should *learn from it*, *optimize itself*, and *enable AI workflows* with built-in primitives for provenance, reproducibility, and governance. Over time KyroDB will graduate from a production-grade single-node KV + RMI engine (the immediate focus) into a modular ecosystem supporting vectors, in‑database model ops, self-tuning knobs, and federated learning, while preserving strong durability, auditability, and developer ergonomics.
-
-This vision balances two things:
-
-1. **Research excellence** — publishable, reproducible contributions (e.g., integrating learned indexes in a durable KV engine).
-2. **Engineering pragmatism** — ship stable, benchmarked software that developers can run and trust.
+A story in three acts:
+- Act I — Make the core undeniable: a production‑grade single‑node KV engine with a learned primary index (RMI), honest latency tails, and a clear durability story.
+- Act II — Programmable intelligence: adaptive indexing, self‑tuning knobs, and optional vector primitives behind stable traits, with a clean API/SDK surface.
+- Act III — Federated and autonomous: replication, sharding, and policy‑driven optimization that keeps correctness and auditability front and center.
 
 ---
 
-# 2. Problem Space & Opportunity
+## Where we are now (today)
 
-Modern AI stacks are complex: ingestion pipelines, streaming infra (Kafka), OLTP/OLAP stores, vector DBs, separate model infra, provenance tooling, and orchestration. This complexity results in:
+KyroDB is a single‑node, durable key–value engine with a learned primary index.
 
-* operational overhead and expensive glue code;
-* brittle pipelines that break under a production incident;
-* lack of end-to-end provenance for model-driven decisions;
-* duplicated storage and inconsistency between vector/materialized views.
+- Interface: HTTP/JSON v1. Control and data share one surface for now.
+- Durability: append‑only WAL, atomic snapshots (manifested), clean recovery.
+- Reads: RMI is the default read path; values fetched via a mmap’d payload index.
+- Writes: fast appends into WAL; a small in‑memory delta makes new keys visible immediately.
+- Swap: RMI is rebuilt off a snapshot and swapped atomically; reads stay linearizable.
+- Ops: Prometheus metrics (/metrics), build info (/build_info), health (/health), rate limiting and bearer auth. Warm‑on‑start and HTTP logging toggle.
 
-KyroDB reduces the stack surface by natively combining **event-sourced durability**, **learned indexing**, and **AI-friendly access patterns** while adding the governance and reproducibility primitives AI applications need.
-
-**Market signals:** increasing interest in learned indexes (research + early engineering), provider-built vector capabilities in major cloud DBs, and developer demand for simpler RAG pipelines.
-
----
-
-# 3. North-Star Goals 
-
-* **Research North-star:** Demonstrate that learned primary indexes can be productionized with durability guarantees and outperform classical indices on realistic workloads; publish reproducible results and release code artifacts.
-* **Product North-star:** A lightweight, pluggable database kernel that: durable by default, self-tuning, provides first-class vector and model ops, and can power both developer prototypes and regulated production services.
-* **Ecosystem North-star:** A healthy open-source community and reproducible benchmark suite that becomes the reference for learned-index research and engineering trade-offs.
-
-Success signals: peer-reviewed paper or arXiv preprint, reproducible benchmarks used by third parties, stable 1.0 engine with adoption in small/medium production projects.
+Key endpoints (v1): /v1/put, /v1/get_fast/{key}, /v1/snapshot, /v1/rmi/build, /v1/warmup.
 
 ---
 
-# 4. Pillars of KyroDB
+## Why KyroDB (the problem and our bet)
 
-## 4.1 Correctness & Durability
-
-Durability is non-negotiable. All learned components must sit on top of clear, auditable storage semantics: WAL + atomic snapshots + clear recovery story. KyroDB’s design principle: **learning augments indexing/performance, never weakens correctness guarantees**.
-
-## 4.2 Reproducible Research & Engineering
-
-Every benchmark, experiment, and design choice must be reproducible: commit hashes, exact scripts, random seeds, and Dockerized runners. This provides credibility in the research community and confidence for adopters.
-
-## 4.3 Self-Optimization (AI4DB)
-
-KyroDB will use data-driven components to tune itself: learned indexes, cost models, autoregressive knob tuning, and query-plan selection. Human operators remain in control of policies and safety fences.
-
-## 4.4 Developer Ergonomics
-
-Provide a small, composable surface: a binary + light SDKs (Rust/Go/TS), clear admin tooling, and worked examples (RAG demo, OLTP + auditing example). The product must be easy to run locally and in CI.
-
-## 4.5 Governance & Provenance
-
-Built-in mechanisms for lineage, immutable logs of model inferences, data-versioning, and audit trails for regulatory compliance.
-
-## 4.6 Modularity & Extensibility
-
-The kernel should expose clear extension points — storage engines, index plugins (RMI, B-Tree), vector backends — so advanced features can be added without monolithic complexity.
+- Today’s AI stacks are a zoo of services. They’re powerful but operationally heavy. Data and semantics scatter across systems.
+- Learned indexes show real promise, but many demos ignore durability, rebuild behavior, and hot read paths under load.
+- Our bet: start with a correct, observable kernel that productionizes learned indexing; then open carefully chosen extension points for vectors and model‑aware features. No magic. Evidence over hype.
 
 ---
 
-# 5. Roadmap (expanded — north-to-south view)
-
-This roadmap spans immediate priorities (KV + RMI) to advanced ambitions (distributed self-driving DB). Each phase includes deliverables and success criteria.
-
-## Phase A — Foundation 
-
-**Goal:** Production-grade KV + RMI.
-**Deliverables:** durable WAL, atomic snapshot+manifest, mmap RMI binary and builder, compaction, HTTP data-plane initially; migrate data-plane to gRPC, bench harness, CI fuzz tests.
-**Success:** reproducible benchmarks (10M/50M/1B), recovery invariants proven by tests, preprint draft outlining RMI productionization.
-
-## Phase B — Polish & Research 
-
-**Goal:** polish RMI, thorough evaluation, and research dissemination.
-**Deliverables:** memory layout optimizations, mispredict heuristics, autoscheduler for re-index builds, publication-ready experiments, documentation & blog series.
-**Success:** accepted preprint or public peer feedback; external reproductions of benchmarks.
-
-## Phase C — Vertical Expansion 
-
-**Goal:** add vector primitives, filters, and simple declarative query extensions.
-**Deliverables:** vector storage + ANN integration (plugin), metadata filters for vector search, canonical RAG demo, SDK improvements.
-**Success:** RAG demo used by external devs; bench comparisons vs Pinecone/Weaviate for select workloads.
-
-## Phase D — Autonomy & Governance
-
-**Goal:** add self-tuning, workload-aware policies, governance and provenance features.
-**Deliverables:** adaptive knob tuning, model-registry integration, lineage trackers, explainability hooks, compliance features.
-**Success:** KyroDB demonstrates lower operational costs on targeted workloads and provides audit trails for sample regulated use-cases.
-
-## Phase E — Scale & Distribution 
-
-**Goal:** optional distributed mode — sharding, replication, and multi-region.
-**Deliverables:** consensus-backed metadata layer, partitioning strategies that preserve learned-index guarantees, WAL replication.
-**Success:** production-grade distributed offering or a managed service prototype.
-
----
-
-# 6. Research Agenda
-
-KyroDB’s research contributions should be focused and reproducible. Candidate topics:
-
-* **Productionizing learned indexes:** error bounds, rebuild policies, mmapped layout, update handling and recovery semantics.
-* **Workload-adaptive indexing:** dynamic bucketization and hybrid RMI/B-Tree fallbacks.
-* **Cost of learning vs cost of rebuild:** model complexity vs rebuild frequency trade-offs.
-* **Combined vector+event provenance:** how to maintain reproducible RAG pipelines with immutable logs.
-
-Each research paper must include: code, dataset generation scripts, run commands, and an artifact bundled in a Docker image.
-
----
-
-# 7. Architecture Principles (non-exhaustive)
-
-* **Immutable log as source-of-truth.** The WAL + snapshot becomes the canonical history for audits, rebuilds, and time-travel.
-* **Index immutability per epoch.** RMI indices are built off snapshots and swapped atomically; live writes land in the WAL + mem-delta.
-* **Mispredict detector.** Track probe lengths and mispredict rates; trigger rebuilds if error grows beyond thresholds.
-* **Separation of control & data planes.** Today: HTTP/JSON for data and admin while iterating; Phase A: migrate data-plane to gRPC for low-latency ops, keep HTTP for admin/metrics.
-* **Pluggable index/storage traits.** Provide documented interfaces for swapping implementations.
-
----
-
-# 8. Architecture Diagrams
-
-## 8.1 System Overview
+## System overview
 
 ```mermaid
 graph TB
-    subgraph "Client Layer"
-        HTTP[HTTP Client]
-        CLI[kyrodbctl CLI]
+  subgraph Clients
+    C1[HTTP clients]
+    C2[kyrodbctl]
+  end
+
+  subgraph KyroDB_Engine
+    API[HTTP v1 API]
+    AUTH[Auth]
+    RL[Rate limiting]
+
+    subgraph Core
+      WAL[Write‑ahead log]
+      SNAP[Snapshot manager]
+      RMI[Learned index (RMI)]
+      DELTA[In‑memory delta]
+      PCACHE[Payload cache]
     end
-    
-    subgraph "KyroDB Engine"
-        API[HTTP API Layer]
-        RL[Rate Limiter]
-        Auth[Auth Middleware]
-        
-        subgraph "Core Engine"
-            WAL[Write-Ahead Log]
-            SNAP[Snapshot Manager]
-            RMI[RMI Index]
-            BTREE[B-Tree Index]
-            DELTA[Delta Store]
-            CACHE[LRU Cache]
-        end
-        
-        subgraph "Background Tasks"
-            COMPACT[Compaction]
-            REBUILD[RMI Rebuild]
-            WARMUP[Warmup]
-        end
-        
-        subgraph "Monitoring"
-            METRICS[Prometheus Metrics]
-            LOGS[Structured Logging]
-        end
+
+    subgraph Background
+      B1[Compaction & retention]
+      B2[RMI rebuild]
+      B3[Warmup]
     end
-    
-    subgraph "Storage Layer"
-        DISK[Local Filesystem]
-        MMAP[Memory Mapped Files]
+
+    subgraph Observability
+      M[Prometheus /metrics]
+      BI[/build_info]
+      LOG[Structured logging]
     end
-    
-    HTTP --> API
-    CLI --> API
-    API --> RL
-    RL --> Auth
-    Auth --> WAL
-    Auth --> RMI
-    Auth --> BTREE
-    
-    WAL --> DISK
-    SNAP --> DISK
-    RMI --> MMAP
-    BTREE --> MMAP
-    DELTA --> MMAP
-    CACHE --> MMAP
-    
-    COMPACT --> WAL
-    COMPACT --> SNAP
-    REBUILD --> RMI
-    WARMUP --> MMAP
-    
-    RMI --> METRICS
-    WAL --> METRICS
-    API --> LOGS
+  end
+
+  subgraph Storage
+    FS[Local filesystem]
+    MMAP[Memory‑mapped files]
+  end
+
+  C1 --> API
+  C2 --> API
+  API --> RL --> AUTH
+
+  AUTH --> WAL
+  AUTH --> RMI
+  AUTH --> DELTA
+
+  WAL --> FS
+  SNAP --> FS
+  RMI --> MMAP
+  DELTA -. overlays .-> RMI
+  PCACHE --> MMAP
+
+  B1 --> WAL
+  B1 --> SNAP
+  B2 --> RMI
+  B3 --> MMAP
+
+  M -. exports .-> API
+  BI -. exports .-> API
+  LOG -.-> API
 ```
 
-## 8.2 Data Flow Architecture
+What to notice:
+- Single binary, local disk, mmap for hot value fetches.
+- Learned index augments performance; correctness is anchored in WAL+snapshot.
+- Background work never blocks reads; swaps are atomic.
+
+---
+
+## Read, write, and background flows
 
 ```mermaid
 flowchart TD
-    subgraph "Write Path"
-        PUT[PUT Request] --> VALIDATE[Validate Input]
-        VALIDATE --> WAL[Append to WAL]
-        WAL --> DELTA[Update Delta Store]
-        DELTA --> RESPONSE[Return Offset]
-    end
-    
-    subgraph "Read Path"
-        GET[GET Request] --> LOOKUP[Index Lookup]
-        LOOKUP --> RMI{Use RMI?}
-        RMI -->|Yes| RMI_LOOKUP[RMI Predict + Probe]
-        RMI -->|No| BTREE_LOOKUP[B-Tree Lookup]
-        RMI_LOOKUP --> OFFSET[Get Offset]
-        BTREE_LOOKUP --> OFFSET
-        OFFSET --> FETCH[Fetch Value]
-        FETCH --> CACHE{In Cache?}
-        CACHE -->|Yes| CACHE_RET[Return Cached]
-        CACHE -->|No| SNAP_LOOKUP[Snapshot Lookup]
-        SNAP_LOOKUP --> CACHE_STORE[Store in Cache]
-        CACHE_STORE --> CACHE_RET
-        CACHE_RET --> RESPONSE_READ[Return Value]
-    end
-    
-    subgraph "Background Operations"
-        TRIGGER[Rebuild Trigger] --> REBUILD[RMI Rebuild]
-        REBUILD --> SWAP[Atomic Index Swap]
-        SWAP --> MANIFEST[Update Manifest]
-        
-        COMPACT_TRIGGER[Compaction Trigger] --> COMPACT[Compact WAL]
-        COMPACT --> SNAPSHOT[Create Snapshot]
-        SNAPSHOT --> CLEANUP[Clean Old Segments]
-    end
+  subgraph Write_Path
+    P1[PUT key,value] --> P2[Validate]
+    P2 --> P3[Append event to WAL]
+    P3 --> P4[Update in‑memory delta]
+    P4 --> P5[Return offset]
+  end
+
+  subgraph Read_Path
+    G1[GET key] --> G2[RMI predict + probe]
+    G2 --> G3[Resolve offset]
+    G3 --> G4[Fetch via mmap(payload index)]
+    G4 --> G5{Cache hit?}
+    G5 -- Yes --> G7[Return value]
+    G5 -- No --> G6[Insert into payload cache] --> G7
+    G2 -. miss in snapshot .-> G8[Read from delta]
+    G8 --> G7
+  end
+
+  subgraph Background
+    B0[Heuristics: error, probe len, volume] --> B10[Rebuild RMI]
+    B10 --> B11[Validate + checksum]
+    B11 --> B12[Atomic swap + manifest]
+
+    B20[Size/age triggers] --> B21[Compact WAL]
+    B21 --> B22[Create snapshot (bin + data)]
+    B22 --> B23[Prune old segments]
+  end
 ```
 
-## 8.3 RMI (Recursive Model Index) Structure
+Notes:
+- Reads prefer the snapshot‑backed path; the delta overlays recent writes.
+- Snapshots produce two files: structured state (bin) and mmap‑friendly payload (data).
+
+---
+
+## RMI at a glance (on‑disk and lookup)
 
 ```mermaid
 graph TB
-    subgraph "RMI Architecture"
-        subgraph "Stage 0: Root Model"
-            ROOT[Root Model<br/>key → leaf_id]
-            ROUTER[Router Table<br/>2^bits entries]
-        end
-        
-        subgraph "Stage 1: Leaf Models"
-            LEAF1[Leaf 1<br/>key → predicted_pos]
-            LEAF2[Leaf 2<br/>key → predicted_pos]
-            LEAFN[Leaf N<br/>key → predicted_pos]
-        end
-        
-        subgraph "Data Storage"
-            KEYS[Sorted Keys]
-            OFFSETS[Sorted Offsets]
-            META[Leaf Metadata<br/>epsilon, bounds]
-        end
-    end
-    
-    subgraph "Lookup Process"
-        KEY[Input Key] --> ROOT
-        ROOT --> ROUTER
-        ROUTER --> LEAF_SELECT[Select Leaf]
-        LEAF_SELECT --> LEAF1
-        LEAF_SELECT --> LEAF2
-        LEAF_SELECT --> LEAFN
-        LEAF1 --> PREDICT[Predict Position]
-        LEAF2 --> PREDICT
-        LEAFN --> PREDICT
-        PREDICT --> BOUNDS[Apply Epsilon Bounds]
-        BOUNDS --> PROBE[Binary Search Probe]
-        PROBE --> KEYS
-        PROBE --> OFFSETS
-        PROBE --> RESULT[Return Offset]
-    end
-    
-    subgraph "Storage Format"
-        HEADER[Header<br/>Magic + Version]
-        ROOT_DATA[Root Model Data]
-        LEAF_DATA[Leaf Models Data]
-        KEY_DATA[Key/Offset Arrays]
-        CHECKSUM[XXHash Checksum]
-    end
+  subgraph On_disk
+    H[Header: magic + version]
+    R[Router table (dynamic bits)]
+    L[Leaf models + metadata (epsilon bounds)]
+    K[Key metadata (ordering/hints)]
+    CS[CRC32C checksum]
+  end
+
+  subgraph Lookup
+    I[Input key] --> R0[Root predict]
+    R0 --> R1[Route to leaf]
+    R1 --> L0[Leaf predict]
+    L0 --> B0[Bounded probe (SIMD‑aware)]
+    B0 --> O[Offset]
+  end
 ```
 
-## 8.4 WAL + Snapshot Durability Model
+Today’s index is array‑of‑structures (AoS v5) with runtime SIMD dispatch, prefetching, and bounded probing under recorded epsilon. Rebuilds are driven by mispredict/volume thresholds and swap atomically.
+
+---
+
+## Durability and recovery
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant Engine
-    participant WAL
-    participant Snapshot
-    participant Index
-    participant Manifest
-    
-    Note over Client,Manifest: Normal Write Operation
-    Client->>Engine: PUT(key, value)
-    Engine->>WAL: Append Event
-    WAL-->>Engine: Success
-    Engine->>Index: Update Delta
-    Engine-->>Client: Return Offset
-    
-    Note over Client,Manifest: Snapshot Creation
-    Engine->>Snapshot: Create Snapshot
-    Snapshot->>Snapshot: Write Events to File
-    Snapshot->>Snapshot: Write Payload Index
-    Snapshot->>Manifest: Update Manifest
-    Snapshot-->>Engine: Success
-    
-    Note over Client,Manifest: RMI Rebuild
-    Engine->>Index: Build RMI from Snapshot
-    Index->>Index: Write to .tmp file
-    Index->>Index: Validate Checksum
-    Index->>Index: Atomic Rename
-    Index->>Manifest: Update Manifest
-    Index-->>Engine: Success
-    
-    Note over Client,Manifest: Recovery on Restart
-    Engine->>Manifest: Read Manifest
-    Engine->>Snapshot: Load Snapshot
-    Engine->>WAL: Replay WAL Segments
-    Engine->>Index: Load RMI if Valid
-    Engine-->>Engine: Ready for Operations
-```
+  participant Client
+  participant Engine
+  participant WAL
+  participant Snapshot
+  participant Index
+  participant Manifest
 
-## 8.5 Component Interaction Matrix
+  Note over Client,Manifest: Normal write
+  Client->>Engine: PUT(key,value)
+  Engine->>WAL: append
+  WAL-->>Engine: fsync ok
+  Engine-->>Client: offset
 
-```mermaid
-graph LR
-    subgraph "Components"
-        HTTP[HTTP API]
-        WAL[WAL Manager]
-        SNAP[Snapshot]
-        RMI[RMI Index]
-        BTREE[B-Tree]
-        DELTA[Delta Store]
-        CACHE[Cache]
-        COMPACT[Compaction]
-        REBUILD[Rebuild]
-    end
-    
-    subgraph "Interactions"
-        HTTP -.->|Read| RMI
-        HTTP -.->|Read| BTREE
-        HTTP -.->|Write| WAL
-        HTTP -.->|Write| DELTA
-        HTTP -.->|Read| CACHE
-        
-        WAL -.->|Recovery| SNAP
-        WAL -.->|Rotation| COMPACT
-        SNAP -.->|Build| RMI
-        SNAP -.->|Load| RMI
-        
-        RMI -.->|Fallback| BTREE
-        DELTA -.->|Merge| RMI
-        COMPACT -.->|Trigger| REBUILD
-        REBUILD -.->|Swap| RMI
-    end
-```
+  Note over Client,Manifest: Snapshot
+  Engine->>Snapshot: build snapshot.bin + snapshot.data
+  Snapshot->>Manifest: write + fsync
+  Snapshot-->>Engine: ready
 
-## 8.6 Performance Characteristics
+  Note over Client,Manifest: RMI rebuild
+  Engine->>Index: build from snapshot
+  Index->>Index: validate + checksum
+  Index->>Manifest: atomic rename + update
+  Index-->>Engine: swap pointer
 
-```mermaid
-graph TB
-    subgraph "Latency Profile"
-        subgraph "RMI Path"
-            RMI_PREDICT[Predict: ~10ns]
-            RMI_PROBE[Probe: ~100ns]
-            RMI_TOTAL[RMI Total: ~110ns]
-        end
-        
-        subgraph "B-Tree Path"
-            BTREE_SEARCH[Search: ~500ns]
-            BTREE_TOTAL[B-Tree Total: ~500ns]
-        end
-        
-        subgraph "HTTP Overhead"
-            HTTP_PARSE[Parse: ~1μs]
-            HTTP_SER[Serialize: ~1μs]
-            HTTP_TOTAL[HTTP Total: ~2μs]
-        end
-        
-        subgraph "Storage Access"
-            CACHE_HIT[Cache Hit: ~10ns]
-            MMAP_READ[Mmap Read: ~100ns]
-            DISK_READ[Disk Read: ~1ms]
-        end
-    end
-    
-    RMI_PREDICT --> RMI_PROBE
-    RMI_PROBE --> RMI_TOTAL
-    BTREE_SEARCH --> BTREE_TOTAL
-    HTTP_PARSE --> HTTP_SER
-    HTTP_SER --> HTTP_TOTAL
+  Note over Client,Manifest: Recovery
+  Engine->>Manifest: read
+  Engine->>Snapshot: mmap payload
+  Engine->>WAL: replay tail
+  Engine->>Index: load if present
+  Engine-->>Engine: serve traffic
 ```
 
 ---
 
-# 9. Use Cases & Target Customers
+## API surface (v1) and ops knobs
 
-* **AI startups building RAG systems** who want provenance and simplified infra.
-* **SMBs with heavy point-lookup workloads** who need low p99 and compact indexes without operating Kafka.
-* **Research groups** studying learned indexes and system-level trade-offs.
-* **Regulated industries** requiring immutable logs plus semantic search or auditability (finance, healthcare).
-
----
-
-# 10. Ethics, Safety & Governance
-
-* Ensure **transparency**: logs include model versions used for inference and training artifacts.
-* **Bias detection hooks**: enable tooling to detect distributional drift or biased outcomes.
-* **Access controls**: plan for RBAC, TLS, and audit logs before adoption in regulated environments.
-* **Responsible release**: ensure any ML components released with clear caveats about training data and expected behavior.
+- Data/control endpoints:
+  - POST /v1/put, GET /v1/get_fast/{key}
+  - POST /v1/snapshot, POST /v1/rmi/build, POST /v1/warmup
+  - GET /health, GET /build_info, GET /metrics
+- Security/ops:
+  - Bearer auth header (optional)
+  - Per‑IP rate limiting (env‑controlled)
+  - KYRODB_WARM_ON_START, KYRODB_DISABLE_HTTP_LOG; RUST_LOG for logging
 
 ---
 
-# 11. Community & Growth Strategy
+## Performance and benchmarking philosophy
 
-* **Open artifacts**: publish paper drafts, bench results, and Dockerized experiments.
-* **Encourage reproducible PRs**: label PRs that add benchmark evidence.
-* **Engage researchers**: invite external reproductions, host dataset/bench challenges.
-* **Documentation & tutorials**: shipping canonical demos (RAG, audit log replay, small-scale production example).
-
----
-
-# 12. Success Metrics (signals to track)
-
-* **Engineering:** green CI with fuzz tests; 0 reproducible correctness bugs in fuzz suite.
-* **Performance:** p99 improvement vs baseline on at least two distributions; memory reduction for index.
-* **Research:** completed reproducible paper + artifact.
-* **Adoption:** opensource stars, forks running benchmarks, at least one external production adopter or pilot.
+- Bench warm vs cold explicitly; snapshot → rmi/build → warmup before measuring.
+- Measure both overall and "during rebuild" lookup latency; watch fallback scan counters.
+- Prefer full‑throttle tests with per‑request logging off and generous rate limits.
+- Check mmap fast path is active (snapshot.data present) to avoid O(n) scans.
 
 ---
 
-# 13. Governance & Licensing
+## End‑state vision (the “final point”)
 
-KyroDB is Apache-2.0. Maintain a CLA/CONTRIBUTING doc for larger contributions. Keep governance minimal at first, formalize if community grows.
+KyroDB becomes an AI‑native database kernel with:
+- Unified, immutable history (WAL) plus snapshot epochs for time travel and audits.
+- Learned indexing as a first‑class primitive that adapts to workload and data drift.
+- Optional vector storage/ANN behind a trait; filters and hybrid lookups in one place.
+- Built‑in provenance: lineage of data, models, and inferences; reproducible pipelines.
+- Self‑tuning policies with human‑visible safety rails and clear explainability hooks.
+- A path to distribution (replication, sharding) that preserves the same invariants.
+
+Success looks like: reproducible research artifacts; stable 1.0 used in production; a community that trusts the numbers and the durability story.
 
 ---
 
-# 14. Next Actions (short-term)
+## How we’ll get there (strategy and milestones)
 
-1. Finalize README + charter (done).
-2. Lock scope to KV + RMI and start Phase A deliverables.
-3. Create reproducible bench harness and publish first CSVs.
-4. Draft the first preprint outline using the `paper/` directory (data + scripts + Docker).
+Pillars:
+- Correctness first: learning augments performance, never weakens guarantees.
+- Evidence over claims: benchmarks, CI, fuzzing, failpoints; publish scripts and CSVs.
+- Small, strong kernel: clear traits for storage/indexes; feature plugins on top.
+- Operational clarity: simple defaults, strong observability, safe rebuild/compaction.
+
+Milestones (phased, not calendar‑bound):
+- Phase A — Foundation: KV + RMI; atomic snapshots; mmap payload index; HTTP v1; bench harness; CI with fuzz and failpoints.
+- Phase B — Polish & research: SIMD/runtime dispatch, router tuning, rebuild heuristics; publish evaluation and scripts.
+- Phase C — Primitives expansion: vector storage + ANN behind a trait; filters; SDKs; canonical RAG demo.
+- Phase D — Autonomy & governance: self‑tuning policies; model registry integration; lineage/audit features.
+- Phase E — Scale out: replication, sharding; consensus‑backed metadata; WAL replication.
+
+Each phase ships measurable artifacts (code, docs, data, plots) and success criteria.
 
 ---
 
-# Appendix
+## Risks and mitigations
+
+- Rebuild interference with latency tails → segment metrics; throttle; delta‑first reads; atomic swap.
+- Learned index drift → mispredict/probe metrics; rebuild thresholds; checksummed artifacts.
+- mmap portability and OS quirks → clear tuning docs; fallbacks; checks on load.
+- Durability regressions → failpoints for snapshot/rename/fsync; recovery tests; fuzzing.
+
+---
+
+## Who is it for (use cases)
+
+- AI startups building RAG systems that want provenance and fewer moving parts.
+- Services with heavy point lookups needing compact indexes and tight p99.
+- Researchers exploring learned indexes with reproducible, honest results.
+- Regulated workloads needing immutable logs plus search/audit hooks.
+
+---
+
+
+---
+
+## Appendix
+
+- Metrics: /metrics (Prometheus). Includes RMI lookup latency and probe length, fallback counters, rebuild progress, WAL rotation/retention stats.
+- Operational endpoints: /health, /build_info, /v1/snapshot, /v1/rmi/build, /v1/warmup.
+- Helpful env toggles: warm on start, rate limit knobs, per‑request logging toggle.
+- Benchmarks: in‑process (cargo bench -p bench --bench kv_index) and end‑to‑end (bench/README.bench.md).
 
 **Glossary**: RMI = Recursive Model Index; mmap= Memory Mapped; WAL = Write-Ahead Log; RAG = Retrieval-Augmented Generation.
 
