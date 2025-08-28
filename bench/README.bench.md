@@ -23,6 +23,14 @@ cargo build -p engine --release --features learned-index
 KYRODB_WARM_ON_START=1 ./target/release/kyrodb-engine serve 127.0.0.1 3030
 ```
 
+## Run server with gRPC (data-plane)
+- Start the same server with an additional gRPC bind. HTTP remains for metrics/admin.
+```
+./target/release/kyrodb-engine serve 127.0.0.1 3030 --grpc-addr 127.0.0.1:50051 \
+  --rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0
+```
+- Logging: set `KYRODB_DISABLE_HTTP_LOG=1` to silence HTTP access log; use `RUST_LOG` for structured logs.
+
 ## Load and run HTTP read test
 ```
 # Load N keys with V-byte values, then build RMI and warm up before measuring
@@ -40,6 +48,12 @@ KYRODB_WARM_ON_START=1 ./target/release/kyrodb-engine serve 127.0.0.1 3030
 - CSV is written to the provided path; capture.sh stores it under bench/results/<commit>/.
 - To include skew, use `--dist zipf --zipf-theta 1.1`.
 - Index-only vs full read: `/v1/lookup_fast/{k}` returns offset (index-only), `/v1/get_fast/{k}` returns value bytes (includes storage cost).
+
+## gRPC read hints (optional)
+- The gRPC API exposes two RPCs mirroring fast paths:
+  - `Lookup(LookupReq{key}) -> LookupResp{found, offset}`
+  - `Get(GetReq{key}) -> GetResp{found, value}`
+- Example client stubs can be generated via `prost/tonic`. Sample code (Rust/Go) not included here; ask maintainers if needed.
 
 ## Warm vs Cold
 - Cold starts incur page faults; expect higher first-hit latencies.
