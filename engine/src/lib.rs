@@ -18,6 +18,31 @@ pub mod schema;
 // Convenient alias to reduce type complexity for the mmap payload index
 type SnapshotIndex = std::collections::HashMap<u64, (usize, usize)>;
 
+// --- New: fsync policy knob for WAL appends ---
+#[derive(Clone, Copy, Debug)]
+enum FsyncPolicy {
+    Data,
+    All,
+    None,
+}
+impl FsyncPolicy {
+    fn from_env() -> Self {
+        let v = std::env::var("KYRODB_FSYNC_POLICY").unwrap_or_else(|_| "data".to_string());
+        match v.to_ascii_lowercase().as_str() {
+            "all" => FsyncPolicy::All,
+            "none" | "off" | "0" => FsyncPolicy::None,
+            _ => FsyncPolicy::Data,
+        }
+    }
+    fn sync_file(&self, f: &File) -> std::io::Result<()> {
+        match self {
+            FsyncPolicy::Data => f.sync_data(),
+            FsyncPolicy::All => f.sync_all(),
+            FsyncPolicy::None => Ok(()),
+        }
+    }
+}
+
 // fsync helper for directories (ensure rename/truncate is durable)
 fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     // On Unix, opening a directory and calling sync_all is supported.
@@ -130,6 +155,8 @@ pub struct PersistentEventLog {
     snapshot_payload_index: Arc<RwLock<Option<SnapshotIndex>>>,
     // Small hot payload cache keyed by offset
     wal_block_cache: Arc<RwLock<LruCache<u64, Vec<u8>>>>,
+    // new: fsync policy for WAL appends
+    fsync_policy: FsyncPolicy,
 }
 
 impl PersistentEventLog {
@@ -321,6 +348,7 @@ impl PersistentEventLog {
             snapshot_mmap: Arc::new(RwLock::new(None)),
             snapshot_payload_index: Arc::new(RwLock::new(None)),
             wal_block_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(4096).unwrap()))),
+            fsync_policy: FsyncPolicy::from_env(),
         };
 
         // Try to mmap snapshot.data and build index for fast get() access.
@@ -422,7 +450,7 @@ impl PersistentEventLog {
         };
         drop(noff);
 
-        // Write to WAL current segment (flush + fsync for durability)
+        // Write to WAL current segment (flush + fsync based on policy)
         {
             let mut w = self.wal.write().await;
             let frame = bopt.serialize(&event).context("encode wal frame")?;
@@ -433,7 +461,10 @@ impl PersistentEventLog {
             w.write_all(&frame).context("write wal frame")?;
             w.write_all(&crc).context("write wal crc")?;
             w.flush().context("flushing wal")?;
-            w.get_ref().sync_data().context("fsync wal (data)")?;
+            // policy-controlled fsync
+            self.fsync_policy
+                .sync_file(w.get_ref())
+                .context("fsync wal (policy)")?;
         }
         // maybe rotate
         self.rotate_wal_if_needed().await;
