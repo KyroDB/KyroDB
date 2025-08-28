@@ -8,8 +8,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build -p engine --release --features learned-index
-      - run: cargo build -p bench  --release
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - run: cargo build -p engine --release --locked --features learned-index,grpc
+      - run: cargo build -p bench  --release --locked
       - name: Upload engine
         uses: softprops/action-gh-release@v2
         with:
