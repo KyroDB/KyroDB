@@ -21,3 +21,10 @@ path = "fuzz_targets/fuzz_target_1.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rmi_probe"
+path = "fuzz_targets/rmi_probe.rs"
+test = false
+doc = false
+bench = false
