@@ -63,3 +63,4 @@ engine/fuzz/artifacts/
 engine/fuzz/corpus/
 engine/fuzz/coverage/
 engine/fuzz/target/
+.github/copilot-instructions.md

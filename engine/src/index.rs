@@ -212,7 +212,7 @@ impl RmiIndex {
     #[inline]
     fn off_at(&self, idx: usize) -> u64 {
         match &self.backing {
-            RmiBacking::Owned { sorted_offsets, .. } => sortedOffsets[idx],
+            RmiBacking::Owned { sorted_offsets, .. } => sorted_offsets[idx],
             RmiBacking::Mmap { mmap, offs_off, .. } => unsafe {
                 let ptr = mmap
                     .as_ptr()
@@ -1370,7 +1370,7 @@ impl RmiIndex {
                 sorted_offsets,
             } => {
                 let step = (4096usize / core::mem::size_of::<u64>()).max(1);
-                let n = core::cmp::min(sorted_keys.len(), sortedOffsets.len());
+                let n = core::cmp::min(sorted_keys.len(), sorted_offsets.len());
                 let mut i = 0usize;
                 while i < n {
                     // SAFETY: we clamp i < n and step forward

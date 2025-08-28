@@ -38,4 +38,19 @@ fn main() {
     // Rebuild when HEAD or refs change (best-effort; harmless if repo absent)
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
+
+    // Build gRPC code only when grpc feature is enabled
+    let grpc_enabled = std::env::var("CARGO_FEATURE_GRPC").ok().as_deref() == Some("1");
+    if grpc_enabled {
+        // Watch the proto file relative to this crate (engine/)
+        println!("cargo:rerun-if-changed=proto/kyrodb.proto");
+        // Use vendored protoc to avoid system dependencies
+        let protoc_path = protoc_bin_vendored::protoc_bin_path().expect("protoc not found");
+        std::env::set_var("PROTOC", protoc_path);
+        tonic_build::configure()
+            .build_server(true)
+            .build_client(true)
+            .compile(&["proto/kyrodb.proto"], &["proto"]) // fixed paths
+            .expect("failed to build gRPC code");
+    }
 }

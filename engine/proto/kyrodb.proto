@@ -1,0 +1,13 @@
+syntax = "proto3";
+package kyrodb.v1;
+
+service Kyrodb {
+  rpc Lookup(LookupReq) returns (LookupResp);
+  rpc Get(GetReq) returns (GetResp);
+}
+
+message LookupReq { uint64 key = 1; }
+message LookupResp { bool found = 1; uint64 offset = 2; }
+
+message GetReq { uint64 key = 1; }
+message GetResp { bool found = 1; bytes value = 2; }

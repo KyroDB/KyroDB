@@ -8,6 +8,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 use warp::Filter;
 mod sql;
+#[cfg(feature = "grpc")]
+mod grpc_svc;
 
 // --- Rate limiting (simple token-bucket per client IP) -----------------------
 use dashmap::DashMap;
@@ -148,6 +150,9 @@ enum Commands {
         /// Compact when WAL bytes exceed this threshold (0 to disable)
         #[arg(long, default_value_t = 0)]
         compact_when_wal_bytes: u64,
+        /// Optional gRPC bind address (e.g., 0.0.0.0:50051). If set, start gRPC data-plane.
+        #[arg(long)]
+        grpc_addr: Option<String>,
     },
 }
 
@@ -194,6 +199,7 @@ async fn main() -> Result<()> {
             wal_max_segments,
             compact_interval_secs,
             compact_when_wal_bytes,
+            grpc_addr,
         } => {
             // Silence unused when learned-index feature is disabled
             #[cfg(not(feature = "learned-index"))]
@@ -354,6 +360,21 @@ async fn main() -> Result<()> {
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
                         }
                     }
+                });
+            }
+
+            // Start gRPC data-plane server if requested (lookup/get fast paths)
+            #[cfg(feature = "grpc")]
+            if let Some(addr_str) = grpc_addr.clone() {
+                let addr: std::net::SocketAddr = addr_str.parse().expect("invalid --grpc-addr");
+                let svc = grpc_svc::GrpcService::new(log.clone());
+                tokio::spawn(async move {
+                    println!("📡 gRPC serving on {}", addr);
+                    tonic::transport::Server::builder()
+                        .add_service(svc.into_server())
+                        .serve(addr)
+                        .await
+                        .expect("gRPC server failed");
                 });
             }
 
@@ -917,16 +938,23 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // Conditional per-request logging: use no-op filter when disabled, else warp::log("kyrodb")
-            let log_filter = if std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1") {
-                // No-op filter with Error = Rejection so it type-checks for .with(...)
-                warp::any()
-                    .and_then(|| async { Ok::<(), warp::Rejection>(()) })
-                    .boxed()
-            } else {
-                warp::log("kyrodb").boxed()
-            };
-            let routes = routes.with(log_filter);
+            // Per-request logging with runtime disable via KYRODB_DISABLE_HTTP_LOG=1
+            let disable_http_log = std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
+            let routes = routes.with(warp::log::custom({
+                let disable_http_log = disable_http_log;
+                move |info: warp::log::Info| {
+                    if disable_http_log {
+                        return;
+                    }
+                    tracing::info!(
+                        target: "kyrodb",
+                        method = %info.method(),
+                        path = info.path(),
+                        status = info.status().as_u16(),
+                        elapsed_ms = info.elapsed().as_millis()
+                    );
+                }
+            }));
 
             // start server
             tracing::info!(
