@@ -349,6 +349,10 @@ async fn main() -> Result<()> {
                             if write_res.is_err() { eprintln!("❌ RMI rebuild task panicked"); rebuild_timer.observe_duration(); engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0); continue; }
                             if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
                             if let Err(e) = std::fs::rename(&tmp, &dst) { eprintln!("❌ RMI rename failed: {}", e); rebuild_timer.observe_duration(); engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0); continue; }
+                            // Ensure directory metadata is durable after rename
+                            if let Err(e) = engine_crate::fsync_dir(std::path::Path::new(&data_dir)) {
+                                eprintln!("⚠️ fsync data dir after RMI rebuild rename failed: {}", e);
+                            }
                             if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
                                 rebuild_log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
                                 last_built = cur;
@@ -735,16 +739,13 @@ async fn main() -> Result<()> {
                             if ok {
                                 if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
                                 if let Err(e) = std::fs::rename(&tmp, &dst) { eprintln!("❌ RMI rename failed: {}", e); ok = false; }
+                                // Ensure directory metadata is durable after rename
+                                if let Err(e) = engine_crate::fsync_dir(std::path::Path::new(&data_dir)) {
+                                    eprintln!("⚠️ fsync data dir after RMI build rename failed: {}", e);
+                                }
                             }
-                            if ok {
-                                if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
-                                    log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
-                                    engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                                    let _ = log.write_manifest().await;
-                                } else { eprintln!("❌ RMI reload failed after rebuild"); ok = false; }
-                            }
-                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
                             timer.observe_duration();
+                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
                             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
                                 "ok": ok,
                                 "count": pairs.len()

@@ -44,7 +44,7 @@ impl FsyncPolicy {
 }
 
 // fsync helper for directories (ensure rename/truncate is durable)
-fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+pub fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     // On Unix, opening a directory and calling sync_all is supported.
     // On other platforms, this may be a no-op if unsupported.
     let f = File::open(dir)?;
