@@ -311,10 +311,9 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for detai
 
 ## Community & Support
 
-- 📖 **Documentation**: [docs.kyrodb.dev](https://docs.kyrodb.dev)
 - 🐛 **Issues**: [GitHub Issues](https://github.com/vatskishan03/KyroDB/issues)
 - 💬 **Discussions**: [GitHub Discussions](https://github.com/vatskishan03/KyroDB/discussions)
-- 📧 **Email**: team@kyrodb.dev
+- 📧 **Email**: kishanvats2003@gmail.com
 
 ---
 
