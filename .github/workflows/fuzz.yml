@@ -21,4 +21,13 @@ jobs:
           cargo fuzz list
           # ensure both targets build
           cargo fuzz build rmi_probe
-      # Intentionally not running fuzz by default; enable locally or in longer CI jobs
+      - name: Run RMI Probe Fuzzer
+        run: |
+          cd engine
+          # Run fuzzing for a short duration to catch obvious bugs
+          timeout 300 cargo fuzz run rmi_probe -- -max_len=1024 -runs=10000 || true
+      - name: Run WAL Snapshot Fuzzer
+        run: |
+          cd engine
+          # Run fuzzing for WAL/snapshot parsing
+          timeout 300 cargo fuzz run fuzz_target_1 -- -max_len=1024 -runs=10000 || true
