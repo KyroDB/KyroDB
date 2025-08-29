@@ -1,8 +1,16 @@
 [package]
-name = "engine"
+name = "kyrodb-engine"
 version = "0.1.0"
 edition = "2021"
+authors = ["KyroDB Team <team@kyrodb.dev>"]
 license = "Apache-2.0"
+description = "High-performance database engine with learned indexes (RMI) and vector search"
+repository = "https://github.com/vatskishan03/ProjectKyro"
+homepage = "https://kyrodb.dev"
+documentation = "https://docs.kyrodb.dev"
+readme = "../README.md"
+keywords = ["database", "kv", "learned-index", "rmi", "vector-search", "durability", "wal"]
+categories = ["database-implementations", "data-structures", "concurrency"]
 build = "build.rs"
 
 [lib]

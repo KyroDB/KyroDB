@@ -1,66 +1,129 @@
-# Build artifacts
+# Build artifacts and binaries
 /target/
 /**/target/
+*.exe
+*.dll
+*.so
+*.dylib
 
-# Rust/Cargo
+# Rust specific
 **/*.rs.bk
+Cargo.lock
+.cargo/config.toml
 
 # IDEs and editors
 .vscode/
 .idea/
 *.swp
 *~
-
-# Logs and temp files
-*.log
 *.tmp
+*.bak
 
-# OS files
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+Desktop.ini
 
-# Environment
-.env
-.env.*.local
+# Logs and temporary files
+*.log
+*.log.*
+logs/
+tmp/
+temp/
 
-# Runtime data
+# Runtime data and databases
 /data/**
 !/data/.gitkeep
-/engine/data/*.bin
+/engine/data/**
+!/engine/data/.gitkeep
 /orchestrator/data/**
 !/orchestrator/data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
 
-# Local binaries
-/orchestrator/kyrodbctl
-/orchestrator/ngdbctl
-/orchestrator/orchestrator
-
-# Bench/plot artifacts
-bench/*.png
-bench/*.svg
-bench/*.csv
-bench_server.log
-# Keep headline figures in repo
-!bench/http_uniform_64c_30s.png
-!bench/rmi_vs_btree.png
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn-integrity
+package-lock.json
+yarn.lock
+.pnpm-debug.log*
 
 # Python
-.venv/
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Node leftovers (not used)
-node_modules/
-package-lock.json
-/orchestrator/node_modules/
-/orchestrator/package-lock.json
+# Go
+orchestrator/kyrodbctl
+orchestrator/ngdbctl
+orchestrator/orchestrator
+go.work
+go.work.sum
 
-# Docs scratch
+# Environment and secrets
+.env
+.env.*
+!.env.example
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.pem
+*.key
+*.crt
+*.cer
+
+# Documentation scratch and experimental
 docs/TODO.md
 experimental.local.md
+.github/copilot-instructions.md
 
 # Fuzzing artifacts
 engine/fuzz/artifacts/
 engine/fuzz/corpus/
 engine/fuzz/coverage/
 engine/fuzz/target/
-.github/copilot-instructions.md
+
+# Benchmark artifacts
+bench/*.png
+bench/*.svg
+bench/*.csv
+bench_server.log
+
+# Docker
+.dockerignore
+
+# CI/CD
+.github/workflows/*.log
+
+# Local development
+.vscode/settings.json
+.idea/workspace.xml

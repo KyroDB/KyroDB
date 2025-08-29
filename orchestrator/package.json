@@ -1,4 +1,29 @@
 {
+  "name": "kyrodb-orchestrator",
+  "version": "0.1.0",
+  "description": "KyroDB CLI orchestrator for database management and operations",
+  "main": "index.js",
+  "scripts": {
+    "build": "go build -o kyrodbctl",
+    "test": "go test ./...",
+    "clean": "rm -f kyrodbctl ngdbctl orchestrator"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vatskishan03/ProjectKyro.git"
+  },
+  "keywords": [
+    "database",
+    "cli",
+    "orchestrator",
+    "kyrodb"
+  ],
+  "author": "KyroDB Team <team@kyrodb.dev>",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/vatskishan03/ProjectKyro/issues"
+  },
+  "homepage": "https://github.com/vatskishan03/ProjectKyro#readme",
   "dependencies": {
     "cargo": "^0.8.0"
   }

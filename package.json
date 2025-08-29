@@ -1,4 +1,30 @@
 {
+  "name": "kyrodb",
+  "version": "0.1.0",
+  "description": "KyroDB: High-performance database with learned indexes and vector search",
+  "main": "index.js",
+  "scripts": {
+    "bench": "python3 bench/scripts/generate_plots.py",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vatskishan03/KyroDB.git"
+  },
+  "keywords": [
+    "database",
+    "kv",
+    "learned-index",
+    "rmi",
+    "vector-search",
+    "performance"
+  ],
+  "author": "KyroDB Team <team@kyrodb.dev>",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/vatskishan03/KyroDB/issues"
+  },
+  "homepage": "https://github.com/vatskishan03/KyroDB#readme",
   "dependencies": {
     "matplotlib": "^1.0.0",
     "numpy": "^0.0.1",

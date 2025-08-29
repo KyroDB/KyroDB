@@ -1,4 +1,4 @@
-module projectkyro/orchestrator
+module github.com/vatskishan03/ProjectKyro/orchestrator
 
 go 1.21
 
