@@ -33,7 +33,7 @@ Brief description of the changes made in this PR.
 ### Test Results
 ```bash
 # Test output or benchmark results
-cargo test -p engine
+cargo test -p kyrodb-engine
 # ... test results
 ```
 
@@ -53,7 +53,7 @@ cargo test -p engine
 
 ## Checklist
 - [ ] Code follows project style guidelines
-- [ ] All tests pass (`cargo test -p engine`)
+- [ ] All tests pass (`cargo test -p kyrodb-engine`)
 - [ ] Code is properly documented
 - [ ] Commit messages follow conventions
 - [ ] No sensitive data committed

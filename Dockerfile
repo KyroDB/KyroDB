@@ -2,7 +2,7 @@
 FROM rust:1-bookworm as build
 WORKDIR /work
 COPY . .
-RUN cargo build -p engine --release --features learned-index && \
+RUN cargo build -p kyrodb-engine --release --features learned-index && \
     cargo build -p bench --release
 
 FROM debian:bookworm-slim

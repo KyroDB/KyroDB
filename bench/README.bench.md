@@ -8,7 +8,7 @@ This document describes how to reproduce KyroDB results for 1M / 10M / 50M keys,
 
 ## Build
 ```
-cargo build -p engine --release --features learned-index
+cargo build -p kyrodb-engine --release --features learned-index
 ```
 
 ## Run server for HTTP bench (raw/fast endpoints)

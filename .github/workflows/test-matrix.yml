@@ -19,13 +19,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build -p engine --release
+        run: cargo build -p kyrodb-engine --release
 
       - name: Test (default features)
-        run: cargo test -p engine --all-targets --locked --verbose
+        run: cargo test -p kyrodb-engine --all-targets --locked --verbose
 
       - name: Test (no default features)
-        run: cargo test -p engine --no-default-features --all-targets --locked --verbose
+        run: cargo test -p kyrodb-engine --no-default-features --all-targets --locked --verbose
 
       - name: Test (http-test feature)
-        run: cargo test -p engine --features http-test --all-targets --locked --verbose
+        run: cargo test -p kyrodb-engine --features http-test --all-targets --locked --verbose

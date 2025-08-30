@@ -222,10 +222,10 @@ dependencies = [
  "base64",
  "clap",
  "criterion",
- "engine",
  "futures",
  "hdrhistogram",
  "indicatif",
+ "kyrodb-engine",
  "rand",
  "rand_distr",
  "reqwest",
@@ -594,46 +594,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "chrono",
- "clap",
- "crc32c",
- "dashmap",
- "fail",
- "futures",
- "hex",
- "hora",
- "libc",
- "loom",
- "lru",
- "memmap2",
- "once_cell",
- "prometheus",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "sqlparser",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "warp",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -1315,6 +1275,46 @@ checksum = "1cfaf33c695fc6e08064efbc1f72ec937429614f25eef83af942d0e227c3a28f"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kyrodb-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "chrono",
+ "clap",
+ "crc32c",
+ "dashmap",
+ "fail",
+ "futures",
+ "hex",
+ "hora",
+ "libc",
+ "loom",
+ "lru",
+ "memmap2",
+ "once_cell",
+ "prometheus",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "warp",
+ "xxhash-rust",
 ]
 
 [[package]]

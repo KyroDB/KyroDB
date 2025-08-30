@@ -17,11 +17,11 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
       - name: Build engine (release, default features)
-        run: cargo build -p engine --release --locked --verbose
+        run: cargo build -p kyrodb-engine --release --locked --verbose
       - name: Test engine (default features: learned-index + grpc)
-        run: cargo test -p engine --all-targets --locked --verbose
+        run: cargo test -p kyrodb-engine --all-targets --locked --verbose
       - name: Test engine (no default features)
-        run: cargo test -p engine --no-default-features --all-targets --locked --verbose
+        run: cargo test -p kyrodb-engine --no-default-features --all-targets --locked --verbose
 
   bench-smoke:
     if: ${{ false }}
@@ -47,7 +47,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build engine & bench
         run: |
-          cargo build -p engine --release
+          cargo build -p kyrodb-engine --release
           cargo build -p bench --release
       - name: Run engine server
         run: |

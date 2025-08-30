@@ -10,7 +10,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-      - run: cargo build -p engine --release --locked --features learned-index,grpc
+      - run: cargo build -p kyrodb-engine --release --locked --features learned-index,grpc
       - run: cargo build -p bench  --release --locked
       - name: Upload engine
         uses: softprops/action-gh-release@v2

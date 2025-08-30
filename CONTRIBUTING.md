@@ -36,13 +36,13 @@ git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
 # Build the engine
-cargo build -p engine --release
+cargo build -p kyrodb-engine --release
 
 # Build the orchestrator (optional)
 cd orchestrator && go build -o kyrodbctl
 
 # Run tests
-cargo test -p engine
+cargo test -p kyrodb-engine
 ```
 
 ## Development Setup
@@ -122,13 +122,13 @@ Types:
 ### Running Tests
 ```bash
 # Run all engine tests
-cargo test -p engine
+cargo test -p kyrodb-engine
 
 # Run specific test
-cargo test -p engine test_name
+cargo test -p kyrodb-engine test_name
 
 # Run with features
-cargo test -p engine --features failpoints
+cargo test -p kyrodb-engine --features failpoints
 
 # Run fuzzing (requires nightly)
 cargo +nightly fuzz run rmi_probe
@@ -152,7 +152,7 @@ cargo +nightly fuzz run rmi_probe
 7. Submit a pull request
 
 ### PR Requirements
-- [ ] Tests pass (`cargo test -p engine`)
+- [ ] Tests pass (`cargo test -p kyrodb-engine`)
 - [ ] Code follows style guidelines (`cargo fmt`, `cargo clippy`)
 - [ ] Documentation updated
 - [ ] Commit messages follow conventions

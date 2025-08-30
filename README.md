@@ -44,7 +44,7 @@ git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
 # Build and run
-cargo build -p engine --release
+cargo build -p kyrodb-engine --release
 ./target/release/kyrodb-engine serve 127.0.0.1 3030
 ```
 
@@ -285,7 +285,7 @@ git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
 # Run tests
-cargo test -p engine
+cargo test -p kyrodb-engine
 
 # Run fuzzing (nightly required)
 cargo +nightly fuzz run rmi_probe

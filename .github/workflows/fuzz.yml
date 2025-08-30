@@ -20,8 +20,6 @@ jobs:
           cd engine
           cargo fuzz build
           cargo fuzz list
-          # ensure both targets build
-          cargo fuzz build rmi_probe
       - name: Run RMI Probe Fuzzer
         run: |
           cd engine

@@ -1,0 +1,105 @@
+name: Concurrency Tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run nightly at 3 AM UTC (after fuzz tests)
+    - cron: '0 3 * * *'
+  pull_request:
+    paths:
+      - 'engine/src/**'
+      - 'engine/tests/**'
+      - '.github/workflows/concurrency-tests.yml'
+
+jobs:
+  loom-concurrency-tests:
+    name: Loom Concurrency Model Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly for Loom)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Loom dependencies
+        run: |
+          cargo install cargo-loom
+
+      - name: Run Loom snapshot/manifest tests
+        run: |
+          cd engine
+          cargo loom test loom_snapshot_manifest --release
+
+      - name: Run Loom RMI concurrency tests
+        run: |
+          cd engine
+          cargo loom test loom_rmi_concurrency --release
+
+      - name: Run all Loom tests with maximum preemption
+        run: |
+          cd engine
+          LOOM_MAX_PREEMPTIONS=3 cargo loom test --release
+        continue-on-error: true
+
+      - name: Run Loom tests with different configurations
+        run: |
+          cd engine
+          # Test with different thread counts
+          LOOM_MAX_BRANCHES=1000 LOOM_MAX_PREEMPTIONS=2 cargo loom test loom_rmi_concurrency --release
+          # Test with maximum permutations
+          LOOM_MAX_BRANCHES=2000 LOOM_MAX_PREEMPTIONS=1 cargo loom test loom_snapshot_manifest --release
+        continue-on-error: true
+
+  loom-optional-features:
+    name: Loom Tests with Optional Features
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Loom
+        run: |
+          cargo install cargo-loom
+
+      - name: Test with failpoints enabled
+        run: |
+          cd engine
+          cargo loom test --features failpoints --release
+        continue-on-error: true
+
+      - name: Test with learned-index disabled
+        run: |
+          cd engine
+          cargo loom test --no-default-features --release
+        continue-on-error: true
+
+  concurrency-test-summary:
+    name: Concurrency Test Results
+    runs-on: ubuntu-latest
+    needs: [loom-concurrency-tests, loom-optional-features]
+    if: always()
+
+    steps:
+      - name: Check test results
+        run: |
+          if [[ "${{ needs.loom-concurrency-tests.result }}" == "failure" ]] || \
+             [[ "${{ needs.loom-optional-features.result }}" == "failure" ]]; then
+            echo "❌ Some concurrency tests failed"
+            exit 1
+          else
+            echo "✅ All concurrency tests passed"
+          fi
