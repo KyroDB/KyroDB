@@ -4,7 +4,10 @@
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
 [![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8)](https://golang.org/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED)](https://www.docker.com/)
-[![CI](https://github.com/vatskishan03/KyroDB/actions/workflows/test-matrix.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
+[![CI](https://github.com/vatskishan03/KyroDB/actions/workflows/ci.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
+[![Cross-Platform](https://github.com/vatskishan03/KyroDB/actions/workflows/test-matrix.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
+[![Fuzz](https://github.com/vatskishan03/KyroDB/actions/workflows/fuzz.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
+[![Concurrency](https://github.com/vatskishan03/KyroDB/actions/workflows/concurrency-tests.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
 [![codecov](https://codecov.io/gh/vatskishan03/KyroDB/branch/main/graph/badge.svg)](https://codecov.io/gh/vatskishan03/KyroDB)
 
 **Status: Alpha** (focused scope: KV + RMI) | **Latest: v0.1.0**

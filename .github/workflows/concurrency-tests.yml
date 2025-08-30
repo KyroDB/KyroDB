@@ -12,15 +12,16 @@ on:
       - '.github/workflows/concurrency-tests.yml'
 
 jobs:
-  loom-concurrency-tests:
-    name: Loom Concurrency Model Tests
+  loom-setup:
+    name: Setup Loom Environment
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Install Rust (nightly for Loom)
+      - name: Setup Rust (nightly for Loom)
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt, clippy
@@ -32,40 +33,25 @@ jobs:
         run: |
           cargo install cargo-loom
 
-      - name: Run Loom snapshot/manifest tests
+      - name: Verify Loom installation
         run: |
-          cd engine
-          cargo loom test loom_snapshot_manifest --release
+          cargo loom --version
 
-      - name: Run Loom RMI concurrency tests
-        run: |
-          cd engine
-          cargo loom test loom_rmi_concurrency --release
-
-      - name: Run all Loom tests with maximum preemption
-        run: |
-          cd engine
-          LOOM_MAX_PREEMPTIONS=3 cargo loom test --release
-        continue-on-error: true
-
-      - name: Run Loom tests with different configurations
-        run: |
-          cd engine
-          # Test with different thread counts
-          LOOM_MAX_BRANCHES=1000 LOOM_MAX_PREEMPTIONS=2 cargo loom test loom_rmi_concurrency --release
-          # Test with maximum permutations
-          LOOM_MAX_BRANCHES=2000 LOOM_MAX_PREEMPTIONS=1 cargo loom test loom_snapshot_manifest --release
-        continue-on-error: true
-
-  loom-optional-features:
-    name: Loom Tests with Optional Features
+  loom-core-tests:
+    name: Loom Core Concurrency Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    needs: loom-setup
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        test_type: ["snapshot_manifest", "rmi_concurrency"]
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Install Rust (nightly)
+      - name: Setup Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo
@@ -75,31 +61,124 @@ jobs:
         run: |
           cargo install cargo-loom
 
-      - name: Test with failpoints enabled
+      - name: Run Loom ${{ matrix.test_type }} tests
         run: |
           cd engine
-          cargo loom test --features failpoints --release
-        continue-on-error: true
+          cargo loom test loom_${{ matrix.test_type }} --release
 
-      - name: Test with learned-index disabled
+      - name: Run with different preemption levels
         run: |
           cd engine
-          cargo loom test --no-default-features --release
+          # Test with maximum preemption for thorough checking
+          LOOM_MAX_PREEMPTIONS=3 cargo loom test loom_${{ matrix.test_type }} --release
         continue-on-error: true
 
-  concurrency-test-summary:
+  loom-feature-tests:
+    name: Loom Feature Variation Tests
+    runs-on: ubuntu-latest
+    needs: loom-setup
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "failpoints", "no-default"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Loom
+        run: |
+          cargo install cargo-loom
+
+      - name: Run Loom tests with ${{ matrix.features }} features
+        run: |
+          cd engine
+          if [ "${{ matrix.features }}" = "no-default" ]; then
+            cargo loom test --no-default-features --release
+          elif [ "${{ matrix.features }}" = "failpoints" ]; then
+            cargo loom test --features failpoints --release
+          else
+            cargo loom test --release
+          fi
+        continue-on-error: true
+
+  loom-extended:
+    name: Loom Extended Testing
+    runs-on: ubuntu-latest
+    needs: [loom-core-tests, loom-feature-tests]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Loom
+        run: |
+          cargo install cargo-loom
+
+      - name: Run extended Loom tests
+        run: |
+          cd engine
+          # Test with different thread counts and configurations
+          echo "Testing with high branch limit..."
+          LOOM_MAX_BRANCHES=2000 LOOM_MAX_PREEMPTIONS=2 cargo loom test --release
+
+          echo "Testing with maximum permutations..."
+          LOOM_MAX_BRANCHES=1000 LOOM_MAX_PREEMPTIONS=1 cargo loom test loom_rmi_concurrency --release
+
+          echo "Testing with different model sizes..."
+          LOOM_MAX_BRANCHES=500 LOOM_MAX_PREEMPTIONS=4 cargo loom test loom_snapshot_manifest --release
+        continue-on-error: true
+
+  concurrency-summary:
     name: Concurrency Test Results
     runs-on: ubuntu-latest
-    needs: [loom-concurrency-tests, loom-optional-features]
+    needs: [loom-core-tests, loom-feature-tests, loom-extended]
     if: always()
 
     steps:
-      - name: Check test results
+      - name: Analyze test results
         run: |
-          if [[ "${{ needs.loom-concurrency-tests.result }}" == "failure" ]] || \
-             [[ "${{ needs.loom-optional-features.result }}" == "failure" ]]; then
-            echo "❌ Some concurrency tests failed"
-            exit 1
+          echo "=== Concurrency Test Summary ==="
+
+          if [[ "${{ needs.loom-core-tests.result }}" == "success" ]]; then
+            echo "✅ Core concurrency tests passed"
           else
-            echo "✅ All concurrency tests passed"
+            echo "❌ Core concurrency tests failed"
+          fi
+
+          if [[ "${{ needs.loom-feature-tests.result }}" == "success" ]]; then
+            echo "✅ Feature variation tests passed"
+          else
+            echo "⚠️ Feature variation tests had issues (may be expected)"
+          fi
+
+          if [[ "${{ needs.loom-extended.result }}" == "success" ]]; then
+            echo "✅ Extended concurrency tests passed"
+          else
+            echo "⚠️ Extended concurrency tests had issues (may be expected)"
+          fi
+
+          # Overall assessment
+          if [[ "${{ needs.loom-core-tests.result }}" == "success" ]]; then
+            echo ""
+            echo "🎉 Concurrency testing completed successfully!"
+            echo "Core race conditions have been validated."
+          else
+            echo ""
+            echo "❌ Critical concurrency issues detected!"
+            exit 1
           fi

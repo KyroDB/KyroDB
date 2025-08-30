@@ -1,31 +1,100 @@
-name: test-matrix
+name: Cross-Platform Test Matrix
 
 on:
   workflow_dispatch:
+  schedule:
+    # Weekly cross-platform test
+    - cron: '0 4 * * 1'
 
 jobs:
-  engine-tests:
-    name: Engine tests (${{ matrix.os }})
+  cross-platform-tests:
+    name: Cross-Platform (${{ matrix.os }}, ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: macos-latest
+            arch: x86_64
+          - os: macos-latest
+            arch: arm64
+          - os: windows-latest
+            arch: x86_64
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch != 'x86_64' && format('{0}-apple-darwin', matrix.arch) || '' }}
 
-      - name: Build
-        run: cargo build -p kyrodb-engine --release
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.arch }}
 
-      - name: Test (default features)
-        run: cargo test -p kyrodb-engine --all-targets --locked --verbose
+      - name: Build kyrodb-engine (release)
+        run: cargo build -p kyrodb-engine --release --locked
 
-      - name: Test (no default features)
-        run: cargo test -p kyrodb-engine --no-default-features --all-targets --locked --verbose
+      - name: Build kyrodb-engine (debug)
+        run: cargo build -p kyrodb-engine --locked
 
-      - name: Test (http-test feature)
-        run: cargo test -p kyrodb-engine --features http-test --all-targets --locked --verbose
+      - name: Test kyrodb-engine (default features)
+        run: cargo test -p kyrodb-engine --all-targets --locked
+
+      - name: Test kyrodb-engine (no default features)
+        run: cargo test -p kyrodb-engine --no-default-features --all-targets --locked
+
+      - name: Test kyrodb-engine (http-test feature)
+        run: cargo test -p kyrodb-engine --features http-test --all-targets --locked
+
+      - name: Test kyrodb-engine (failpoints feature)
+        run: cargo test -p kyrodb-engine --features failpoints --all-targets --locked
+
+  minimal-feature-test:
+    name: Minimal Dependencies Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (stable, minimal profile)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          profile: minimal
+
+      - name: Build with minimal features
+        run: |
+          # Test with only essential dependencies
+          cargo build -p kyrodb-engine --no-default-features --locked
+
+      - name: Test with minimal features
+        run: |
+          cargo test -p kyrodb-engine --no-default-features --locked
+
+  msrv-test:
+    name: MSRV (Minimum Supported Rust Version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (1.70.0 - MSRV)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.70.0
+
+      - name: Build kyrodb-engine
+        run: cargo build -p kyrodb-engine --locked
+
+      - name: Test kyrodb-engine
+        run: cargo test -p kyrodb-engine --locked
