@@ -242,7 +242,7 @@ graph TB
   OFFSET_ARRAY --> CHECKSUM
 
   subgraph "Lookup Algorithm Flow"
-    INPUT[Input Key<br/>u64] --> ROUTE[Router Lookup<br/>key >> (64 - bits)]
+    INPUT[Input Key<br/>u64] --> ROUTE[Router Lookup<br/>key shifted right by (64 - bits)]
     ROUTE --> LEAF_SELECT[Select Leaf<br/>From router table]
     LEAF_SELECT --> PREDICT[Predict Position<br/>slope × key + intercept]
     PREDICT --> CLAMP[Clamp to Bounds<br/>max(0, min(pred ± ε, leaf_end))]
@@ -514,111 +514,7 @@ Pillars:
 - Small, strong kernel: clear traits for storage/indexes; feature plugins on top.
 - Operational clarity: simple defaults, strong observability, safe rebuild/compaction.
 
-Milestones (phased, not calendar‑bound):
 
-```mermaid
-graph TB
-  subgraph "Phase A: Foundation (Current)"
-    A1[Core KV + RMI<br/>Learned index with durability]
-    A2[Atomic snapshots<br/>WAL + manifest consistency]
-    A3[HTTP v1 API<br/>RESTful interface]
-    A4[Memory-mapped reads<br/>Zero-copy payload access]
-    A5[Background compaction<br/>WAL retention policies]
-    A6[Observability<br/>Prometheus metrics + health checks]
-    A7[Testing<br/>Fuzzing + failpoints + CI pipeline]
-  end
-
-  subgraph "Phase B: Polish & Research (Next)"
-    B1[SIMD optimization<br/>Runtime CPU feature detection]
-    B2[Router tuning<br/>Dynamic bit width adaptation]
-    B3[Rebuild heuristics<br/>Adaptive mispredict thresholds]
-    B4[Performance benchmarking<br/>Published results + scripts]
-    B5[Documentation<br/>Comprehensive operational guides]
-    B6[SDK ecosystem<br/>Language bindings and examples]
-  end
-
-  subgraph "Phase C: Primitives Expansion (Future)"
-    C1[Vector storage<br/>ANN/HNSW behind trait interface]
-    C2[Hybrid queries<br/>Text + vector + metadata filters]
-    C3[Model registry<br/>Built-in model versioning]
-    C4[Provenance tracking<br/>Data lineage and audit trails]
-    C5[RAG primitives<br/>Retrieval-augmented generation support]
-    C6[Plugin architecture<br/>Extensible storage backends]
-  end
-
-  subgraph "Phase D: Autonomy & Governance (Advanced)"
-    D1[Self-tuning policies<br/>Automatic parameter optimization]
-    D2[Workload adaptation<br/>Learned index parameter tuning]
-    D3[Governance framework<br/>Policy-driven data management]
-    D4[Audit compliance<br/>Immutable logs + compliance reporting]
-    D5[Cost optimization<br/>Intelligent resource allocation]
-    D6[Multi-tenant isolation<br/>Namespace and quota management]
-  end
-
-  subgraph "Phase E: Scale Out (Distributed)"
-    E1[Replication<br/>Multi-node consensus]
-    E2[Sharding<br/>Horizontal scalability]
-    E3[Distributed snapshots<br/>Cross-node consistency]
-    E4[Load balancing<br/>Request routing and failover]
-    E5[Global secondary indexes<br/>Distributed learned indexes]
-    E6[Federation<br/>Multi-cluster coordination]
-  end
-
-  A1 --> B1
-  A2 --> B2
-  A3 --> B3
-  A4 --> B4
-  A5 --> B5
-  A6 --> B6
-
-  B1 --> C1
-  B2 --> C2
-  B3 --> C3
-  B4 --> C4
-  B5 --> C5
-  B6 --> C6
-
-  C1 --> D1
-  C2 --> D2
-  C3 --> D3
-  C4 --> D4
-  C5 --> D5
-  C6 --> D6
-
-  D1 --> E1
-  D2 --> E2
-  D3 --> E3
-  D4 --> E4
-  D5 --> E5
-  D6 --> E6
-
-  subgraph "Success Metrics"
-    M1[Production Deployments<br/>External users]
-    M2[Performance Benchmarks<br/>Published results]
-    M3[Research Citations<br/>Academic papers]
-    M4[Community Ecosystem<br/>Extensions + tools]
-  end
-
-  E1 --> M1
-  E2 --> M2
-  E3 --> M3
-  E4 --> M4
-
-  %% Styling
-  classDef phaseAClass fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
-  classDef phaseBClass fill:#e3f2fd,stroke:#0d47a1,stroke-width:2px
-  classDef phaseCClass fill:#fff3e0,stroke:#e65100,stroke-width:2px
-  classDef phaseDClass fill:#fce4ec,stroke:#880e4f,stroke-width:2px
-  classDef phaseEClass fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-  classDef successClass fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-
-  class A1,A2,A3,A4,A5,A6,A7 phaseAClass
-  class B1,B2,B3,B4,B5,B6 phaseBClass
-  class C1,C2,C3,C4,C5,C6 phaseCClass
-  class D1,D2,D3,D4,D5,D6 phaseDClass
-  class E1,E2,E3,E4,E5,E6 phaseEClass
-  class M1,M2,M3,M4 successClass
-```
 
 ## Risks and mitigations
 
