@@ -211,7 +211,7 @@ graph TB
 
     subgraph "Router Table (Dynamic Size)"
       ROUTER_BITS[Router Bits<br/>Configurable 8-24]
-      ROUTER_ENTRIES[Router Entries<br/>2^bits × 4 bytes]
+      ROUTER_ENTRIES["Router Entries<br/>2^bits × 4 bytes"]
     end
 
     subgraph "Leaf Models"
@@ -242,10 +242,10 @@ graph TB
   OFFSET_ARRAY --> CHECKSUM
 
   subgraph "Lookup Algorithm Flow"
-    INPUT[Input Key<br/>u64] --> ROUTE[Router Lookup<br/>key shifted right by (64 - bits)]
+    INPUT[Input Key<br/>u64] --> ROUTE["Router Lookup<br/>key shifted right by (64 - bits)"]
     ROUTE --> LEAF_SELECT[Select Leaf<br/>From router table]
     LEAF_SELECT --> PREDICT[Predict Position<br/>slope × key + intercept]
-    PREDICT --> CLAMP[Clamp to Bounds<br/>max(0, min(pred ± ε, leaf_end))]
+    PREDICT --> CLAMP["Clamp to Bounds<br/>max(0, min(pred ± ε, leaf_end))"]
     CLAMP --> PREFETCH[Prefetch Window<br/>OS page hints]
     PREFETCH --> PROBE{SIMD Probe<br/>AVX2/AVX512/NEON}
     
@@ -261,10 +261,10 @@ graph TB
   end
 
   subgraph "SIMD Probe Details"
-    AVX512[AVX512 Path<br/>8-way gather + compare]
-    AVX2[AVX2 Path<br/>4-way gather + compare]
-    NEON[NEON Path<br/>2-way pairwise compare]
-    SCALAR[Scalar Fallback<br/>4-way unrolled loop]
+    AVX512["AVX512 Path<br/>8-way gather + compare"]
+    AVX2["AVX2 Path<br/>4-way gather + compare"]
+    NEON["NEON Path<br/>2-way pairwise compare"]
+    SCALAR["Scalar Fallback<br/>4-way unrolled loop"]
   end
 
   PROBE -.-> AVX512
@@ -420,9 +420,9 @@ graph LR
 
   %% Performance targets
   subgraph "Target Performance"
-    TARGET_P50[P50 < 10μs<br/>Point lookups]
-    TARGET_P99[P99 < 100μs<br/>Tail latency]
-    TARGET_QPS[QPS > 100K<br/>Sustained throughput]
+    TARGET_P50["P50 < 10μs<br/>Point lookups"]
+    TARGET_P99["P99 < 100μs<br/>Tail latency"]
+    TARGET_QPS["QPS > 100K<br/>Sustained throughput"]
   end
 
   PROBE_LEN --> TARGET_P50
@@ -439,7 +439,7 @@ graph TB
   end
 
   subgraph "Latency Breakdown"
-    ROUTER_LOOKUP[Router Lookup<br/>O&#40;1&#41; hash]
+    ROUTER_LOOKUP[Router Lookup<br/>O(1) hash]
     MODEL_PREDICT[Model Prediction<br/>Fixed-point math]
     SIMD_PROBE[SIMD Probe<br/>Vectorized search]
     PAYLOAD_FETCH[Payload Fetch<br/>mmap access]
@@ -599,7 +599,7 @@ flowchart TD
   end
 
   subgraph "Read Path (Multi-Level)"
-    R1[GET /v1/get_fast/&#123;key&#125;] --> R2[Check Delta<br/>Recent writes]
+    R1["GET /v1/get_fast/{key}"] --> R2[Check Delta<br/>Recent writes]
     R2 --> R3{Found in<br/>Delta?}
     R3 -->|Yes| R4[Return Value<br/>From memory]
     R3 -->|No| R5[RMI Lookup<br/>Learned index]
