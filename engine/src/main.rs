@@ -7,9 +7,9 @@ use kyrodb_engine as engine_crate;
 use std::sync::Arc;
 use uuid::Uuid;
 use warp::Filter;
-mod sql;
 #[cfg(feature = "grpc")]
 mod grpc_svc;
+mod sql;
 
 // --- Rate limiting (simple token-bucket per client IP) -----------------------
 use dashmap::DashMap;
@@ -155,10 +155,10 @@ enum Commands {
         grpc_addr: Option<String>,
         /// TLS certificate file path (enables HTTPS)
         #[arg(long)]
-        tls_cert: Option<String>,
+        _tls_cert: Option<String>,
         /// TLS private key file path (enables HTTPS)
         #[arg(long)]
-        tls_key: Option<String>,
+        _tls_key: Option<String>,
         /// Admin token for privileged operations (separate from auth_token for read/write)
         #[arg(long)]
         admin_token: Option<String>,
@@ -170,17 +170,23 @@ async fn main() -> Result<()> {
     // init structured JSON logs with env-based filter (RUST_LOG)
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).json().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .init();
 
     // Build info stamp
     let build_commit: &str = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
     let build_features: &str = option_env!("CARGO_FEATURES").unwrap_or("");
-    tracing::info!(commit = build_commit, features = build_features, "build_info");
+    tracing::info!(
+        commit = build_commit,
+        features = build_features,
+        "build_info"
+    );
 
     let cli = Cli::parse();
     let log = Arc::new(
-        engine_crate::PersistentEventLog::open(std::path::Path::new(&cli.data_dir))
-            .await?
+        engine_crate::PersistentEventLog::open(std::path::Path::new(&cli.data_dir)).await?,
     );
 
     // --- Rate limiter configs (env tunables) --------------------------------
@@ -209,8 +215,8 @@ async fn main() -> Result<()> {
             compact_interval_secs,
             compact_when_wal_bytes,
             grpc_addr,
-            tls_cert,
-            tls_key,
+            _tls_cert,
+            _tls_key,
             admin_token,
         } => {
             // Silence unused when learned-index feature is disabled
@@ -262,9 +268,9 @@ async fn main() -> Result<()> {
             if compact_interval_secs > 0 {
                 let log_for_compact = log.clone();
                 tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(
-                        tokio::time::Duration::from_secs(compact_interval_secs),
-                    );
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+                        compact_interval_secs,
+                    ));
                     loop {
                         interval.tick().await;
                         if compact_when_wal_bytes == 0
@@ -340,8 +346,14 @@ async fn main() -> Result<()> {
                         let appended = cur.saturating_sub(last_built);
                         let pairs = rebuild_log.collect_key_offset_pairs().await;
                         let distinct = pairs.len() as u64;
-                        let ratio = if distinct == 0 { 0.0 } else { appended as f64 / distinct as f64 };
-                        if (app_thresh > 0 && appended >= app_thresh) || (ratio_thresh > 0.0 && ratio >= ratio_thresh) {
+                        let ratio = if distinct == 0 {
+                            0.0
+                        } else {
+                            appended as f64 / distinct as f64
+                        };
+                        if (app_thresh > 0 && appended >= app_thresh)
+                            || (ratio_thresh > 0.0 && ratio >= ratio_thresh)
+                        {
                             let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
                             let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
                             let rebuild_timer =
@@ -357,22 +369,48 @@ async fn main() -> Result<()> {
                                 )
                             })
                             .await;
-                            if let Ok(Err(e)) = write_res { eprintln!("❌ RMI rebuild write failed: {}", e); rebuild_timer.observe_duration(); engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0); continue; }
-                            if write_res.is_err() { eprintln!("❌ RMI rebuild task panicked"); rebuild_timer.observe_duration(); engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0); continue; }
-                            if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
-                            if let Err(e) = std::fs::rename(&tmp, &dst) { eprintln!("❌ RMI rename failed: {}", e); rebuild_timer.observe_duration(); engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0); continue; }
+                            if let Ok(Err(e)) = write_res {
+                                eprintln!("❌ RMI rebuild write failed: {}", e);
+                                rebuild_timer.observe_duration();
+                                engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
+                                continue;
+                            }
+                            if write_res.is_err() {
+                                eprintln!("❌ RMI rebuild task panicked");
+                                rebuild_timer.observe_duration();
+                                engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
+                                continue;
+                            }
+                            if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+                                let _ = f.sync_all();
+                            }
+                            if let Err(e) = std::fs::rename(&tmp, &dst) {
+                                eprintln!("❌ RMI rename failed: {}", e);
+                                rebuild_timer.observe_duration();
+                                engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
+                                continue;
+                            }
                             // Ensure directory metadata is durable after rename
-                            if let Err(e) = engine_crate::fsync_dir(std::path::Path::new(&data_dir)) {
-                                eprintln!("⚠️ fsync data dir after RMI rebuild rename failed: {}", e);
+                            if let Err(e) = engine_crate::fsync_dir(std::path::Path::new(&data_dir))
+                            {
+                                eprintln!(
+                                    "⚠️ fsync data dir after RMI rebuild rename failed: {}",
+                                    e
+                                );
                             }
                             if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
-                                rebuild_log.swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi)).await;
+                                rebuild_log
+                                    .swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi))
+                                    .await;
                                 last_built = cur;
                                 engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                                 rebuild_timer.observe_duration();
                                 let _ = rebuild_log.write_manifest().await;
                                 println!("✅ RMI rebuilt, swapped, and manifest committed (appended={}, ratio={:.3})", appended, ratio);
-                            } else { eprintln!("❌ RMI reload failed after rebuild"); rebuild_timer.observe_duration(); }
+                            } else {
+                                eprintln!("❌ RMI reload failed after rebuild");
+                                rebuild_timer.observe_duration();
+                            }
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
                         }
                     }
@@ -400,7 +438,8 @@ async fn main() -> Result<()> {
                 use prometheus::register_counter;
                 (
                     register_counter!("kyrodb_rmi_reads_total", "Total reads served by RMI").ok(),
-                    register_counter!("kyrodb_btree_reads_total", "Total reads served by BTree").ok(),
+                    register_counter!("kyrodb_btree_reads_total", "Total reads served by BTree")
+                        .ok(),
                 )
             };
 
@@ -468,7 +507,9 @@ async fn main() -> Result<()> {
                         use warp::http::{Response, StatusCode};
                         if let Some(off) = log.lookup_key(k).await {
                             if let Some(bytes) = log.get(off).await {
-                                if let Ok(rec) = bincode::deserialize::<kyrodb_engine::Record>(&bytes) {
+                                if let Ok(rec) =
+                                    bincode::deserialize::<kyrodb_engine::Record>(&bytes)
+                                {
                                     let resp = Response::builder()
                                         .status(StatusCode::OK)
                                         .header("Content-Type", "application/octet-stream")
@@ -516,54 +557,67 @@ async fn main() -> Result<()> {
 
             // --- NEW: Snapshot trigger endpoint -----------------------------------------------
             let snapshot_log = log.clone();
-            let snapshot_route = v1.and(warp::path("snapshot")).and(warp::post()).and_then(move || {
-                let log = snapshot_log.clone();
-                async move {
-                    if let Err(e) = log.snapshot().await {
-                        eprintln!("❌ Snapshot failed: {}", e);
-                        return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        ));
-                    }
-                    Ok::<_, warp::Rejection>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
-                        warp::http::StatusCode::OK,
-                    ))
-                }
-            });
+            let snapshot_route =
+                v1.and(warp::path("snapshot"))
+                    .and(warp::post())
+                    .and_then(move || {
+                        let log = snapshot_log.clone();
+                        async move {
+                            if let Err(e) = log.snapshot().await {
+                                eprintln!("❌ Snapshot failed: {}", e);
+                                return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::json(
+                                        &serde_json::json!({ "error": e.to_string() }),
+                                    ),
+                                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                ));
+                            }
+                            Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
+                                warp::http::StatusCode::OK,
+                            ))
+                        }
+                    });
 
             // --- NEW: Compaction endpoint -----------------------------------------------------
             let compact_log = log.clone();
-            let compact_route = v1.and(warp::path("compact")).and(warp::post()).and_then(move || {
-                let log = compact_log.clone();
-                async move {
-                    match log.compact_keep_latest_and_snapshot_stats().await {
-                        Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(
-                                &serde_json::json!({ "compact": "ok", "stats": stats }),
-                            ),
-                            warp::http::StatusCode::OK,
-                        )),
-                        Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        )),
-                    }
-                }
-            });
+            let compact_route =
+                v1.and(warp::path("compact"))
+                    .and(warp::post())
+                    .and_then(move || {
+                        let log = compact_log.clone();
+                        async move {
+                            match log.compact_keep_latest_and_snapshot_stats().await {
+                                Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::json(
+                                        &serde_json::json!({ "compact": "ok", "stats": stats }),
+                                    ),
+                                    warp::http::StatusCode::OK,
+                                )),
+                                Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::json(
+                                        &serde_json::json!({ "error": e.to_string() }),
+                                    ),
+                                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                )),
+                            }
+                        }
+                    });
 
             // --- NEW: Offset endpoint ---------------------------------------------------------
             let offset_log = log.clone();
-            let offset_route = v1.and(warp::path("offset")).and(warp::get()).and_then(move || {
-                let log = offset_log.clone();
-                async move {
-                    let off = log.get_offset().await;
-                    Ok::<_, warp::Rejection>(warp::reply::json(
-                        &serde_json::json!({ "offset": off }),
-                    ))
-                }
-            });
+            let offset_route = v1
+                .and(warp::path("offset"))
+                .and(warp::get())
+                .and_then(move || {
+                    let log = offset_log.clone();
+                    async move {
+                        let off = log.get_offset().await;
+                        Ok::<_, warp::Rejection>(warp::reply::json(
+                            &serde_json::json!({ "offset": off }),
+                        ))
+                    }
+                });
 
             let replay_log = log.clone();
             let replay_route = v1
@@ -627,7 +681,9 @@ async fn main() -> Result<()> {
                             if let Some(offset) = log.lookup_key(k).await {
                                 // Fetch payload via mmap-backed snapshot (with WAL/memory fallback)
                                 if let Some(bytes) = log.get(offset).await {
-                                    if let Ok(rec) = bincode::deserialize::<kyrodb_engine::Record>(&bytes) {
+                                    if let Ok(rec) =
+                                        bincode::deserialize::<kyrodb_engine::Record>(&bytes)
+                                    {
                                         return Ok::<_, warp::Rejection>(warp::reply::json(
                                             &serde_json::json!({
                                                 "key": rec.key,
@@ -719,7 +775,7 @@ async fn main() -> Result<()> {
             struct InsufficientPermissions;
             impl warp::reject::Reject for InsufficientPermissions {}
 
-            let auth_with_role = {
+            let _auth_with_role = {
                 let token_opt = auth_token.clone();
                 let admin_token_opt = admin_token.clone();
                 warp::any()
@@ -754,7 +810,7 @@ async fn main() -> Result<()> {
                     })
             };
 
-            let auth = {
+            let _auth = {
                 let token_opt = auth_token.clone();
                 warp::any()
                     .and(warp::header::optional::<String>("authorization"))
@@ -786,22 +842,36 @@ async fn main() -> Result<()> {
                             let pairs = log.collect_key_offset_pairs().await;
                             let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
                             let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
-                            let timer = engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
+                            let timer =
+                                engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
                             // Write index on a blocking thread to avoid starving the reactor
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();
                             let write_res = tokio::task::spawn_blocking(move || {
-                                engine_crate::index::RmiIndex::write_from_pairs_auto(&tmp_clone, &pairs_clone)
+                                engine_crate::index::RmiIndex::write_from_pairs_auto(
+                                    &tmp_clone,
+                                    &pairs_clone,
+                                )
                             })
                             .await;
                             let mut ok = matches!(write_res, Ok(Ok(())));
                             if ok {
-                                if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) { let _ = f.sync_all(); }
-                                if let Err(e) = std::fs::rename(&tmp, &dst) { eprintln!("❌ RMI rename failed: {}", e); ok = false; }
+                                if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+                                    let _ = f.sync_all();
+                                }
+                                if let Err(e) = std::fs::rename(&tmp, &dst) {
+                                    eprintln!("❌ RMI rename failed: {}", e);
+                                    ok = false;
+                                }
                                 // Ensure directory metadata is durable after rename
-                                if let Err(e) = engine_crate::fsync_dir(std::path::Path::new(&data_dir)) {
-                                    eprintln!("⚠️ fsync data dir after RMI build rename failed: {}", e);
+                                if let Err(e) =
+                                    engine_crate::fsync_dir(std::path::Path::new(&data_dir))
+                                {
+                                    eprintln!(
+                                        "⚠️ fsync data dir after RMI build rename failed: {}",
+                                        e
+                                    );
                                 }
                             }
                             timer.observe_duration();
@@ -817,14 +887,16 @@ async fn main() -> Result<()> {
             #[cfg(not(feature = "learned-index"))]
             let rmi_build = {
                 use warp::http::StatusCode;
-                v1.and(warp::path!("rmi" / "build")).and(warp::post()).map(|| {
-                    warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({
-                            "error": "learned-index feature not enabled"
-                        })),
-                        StatusCode::NOT_IMPLEMENTED,
-                    )
-                })
+                v1.and(warp::path!("rmi" / "build"))
+                    .and(warp::post())
+                    .map(|| {
+                        warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "learned-index feature not enabled"
+                            })),
+                            StatusCode::NOT_IMPLEMENTED,
+                        )
+                    })
             };
 
             let subscribe_log = log.clone();
@@ -908,7 +980,9 @@ async fn main() -> Result<()> {
                         let log = log2.clone();
                         async move {
                             log.warmup().await;
-                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"status":"ok"})))
+                            Ok::<_, warp::Rejection>(warp::reply::json(
+                                &serde_json::json!({"status":"ok"}),
+                            ))
                         }
                     })
             };
@@ -977,10 +1051,14 @@ async fn main() -> Result<()> {
                         ))
                     } else if rej.find::<InsufficientPermissions>().is_some() {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error":"insufficient_permissions"})),
+                            warp::reply::json(
+                                &serde_json::json!({"error":"insufficient_permissions"}),
+                            ),
                             StatusCode::FORBIDDEN,
                         ))
-                    } else if rej.find::<AdminRateLimited>().is_some() || rej.find::<DataRateLimited>().is_some() {
+                    } else if rej.find::<AdminRateLimited>().is_some()
+                        || rej.find::<DataRateLimited>().is_some()
+                    {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(
                             warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
                             StatusCode::TOO_MANY_REQUESTS,
@@ -994,9 +1072,9 @@ async fn main() -> Result<()> {
                 });
 
             // Per-request logging with runtime disable via KYRODB_DISABLE_HTTP_LOG=1
-            let disable_http_log = std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
+            let disable_http_log =
+                std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
             let routes = routes.with(warp::log::custom({
-                let disable_http_log = disable_http_log;
                 move |info: warp::log::Info| {
                     if disable_http_log {
                         return;
@@ -1023,15 +1101,10 @@ async fn main() -> Result<()> {
 
             println!(
                 "🚀 Starting server at http://{}:{} (commit={}, features={})",
-                host,
-                port,
-                build_commit,
-                build_features
+                host, port, build_commit, build_features
             );
 
-            warp::serve(routes)
-                .run(addr)
-                .await;
+            warp::serve(routes).run(addr).await;
         }
     }
 

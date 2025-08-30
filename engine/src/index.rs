@@ -666,8 +666,8 @@ impl RmiIndex {
                 if sum_calc != sum_read {
                     return None;
                 }
-                let aligned = (keys_off % std::mem::align_of::<u64>() == 0)
-                    && (offs_off % std::mem::align_of::<u64>() == 0);
+                let aligned = keys_off.is_multiple_of(std::mem::align_of::<u64>())
+                    && offs_off.is_multiple_of(std::mem::align_of::<u64>());
                 let backing = if aligned {
                     RmiBacking::Mmap {
                         mmap: map,
@@ -790,7 +790,9 @@ impl RmiIndex {
                     return None;
                 }
                 let offw = map[off];
-                if offw != 4 && offw != 8 { return None; }
+                if offw != 4 && offw != 8 {
+                    return None;
+                }
                 let off_is_u32 = offw == 4;
                 off += 8;
                 let leaf_rec_size = size_of::<u64>() * 2

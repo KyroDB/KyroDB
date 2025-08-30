@@ -58,7 +58,8 @@ pub fn parse_wal_stream_bytes(mut data: &[u8]) -> usize {
     let mut ok = 0usize;
     while data.len() >= 8 {
         let (len_bytes, rest) = data.split_at(4);
-        let len = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        let len =
+            u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
         if rest.len() < len + 4 {
             break; // partial frame at tail
         }
@@ -67,7 +68,9 @@ pub fn parse_wal_stream_bytes(mut data: &[u8]) -> usize {
         let crc_read = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
         let crc_calc = crc32c::crc32c(frame);
         // attempt to deserialize Event, but don't fail the parser on bincode errors
-        let _ = bincode::options().with_limit(16 * 1024 * 1024).deserialize::<Event>(frame);
+        let _ = bincode::options()
+            .with_limit(16 * 1024 * 1024)
+            .deserialize::<Event>(frame);
         if crc_read == crc_calc {
             ok = ok.saturating_add(1);
         }
@@ -141,7 +144,7 @@ pub struct PersistentEventLog {
     tx: broadcast::Sender<Event>,
     index: Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
     // Replace with epoch-guarded shared pointer for linearizable swaps
-    next_offset: Arc<RwLock<u64>>,           // monotonic sequence (not tied to vec length)
+    next_offset: Arc<RwLock<u64>>, // monotonic sequence (not tied to vec length)
     // current WAL segment index for rotation
     wal_seg_index: Arc<RwLock<u32>>,
     // rotation config
@@ -338,7 +341,7 @@ impl PersistentEventLog {
             data_dir: data_dir.clone(),
             tx,
             index: Arc::new(RwLock::new(idx)),
-            // TODO: migrate to ArcSwap<index::PrimaryIndex> 
+            // TODO: migrate to ArcSwap<index::PrimaryIndex>
             next_offset: Arc::new(RwLock::new(next)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
@@ -405,7 +408,10 @@ impl PersistentEventLog {
                     let end = start.saturating_add(len);
                     if end <= mmap.len() {
                         let bytes = mmap[start..end].to_vec();
-                        self.wal_block_cache.write().await.put(offset, bytes.clone());
+                        self.wal_block_cache
+                            .write()
+                            .await
+                            .put(offset, bytes.clone());
                         return Some(bytes);
                     }
                 }
@@ -415,7 +421,10 @@ impl PersistentEventLog {
         let read = self.inner.read().await;
         if let Some(ev) = read.iter().find(|e| e.offset == offset) {
             let bytes = ev.payload.clone();
-            self.wal_block_cache.write().await.put(offset, bytes.clone());
+            self.wal_block_cache
+                .write()
+                .await
+                .put(offset, bytes.clone());
             return Some(bytes);
         }
         None
@@ -517,12 +526,18 @@ impl PersistentEventLog {
                     let timer_all = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
                     #[cfg(not(feature = "bench-no-metrics"))]
                     let rebuild_timer_opt = if crate::metrics::rmi_rebuild_in_progress() {
-                        Some(crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer())
-                    } else { None };
+                        Some(
+                            crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer(),
+                        )
+                    } else {
+                        None
+                    };
                     let res = r.predict_get(&key);
                     timer_all.observe_duration();
                     #[cfg(not(feature = "bench-no-metrics"))]
-                    if let Some(t) = rebuild_timer_opt { t.observe_duration(); }
+                    if let Some(t) = rebuild_timer_opt {
+                        t.observe_duration();
+                    }
                     if let Some(v) = res {
                         crate::metrics::RMI_HITS_TOTAL.inc();
                         crate::metrics::RMI_READS_TOTAL.inc();
@@ -547,14 +562,19 @@ impl PersistentEventLog {
         #[cfg(feature = "learned-index")]
         {
             let idx = self.index.read().await;
-            if let index::PrimaryIndex::Rmi(r) = &*idx { r.warm(); }
+            if let index::PrimaryIndex::Rmi(r) = &*idx {
+                r.warm();
+            }
         }
         // Touch snapshot mmap pages to reduce first access latency
         if let Some(ref mmap) = *self.snapshot_mmap.read().await {
             let bytes: &[u8] = &mmap[..];
             let page = 4096usize;
             let mut i = 0usize;
-            while i < bytes.len() { let _ = std::hint::black_box(bytes[i]); i = i.saturating_add(page); }
+            while i < bytes.len() {
+                let _ = std::hint::black_box(bytes[i]);
+                i = i.saturating_add(page);
+            }
         }
     }
 
@@ -565,7 +585,7 @@ impl PersistentEventLog {
         let bopt = bincode::options();
         let path = self.data_dir.join("snapshot.bin");
         let tmp = self.data_dir.join("snapshot.tmp");
-        
+
         #[cfg(feature = "failpoints")]
         fail::fail_point!("snapshot_before_write", |_| {
             Err(anyhow::anyhow!("failpoint: snapshot_before_write"))
@@ -574,8 +594,7 @@ impl PersistentEventLog {
             let f = File::create(&tmp).context("creating snapshot.tmp")?;
             let mut w = BufWriter::new(f);
             let read = self.inner.read().await;
-            bopt
-                .serialize_into(&mut w, &*read)
+            bopt.serialize_into(&mut w, &*read)
                 .context("writing snapshot")?;
             w.flush().context("flushing snapshot")?;
             // Ensure snapshot.tmp contents are durable before rename
@@ -675,7 +694,9 @@ impl PersistentEventLog {
                 // Keep event with the highest offset for this key
                 match latest.get(&rec.key) {
                     Some((off, _)) if *off >= ev.offset => {}
-                    _ => { latest.insert(rec.key, (ev.offset, ev)); }
+                    _ => {
+                        latest.insert(rec.key, (ev.offset, ev));
+                    }
                 }
             }
         }
@@ -685,11 +706,17 @@ impl PersistentEventLog {
 
         // 3) Swap in-memory state and rebuild index consistently
         {
-            let mut w = self.inner.write().await; *w = compacted.clone();
+            let mut w = self.inner.write().await;
+            *w = compacted.clone();
         }
         {
-            let mut idx = self.index.write().await; *idx = index::PrimaryIndex::new_btree();
-            for ev in &compacted { if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) { idx.insert(rec.key, ev.offset); } }
+            let mut idx = self.index.write().await;
+            *idx = index::PrimaryIndex::new_btree();
+            for ev in &compacted {
+                if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                    idx.insert(rec.key, ev.offset);
+                }
+            }
         }
 
         // 4) Persist snapshot of compacted state and reset WAL segments
@@ -716,22 +743,35 @@ impl PersistentEventLog {
     }
 
     /// Get the next write offset (i.e. current monotonic sequence).
-    pub async fn get_offset(&self) -> u64 { *self.next_offset.read().await }
+    pub async fn get_offset(&self) -> u64 {
+        *self.next_offset.read().await
+    }
 
     /// Path to the schema registry JSON file.
-    pub fn registry_path(&self) -> std::path::PathBuf { self.data_dir.join("schema.json") }
+    pub fn registry_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("schema.json")
+    }
 
     /// Current WAL size in bytes (sum of segments).
-    pub fn wal_size_bytes(&self) -> u64 { Self::wal_total_bytes(&self.data_dir) }
+    pub fn wal_size_bytes(&self) -> u64 {
+        Self::wal_total_bytes(&self.data_dir)
+    }
 
     /// Minimal manifest path
-    pub fn manifest_path(&self) -> std::path::PathBuf { self.data_dir.join("manifest.json") }
+    pub fn manifest_path(&self) -> std::path::PathBuf {
+        self.data_dir.join("manifest.json")
+    }
 
     /// List current WAL segments' basenames
     fn current_wal_segments(&self) -> Vec<String> {
         Self::list_wal_segments(&self.data_dir)
             .into_iter()
-            .map(|(_, p)| p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string())
+            .map(|(_, p)| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect()
     }
 
@@ -757,8 +797,12 @@ impl PersistentEventLog {
         fail::fail_point!("manifest_before_rename", |_| {
             Err(anyhow::anyhow!("failpoint: manifest_before_rename"))
         });
-        std::fs::rename(&tmp, self.manifest_path()).context("rename manifest.tmp -> manifest.json")?;
-        let _ = fsync_dir(&self.data_dir).map_err(|e| { eprintln!("⚠️ fsync data dir after manifest rename failed: {}", e); e });
+        std::fs::rename(&tmp, self.manifest_path())
+            .context("rename manifest.tmp -> manifest.json")?;
+        let _ = fsync_dir(&self.data_dir).map_err(|e| {
+            eprintln!("⚠️ fsync data dir after manifest rename failed: {}", e);
+            e
+        });
         Ok(())
     }
 
@@ -768,10 +812,14 @@ impl PersistentEventLog {
         let mut guard = self.index.write().await;
         match (&*guard, &mut new_index) {
             (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::Rmi(new_rmi)) => {
-                for (k, v) in old_rmi.delta_pairs() { new_rmi.insert_delta(k, v); }
+                for (k, v) in old_rmi.delta_pairs() {
+                    new_rmi.insert_delta(k, v);
+                }
             }
             (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::BTree(btree)) => {
-                for (k, v) in old_rmi.delta_pairs() { btree.insert(k, v); }
+                for (k, v) in old_rmi.delta_pairs() {
+                    btree.insert(k, v);
+                }
             }
             _ => {}
         }
@@ -782,19 +830,28 @@ impl PersistentEventLog {
     pub async fn replay(&self, start: u64, end: Option<u64>) -> Vec<Event> {
         let read = self.inner.read().await;
         let end = end.unwrap_or_else(|| read.len() as u64);
-        read.iter().filter(|e| e.offset >= start && e.offset < end).cloned().collect()
+        read.iter()
+            .filter(|e| e.offset >= start && e.offset < end)
+            .cloned()
+            .collect()
     }
 }
 
 impl PersistentEventLog {
     async fn rotate_wal_if_needed(&self) {
         let seg_bytes = *self.wal_segment_bytes.read().await;
-        let Some(max_seg_bytes) = seg_bytes else { return; };
-        if max_seg_bytes == 0 { return; }
+        let Some(max_seg_bytes) = seg_bytes else {
+            return;
+        };
+        if max_seg_bytes == 0 {
+            return;
+        }
         let cur_idx = *self.wal_seg_index.read().await;
         let cur_path = Self::wal_segment_path(&self.data_dir, cur_idx);
         let cur_size = std::fs::metadata(&cur_path).map(|m| m.len()).unwrap_or(0);
-        if cur_size < max_seg_bytes { return; }
+        if cur_size < max_seg_bytes {
+            return;
+        }
         // rotate
         #[cfg(feature = "failpoints")]
         fail::fail_point!("wal_before_rotate", |_| { () });
@@ -802,15 +859,23 @@ impl PersistentEventLog {
         let mut seg_idx = self.wal_seg_index.write().await;
         let next_idx = seg_idx.saturating_add(1);
         let next_path = Self::wal_segment_path(&self.data_dir, next_idx);
-        if let Ok(new_file) = OpenOptions::new().write(true).create(true).truncate(true).open(&next_path) {
+        if let Ok(new_file) = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&next_path)
+        {
             #[cfg(feature = "failpoints")]
             fail::fail_point!("wal_after_open_new_before_switch", |_| { () });
             *w = BufWriter::new(new_file);
             #[cfg(feature = "failpoints")]
             fail::fail_point!("wal_after_switch_before_dirsync", |_| { () });
             *seg_idx = next_idx;
-            if let Err(e) = fsync_dir(&self.data_dir) { eprintln!("⚠️ fsync data dir after wal rotate failed: {}", e); }
-            drop(w); drop(seg_idx);
+            if let Err(e) = fsync_dir(&self.data_dir) {
+                eprintln!("⚠️ fsync data dir after wal rotate failed: {}", e);
+            }
+            drop(w);
+            drop(seg_idx);
             #[cfg(feature = "failpoints")]
             fail::fail_point!("wal_after_rotate_before_retention", |_| { () });
             #[cfg(feature = "failpoints")]
@@ -822,14 +887,20 @@ impl PersistentEventLog {
                 if segs.len() > max_keep {
                     let to_remove = segs.len() - max_keep;
                     for (idx, path) in segs.drain(..to_remove) {
-                        if idx != next_idx { let _ = std::fs::remove_file(path); }
+                        if idx != next_idx {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
-                    if let Err(e) = fsync_dir(&self.data_dir) { eprintln!("⚠️ fsync data dir after wal retention failed: {}", e); }
+                    if let Err(e) = fsync_dir(&self.data_dir) {
+                        eprintln!("⚠️ fsync data dir after wal retention failed: {}", e);
+                    }
                 }
             }
             #[cfg(feature = "failpoints")]
             fail::fail_point!("wal_after_retention_before_manifest", |_| { () });
-            if let Err(e) = self.write_manifest().await { eprintln!("⚠️ manifest write after rotation failed: {}", e); }
+            if let Err(e) = self.write_manifest().await {
+                eprintln!("⚠️ manifest write after rotation failed: {}", e);
+            }
         }
     }
 
@@ -879,18 +950,23 @@ impl PersistentEventLog {
     }
 
     /// Configure WAL rotation policy.
-    pub async fn configure_wal_rotation(&self, max_segment_bytes: Option<u64>, max_segments: usize) {
+    pub async fn configure_wal_rotation(
+        &self,
+        max_segment_bytes: Option<u64>,
+        max_segments: usize,
+    ) {
         *self.wal_segment_bytes.write().await = max_segment_bytes;
         *self.wal_max_segments.write().await = max_segments.max(1);
     }
 
     /// Backwards-compatible alias used by older tests.
     pub async fn set_wal_rotation(&self, max_segment_bytes: Option<u64>, max_segments: usize) {
-        self.configure_wal_rotation(max_segment_bytes, max_segments).await;
+        self.configure_wal_rotation(max_segment_bytes, max_segments)
+            .await;
     }
 
     /// Naive L2 search over latest vectors per key (CPU baseline).
-    pub async fn search_vector_l2(&self, query: &Vec<f32>, k: usize) -> Vec<(u64, f32)> {
+    pub async fn search_vector_l2(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
         use std::collections::HashSet;
         let mut out: Vec<(u64, f32)> = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
@@ -918,7 +994,7 @@ impl PersistentEventLog {
     }
 
     /// Approximate ANN search when HNSW index is available; falls back to L2 scan otherwise.
-    pub async fn search_vector_ann(&self, query: &Vec<f32>, k: usize) -> Vec<(u64, f32)> {
+    pub async fn search_vector_ann(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
         #[cfg(feature = "ann-hnsw")]
         {
             if let Some(idx) = self.ann.read().await.as_ref() {
