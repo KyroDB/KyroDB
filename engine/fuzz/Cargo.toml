@@ -12,8 +12,12 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.engine]
+[dependencies.kyrodb-engine]
 path = ".."
+features = ["learned-index"]
+
+[features]
+learned-index = []
 
 [[bin]]
 name = "fuzz_target_1"

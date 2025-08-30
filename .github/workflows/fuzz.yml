@@ -2,10 +2,13 @@ name: fuzz
 
 on:
   workflow_dispatch:
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
 
 jobs:
   fuzz-wal-snapshot:
-    name: cargo-fuzz (manual)
+    name: cargo-fuzz (manual/nightly)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,8 +18,6 @@ jobs:
       - name: Build fuzzers
         run: |
           cd engine
-          # break workspace inheritance to avoid workspace build in CI
-          echo "[workspace]" >> fuzz/Cargo.toml
           cargo fuzz build
           cargo fuzz list
           # ensure both targets build
@@ -31,3 +32,12 @@ jobs:
           cd engine
           # Run fuzzing for WAL/snapshot parsing
           timeout 300 cargo fuzz run fuzz_target_1 -- -max_len=1024 -runs=10000 || true
+      - name: Upload crash artifacts (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          path: |
+            engine/fuzz/artifacts/
+            engine/fuzz/crash-*
+          retention-days: 30

@@ -430,44 +430,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "engine"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "chrono",
- "clap",
- "crc32c",
- "dashmap",
- "futures",
- "hex",
- "libc",
- "lru",
- "memmap2",
- "once_cell",
- "prometheus",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "serde",
- "serde_json",
- "sqlparser",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "warp",
- "xxhash-rust",
-]
-
-[[package]]
 name = "engine-fuzz"
 version = "0.0.0"
 dependencies = [
- "engine",
+ "kyrodb-engine",
  "libfuzzer-sys",
 ]
 
@@ -1008,6 +974,40 @@ checksum = "1cfaf33c695fc6e08064efbc1f72ec937429614f25eef83af942d0e227c3a28f"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kyrodb-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "chrono",
+ "clap",
+ "crc32c",
+ "dashmap",
+ "futures",
+ "hex",
+ "libc",
+ "lru",
+ "memmap2",
+ "once_cell",
+ "prometheus",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "warp",
+ "xxhash-rust",
 ]
 
 [[package]]

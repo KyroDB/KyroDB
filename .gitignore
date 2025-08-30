@@ -127,3 +127,4 @@ bench_server.log
 # Local development
 .vscode/settings.json
 .idea/workspace.xml
+.github/copilot-instructions.md
