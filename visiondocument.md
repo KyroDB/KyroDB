@@ -242,10 +242,10 @@ graph TB
   OFFSET_ARRAY --> CHECKSUM
 
   subgraph "Lookup Algorithm Flow"
-    INPUT[Input Key<br/>u64] --> ROUTE[Router Lookup<br/>key >> (64-bits)]
+    INPUT[Input Key<br/>u64] --> ROUTE[Router Lookup<br/>key &gt;&gt; (64-bits)]
     ROUTE --> LEAF_SELECT[Select Leaf<br/>From router table]
     LEAF_SELECT --> PREDICT[Predict Position<br/>slope × key + intercept]
-    PREDICT --> CLAMP[Clamp to Bounds<br/>max(0, min(pred ± ε, leaf_end))]
+    PREDICT --> CLAMP[Clamp to Bounds<br/>max&#40;0, min&#40;pred &#177; &epsilon;, leaf_end&#41;&#41;]
     CLAMP --> PREFETCH[Prefetch Window<br/>OS page hints]
     PREFETCH --> PROBE{SIMD Probe<br/>AVX2/AVX512/NEON}
     
@@ -440,7 +440,7 @@ graph TB
   end
 
   subgraph "Latency Breakdown"
-    ROUTER_LOOKUP[Router Lookup<br/>O(1) hash]
+    ROUTER_LOOKUP[Router Lookup<br/>O&#40;1&#41; hash]
     MODEL_PREDICT[Model Prediction<br/>Fixed-point math]
     SIMD_PROBE[SIMD Probe<br/>Vectorized search]
     PAYLOAD_FETCH[Payload Fetch<br/>mmap access]
@@ -610,7 +610,7 @@ flowchart TD
   end
 
   subgraph "Read Path (Multi-Level)"
-    R1[GET /v1/get_fast/{key}] --> R2[Check Delta<br/>Recent writes]
+    R1[GET /v1/get_fast/&#123;key&#125;] --> R2[Check Delta<br/>Recent writes]
     R2 --> R3{Found in<br/>Delta?}
     R3 -->|Yes| R4[Return Value<br/>From memory]
     R3 -->|No| R5[RMI Lookup<br/>Learned index]
@@ -658,269 +658,3 @@ flowchart TD
   class B1,B2,B3,B4,B5,B6,B7,B8,B9 backgroundClass
   class C1,C2,C3,C4 consistencyClass
 ```
-
-## Deployment and Operations
-
-```mermaid
-graph TB
-  subgraph "Deployment Scenarios"
-    subgraph "Development"
-      DEV_LOCAL[Local Development<br/>Single node]
-      DEV_DOCKER[Docker Compose<br/>With dependencies]
-    end
-
-    subgraph "Staging"
-      STAGING[Kubernetes<br/>Single replica]
-      STAGING_LOAD[Load Testing<br/>Performance validation]
-    end
-
-    subgraph "Production"
-      PROD_K8S[Kubernetes<br/>StatefulSet]
-      PROD_VM[VM/Bare Metal<br/>Systemd service]
-      PROD_DOCKER[Docker Swarm<br/>Container orchestration]
-    end
-  end
-
-  subgraph "Operational Workflows"
-    subgraph "Day 0: Setup"
-      SETUP1[Deploy KyroDB<br/>Binary or container]
-      SETUP2[Configure Storage<br/>Disk sizing]
-      SETUP3[Set Environment<br/>Tuning knobs]
-      SETUP4[Initialize<br/>First snapshot]
-    end
-
-    subgraph "Day 1: Monitoring"
-      MONITOR1[Health Checks<br/>Readiness probes]
-      MONITOR2[Metrics Scraping<br/>Prometheus]
-      MONITOR3[Log Aggregation<br/>Structured logging]
-      MONITOR4[Alert Rules<br/>Performance thresholds]
-    end
-
-    subgraph "Day 2+: Maintenance"
-      MAINTAIN1[Backup Strategy<br/>Snapshot export]
-      MAINTAIN2[Index Optimization<br/>Rebuild tuning]
-      MAINTAIN3[Capacity Planning<br/>Growth monitoring]
-      MAINTAIN4[Upgrade Process<br/>Rolling updates]
-    end
-  end
-
-  subgraph "Configuration Hierarchy"
-    subgraph "Environment Variables"
-      ENV_WARM[KYRODB_WARM_ON_START]
-      ENV_LOG[KYRODB_DISABLE_HTTP_LOG]
-      ENV_RMI[RMI tuning knobs]
-      ENV_RATE[Rate limiting]
-    end
-
-    subgraph "Runtime API"
-      API_SNAPSHOT[POST /v1/snapshot]
-      API_REBUILD[POST /v1/rmi/build]
-      API_WARMUP[POST /v1/warmup]
-      API_METRICS[GET /metrics]
-    end
-
-    subgraph "Operational Tools"
-      TOOL_CLI[kyrodbctl CLI]
-      TOOL_K8S[Kubernetes operators]
-      TOOL_MONITOR[Monitoring dashboards]
-    end
-  end
-
-  DEV_LOCAL --> STAGING
-  DEV_DOCKER --> STAGING
-  STAGING --> PROD_K8S
-  STAGING --> PROD_VM
-  STAGING --> PROD_DOCKER
-
-  SETUP1 --> SETUP2
-  SETUP2 --> SETUP3
-  SETUP3 --> SETUP4
-
-  MONITOR1 --> MONITOR2
-  MONITOR2 --> MONITOR3
-  MONITOR3 --> MONITOR4
-
-  MAINTAIN1 --> MAINTAIN2
-  MAINTAIN2 --> MAINTAIN3
-  MAINTAIN3 --> MAINTAIN4
-
-  subgraph "Success Metrics"
-    M1[Production Deployments<br/>External users]
-    M2[Performance Benchmarks<br/>Published results]
-    M3[Research Citations<br/>Academic papers]
-    M4[Community Ecosystem<br/>Extensions + tools]
-  end
-
-  E1 --> M1
-  E2 --> M2
-  E3 --> M3
-  E4 --> M4
-
-  %% Styling
-  classDef devClass fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
-  classDef stagingClass fill:#e3f2fd,stroke:#0d47a1,stroke-width:2px
-  classDef prodClass fill:#fce4ec,stroke:#880e4f,stroke-width:2px
-  classDef setupClass fill:#fff3e0,stroke:#e65100,stroke-width:2px
-  classDef monitorClass fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-  classDef maintainClass fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-  classDef configClass fill:#fce4ec,stroke:#311b92,stroke-width:2px
-
-  class DEV_LOCAL,DEV_DOCKER devClass
-  class STAGING,STAGING_LOAD stagingClass
-  class PROD_K8S,PROD_VM,PROD_DOCKER prodClass
-  class SETUP1,SETUP2,SETUP3,SETUP4 setupClass
-  class MONITOR1,MONITOR2,MONITOR3,MONITOR4 monitorClass
-  class MAINTAIN1,MAINTAIN2,MAINTAIN3,MAINTAIN4 maintainClass
-  class ENV_WARM,ENV_LOG,ENV_RMI,ENV_RATE,API_SNAPSHOT,API_REBUILD,API_WARMUP,API_METRICS,TOOL_CLI,TOOL_K8S,TOOL_MONITOR configClass
-```
-
-**Operational Best Practices:**
-- **Health Checks**: Use `/health` endpoint for load balancer readiness
-- **Metrics**: Scrape `/metrics` every 15s for monitoring dashboards
-- **Backups**: Regular snapshot exports for disaster recovery
-- **Capacity**: Monitor disk usage and plan for 3x data growth
-- **Upgrades**: Test in staging before production deployment
-
----
-
-## Evolution Roadmap
-
-```mermaid
-timeline
-  title KyroDB Development Phases
-  section Phase A: Foundation (Current)
-    Core KV + RMI : Learned index with durability
-    Atomic snapshots : WAL + manifest consistency
-    HTTP v1 API : RESTful interface
-    Memory-mapped reads : Zero-copy payload access
-    Background compaction : WAL retention policies
-    Observability : Prometheus metrics + health checks
-    Testing : Fuzzing + failpoints + CI pipeline
-
-  section Phase B: Polish & Research (Next)
-    SIMD optimization : Runtime CPU feature detection
-    Router tuning : Dynamic bit width adaptation
-    Rebuild heuristics : Adaptive mispredict thresholds
-    Performance benchmarking : Published results + scripts
-    Documentation : Comprehensive operational guides
-    SDK ecosystem : Language bindings and examples
-
-  section Phase C: Primitives Expansion (Future)
-    Vector storage : ANN/HNSW behind trait interface
-    Hybrid queries : Text + vector + metadata filters
-    Model registry : Built-in model versioning
-    Provenance tracking : Data lineage and audit trails
-    RAG primitives : Retrieval-augmented generation support
-    Plugin architecture : Extensible storage backends
-
-  section Phase D: Autonomy & Governance (Advanced)
-    Self-tuning policies : Automatic parameter optimization
-    Workload adaptation : Learned index parameter tuning
-    Governance framework : Policy-driven data management
-    Audit compliance : Immutable logs + compliance reporting
-    Cost optimization : Intelligent resource allocation
-    Multi-tenant isolation : Namespace and quota management
-
-  section Phase E: Scale Out (Distributed)
-    Replication : Multi-node consensus
-    Sharding : Horizontal scalability
-    Distributed snapshots : Cross-node consistency
-    Load balancing : Request routing and failover
-    Global secondary indexes : Distributed learned indexes
-    Federation : Multi-cluster coordination
-```
-
-```mermaid
-graph TB
-  subgraph "Phase A: Foundation"
-    A1[Single Node KV<br/>WAL + Snapshots]
-    A2[Learned Index RMI<br/>Bounded search]
-    A3[HTTP API<br/>RESTful interface]
-    A4[Observability<br/>Metrics + health]
-  end
-
-  subgraph "Phase B: Polish"
-    B1[SIMD Optimization<br/>AVX2/AVX512/NEON]
-    B2[Adaptive Tuning<br/>Runtime knobs]
-    B3[Benchmark Suite<br/>Performance validation]
-    B4[Documentation<br/>Operational guides]
-  end
-
-  subgraph "Phase C: Primitives"
-    C1[Vector Storage<br/>ANN/HNSW backend]
-    C2[Hybrid Queries<br/>Multi-modal search]
-    C3[Provenance<br/>Data lineage]
-    C4[Plugin System<br/>Extensible backends]
-  end
-
-  subgraph "Phase D: Autonomy"
-    D1[Self-Tuning<br/>Policy engine]
-    D2[Governance<br/>Compliance framework]
-    D3[Audit Trails<br/>Immutable logs]
-    D4[Multi-Tenant<br/>Namespace isolation]
-  end
-
-  subgraph "Phase E: Scale"
-    E1[Replication<br/>Consensus protocol]
-    E2[Sharding<br/>Horizontal scaling]
-    E3[Distributed RMI<br/>Global indexes]
-    E4[Federation<br/>Multi-cluster]
-  end
-
-  A1 --> B1
-  A2 --> B2
-  A3 --> B3
-  A4 --> B4
-
-  B1 --> C1
-  B2 --> C2
-  B3 --> C3
-  B4 --> C4
-
-  C1 --> D1
-  C2 --> D2
-  C3 --> D3
-  C4 --> D4
-
-  D1 --> E1
-  D2 --> E2
-  D3 --> E3
-  D4 --> E4
-
-  subgraph "Success Metrics"
-    M1[Production Deployments<br/>External users]
-    M2[Performance Benchmarks<br/>Published results]
-    M3[Research Citations<br/>Academic papers]
-    M4[Community Ecosystem<br/>Extensions + tools]
-  end
-
-  E1 --> M1
-  E2 --> M2
-  E3 --> M3
-  E4 --> M4
-
-  %% Styling
-  classDef phaseAClass fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
-  classDef phaseBClass fill:#e3f2fd,stroke:#0d47a1,stroke-width:2px
-  classDef phaseCClass fill:#fff3e0,stroke:#e65100,stroke-width:2px
-  classDef phaseDClass fill:#fce4ec,stroke:#880e4f,stroke-width:2px
-  classDef phaseEClass fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-  classDef successClass fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-
-  class A1,A2,A3,A4 phaseAClass
-  class B1,B2,B3,B4 phaseBClass
-  class C1,C2,C3,C4 phaseCClass
-  class D1,D2,D3,D4 phaseDClass
-  class E1,E2,E3,E4 phaseEClass
-  class M1,M2,M3,M4 successClass
-```
-
-**Development Principles:**
-- **Incremental Progress**: Each phase builds upon the previous with clear success criteria
-- **Evidence-Based**: Performance benchmarks and research validation at each stage
-- **Operational Focus**: Production-ready features with monitoring and maintenance tools
-- **Community-Driven**: Open development with external contributions and feedback
-
-**Glossary**: RMI = Recursive Model Index; mmap= Memory Mapped; WAL = Write-Ahead Log; RAG = Retrieval-Augmented Generation.
-
-**Contact**: [kishanvats2003@gmail.com](mailto:kishanvats2003@gmail.com) | GitHub: @vatskishan03 and Twitter(kishanvats03)
