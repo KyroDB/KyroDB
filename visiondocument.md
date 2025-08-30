@@ -242,7 +242,7 @@ graph TB
   OFFSET_ARRAY --> CHECKSUM
 
   subgraph "Lookup Algorithm Flow"
-    INPUT[Input Key<br/>u64] --> ROUTE[Router Lookup<br/>key &gt;&gt; (64-bits)]
+    INPUT[Input Key<br/>u64] --> ROUTE[Router Lookup<br/>key >> (64 - bits)]
     ROUTE --> LEAF_SELECT[Select Leaf<br/>From router table]
     LEAF_SELECT --> PREDICT[Predict Position<br/>slope × key + intercept]
     PREDICT --> CLAMP[Clamp to Bounds<br/>max&#40;0, min&#40;pred &#177; &epsilon;, leaf_end&#41;&#41;]
@@ -517,11 +517,51 @@ Pillars:
 - Operational clarity: simple defaults, strong observability, safe rebuild/compaction.
 
 Milestones (phased, not calendar‑bound):
-- Phase A — Foundation: KV + RMI; atomic snapshots; mmap payload index; HTTP v1; bench harness; CI with fuzz and failpoints.
-- Phase B — Polish & research: SIMD/runtime dispatch, router tuning, rebuild heuristics; publish evaluation and scripts.
-- Phase C — Primitives expansion: vector storage + ANN behind a trait; filters; SDKs; canonical RAG demo.
-- Phase D — Autonomy & governance: self‑tuning policies; model registry integration; lineage/audit features.
-- Phase E — Scale out: replication, sharding; consensus‑backed metadata; WAL replication.
+
+```mermaid
+timeline
+  title KyroDB Development Phases
+  section Phase A: Foundation (Current)
+    Core KV + RMI : Learned index with durability
+    Atomic snapshots : WAL + manifest consistency
+    HTTP v1 API : RESTful interface
+    Memory-mapped reads : Zero-copy payload access
+    Background compaction : WAL retention policies
+    Observability : Prometheus metrics + health checks
+    Testing : Fuzzing + failpoints + CI pipeline
+
+  section Phase B: Polish & Research (Next)
+    SIMD optimization : Runtime CPU feature detection
+    Router tuning : Dynamic bit width adaptation
+    Rebuild heuristics : Adaptive mispredict thresholds
+    Performance benchmarking : Published results + scripts
+    Documentation : Comprehensive operational guides
+    SDK ecosystem : Language bindings and examples
+
+  section Phase C: Primitives Expansion (Future)
+    Vector storage : ANN/HNSW behind trait interface
+    Hybrid queries : Text + vector + metadata filters
+    Model registry : Built-in model versioning
+    Provenance tracking : Data lineage and audit trails
+    RAG primitives : Retrieval-augmented generation support
+    Plugin architecture : Extensible storage backends
+
+  section Phase D: Autonomy & Governance (Advanced)
+    Self-tuning policies : Automatic parameter optimization
+    Workload adaptation : Learned index parameter tuning
+    Governance framework : Policy-driven data management
+    Audit compliance : Immutable logs + compliance reporting
+    Cost optimization : Intelligent resource allocation
+    Multi-tenant isolation : Namespace and quota management
+
+  section Phase E: Scale Out (Distributed)
+    Replication : Multi-node consensus
+    Sharding : Horizontal scalability
+    Distributed snapshots : Cross-node consistency
+    Load balancing : Request routing and failover
+    Global secondary indexes : Distributed learned indexes
+    Federation : Multi-cluster coordination
+```
 
 Each phase ships measurable artifacts (code, docs, data, plots) and success criteria.
 
