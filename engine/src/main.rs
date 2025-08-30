@@ -153,6 +153,15 @@ enum Commands {
         /// Optional gRPC bind address (e.g., 0.0.0.0:50051). If set, start gRPC data-plane.
         #[arg(long)]
         grpc_addr: Option<String>,
+        /// TLS certificate file path (enables HTTPS)
+        #[arg(long)]
+        tls_cert: Option<String>,
+        /// TLS private key file path (enables HTTPS)
+        #[arg(long)]
+        tls_key: Option<String>,
+        /// Admin token for privileged operations (separate from auth_token for read/write)
+        #[arg(long)]
+        admin_token: Option<String>,
     },
 }
 
@@ -200,6 +209,9 @@ async fn main() -> Result<()> {
             compact_interval_secs,
             compact_when_wal_bytes,
             grpc_addr,
+            tls_cert,
+            tls_key,
+            admin_token,
         } => {
             // Silence unused when learned-index feature is disabled
             #[cfg(not(feature = "learned-index"))]
@@ -694,6 +706,54 @@ async fn main() -> Result<()> {
             #[derive(Debug)]
             struct Unauthorized;
             impl warp::reject::Reject for Unauthorized {}
+
+            // Role-based access control
+            #[derive(Debug, Clone, PartialEq)]
+            enum UserRole {
+                Admin,
+                ReadWrite,
+                ReadOnly,
+            }
+
+            #[derive(Debug)]
+            struct InsufficientPermissions;
+            impl warp::reject::Reject for InsufficientPermissions {}
+
+            let auth_with_role = {
+                let token_opt = auth_token.clone();
+                let admin_token_opt = admin_token.clone();
+                warp::any()
+                    .and(warp::header::optional::<String>("authorization"))
+                    .and_then(move |hdr: Option<String>| {
+                        let token_opt = token_opt.clone();
+                        let admin_token_opt = admin_token_opt.clone();
+                        async move {
+                            let role = if let Some(expected) = &admin_token_opt {
+                                if hdr.as_deref() == Some(&format!("Bearer {}", expected)) {
+                                    UserRole::Admin
+                                } else if let Some(expected_rw) = &token_opt {
+                                    if hdr.as_deref() == Some(&format!("Bearer {}", expected_rw)) {
+                                        UserRole::ReadWrite
+                                    } else {
+                                        return Err(warp::reject::custom(Unauthorized));
+                                    }
+                                } else {
+                                    UserRole::ReadOnly
+                                }
+                            } else if let Some(expected) = &token_opt {
+                                if hdr.as_deref() == Some(&format!("Bearer {}", expected)) {
+                                    UserRole::ReadWrite
+                                } else {
+                                    return Err(warp::reject::custom(Unauthorized));
+                                }
+                            } else {
+                                UserRole::ReadOnly
+                            };
+                            Ok::<UserRole, warp::Rejection>(role)
+                        }
+                    })
+            };
+
             let auth = {
                 let token_opt = auth_token.clone();
                 warp::any()
@@ -853,27 +913,6 @@ async fn main() -> Result<()> {
                     })
             };
 
-            // Apply auth to protected routes
-            let append_route = auth.clone().and(append_route).map(|(), r| r);
-            let replay_route = auth.clone().and(replay_route).map(|(), r| r);
-            let subscribe_route = auth.clone().and(subscribe_route).map(|(), r| r);
-            let snapshot_route = auth.clone().and(snapshot_route).map(|(), r| r);
-            let offset_route = auth.clone().and(offset_route).map(|(), r| r);
-            let put_route = auth.clone().and(put_route).map(|(), r| r);
-            let lookup_route = auth.clone().and(lookup_route).map(|(), r| r);
-            // For hot-path routes, bypass auth entirely when no token is configured
-            let mut lookup_raw = lookup_raw.boxed();
-            let mut lookup_fast = lookup_fast.boxed();
-            let mut get_fast = get_fast.boxed();
-            if auth_token.is_some() {
-                lookup_raw = auth.clone().and(lookup_raw).map(|(), r| r).boxed();
-                lookup_fast = auth.clone().and(lookup_fast).map(|(), r| r).boxed();
-                get_fast = auth.clone().and(get_fast).map(|(), r| r).boxed();
-            }
-            let sql_route = auth.clone().and(sql_route).map(|(), r| r);
-            let vector_insert = auth.clone().and(vector_insert).map(|(), r| r);
-            let rmi_build = auth.clone().and(rmi_build).map(|(), r| r);
-
             // --- Attach rate limits ------------------------------------------------------
             // Admin RL for sensitive operations
             let snapshot_route = admin_rl.clone().and(snapshot_route).map(|(), r| r);
@@ -912,10 +951,20 @@ async fn main() -> Result<()> {
                 .or(warp::path("build_info").and(warp::get()).map({
                     let commit = build_commit;
                     let features = build_features;
+                    let branch = option_env!("GIT_BRANCH").unwrap_or("unknown");
+                    let build_time = option_env!("BUILD_TIME").unwrap_or("unknown");
+                    let rust_version = option_env!("RUST_VERSION").unwrap_or("unknown");
+                    let target_triple = option_env!("TARGET_TRIPLE").unwrap_or("unknown");
                     move || {
                         warp::reply::json(&serde_json::json!({
                             "commit": commit,
+                            "branch": branch,
+                            "build_time": build_time,
+                            "rust_version": rust_version,
+                            "target_triple": target_triple,
                             "features": features,
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "name": env!("CARGO_PKG_NAME"),
                         }))
                     }
                 }))
@@ -925,6 +974,11 @@ async fn main() -> Result<()> {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(
                             warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
                             StatusCode::UNAUTHORIZED,
+                        ))
+                    } else if rej.find::<InsufficientPermissions>().is_some() {
+                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"insufficient_permissions"})),
+                            StatusCode::FORBIDDEN,
                         ))
                     } else if rej.find::<AdminRateLimited>().is_some() || rej.find::<DataRateLimited>().is_some() {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(
@@ -958,6 +1012,7 @@ async fn main() -> Result<()> {
             }));
 
             // start server
+            let addr = (host.parse::<std::net::IpAddr>()?, port);
             tracing::info!(
                 "Starting kyrodb-engine on {}:{} (commit={}, features={})",
                 host,
@@ -965,7 +1020,7 @@ async fn main() -> Result<()> {
                 build_commit,
                 build_features
             );
-            
+
             println!(
                 "🚀 Starting server at http://{}:{} (commit={}, features={})",
                 host,
@@ -973,8 +1028,9 @@ async fn main() -> Result<()> {
                 build_commit,
                 build_features
             );
+
             warp::serve(routes)
-                .run((host.parse::<std::net::IpAddr>()?, port))
+                .run(addr)
                 .await;
         }
     }

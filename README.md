@@ -43,9 +43,16 @@ KyroDB is a durable, append-only key-value engine with a production-grade learne
 git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
-# Build and run
+# Build and run (basic)
 cargo build -p kyrodb-engine --release
 ./target/release/kyrodb-engine serve 127.0.0.1 3030
+
+# Run with TLS and authentication
+./target/release/kyrodb-engine serve 127.0.0.1 3030 \
+  --tls-cert cert.pem \
+  --tls-key key.pem \
+  --auth-token "rw-token-123" \
+  --admin-token "admin-token-456"
 ```
 
 ### Basic Operations
@@ -168,17 +175,42 @@ GET /metrics
 GET /health → {"status": "ok"}
 
 # Build information
-GET /build_info → {"commit": "abc123", "features": ["learned-index"]}
+GET /build_info → {
+  "commit": "abc123",
+  "branch": "main", 
+  "build_time": "2024-01-15T10:30:00Z",
+  "rust_version": "rustc 1.75.0",
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "features": ["learned-index", "grpc"],
+  "version": "0.1.0",
+  "name": "kyrodb-engine"
+}
 ```
 
 ### Authentication
 ```bash
-# Enable with environment variable
-export KYRODB_AUTH_TOKEN="your-secret-token"
+# Enable with role-based access control
+export KYRODB_AUTH_TOKEN="rw-token-123"      # Read/write access
+export KYRODB_ADMIN_TOKEN="admin-token-456"  # Admin access
 
 # Use in requests
-curl -H "Authorization: Bearer your-secret-token" \
-  http://127.0.0.1:3030/v1/put -d '{"key":1,"value":"secret"}'
+curl -H "Authorization: Bearer rw-token-123" \
+  http://127.0.0.1:3030/v1/put -d '{"key":1,"value":"data"}'
+
+# Admin operations require admin token
+curl -H "Authorization: Bearer admin-token-456" \
+  -X POST http://127.0.0.1:3030/v1/snapshot
+```
+
+### TLS/HTTPS
+```bash
+# Generate certificates
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+
+# Run with HTTPS
+./target/release/kyrodb-engine serve 127.0.0.1 3030 \
+  --tls-cert cert.pem \
+  --tls-key key.pem
 ```
 
 ---
@@ -190,6 +222,13 @@ curl -H "Authorization: Bearer your-secret-token" \
 # Core settings
 KYRODB_PORT=3030
 KYRODB_DATA_DIR=./data
+
+# Security
+KYRODB_AUTH_TOKEN=rw-token-123     # Read/write operations
+KYRODB_ADMIN_TOKEN=admin-token-456 # Admin operations
+# TLS certificates (optional, enables HTTPS)
+KYRODB_TLS_CERT=/path/to/cert.pem
+KYRODB_TLS_KEY=/path/to/key.pem
 
 # Performance tuning
 KYRODB_WARM_ON_START=1          # Preload indexes on startup

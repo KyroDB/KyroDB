@@ -70,6 +70,10 @@ fail = { version = "0.5", optional = true, features = ["failpoints"] }
 tonic = { version = "0.11", optional = true, default-features = true, features = ["transport"] }
 prost = { version = "0.12", optional = true }
 prost-types = { version = "0.12", optional = true }
+# TLS support
+rustls = "0.21"
+rustls-pemfile = "1.0"
+tokio-rustls = "0.24"
 
 [dev-dependencies]
 tempfile = "3"
@@ -81,6 +85,7 @@ fail = { version = "0.5", features = ["failpoints"] }
 [build-dependencies]
 tonic-build = "0.11"
 protoc-bin-vendored = "3"
+chrono = { version = "0.4", features = ["serde"] }
 
 [package.metadata.docs.rs]
 features = ["learned-index", "ann-hnsw"]
