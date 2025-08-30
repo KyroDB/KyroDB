@@ -1004,7 +1004,7 @@ impl RmiIndex {
             let mut i = 0usize;
             let target = core::arch::x86_64::_mm512_set1_epi64(key as i64);
             while i + 8 <= len {
-                let idx0 = ((lo + i + 0) * stride) as i64;
+                let idx0 = ((lo + i) * stride) as i64;
                 let idx1 = ((lo + i + 1) * stride) as i64;
                 let idx2 = ((lo + i + 2) * stride) as i64;
                 let idx3 = ((lo + i + 3) * stride) as i64;
@@ -1146,7 +1146,7 @@ impl RmiIndex {
                 let v = core::arch::x86_64::_mm256_loadu_si256(ptr);
                 let cmp = core::arch::x86_64::_mm256_cmpeq_epi64(v, target);
                 let mask = core::arch::x86_64::_mm256_movemask_pd(core::mem::transmute::<
-                    _,
+                    core::arch::x86_64::__m256i,
                     core::arch::x86_64::__m256d,
                 >(cmp));
                 if mask != 0 {
@@ -1165,7 +1165,7 @@ impl RmiIndex {
                 let v = core::arch::x86_64::_mm256_loadu_si256(ptr);
                 let cmp = core::arch::x86_64::_mm256_cmpeq_epi64(v, target);
                 let mask = core::arch::x86_64::_mm256_movemask_pd(core::mem::transmute::<
-                    _,
+                    core::arch::x86_64::__m256i,
                     core::arch::x86_64::__m256d,
                 >(cmp));
                 if mask != 0 {
@@ -1194,7 +1194,7 @@ impl RmiIndex {
             let target = core::arch::x86_64::_mm256_set1_epi64x(key as i64);
             while i + 4 <= len {
                 // byte offsets for gather
-                let idx0 = ((lo + i + 0) * stride) as i64;
+                let idx0 = ((lo + i) * stride) as i64;
                 let idx1 = ((lo + i + 1) * stride) as i64;
                 let idx2 = ((lo + i + 2) * stride) as i64;
                 let idx3 = ((lo + i + 3) * stride) as i64;
@@ -1203,7 +1203,7 @@ impl RmiIndex {
                     core::arch::x86_64::_mm256_i64gather_epi64(base as *const i64, idx_vec, 1);
                 let cmp = core::arch::x86_64::_mm256_cmpeq_epi64(gathered, target);
                 let mask = core::arch::x86_64::_mm256_movemask_pd(core::mem::transmute::<
-                    _,
+                    core::arch::x86_64::__m256i,
                     core::arch::x86_64::__m256d,
                 >(cmp));
                 if mask != 0 {
