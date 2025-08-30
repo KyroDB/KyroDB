@@ -439,8 +439,8 @@ graph TB
   end
 
   subgraph "Latency Breakdown"
-    ROUTER_LOOKUP[Router Lookup<br/>O(1) hash]
-    MODEL_PREDICT[Model Prediction<br/>Fixed-point math]
+    ROUTER_LOOKUP["Router Lookup<br/>O(1) hash"]
+    MODEL_PREDICT["Model Prediction<br/>Fixed-point math"]
     SIMD_PROBE[SIMD Probe<br/>Vectorized search]
     PAYLOAD_FETCH[Payload Fetch<br/>mmap access]
     CACHE_LOOKUP[Cache Lookup<br/>Hash table]
