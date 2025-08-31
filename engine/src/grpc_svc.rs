@@ -39,6 +39,7 @@ pub struct GrpcService {
 
 #[cfg(feature = "grpc")]
 impl GrpcService {
+    #[allow(dead_code)]
     pub fn new(log: Arc<PersistentEventLog>) -> Self {
         Self {
             log,
@@ -59,6 +60,7 @@ impl GrpcService {
         }
     }
 
+    #[allow(dead_code)]
     pub fn into_server(self) -> KyrodbServer<Self> {
         KyrodbServer::new(self)
     }

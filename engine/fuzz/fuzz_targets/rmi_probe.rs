@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
         use kyrodb_engine::index::RmiIndex;
         
         // Parse fuzz input for different test scenarios
-        let scenario = data[0] % 8; // 8 different scenarios
+        let scenario = data[0] % 10; // 10 different scenarios
         let config_byte = data[1];
         
         // Extract parameters from fuzz data
@@ -111,6 +111,55 @@ fuzz_target!(|data: &[u8]| {
                         if i % 2 == 0 { base } else { u64::MAX - base }
                     })
                     .collect()
+            },
+            7 => {
+                // Skewed keys (power-law distribution)
+                data.chunks_exact(8)
+                    .take(key_count)
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(c);
+                        let base = u64::from_le_bytes(b);
+                        // Create power-law distribution with some keys very frequent
+                        if i < key_count / 10 {
+                            base % 1000 // Hot keys
+                        } else {
+                            base
+                        }
+                    })
+                    .collect()
+            },
+            8 => {
+                // ε-bounds edge cases (keys near ε boundaries)
+                let epsilon = 100; // Simulate ε value
+                data.chunks_exact(8)
+                    .take(key_count)
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(c);
+                        let base = u64::from_le_bytes(b);
+                        // Place keys near ε boundaries
+                        (base / epsilon) * epsilon + (i % epsilon)
+                    })
+                    .collect()
+            },
+            9 => {
+                // Extreme ε-bounds failures (keys far from training data)
+                let mut keys = Vec::new();
+                // Add some normal keys
+                for chunk in data.chunks_exact(8).take(key_count / 2) {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(chunk);
+                    keys.push(u64::from_le_bytes(b));
+                }
+                // Add keys that are ε-bounds failures
+                let max_normal = keys.iter().max().unwrap_or(&1000);
+                for i in 0..key_count / 2 {
+                    keys.push(max_normal + 1000000 + i as u64); // Far outside ε bounds
+                }
+                keys
             },
             _ => {
                 // Default: sorted fuzz keys

@@ -432,7 +432,7 @@ async fn main() -> Result<()> {
                 );
 
                 // TLS configuration for gRPC
-                let server = if let (Some(cert_path), Some(key_path)) = (&_tls_cert, &_tls_key) {
+                let server = if let (Some(_cert_path), Some(_key_path)) = (&_tls_cert, &_tls_key) {
                     #[cfg(feature = "tls")]
                     {
                         use std::fs;
