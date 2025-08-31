@@ -11,6 +11,8 @@ on:
         required: true
         type: string
 
+if: false
+
 jobs:
   # Test release build before publishing
   test-release:

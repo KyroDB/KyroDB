@@ -359,6 +359,8 @@ async fn main() -> Result<()> {
                             let rebuild_timer =
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
+                            // Track rebuild stall
+                            engine_crate::metrics::RMI_REBUILD_STALLS_TOTAL.inc();
                             // Write index on blocking thread
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();
@@ -845,6 +847,8 @@ async fn main() -> Result<()> {
                             let timer =
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
+                            // Track rebuild stall
+                            engine_crate::metrics::RMI_REBUILD_STALLS_TOTAL.inc();
                             // Write index on a blocking thread to avoid starving the reactor
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();

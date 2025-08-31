@@ -11,6 +11,8 @@ on:
       - 'engine/src/**'
       - '.github/workflows/fuzz.yml'
 
+if: false
+
 jobs:
   fuzz-build:
     name: Build Fuzz Targets

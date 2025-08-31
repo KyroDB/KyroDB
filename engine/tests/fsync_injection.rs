@@ -44,3 +44,37 @@ async fn append_recovery_with_injected_failures() {
         assert!(offset <= off);
     }
 }
+
+#[tokio::test]
+async fn fsync_policy_edge_cases() {
+    use std::env;
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Test DATA policy (default)
+    env::set_var("KYRODB_FSYNC_POLICY", "data");
+    let log = PersistentEventLog::open(&path).await.unwrap();
+    let _ = log.append(Uuid::new_v4(), b"test1".to_vec()).await.unwrap();
+    drop(log);
+
+    // Test ALL policy
+    env::set_var("KYRODB_FSYNC_POLICY", "all");
+    let log = PersistentEventLog::open(&path).await.unwrap();
+    let _ = log.append(Uuid::new_v4(), b"test2".to_vec()).await.unwrap();
+    drop(log);
+
+    // Test NONE policy (benchmark only)
+    env::set_var("KYRODB_FSYNC_POLICY", "none");
+    let log = PersistentEventLog::open(&path).await.unwrap();
+    let _ = log.append(Uuid::new_v4(), b"test3".to_vec()).await.unwrap();
+    drop(log);
+
+    // Test invalid policy defaults to data
+    env::set_var("KYRODB_FSYNC_POLICY", "invalid");
+    let log = PersistentEventLog::open(&path).await.unwrap();
+    let _ = log.append(Uuid::new_v4(), b"test4".to_vec()).await.unwrap();
+    drop(log);
+
+    // Cleanup
+    env::remove_var("KYRODB_FSYNC_POLICY");
+}

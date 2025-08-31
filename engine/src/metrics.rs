@@ -54,6 +54,7 @@ mod shim {
     pub static BTREE_READS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static LOOKUP_FALLBACK_SCAN_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static RMI_REBUILD_IN_PROGRESS: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static RMI_REBUILD_STALLS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub fn inc_sse_lagged() {}
     pub fn render() -> String {
         String::new()
@@ -318,6 +319,16 @@ pub static RMI_REBUILD_IN_PROGRESS: Lazy<Gauge> = Lazy::new(|| {
         "Gauge set to 1.0 while a background RMI rebuild is running"
     )
     .expect("register kyrodb_rmi_rebuild_in_progress")
+});
+
+// New: RMI rebuild stalls
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_REBUILD_STALLS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_rmi_rebuild_stalls_total",
+        "Total number of stalls during RMI rebuild"
+    )
+    .expect("register kyrodb_rmi_rebuild_stalls_total")
 });
 
 #[cfg(not(feature = "bench-no-metrics"))]

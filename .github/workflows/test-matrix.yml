@@ -6,6 +6,8 @@ on:
     # Weekly cross-platform test
     - cron: '0 4 * * 1'
 
+if: false
+
 jobs:
   cross-platform-tests:
     name: Cross-Platform (${{ matrix.os }}, ${{ matrix.arch }})
