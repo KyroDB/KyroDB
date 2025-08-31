@@ -1006,4 +1006,14 @@ impl PersistentEventLog {
         // Fallback if ANN disabled or not built
         self.search_vector_l2(query, k).await
     }
+
+    /// Get data directory path (for internal use)
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    /// Get current WAL segments (for internal use)
+    pub fn get_wal_segments(&self) -> Vec<String> {
+        self.current_wal_segments()
+    }
 }

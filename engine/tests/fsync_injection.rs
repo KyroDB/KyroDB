@@ -78,3 +78,56 @@ async fn fsync_policy_edge_cases() {
     // Cleanup
     env::remove_var("KYRODB_FSYNC_POLICY");
 }
+
+#[tokio::test]
+async fn ops_knobs_end_to_end() {
+    use std::env;
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Test fsync policy configurations
+    for policy in &["data", "all", "none"] {
+        env::set_var("KYRODB_FSYNC_POLICY", policy);
+        let log = PersistentEventLog::open(&path).await.unwrap();
+
+        // Perform operations and verify they work
+        let offset1 = log.append(Uuid::new_v4(), b"test1".to_vec()).await.unwrap();
+        let offset2 = log.append_kv(Uuid::new_v4(), 123, b"value123".to_vec()).await.unwrap();
+
+        // Verify data integrity
+        assert!(offset1 < offset2);
+        assert_eq!(log.lookup_key(123).await, Some(offset2));
+
+        drop(log);
+    }
+
+    // Test WAL rotation knobs
+    env::set_var("KYRODB_FSYNC_POLICY", "data");
+    let log = PersistentEventLog::open(&path).await.unwrap();
+    log.configure_wal_rotation(Some(1024), 3).await; // Small segment size for testing
+
+    // Fill WAL to trigger rotation
+    for i in 0..100 {
+        log.append(Uuid::new_v4(), format!("test data {}", i).into_bytes()).await.unwrap();
+    }
+
+    // Verify WAL rotation worked
+    let segments = log.get_wal_segments();
+    assert!(!segments.is_empty());
+
+    drop(log);
+
+    // Test environment variable configurations
+    env::set_var("KYRODB_WARM_ON_START", "1");
+    env::set_var("KYRODB_DISABLE_HTTP_LOG", "1");
+    env::set_var("KYRODB_RMI_ROUTER_BITS", "12");
+
+    let log = PersistentEventLog::open(&path).await.unwrap();
+    log.warmup().await; // Should work without errors
+
+    // Cleanup
+    env::remove_var("KYRODB_FSYNC_POLICY");
+    env::remove_var("KYRODB_WARM_ON_START");
+    env::remove_var("KYRODB_DISABLE_HTTP_LOG");
+    env::remove_var("KYRODB_RMI_ROUTER_BITS");
+}

@@ -9,6 +9,8 @@ use uuid::Uuid;
 use warp::Filter;
 #[cfg(feature = "grpc")]
 mod grpc_svc;
+#[cfg(feature = "grpc")]
+use grpc_svc::pb::kyrodb_server::KyrodbServer;
 mod sql;
 
 // --- Rate limiting (simple token-bucket per client IP) -----------------------
@@ -423,11 +425,40 @@ async fn main() -> Result<()> {
             #[cfg(feature = "grpc")]
             if let Some(addr_str) = grpc_addr.clone() {
                 let addr: std::net::SocketAddr = addr_str.parse().expect("invalid --grpc-addr");
-                let svc = grpc_svc::GrpcService::new(log.clone());
+                let svc = grpc_svc::GrpcService::new_with_auth(
+                    log.clone(),
+                    auth_token.clone(),
+                    admin_token.clone()
+                );
+
+                // TLS configuration for gRPC
+                let server = if let (Some(cert_path), Some(key_path)) = (&_tls_cert, &_tls_key) {
+                    #[cfg(feature = "tls")]
+                    {
+                        use std::fs;
+                        use tonic::transport::{Identity, ServerTlsConfig};
+
+                        let cert = fs::read(cert_path).expect("Failed to read TLS certificate");
+                        let key = fs::read(key_path).expect("Failed to read TLS private key");
+                        let identity = Identity::from_pem(cert, key);
+
+                        KyrodbServer::new(svc)
+                            .tls_config(ServerTlsConfig::new().identity(identity))
+                            .expect("Failed to configure TLS")
+                    }
+                    #[cfg(not(feature = "tls"))]
+                    {
+                        eprintln!("⚠️ TLS requested but tonic built without TLS support");
+                        KyrodbServer::new(svc)
+                    }
+                } else {
+                    KyrodbServer::new(svc)
+                };
+
                 tokio::spawn(async move {
-                    println!("📡 gRPC serving on {}", addr);
+                    println!("📡 gRPC serving on {} (TLS: {})", addr, _tls_cert.is_some());
                     tonic::transport::Server::builder()
-                        .add_service(svc.into_server())
+                        .add_service(server)
                         .serve(addr)
                         .await
                         .expect("gRPC server failed");
