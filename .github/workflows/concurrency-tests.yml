@@ -11,8 +11,6 @@ on:
       - 'engine/tests/**'
       - '.github/workflows/concurrency-tests.yml'
 
-if: false
-
 jobs:
   loom-setup:
     name: Setup Loom Environment
