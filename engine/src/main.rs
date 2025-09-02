@@ -362,7 +362,7 @@ async fn main() -> Result<()> {
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
                             // Track rebuild stall
-                            engine_crate::metrics::RMI_REBUILD_STALLS_TOTAL.inc();
+                            engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                             // Write index on blocking thread
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();
@@ -428,23 +428,15 @@ async fn main() -> Result<()> {
                 let svc = grpc_svc::GrpcService::new_with_auth(
                     log.clone(),
                     auth_token.clone(),
-                    admin_token.clone()
+                    admin_token.clone(),
                 );
 
                 // TLS configuration for gRPC
                 let server = if let (Some(_cert_path), Some(_key_path)) = (&_tls_cert, &_tls_key) {
                     #[cfg(feature = "tls")]
                     {
-                        use std::fs;
-                        use tonic::transport::{Identity, ServerTlsConfig};
-
-                        let cert = fs::read(cert_path).expect("Failed to read TLS certificate");
-                        let key = fs::read(key_path).expect("Failed to read TLS private key");
-                        let identity = Identity::from_pem(cert, key);
-
-                        KyrodbServer::new(svc)
-                            .tls_config(ServerTlsConfig::new().identity(identity))
-                            .expect("Failed to configure TLS")
+                        // TLS is not currently supported in this build
+                        panic!("TLS feature is enabled but not properly implemented for current tonic version");
                     }
                     #[cfg(not(feature = "tls"))]
                     {
@@ -879,7 +871,7 @@ async fn main() -> Result<()> {
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
                             // Track rebuild stall
-                            engine_crate::metrics::RMI_REBUILD_STALLS_TOTAL.inc();
+                            engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                             // Write index on a blocking thread to avoid starving the reactor
                             let pairs_clone = pairs.clone();
                             let tmp_clone = tmp.clone();

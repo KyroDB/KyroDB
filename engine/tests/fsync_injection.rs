@@ -92,7 +92,10 @@ async fn ops_knobs_end_to_end() {
 
         // Perform operations and verify they work
         let offset1 = log.append(Uuid::new_v4(), b"test1".to_vec()).await.unwrap();
-        let offset2 = log.append_kv(Uuid::new_v4(), 123, b"value123".to_vec()).await.unwrap();
+        let offset2 = log
+            .append_kv(Uuid::new_v4(), 123, b"value123".to_vec())
+            .await
+            .unwrap();
 
         // Verify data integrity
         assert!(offset1 < offset2);
@@ -108,7 +111,9 @@ async fn ops_knobs_end_to_end() {
 
     // Fill WAL to trigger rotation
     for i in 0..100 {
-        log.append(Uuid::new_v4(), format!("test data {}", i).into_bytes()).await.unwrap();
+        log.append(Uuid::new_v4(), format!("test data {}", i).into_bytes())
+            .await
+            .unwrap();
     }
 
     // Verify WAL rotation worked

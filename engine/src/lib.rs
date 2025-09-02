@@ -3,6 +3,8 @@
 use anyhow::{Context, Result};
 use bincode::Options;
 use chrono::Utc;
+#[cfg(feature = "ann-hnsw")]
+use hora::core::ann_index::ANNIndex;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -854,7 +856,7 @@ impl PersistentEventLog {
         }
         // rotate
         #[cfg(feature = "failpoints")]
-        fail::fail_point!("wal_before_rotate", |_| { () });
+        fail::fail_point!("wal_before_rotate", |_| {});
         let mut w = self.wal.write().await;
         let mut seg_idx = self.wal_seg_index.write().await;
         let next_idx = seg_idx.saturating_add(1);
@@ -866,10 +868,10 @@ impl PersistentEventLog {
             .open(&next_path)
         {
             #[cfg(feature = "failpoints")]
-            fail::fail_point!("wal_after_open_new_before_switch", |_| { () });
+            fail::fail_point!("wal_after_open_new_before_switch", |_| {});
             *w = BufWriter::new(new_file);
             #[cfg(feature = "failpoints")]
-            fail::fail_point!("wal_after_switch_before_dirsync", |_| { () });
+            fail::fail_point!("wal_after_switch_before_dirsync", |_| {});
             *seg_idx = next_idx;
             if let Err(e) = fsync_dir(&self.data_dir) {
                 eprintln!("⚠️ fsync data dir after wal rotate failed: {}", e);
@@ -877,9 +879,9 @@ impl PersistentEventLog {
             drop(w);
             drop(seg_idx);
             #[cfg(feature = "failpoints")]
-            fail::fail_point!("wal_after_rotate_before_retention", |_| { () });
+            fail::fail_point!("wal_after_rotate_before_retention", |_| {});
             #[cfg(feature = "failpoints")]
-            fail::fail_point!("wal_before_retention", |_| { () });
+            fail::fail_point!("wal_before_retention", |_| {});
             // retention
             let max_keep = *self.wal_max_segments.read().await;
             if max_keep > 0 {
@@ -897,7 +899,7 @@ impl PersistentEventLog {
                 }
             }
             #[cfg(feature = "failpoints")]
-            fail::fail_point!("wal_after_retention_before_manifest", |_| { () });
+            fail::fail_point!("wal_after_retention_before_manifest", |_| {});
             if let Err(e) = self.write_manifest().await {
                 eprintln!("⚠️ manifest write after rotation failed: {}", e);
             }
@@ -998,9 +1000,9 @@ impl PersistentEventLog {
         #[cfg(feature = "ann-hnsw")]
         {
             if let Some(idx) = self.ann.read().await.as_ref() {
-                // hora returns (key, distance), we map to desired tuple
+                // hora's search returns Vec<u64> (just the IDs), we need to add dummy distances
                 let res = idx.search(query, k);
-                return res.into_iter().map(|(k, d)| (k, d)).collect();
+                return res.into_iter().map(|id| (id, 0.0)).collect();
             }
         }
         // Fallback if ANN disabled or not built

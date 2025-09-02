@@ -19,7 +19,7 @@ mod crash_recovery_tests {
             crash_point in 0..50usize
         ) {
             let rt = Runtime::new().unwrap();
-            rt.block_on(async {
+            let _ = rt.block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let data_dir = temp_dir.path();
 
@@ -87,7 +87,7 @@ mod crash_recovery_tests {
             snapshot_points in prop::collection::vec(1..30usize, 1..5)
         ) {
             let rt = Runtime::new().unwrap();
-            rt.block_on(async {
+            let _ = rt.block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let data_dir = temp_dir.path();
 
@@ -158,7 +158,7 @@ mod crash_recovery_tests {
             compact_after in 5..50usize
         ) {
             let rt = Runtime::new().unwrap();
-            rt.block_on(async {
+            let _ = rt.block_on(async {
                 let temp_dir = TempDir::new().unwrap();
                 let data_dir = temp_dir.path();
 
@@ -275,8 +275,12 @@ mod crash_recovery_tests {
             Ok(log) => {
                 // If recovery succeeds, verify we can still read existing data
                 let recovered_offset = log.get_offset().await;
-                assert!(recovered_offset <= original_offset,
-                    "Recovered offset {} should not exceed original {}", recovered_offset, original_offset);
+                assert!(
+                    recovered_offset <= original_offset,
+                    "Recovered offset {} should not exceed original {}",
+                    recovered_offset,
+                    original_offset
+                );
             }
             Err(_) => {
                 // Corruption detected - this is acceptable behavior
@@ -302,7 +306,7 @@ mod crash_recovery_tests {
 
         // Take a good snapshot first
         log.snapshot().await.unwrap();
-        let snapshot_offset = log.get_offset().await;
+        let _snapshot_offset = log.get_offset().await;
 
         // Add more data
         for i in 100..200 {
@@ -325,7 +329,8 @@ mod crash_recovery_tests {
                 format!("data {}", i)
             } else {
                 format!("more data {}", i)
-            }.into_bytes();
+            }
+            .into_bytes();
 
             let record = recovered_log.get(i as u64).await.unwrap();
             assert_eq!(record, expected_payload, "Record {} mismatch", i);
