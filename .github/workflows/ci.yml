@@ -37,8 +37,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Debug matrix values
+        run: |
+          echo "OS: ${{ matrix.os }}"
+          echo "Toolchain: ${{ matrix.toolchain }}"
+          echo "Features: ${{ matrix.features }}"
+
       - name: Setup Rust toolchain (${{ matrix.toolchain }})
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
@@ -58,16 +64,16 @@ jobs:
         run: |
           case "${{ matrix.features }}" in
             "default")
-              cargo build -p kyrodb-engine --release --locked --verbose
+              cargo build -p kyrodb-engine --release --features learned-index --locked --verbose
               ;;
             "no-default")
               cargo build -p kyrodb-engine --release --no-default-features --locked --verbose
               ;;
             "http-test")
-              cargo build -p kyrodb-engine --release --features http-test --locked --verbose
+              cargo build -p kyrodb-engine --release --features "learned-index,http-test" --locked --verbose
               ;;
             "failpoints")
-              cargo build -p kyrodb-engine --release --features failpoints --locked --verbose
+              cargo build -p kyrodb-engine --release --features "learned-index,failpoints" --locked --verbose
               ;;
           esac
 
@@ -75,16 +81,16 @@ jobs:
         run: |
           case "${{ matrix.features }}" in
             "default")
-              cargo test -p kyrodb-engine --all-targets --locked --verbose
+              cargo test -p kyrodb-engine --features learned-index --all-targets --locked --verbose
               ;;
             "no-default")
               cargo test -p kyrodb-engine --no-default-features --all-targets --locked --verbose
               ;;
             "http-test")
-              cargo test -p kyrodb-engine --features http-test --all-targets --locked --verbose
+              cargo test -p kyrodb-engine --features "learned-index,http-test" --all-targets --locked --verbose
               ;;
             "failpoints")
-              cargo test -p kyrodb-engine --features failpoints --all-targets --locked --verbose
+              cargo test -p kyrodb-engine --features "learned-index,failpoints" --all-targets --locked --verbose
               ;;
           esac
 
@@ -117,13 +123,12 @@ jobs:
 
       - name: Build engine & bench
         run: |
-          cargo build -p kyrodb-engine --release
+          cargo build -p kyrodb-engine --release --features learned-index
           cargo build -p bench --release
 
       - name: Start engine server
         run: |
-          target/release/kyrodb-engine serve 127.0.0.1 3030 --data-dir /tmp/kyrodb-test \
-            --rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0 &
+          ./target/release/kyrodb-engine --data-dir /tmp/kyrodb-test serve 127.0.0.1 3030 &
           echo $! > engine.pid
           sleep 3
 
@@ -147,8 +152,8 @@ jobs:
 
       - name: HTTP benchmark smoke test
         run: |
-          target/release/bench --base http://127.0.0.1:3030 \
-            --endpoint lookup_fast --load-n 1000 --read-concurrency 4 --read-seconds 3 || true
+          ./target/release/bench --base http://127.0.0.1:3030 \
+            --load-n 1000 --read-concurrency 4 --read-seconds 3 || true
 
       - name: Stop engine
         if: always()

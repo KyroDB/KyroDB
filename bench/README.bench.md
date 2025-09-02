@@ -26,7 +26,7 @@ KYRODB_WARM_ON_START=1 ./target/release/kyrodb-engine serve 127.0.0.1 3030
 ## Run server with gRPC (data-plane)
 - Start the same server with an additional gRPC bind. HTTP remains for metrics/admin.
 ```
-./target/release/kyrodb-engine serve 127.0.0.1 3030 --grpc-addr 127.0.0.1:50051 \
+./target/release/kyrodb-engine --grpc-addr 127.0.0.1:50051 serve 127.0.0.1 3030 \
   --rmi-rebuild-appends 0 --rmi-rebuild-ratio 0.0
 ```
 - Logging: set `KYRODB_DISABLE_HTTP_LOG=1` to silence HTTP access log; use `RUST_LOG` for structured logs.

@@ -6,7 +6,7 @@
 - Systemd: see docs/systemd/kyrodb-engine.service
 
 ## Run
-- Data dir: /var/lib/kyrodb (set --data-dir)
+- Data dir: /var/lib/kyrodb (set via global --data-dir argument before 'serve' command)
 - Auth: --auth-token TOKEN (read/write access), --admin-token TOKEN (admin access)
 - TLS: --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem (enables HTTPS)
 - Rotation: --wal-segment-bytes, --wal-max-segments
@@ -20,7 +20,7 @@
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
 
 # Run with TLS
-./kyrodb-engine serve 0.0.0.0 3030 --tls-cert cert.pem --tls-key key.pem
+./kyrodb-engine --tls-cert cert.pem --tls-key key.pem serve 0.0.0.0 3030
 ```
 
 ### Authentication & Authorization

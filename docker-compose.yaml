@@ -9,6 +9,6 @@ services:
       - RUST_LOG=info
     volumes:
       - kyrodb_data:/var/lib/kyrodb
-    command: ["kyrodb-engine", "serve", "0.0.0.0", "3030", "--data-dir", "/var/lib/kyrodb", "--wal-segment-bytes", "134217728", "--wal-max-segments", "8"]
+    command: ["kyrodb-engine", "--data-dir", "/var/lib/kyrodb", "--wal-segment-bytes", "134217728", "--wal-max-segments", "8", "serve", "0.0.0.0", "3030"]
 volumes:
   kyrodb_data:

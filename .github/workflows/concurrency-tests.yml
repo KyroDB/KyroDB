@@ -31,11 +31,11 @@ jobs:
 
       - name: Install Loom dependencies
         run: |
-          cargo install cargo-loom
+          echo "Loom tests run via regular cargo test with --features loom-tests"
 
-      - name: Verify Loom installation
+      - name: Verify test setup
         run: |
-          cargo loom --version
+          echo "Loom tests are available via: cargo test --features loom-tests -- --ignored"
 
   loom-core-tests:
     name: Loom Core Concurrency Tests
@@ -59,18 +59,18 @@ jobs:
 
       - name: Install Loom
         run: |
-          cargo install cargo-loom
+          echo "Using built-in Loom via Cargo features"
 
       - name: Run Loom ${{ matrix.test_type }} tests
         run: |
           cd engine
-          cargo loom test loom_${{ matrix.test_type }} --release
+          cargo test --features loom-tests loom_${{ matrix.test_type }} --release -- --ignored
 
       - name: Run with different preemption levels
         run: |
           cd engine
           # Test with maximum preemption for thorough checking
-          LOOM_MAX_PREEMPTIONS=3 cargo loom test loom_${{ matrix.test_type }} --release
+          LOOM_MAX_PREEMPTIONS=3 cargo test --features loom-tests loom_${{ matrix.test_type }} --release -- --ignored
         continue-on-error: true
 
   loom-feature-tests:
@@ -95,17 +95,17 @@ jobs:
 
       - name: Install Loom
         run: |
-          cargo install cargo-loom
+          echo "Using built-in Loom via Cargo features"
 
       - name: Run Loom tests with ${{ matrix.features }} features
         run: |
           cd engine
           if [ "${{ matrix.features }}" = "no-default" ]; then
-            cargo loom test --no-default-features --release
+            cargo test --no-default-features --features loom-tests --release -- --ignored
           elif [ "${{ matrix.features }}" = "failpoints" ]; then
-            cargo loom test --features failpoints --release
+            cargo test --features "failpoints,loom-tests" --release -- --ignored
           else
-            cargo loom test --release
+            cargo test --features loom-tests --release -- --ignored
           fi
         continue-on-error: true
 
@@ -127,20 +127,20 @@ jobs:
 
       - name: Install Loom
         run: |
-          cargo install cargo-loom
+          echo "Using built-in Loom via Cargo features"
 
       - name: Run extended Loom tests
         run: |
           cd engine
           # Test with different thread counts and configurations
           echo "Testing with high branch limit..."
-          LOOM_MAX_BRANCHES=2000 LOOM_MAX_PREEMPTIONS=2 cargo loom test --release
+          LOOM_MAX_BRANCHES=2000 LOOM_MAX_PREEMPTIONS=2 cargo test --features loom-tests --release -- --ignored
 
           echo "Testing with maximum permutations..."
-          LOOM_MAX_BRANCHES=1000 LOOM_MAX_PREEMPTIONS=1 cargo loom test loom_rmi_concurrency --release
+          LOOM_MAX_BRANCHES=1000 LOOM_MAX_PREEMPTIONS=1 cargo test --features loom-tests loom_rmi_concurrency --release -- --ignored
 
           echo "Testing with different model sizes..."
-          LOOM_MAX_BRANCHES=500 LOOM_MAX_PREEMPTIONS=4 cargo loom test loom_snapshot_manifest --release
+          LOOM_MAX_BRANCHES=500 LOOM_MAX_PREEMPTIONS=4 cargo test --features loom-tests loom_snapshot_manifest --release -- --ignored
         continue-on-error: true
 
   concurrency-summary:

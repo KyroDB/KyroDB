@@ -6,8 +6,6 @@ on:
     # Weekly cross-platform test
     - cron: '0 4 * * 1'
 
-if: false
-
 jobs:
   cross-platform-tests:
     name: Cross-Platform (${{ matrix.os }}, ${{ matrix.arch }})
@@ -19,12 +17,16 @@ jobs:
         include:
           - os: ubuntu-latest
             arch: x86_64
+            toolchain: stable
           - os: macos-latest
             arch: x86_64
+            toolchain: stable
           - os: macos-latest
             arch: arm64
+            toolchain: stable
           - os: windows-latest
             arch: x86_64
+            toolchain: stable
 
     steps:
       - name: Checkout repository
@@ -33,6 +35,7 @@ jobs:
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ matrix.toolchain }}
           targets: ${{ matrix.arch != 'x86_64' && format('{0}-apple-darwin', matrix.arch) || '' }}
 
       - name: Cache cargo
@@ -67,10 +70,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Rust (stable, minimal profile)
+      - name: Setup Rust (stable, minimal)
         uses: dtolnay/rust-toolchain@stable
-        with:
-          profile: minimal
 
       - name: Build with minimal features
         run: |
