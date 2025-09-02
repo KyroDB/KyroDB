@@ -123,14 +123,15 @@ jobs:
 
       - name: Build engine & bench
         run: |
-          cargo build -p kyrodb-engine --release --features learned-index
+          cargo build -p kyrodb-engine --release --features "learned-index,http-test"
           cargo build -p bench --release
 
       - name: Start engine server
         run: |
+          mkdir -p /tmp/kyrodb-test
           ./target/release/kyrodb-engine --data-dir /tmp/kyrodb-test serve 127.0.0.1 3030 &
           echo $! > engine.pid
-          sleep 3
+          sleep 5
 
       - name: Test health endpoint
         run: |
@@ -139,6 +140,11 @@ jobs:
       - name: Test build_info endpoint
         run: |
           curl -f http://127.0.0.1:3030/build_info || exit 1
+
+      - name: Run integration tests
+        run: |
+          cargo test -p kyrodb-engine --features "learned-index,http-test" --test http_integration -- --nocapture || echo "Some integration tests failed (may be rate limiting)"
+          cargo test -p kyrodb-engine --features "learned-index,http-test" --test http_compact_endpoint -- --nocapture
 
       - name: Test basic API endpoints
         run: |

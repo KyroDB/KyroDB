@@ -64,6 +64,7 @@ impl GrpcService {
     }
 
     // Authentication helper
+    #[allow(clippy::result_large_err)]
     fn authenticate<T>(&self, req: &Request<T>) -> Result<pb::UserRole, Status> {
         let metadata = req.metadata();
         let auth_header = metadata.get("authorization");
@@ -84,6 +85,7 @@ impl GrpcService {
         Ok(pb::UserRole::ReadOnly)
     }
 
+    #[allow(clippy::result_large_err)]
     fn require_role<T>(&self, req: &Request<T>, required: pb::UserRole) -> Result<(), Status> {
         let user_role = self.authenticate(req)?;
         if user_role as i32 >= required as i32 {
