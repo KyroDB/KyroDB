@@ -1298,6 +1298,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "bytes",
  "chrono",
  "clap",
  "crc32c",

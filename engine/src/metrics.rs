@@ -56,6 +56,9 @@ mod shim {
     pub static RMI_REBUILD_IN_PROGRESS: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
     #[allow(dead_code)]
     pub static RMI_REBUILD_STALLS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static GROUP_COMMIT_BATCH_SIZE: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static GROUP_COMMIT_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static GROUP_COMMIT_BATCHES_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub fn inc_sse_lagged() {}
     pub fn render() -> String {
         String::new()
@@ -74,7 +77,8 @@ pub use shim::{
     RMI_MISSES_TOTAL, RMI_PROBE_LEN, RMI_READS_TOTAL, RMI_REBUILDS_TOTAL,
     RMI_REBUILD_DURATION_SECONDS, RMI_REBUILD_IN_PROGRESS, SNAPSHOTS_TOTAL,
     SNAPSHOT_LATENCY_SECONDS, SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL,
-    WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL,
+    WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, GROUP_COMMIT_BATCH_SIZE,
+    GROUP_COMMIT_LATENCY_SECONDS, GROUP_COMMIT_BATCHES_TOTAL,
 };
 
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -351,3 +355,33 @@ pub fn render() -> String {
 pub fn rmi_rebuild_in_progress() -> bool {
     RMI_REBUILD_IN_PROGRESS.get() > 0.5
 }
+
+// Enterprise Group Commit Metrics
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static GROUP_COMMIT_BATCH_SIZE: Lazy<Histogram> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "kyrodb_group_commit_batch_size",
+        "Number of writes per group commit batch"
+    )
+    .buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_group_commit_batch_size")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static GROUP_COMMIT_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "kyrodb_group_commit_latency_seconds",
+        "Group commit batch processing latency"
+    )
+    .buckets(prometheus::exponential_buckets(0.00001, 2.0, 20).unwrap());
+    prometheus::register_histogram!(opts).expect("register kyrodb_group_commit_latency_seconds")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static GROUP_COMMIT_BATCHES_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_group_commit_batches_total",
+        "Total number of group commit batches processed"
+    )
+    .expect("register kyrodb_group_commit_batches_total")
+});

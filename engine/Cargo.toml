@@ -58,6 +58,7 @@ memmap2 = "0.9"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 libc = "0.2"
 dashmap = "5"
+bytes = "1.5"
 # ANN library (optional)
 hora = { version = "0.1", optional = true }
 # Small LRU cache for hot payloads (steady p99)
