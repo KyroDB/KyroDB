@@ -1000,22 +1000,48 @@ impl PersistentEventLog {
 
     #[cfg(feature = "learned-index")]
     /// Swap the in-memory primary index (e.g., after RMI rebuild) while preserving delta.
+    /// 
+    /// This implementation is designed to be deadlock-free by:
+    /// 1. Minimizing critical section time (no I/O while holding lock)
+    /// 2. Preparing the new index outside the critical section
+    /// 3. Using atomic swap to minimize lock holding time
     pub async fn swap_primary_index(&self, mut new_index: index::PrimaryIndex) {
-        let mut guard = self.index.write().await;
-        match (&*guard, &mut new_index) {
-            (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::Rmi(new_rmi)) => {
-                for (k, v) in old_rmi.delta_pairs() {
+        // Step 1: Prepare delta migration outside the critical section
+        // Extract delta pairs from current index without holding write lock
+        let delta_pairs: Vec<(u64, u64)> = {
+            let guard = self.index.read().await;
+            match &*guard {
+                index::PrimaryIndex::Rmi(old_rmi) => {
+                    old_rmi.delta_pairs()
+                }
+                _ => Vec::new(),
+            }
+        };
+        
+        // Step 2: Apply delta to new index outside critical section
+        // This is the expensive operation that was causing deadlocks
+        match &mut new_index {
+            index::PrimaryIndex::Rmi(new_rmi) => {
+                for (k, v) in delta_pairs {
                     new_rmi.insert_delta(k, v);
                 }
             }
-            (index::PrimaryIndex::Rmi(old_rmi), index::PrimaryIndex::BTree(btree)) => {
-                for (k, v) in old_rmi.delta_pairs() {
+            index::PrimaryIndex::BTree(btree) => {
+                for (k, v) in delta_pairs {
                     btree.insert(k, v);
                 }
             }
-            _ => {}
         }
-        *guard = new_index;
+        
+        // Step 3: Atomic swap in minimal critical section
+        // Only hold write lock for the actual swap - no computation
+        {
+            let mut guard = self.index.write().await;
+            *guard = new_index;
+        }
+        
+        // Note: No I/O, no expensive operations while holding the write lock
+        // This eliminates the deadlock potential with append operations
     }
 
     /// Replay events from `start` (inclusive) to `end` (exclusive). If None, to latest.
