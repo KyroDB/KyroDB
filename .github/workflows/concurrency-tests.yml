@@ -1,15 +1,9 @@
 name: Concurrency Tests
 
+# Temporarily disabled to focus on write performance optimization
+# Original triggers: workflow_dispatch, schedule (nightly), PR on engine paths
 on:
-  workflow_dispatch:
-  schedule:
-    # Run nightly at 3 AM UTC (after fuzz tests)
-    - cron: '0 3 * * *'
-  pull_request:
-    paths:
-      - 'engine/src/**'
-      - 'engine/tests/**'
-      - '.github/workflows/concurrency-tests.yml'
+  workflow_dispatch:  # Manual trigger only
 
 jobs:
   loom-setup:

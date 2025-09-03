@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Notify, Mutex, oneshot};
 use uuid::Uuid;
+use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
@@ -27,6 +29,7 @@ enum FsyncPolicy {
     All,
     None,
 }
+
 impl FsyncPolicy {
     fn from_env() -> Self {
         let v = std::env::var("KYRODB_FSYNC_POLICY").unwrap_or_else(|_| "data".to_string());
@@ -43,6 +46,54 @@ impl FsyncPolicy {
             FsyncPolicy::None => Ok(()),
         }
     }
+}
+
+// --- New: Group commit configuration ---
+#[derive(Clone, Copy, Debug)]
+pub struct GroupCommitConfig {
+    /// Maximum time to wait before forcing a batch commit (microseconds)
+    pub max_batch_delay_micros: u64,
+    /// Maximum number of writes to batch before forcing a commit
+    pub max_batch_size: usize,
+    /// Enable group commit (false = per-write fsync like before)
+    pub enabled: bool,
+}
+
+impl Default for GroupCommitConfig {
+    fn default() -> Self {
+        Self {
+            // Default: 500µs max delay for good latency vs throughput balance
+            max_batch_delay_micros: std::env::var("KYRODB_GROUP_COMMIT_DELAY_MICROS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(500), // 500µs default - much more aggressive
+            // Default: batch up to 50 writes for better fsync amortization
+            max_batch_size: std::env::var("KYRODB_GROUP_COMMIT_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50), // Smaller batches for lower latency
+            // Enable by default for high throughput
+            enabled: std::env::var("KYRODB_GROUP_COMMIT_ENABLED")
+                .map(|s| s != "0" && s.to_lowercase() != "false")
+                .unwrap_or(true),
+        }
+    }
+}
+
+// --- Group commit batch item ---
+#[derive(Debug)]
+struct BatchItem {
+    event: Event,
+    response_tx: oneshot::Sender<Result<u64>>,
+}
+
+// --- Group commit state ---
+#[derive(Debug)]
+struct GroupCommitState {
+    batch: VecDeque<BatchItem>,
+    batch_start_time: Option<Instant>,
+    fsync_notify: Arc<Notify>,
+    config: GroupCommitConfig,
 }
 
 // fsync helper for directories (ensure rename/truncate is durable)
@@ -162,6 +213,8 @@ pub struct PersistentEventLog {
     wal_block_cache: Arc<RwLock<LruCache<u64, Vec<u8>>>>,
     // new: fsync policy for WAL appends
     fsync_policy: FsyncPolicy,
+    // new: group commit state for high throughput writes
+    group_commit_state: Arc<Mutex<GroupCommitState>>,
 }
 
 impl PersistentEventLog {
@@ -337,6 +390,14 @@ impl PersistentEventLog {
             }
         }
 
+        let group_commit_config = GroupCommitConfig::default();
+        let group_commit_state = Arc::new(Mutex::new(GroupCommitState {
+            batch: VecDeque::new(),
+            batch_start_time: None,
+            fsync_notify: Arc::new(Notify::new()),
+            config: group_commit_config,
+        }));
+
         let log = Self {
             inner: Arc::new(RwLock::new(events)),
             wal,
@@ -354,6 +415,7 @@ impl PersistentEventLog {
             snapshot_payload_index: Arc::new(RwLock::new(None)),
             wal_block_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(4096).unwrap()))),
             fsync_policy: FsyncPolicy::from_env(),
+            group_commit_state: group_commit_state.clone(),
         };
 
         // Try to mmap snapshot.data and build index for fast get() access.
@@ -369,6 +431,14 @@ impl PersistentEventLog {
                     }
                 }
             }
+        }
+
+        // Start the group commit background task if enabled
+        if group_commit_config.enabled {
+            let log_clone = log.clone();
+            tokio::spawn(async move {
+                log_clone.group_commit_background_task().await;
+            });
         }
 
         Ok(log)
@@ -435,8 +505,7 @@ impl PersistentEventLog {
     /// Append (durably) and return its offset.
     pub async fn append(&self, request_id: Uuid, payload: Vec<u8>) -> Result<u64> {
         let timer = metrics::APPEND_LATENCY_SECONDS.start_timer();
-        // bincode options with a safety limit for serialization
-        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+        
         // Idempotency check
         {
             let read = self.inner.read().await;
@@ -447,8 +516,7 @@ impl PersistentEventLog {
             }
         }
 
-        // Build event
-        let mut write = self.inner.write().await;
+        // Build event with next offset
         let mut noff = self.next_offset.write().await;
         let offset = *noff;
         *noff = noff.saturating_add(1);
@@ -461,6 +529,75 @@ impl PersistentEventLog {
         };
         drop(noff);
 
+        // Check if group commit is enabled
+        let group_commit_enabled = {
+            let state = self.group_commit_state.lock().await;
+            state.config.enabled
+        };
+
+        if group_commit_enabled {
+            // Use group commit for high throughput
+            let (response_tx, response_rx) = oneshot::channel();
+            
+            // Add to batch
+            {
+                let mut state = self.group_commit_state.lock().await;
+                state.batch.push_back(BatchItem {
+                    event: event.clone(),
+                    response_tx,
+                });
+                
+                // Start batch timer if this is the first item
+                if state.batch.len() == 1 {
+                    state.batch_start_time = Some(Instant::now());
+                }
+                
+                // Check if we should trigger immediate flush
+                let should_flush = state.batch.len() >= state.config.max_batch_size;
+                
+                if should_flush {
+                    state.fsync_notify.notify_one();
+                }
+            }
+            
+            // Wait for group commit to complete
+            match response_rx.await {
+                Ok(result) => {
+                    if result.is_ok() {
+                        // Update in-memory state and index
+                        {
+                            let mut write = self.inner.write().await;
+                            write.push(event.clone());
+                        }
+
+                        // Update index if payload is Record
+                        if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
+                            let mut idx = self.index.write().await;
+                            idx.insert(rec.key, event.offset);
+                        }
+
+                        // Broadcast to subscribers
+                        let _ = self.tx.send(event);
+                    }
+                    
+                    metrics::APPENDS_TOTAL.inc();
+                    timer.observe_duration();
+                    result
+                }
+                Err(_) => {
+                    Err(anyhow::anyhow!("Group commit channel closed"))
+                }
+            }
+        } else {
+            // Legacy per-write fsync path (for compatibility)
+            self.append_with_immediate_fsync(event, timer).await
+        }
+    }
+
+    /// Legacy append path with immediate fsync (used when group commit disabled)
+    async fn append_with_immediate_fsync(&self, event: Event, timer: prometheus::HistogramTimer) -> Result<u64> {
+        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+        
         // Write to WAL current segment (flush + fsync based on policy)
         {
             let mut w = self.wal.write().await;
@@ -481,8 +618,10 @@ impl PersistentEventLog {
         self.rotate_wal_if_needed().await;
 
         // Append in-memory
-        write.push(event.clone());
-        drop(write);
+        {
+            let mut write = self.inner.write().await;
+            write.push(event.clone());
+        }
 
         // Update index if payload is Record
         if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
@@ -491,11 +630,11 @@ impl PersistentEventLog {
         }
 
         // Broadcast to subscribers
-        let _ = self.tx.send(event);
+        let _ = self.tx.send(event.clone());
 
         metrics::APPENDS_TOTAL.inc();
         timer.observe_duration();
-        Ok(offset)
+        Ok(event.offset)
     }
 
     /// Append a key-value record. Serializes the record with bincode and stores as payload.
@@ -1017,5 +1156,151 @@ impl PersistentEventLog {
     /// Get current WAL segments (for internal use)
     pub fn get_wal_segments(&self) -> Vec<String> {
         self.current_wal_segments()
+    }
+
+    /// Group commit background task for high-throughput writes
+    async fn group_commit_background_task(&self) {
+        let mut interval = tokio::time::interval(Duration::from_micros(10)); // Check every 10µs for faster responsiveness
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
+        loop {
+            // Wait for either interval or flush notification
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.try_flush_batch().await;
+                }
+                _ = async {
+                    let state = self.group_commit_state.lock().await;
+                    let notify = state.fsync_notify.clone();
+                    drop(state);
+                    notify.notified().await;
+                } => {
+                    self.try_flush_batch().await;
+                }
+            }
+        }
+    }
+
+    /// Try to flush the current batch if it meets the criteria
+    async fn try_flush_batch(&self) {
+        let mut batch_to_flush = Vec::new();
+        let should_flush = {
+            let mut state = self.group_commit_state.lock().await;
+            
+            if state.batch.is_empty() {
+                return;
+            }
+            
+            let batch_size = state.batch.len();
+            let batch_age = state.batch_start_time
+                .map(|start| start.elapsed())
+                .unwrap_or(Duration::ZERO);
+                
+            // Flush if batch is large enough or old enough
+            let size_trigger = batch_size >= state.config.max_batch_size;
+            let time_trigger = batch_age.as_micros() >= state.config.max_batch_delay_micros as u128;
+            
+            // Be more aggressive about flushing - even single items after delay
+            if size_trigger || time_trigger || (batch_size > 0 && batch_age.as_micros() >= 500) {
+                // Take all items from batch
+                batch_to_flush = state.batch.drain(..).collect();
+                state.batch_start_time = None;
+                true
+            } else {
+                false
+            }
+        };
+        
+        if should_flush && !batch_to_flush.is_empty() {
+            self.flush_batch(batch_to_flush).await;
+        }
+    }
+
+    /// Flush a batch of writes to WAL with single fsync
+    async fn flush_batch(&self, batch: Vec<BatchItem>) {
+        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+        
+        // Serialize all events first
+        let mut serialized_events = Vec::with_capacity(batch.len());
+        let mut serialize_errors = Vec::new();
+        
+        for (i, item) in batch.iter().enumerate() {
+            match bopt.serialize(&item.event) {
+                Ok(frame) => {
+                    let len = (frame.len() as u32).to_le_bytes();
+                    let crc = crc32c::crc32c(&frame).to_le_bytes();
+                    serialized_events.push((len, frame, crc));
+                }
+                Err(e) => {
+                    serialize_errors.push((i, anyhow::anyhow!("Serialize error: {}", e)));
+                }
+            }
+        }
+        
+        // Write all frames to WAL in one operation
+        let write_result = {
+            let mut w = self.wal.write().await;
+            let mut write_ok = true;
+            
+            // Write all serialized events
+            for (len, frame, crc) in &serialized_events {
+                if write_ok {
+                    if let Err(e) = w.write_all(len) {
+                        write_ok = false;
+                        eprintln!("WAL write error (len): {}", e);
+                        break;
+                    }
+                    if let Err(e) = w.write_all(frame) {
+                        write_ok = false;
+                        eprintln!("WAL write error (frame): {}", e);
+                        break;
+                    }
+                    if let Err(e) = w.write_all(crc) {
+                        write_ok = false;
+                        eprintln!("WAL write error (crc): {}", e);
+                        break;
+                    }
+                }
+            }
+            
+            if write_ok {
+                if let Err(e) = w.flush() {
+                    write_ok = false;
+                    eprintln!("WAL flush error: {}", e);
+                }
+            }
+            
+            // Single fsync for entire batch
+            if write_ok {
+                if let Err(e) = self.fsync_policy.sync_file(w.get_ref()) {
+                    write_ok = false;
+                    eprintln!("WAL fsync error: {}", e);
+                }
+            }
+            
+            write_ok
+        };
+        
+        // Check if WAL rotation is needed
+        if write_result {
+            self.rotate_wal_if_needed().await;
+        }
+        
+        // Send results to all waiters
+        let mut serialize_error_map: std::collections::HashMap<usize, anyhow::Error> = 
+            serialize_errors.into_iter().collect();
+            
+        for (i, item) in batch.into_iter().enumerate() {
+            let result = if let Some(err) = serialize_error_map.remove(&i) {
+                Err(err)
+            } else if write_result {
+                Ok(item.event.offset)
+            } else {
+                Err(anyhow::anyhow!("Batch write failed"))
+            };
+            
+            // Send result back to waiter (ignore if receiver dropped)
+            let _ = item.response_tx.send(result);
+        }
     }
 }

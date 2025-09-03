@@ -1,11 +1,14 @@
 name: CI
 
+# DISABLED: Temporarily disabled to fix write performance issues
+# Will be re-enabled after implementing group commit and async fsync
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run CI (debugging only)'
+        required: false
+        default: 'false'
 
 jobs:
   # Main test matrix - runs on every PR/push

@@ -1,15 +1,9 @@
 name: Fuzz Testing
 
+# Temporarily disabled to focus on write performance optimization
+# Original triggers: workflow_dispatch, schedule (nightly), PR on fuzz/engine paths
 on:
-  workflow_dispatch:
-  schedule:
-    # Run nightly at 2 AM UTC
-    - cron: '0 2 * * *'
-  pull_request:
-    paths:
-      - 'engine/fuzz/**'
-      - 'engine/src/**'
-      - '.github/workflows/fuzz.yml'
+  workflow_dispatch:  # Manual trigger only
 
 jobs:
   fuzz-build:

@@ -1,9 +1,8 @@
 name: Release
 
+# Temporarily disabled to focus on write performance optimization
+# Original triggers: push tags (v*.*.*), workflow_dispatch with tag input
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag_name:

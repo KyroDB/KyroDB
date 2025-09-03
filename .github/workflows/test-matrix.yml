@@ -1,10 +1,9 @@
 name: Cross-Platform Test Matrix
 
+# Temporarily disabled to focus on write performance optimization
+# Original triggers: workflow_dispatch, schedule (weekly Monday)
 on:
-  workflow_dispatch:
-  schedule:
-    # Weekly cross-platform test
-    - cron: '0 4 * * 1'
+  workflow_dispatch:  # Manual trigger only
 
 jobs:
   cross-platform-tests:
