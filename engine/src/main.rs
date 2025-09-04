@@ -6,12 +6,13 @@ use futures::stream::StreamExt;
 use kyrodb_engine as engine_crate;
 use std::sync::Arc;
 use uuid::Uuid;
+use warp::http::StatusCode;
 use warp::Filter;
 #[cfg(feature = "grpc")]
 mod grpc_svc;
 #[cfg(feature = "grpc")]
 use grpc_svc::pb::kyrodb_server::KyrodbServer;
-mod sql;
+// mod sql;
 
 // --- Rate limiting (simple token-bucket per client IP) -----------------------
 use dashmap::DashMap;
@@ -61,6 +62,23 @@ impl warp::reject::Reject for AdminRateLimited {}
 struct DataRateLimited;
 impl warp::reject::Reject for DataRateLimited {}
 
+// Authorization filter (optional)
+#[derive(Debug)]
+struct Unauthorized;
+impl warp::reject::Reject for Unauthorized {}
+
+// Role-based access control
+#[derive(Debug, Clone, PartialEq)]
+enum UserRole {
+    Admin,
+    ReadWrite,
+    ReadOnly,
+}
+
+#[derive(Debug)]
+struct InsufficientPermissions;
+impl warp::reject::Reject for InsufficientPermissions {}
+
 fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
         .ok()
@@ -74,9 +92,7 @@ fn mk_rl_filter_admin(
     warp::addr::remote().and_then(move |addr: Option<std::net::SocketAddr>| {
         let limiter = limiter.clone();
         async move {
-            let key = addr
-                .map(|a| a.ip().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let key = addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
             if limiter.allow(&key, 1.0) {
                 Ok(())
             } else {
@@ -91,9 +107,7 @@ fn mk_rl_filter_data(
     warp::addr::remote().and_then(move |addr: Option<std::net::SocketAddr>| {
         let limiter = limiter.clone();
         async move {
-            let key = addr
-                .map(|a| a.ip().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let key = addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
             if limiter.allow(&key, 1.0) {
                 Ok(())
             } else {
@@ -164,6 +178,9 @@ enum Commands {
         /// Admin token for privileged operations (separate from auth_token for read/write)
         #[arg(long)]
         admin_token: Option<String>,
+        /// Enable rate limiting (feature-gated; defaults to disabled for full throttle)
+        #[arg(long)]
+        enable_rate_limiting: bool,
     },
 }
 
@@ -220,6 +237,7 @@ async fn main() -> Result<()> {
             _tls_cert,
             _tls_key,
             admin_token,
+            enable_rate_limiting,
         } => {
             // Silence unused when learned-index feature is disabled
             #[cfg(not(feature = "learned-index"))]
@@ -440,7 +458,7 @@ async fn main() -> Result<()> {
                     }
                     #[cfg(not(feature = "tls"))]
                     {
-                        eprintln!("⚠️ TLS requested but tonic built without TLS support");
+                        eprintln!("⚠️ TLS requested but TLS feature not enabled");
                         KyrodbServer::new(svc)
                     }
                 } else {
@@ -467,6 +485,35 @@ async fn main() -> Result<()> {
                         .ok(),
                 )
             };
+
+            // --- Rate limiter configs (env tunables) --------------------------------
+            // Feature-gate rate limiting: Only apply if enabled and feature is active
+            #[cfg(feature = "rate-limiting")]
+            let (admin_limiter, data_limiter) = if enable_rate_limiting {
+                let admin_rps = env_f64("KYRODB_RL_ADMIN_RPS", 2.0);
+                let admin_burst = env_f64("KYRODB_RL_ADMIN_BURST", 5.0);
+                let data_rps = env_f64("KYRODB_RL_DATA_RPS", 5000.0);
+                let data_burst = env_f64("KYRODB_RL_DATA_BURST", 10000.0);
+                (
+                    SimpleRateLimiter::new(admin_rps, admin_burst),
+                    SimpleRateLimiter::new(data_rps, data_burst),
+                )
+            } else {
+                // No-op limiters when disabled
+                (SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY), SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY))
+            };
+
+            #[cfg(not(feature = "rate-limiting"))]
+            let (admin_limiter, data_limiter) = if enable_rate_limiting {
+                eprintln!("⚠️ Rate limiting requested but 'rate-limiting' feature not enabled. Running without limits.");
+                (SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY), SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY))
+            } else {
+                (SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY), SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY))
+            };
+
+            let admin_rl = mk_rl_filter_admin(admin_limiter.clone()).boxed();
+            let data_rl = mk_rl_filter_data(data_limiter.clone()).boxed();
+            // ------------------------------------------------------------------------
 
             // --- Fast lookup endpoints (HTTP hot path) with versioned prefix -----------------
             let v1 = warp::path("v1");
@@ -599,7 +646,7 @@ async fn main() -> Result<()> {
                             }
                             Ok::<_, warp::Rejection>(warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
-                                warp::http::StatusCode::OK,
+                                StatusCode::OK,
                             ))
                         }
                     });
@@ -617,13 +664,13 @@ async fn main() -> Result<()> {
                                     warp::reply::json(
                                         &serde_json::json!({ "compact": "ok", "stats": stats }),
                                     ),
-                                    warp::http::StatusCode::OK,
+                                    StatusCode::OK,
                                 )),
                                 Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
                                     warp::reply::json(
                                         &serde_json::json!({ "error": e.to_string() }),
                                     ),
-                                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    StatusCode::INTERNAL_SERVER_ERROR,
                                 )),
                             }
                         }
@@ -732,6 +779,7 @@ async fn main() -> Result<()> {
                 });
 
             // POST /v1/sql  { sql: "INSERT ..." | "SELECT ..." }
+            /*
             let sql_log = log.clone();
             let sql_route = v1
                 .and(warp::path("sql"))
@@ -776,84 +824,199 @@ async fn main() -> Result<()> {
                         }
                     }
                 });
+            */
 
-            // Metrics endpoint stays unversioned for Prometheus convention
-            let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
-                let text = engine_crate::metrics::render();
-                warp::reply::with_header(text, "Content-Type", "text/plain; version=0.0.4")
-            });
-
-            // Authorization filter (optional)
-            #[derive(Debug)]
-            struct Unauthorized;
-            impl warp::reject::Reject for Unauthorized {}
-
-            // Role-based access control
-            #[derive(Debug, Clone, PartialEq)]
-            enum UserRole {
-                Admin,
-                ReadWrite,
-                ReadOnly,
-            }
-
-            #[derive(Debug)]
-            struct InsufficientPermissions;
-            impl warp::reject::Reject for InsufficientPermissions {}
-
-            let _auth_with_role = {
-                let token_opt = auth_token.clone();
-                let admin_token_opt = admin_token.clone();
-                warp::any()
-                    .and(warp::header::optional::<String>("authorization"))
-                    .and_then(move |hdr: Option<String>| {
-                        let token_opt = token_opt.clone();
-                        let admin_token_opt = admin_token_opt.clone();
-                        async move {
-                            let role = if let Some(expected) = &admin_token_opt {
-                                if hdr.as_deref() == Some(&format!("Bearer {}", expected)) {
-                                    UserRole::Admin
-                                } else if let Some(expected_rw) = &token_opt {
-                                    if hdr.as_deref() == Some(&format!("Bearer {}", expected_rw)) {
-                                        UserRole::ReadWrite
-                                    } else {
-                                        return Err(warp::reject::custom(Unauthorized));
-                                    }
-                                } else {
-                                    UserRole::ReadOnly
-                                }
-                            } else if let Some(expected) = &token_opt {
-                                if hdr.as_deref() == Some(&format!("Bearer {}", expected)) {
-                                    UserRole::ReadWrite
-                                } else {
-                                    return Err(warp::reject::custom(Unauthorized));
-                                }
-                            } else {
-                                UserRole::ReadOnly
-                            };
-                            Ok::<UserRole, warp::Rejection>(role)
+            // --- NEW: Batch PUT endpoint for reduced round-trips -----------------------------
+            let batch_put_log = log.clone();
+            let batch_put_route = v1
+                .and(warp::path("batch_put"))
+                .and(warp::post())
+                .and(warp::body::bytes())  // Zero-copy bytes
+                .and_then(move |body: bytes::Bytes| {
+                    let log = batch_put_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        // Deserialize from MessagePack (faster than JSON)
+                        let items: Vec<(u64, Vec<u8>)> = rmp_serde::from_slice(&body).map_err(|_| warp::reject::reject())?;
+                        let mut offsets = Vec::new();
+                        for (key, value) in items {
+                            if let Ok(off) = log.append_kv(Uuid::new_v4(), key, value).await {
+                                offsets.push(off);
+                            }
                         }
-                    })
-            };
+                        // Return MessagePack for speed
+                        let response = rmp_serde::to_vec(&offsets).unwrap();
+                        Ok::<_, warp::Rejection>(warp::reply::with_header(
+                            response, "Content-Type", "application/msgpack"
+                        ))
+                    }
+                });
 
-            let _auth = {
-                let token_opt = auth_token.clone();
-                warp::any()
-                    .and(warp::header::optional::<String>("authorization"))
-                    .and_then(move |hdr: Option<String>| {
-                        let token_opt = token_opt.clone();
-                        async move {
-                            if let Some(expected) = &token_opt {
-                                let ok = hdr.as_deref() == Some(&format!("Bearer {}", expected));
-                                if !ok {
-                                    return Err(warp::reject::custom(Unauthorized));
+            // --- NEW: MessagePack PUT endpoint -----------------------------------------------
+            let msgpack_put_log = log.clone();
+            let msgpack_put_route = v1
+                .and(warp::path("put"))
+                .and(warp::post())
+                .and(warp::header::exact("content-type", "application/msgpack"))  // Detect format
+                .and(warp::body::bytes())  // Zero-copy bytes
+                .and_then(move |body: bytes::Bytes| {
+                    let log = msgpack_put_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        // Deserialize from MessagePack
+                        let (key, value): (u64, Vec<u8>) = rmp_serde::from_slice(&body).map_err(|_| warp::reject::reject())?;
+                        match log.append_kv(Uuid::new_v4(), key, value).await {
+                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::with_header(
+                                    rmp_serde::to_vec(&serde_json::json!({ "offset": off })).unwrap(),  // Or return binary
+                                    "Content-Type", "application/msgpack"
+                                ),
+                                StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::with_header(
+                                    rmp_serde::to_vec(&serde_json::json!({ "error": e.to_string() })).unwrap(),
+                                    "Content-Type", "application/msgpack"
+                                ),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        }
+                    }
+                });
+
+            // --- NEW: MessagePack GET endpoint -----------------------------------------------
+            let msgpack_get_log = log.clone();
+            let msgpack_get_route = v1
+                .and(warp::path("lookup"))
+                .and(warp::get())
+                .and(warp::header::exact("accept", "application/msgpack"))  // Detect format
+                .and(warp::query::<std::collections::HashMap<String, String>>())
+                .and_then(move |q: std::collections::HashMap<String, String>| {
+                    let log = msgpack_get_log.clone();
+                    async move {
+                        if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
+                            if let Some(offset) = log.lookup_key(k).await {
+                                if let Some(bytes) = log.get(offset).await {
+                                    if let Ok(rec) =
+                                        bincode::deserialize::<kyrodb_engine::Record>(&bytes)
+                                    {
+                                        // Return MessagePack for speed
+                                        let response = rmp_serde::to_vec(&serde_json::json!({
+                                            "key": rec.key,
+                                            "value": rec.value  // Raw bytes, no string conversion
+                                        })).unwrap();
+                                        return Ok::<_, warp::Rejection>(warp::reply::with_header(
+                                            response, "Content-Type", "application/msgpack"
+                                        ));
+                                    }
                                 }
                             }
-                            Ok::<(), warp::Rejection>(())
                         }
-                    })
-            };
+                        let response = rmp_serde::to_vec(&serde_json::json!({"error":"not found"})).unwrap();
+                        Ok::<_, warp::Rejection>(warp::reply::with_header(
+                            response, "Content-Type", "application/msgpack"
+                        ))
+                    }
+                });
 
-            // RMI build: POST /v1/rmi/build  (feature-gated)
+            // --- Cache warmup endpoint --------------------------------------------------------
+            let warmup_log = log.clone();
+            let warmup = v1
+                .and(warp::path("warmup"))
+                .and(warp::post())
+                .and_then(move || {
+                    let log = warmup_log.clone();
+                    async move {
+                        log.warmup().await;
+                        Ok::<_, warp::Rejection>(warp::reply::json(
+                            &serde_json::json!({ "warmup": "ok" }),
+                        ))
+                    }
+                });
+
+            // --- Vector insert endpoint ---------------------------------------------------
+            let vector_log = log.clone();
+            let vector_insert = v1
+                .and(warp::path("vector_insert"))
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = vector_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        let key = body["key"].as_u64().unwrap_or(0);
+                        let vector = body["vector"].as_array().unwrap_or(&Vec::new())
+                            .iter()
+                            .filter_map(|v| v.as_f64())
+                            .collect::<Vec<f64>>();
+                        let value = bincode::serialize(&vector).unwrap_or_default();
+                        match log.append_kv(Uuid::new_v4(), key, value).await {
+                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "offset": off })),
+                                StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        }
+                    }
+                });
+
+            // --- Metrics endpoint ---------------------------------------------------------
+            let metrics_route = warp::path("metrics")
+                .and(warp::get())
+                .map(|| {
+                    #[cfg(not(feature = "bench-no-metrics"))]
+                    {
+                        use prometheus::Encoder;
+                        let encoder = prometheus::TextEncoder::new();
+                        let metric_families = prometheus::gather();
+                        match encoder.encode_to_string(&metric_families) {
+                            Ok(output) => warp::reply::with_header(
+                                output,
+                                "Content-Type",
+                                "text/plain; version=0.0.4",
+                            ),
+                            Err(_) => warp::reply::with_header(
+                                "# Metrics encoding failed".to_string(),
+                                "Content-Type",
+                                "text/plain",
+                            ),
+                        }
+                    }
+                    #[cfg(feature = "bench-no-metrics")]
+                    {
+                        warp::reply::with_header(
+                            "# Metrics disabled for benchmarking".to_string(),
+                            "Content-Type",
+                            "text/plain",
+                        )
+                    }
+                });
+
+            // --- Subscribe endpoint -------------------------------------------------------
+            let subscribe_log = log.clone();
+            let subscribe_route = v1
+                .and(warp::path("subscribe"))
+                .and(warp::get())
+                .and(warp::query::<std::collections::HashMap<String, String>>())
+                .and_then(move |q: std::collections::HashMap<String, String>| {
+                    let log = subscribe_log.clone();
+                    async move {
+                        let start = q.get("start").and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let evs = log.replay(start, None).await;
+                        let stream = futures::stream::iter(evs.into_iter().map(|e| {
+                            Ok::<_, warp::Error>(warp::sse::Event::default().json_data(serde_json::json!({
+                                "offset": e.offset,
+                                "payload": String::from_utf8_lossy(&e.payload)
+                            })).unwrap())
+                        }));
+                        Ok::<_, warp::Rejection>(warp::sse::reply(warp::sse::keep_alive().stream(stream)))
+                    }
+                });
+
+            // --- RMI build: POST /v1/rmi/build  (feature-gated)
             #[cfg(feature = "learned-index")]
             let rmi_build = {
                 let data_dir = cli.data_dir.clone();
@@ -926,94 +1089,6 @@ async fn main() -> Result<()> {
                     })
             };
 
-            let subscribe_log = log.clone();
-            let subscribe_route = v1
-                .and(warp::path("subscribe"))
-                .and(warp::get())
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = subscribe_log.clone();
-                    async move {
-                        let from = q.get("from").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let (past, rx) = log.subscribe(from).await;
-
-                        // Create an SSE stream of past + live events
-                        let past_stream = futures::stream::iter(
-                            past.into_iter().map(Ok::<_, std::convert::Infallible>),
-                        );
-                        let live_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
-                            .filter_map(|res| async move {
-                                match res {
-                                    Ok(v) => Some(v),
-                                    Err(_) => {
-                                        kyrodb_engine::metrics::inc_sse_lagged();
-                                        None
-                                    }
-                                }
-                            })
-                            .map(Ok);
-                        let combined = past_stream.chain(live_stream).map(|e| {
-                            let event = e.unwrap(); // Should be infallible
-                            Ok::<_, warp::Error>(warp::sse::Event::default()
-                                .data(
-                                    serde_json::json!({"offset": event.offset, "payload": String::from_utf8_lossy(&event.payload)})
-                                        .to_string(),
-                                ))
-                        });
-                        Ok::<_, warp::Rejection>(warp::sse::reply(
-                            warp::sse::keep_alive().stream(combined),
-                        ))
-                    }
-                });
-
-            // Vector insert: POST /v1/vector/insert { key: u64, vector: [f32,...] }
-            let vec_ins_log = log.clone();
-            let vector_insert = v1
-                .and(warp::path!("vector" / "insert"))
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = vec_ins_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        let key = body["key"].as_u64().unwrap_or(0);
-                        let vec: Vec<f32> = body["vector"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_f64().map(|x| x as f32))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        match log.append_vector(Uuid::new_v4(), key, vec).await {
-                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({"offset": off})),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )),
-                        }
-                    }
-                });
-
-            // POST /v1/warmup: fault-in index and snapshot pages, best-effort
-            let warmup = {
-                let log2 = log.clone();
-                v1.and(warp::path("warmup"))
-                    .and(warp::post())
-                    .and_then(move || {
-                        let log = log2.clone();
-                        async move {
-                            log.warmup().await;
-                            Ok::<_, warp::Rejection>(warp::reply::json(
-                                &serde_json::json!({"status":"ok"}),
-                            ))
-                        }
-                    })
-            };
-
             // --- Attach rate limits ------------------------------------------------------
             // Admin RL for sensitive operations
             let snapshot_route = admin_rl.clone().and(snapshot_route).map(|(), r| r);
@@ -1027,11 +1102,14 @@ async fn main() -> Result<()> {
             let lookup_raw = data_rl.clone().and(lookup_raw).map(|(), r| r);
             let lookup_fast = data_rl.clone().and(lookup_fast).map(|(), r| r);
             let get_fast = data_rl.clone().and(get_fast).map(|(), r| r);
-            let sql_route = data_rl.clone().and(sql_route).map(|(), r| r);
+            let batch_put_route = data_rl.clone().and(batch_put_route).map(|(), r| r);
+            let msgpack_put_route = data_rl.clone().and(msgpack_put_route).map(|(), r| r);
+            let msgpack_get_route = data_rl.clone().and(msgpack_get_route).map(|(), r| r);
+            // let sql_route = data_rl.clone().and(sql_route).map(|(), r| r);
             let vector_insert = data_rl.clone().and(vector_insert).map(|(), r| r);
             // ---------------------------------------------------------------------------
 
-            // Combine routes
+            // Combine routes with compression and optimizations
             let routes = health_route
                 .or(metrics_route)
                 .or(append_route)
@@ -1044,7 +1122,10 @@ async fn main() -> Result<()> {
                 .or(lookup_raw)
                 .or(lookup_fast)
                 .or(get_fast)
-                .or(sql_route)
+                .or(batch_put_route)
+                .or(msgpack_put_route)
+                .or(msgpack_get_route)
+                // .or(sql_route)
                 .or(vector_insert)
                 .or(rmi_build)
                 .or(compact_route)
@@ -1078,9 +1159,7 @@ async fn main() -> Result<()> {
                         ))
                     } else if rej.find::<InsufficientPermissions>().is_some() {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                            warp::reply::json(
-                                &serde_json::json!({"error":"insufficient_permissions"}),
-                            ),
+                            warp::reply::json(&serde_json::json!({"error":"insufficient_permissions"})),
                             StatusCode::FORBIDDEN,
                         ))
                     } else if rej.find::<AdminRateLimited>().is_some()
@@ -1088,12 +1167,12 @@ async fn main() -> Result<()> {
                     {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(
                             warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
-                            StatusCode::TOO_MANY_REQUESTS,
+                            warp::http::StatusCode::TOO_MANY_REQUESTS,
                         ))
                     } else {
                         Ok::<_, std::convert::Infallible>(warp::reply::with_status(
                             warp::reply::json(&serde_json::json!({"error":"not found"})),
-                            StatusCode::NOT_FOUND,
+                            warp::http::StatusCode::NOT_FOUND,
                         ))
                     }
                 });

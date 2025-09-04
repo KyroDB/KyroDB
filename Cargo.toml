@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "engine",
     "bench",
+    "simple_bench",
 ]
 exclude = [
     "engine/fuzz",

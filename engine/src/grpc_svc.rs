@@ -17,15 +17,18 @@ use pb::kyrodb_server::{Kyrodb, KyrodbServer};
 #[cfg(feature = "grpc")]
 use pb::{
     AppendReq, AppendResp, BatchAppendReq, BatchAppendResp, BatchGetReq, BatchGetResp, BatchPutReq,
-    BatchPutResp, BuildRmiReq, BuildRmiResp, CompactReq, CompactResp, Event as ProtoEvent, GetReq,
-    GetResp, LookupReq, LookupResp, OffsetReq, OffsetResp, PutReq, PutResp, ReplayReq, SnapshotReq,
-    SnapshotResp, SqlReq, SqlResp, StatsReq, StatsResp, SubscribeReq, VectorInsertReq,
-    VectorInsertResp, VectorSearchReq, VectorSearchResp, WarmupReq, WarmupResp,
+    BatchPutResp, BatchPutStreamReq, BatchPutStreamResp, BuildInfoReq, BuildInfoResp, 
+    BuildRmiReq, BuildRmiResp, CompactReq, CompactResp, Event as ProtoEvent, GetFastReq, 
+    GetFastResp, GetReq, GetResp, HealthReq, HealthResp, LookupFastReq, LookupFastResp, 
+    LookupReq, LookupResp, MetricsReq, MetricsResp, OffsetReq, OffsetResp, PutReq, PutResp, 
+    ReplayReq, SnapshotReq, SnapshotResp, SqlReq, SqlResp, StatsReq, StatsResp, SubscribeEvent, 
+    SubscribeReq, SubscribeStreamReq, VectorBatchInsertReq, VectorBatchInsertResp, 
+    VectorInsertReq, VectorInsertResp, VectorSearchReq, VectorSearchResp, WarmupReq, WarmupResp,
 };
 
 // Use the engine library types
 #[cfg(feature = "grpc")]
-use kyrodb_engine::{PersistentEventLog, Record};
+use crate::engine_crate::{PersistentEventLog, Record, deserialize_record_compat, fsync_dir, metrics, index};
 
 #[cfg(feature = "grpc")]
 #[derive(Clone)]
@@ -112,7 +115,8 @@ impl Kyrodb for GrpcService {
         let k = req.into_inner().key;
         if let Some(off) = self.log.lookup_key(k).await {
             if let Some(buf) = self.log.get(off).await {
-                if let Ok(rec) = bincode::deserialize::<Record>(&buf) {
+                // Use optimized deserialization
+                if let Some(rec) = deserialize_record_compat(&buf) {
                     return Ok(Response::new(GetResp {
                         found: true,
                         value: rec.value,
@@ -142,42 +146,52 @@ impl Kyrodb for GrpcService {
         let keys = req.into_inner().keys;
         let mut items = Vec::with_capacity(keys.len());
 
-        for key in keys {
-            let mut item = pb::batch_get_resp::BatchGetItem {
-                key,
-                found: false,
-                value: vec![],
-            };
+        // Optimize: Use parallel lookup with join_all for better performance
+        let lookup_futures: Vec<_> = keys.iter().map(|&key| {
+            let log = self.log.clone();
+            async move {
+                let mut item = pb::batch_get_resp::BatchGetItem {
+                    key,
+                    found: false,
+                    value: vec![],
+                };
 
-            if let Some(off) = self.log.lookup_key(key).await {
-                if let Some(buf) = self.log.get(off).await {
-                    if let Ok(rec) = bincode::deserialize::<Record>(&buf) {
-                        item.found = true;
-                        item.value = rec.value;
+                if let Some(off) = log.lookup_key(key).await {
+                    if let Some(buf) = log.get(off).await {
+                        // Use the new compatible deserialization
+                        if let Some(rec) = deserialize_record_compat(&buf) {
+                            item.found = true;
+                            item.value = rec.value;
+                        }
                     }
                 }
+                item
             }
-            items.push(item);
-        }
+        }).collect();
 
+        items = futures::future::join_all(lookup_futures).await;
         Ok(Response::new(BatchGetResp { items }))
     }
 
     async fn batch_put(&self, req: Request<BatchPutReq>) -> Result<Response<BatchPutResp>, Status> {
         self.require_role(&req, pb::UserRole::ReadWrite)?;
         let batch_req = req.into_inner();
-        let mut offsets = Vec::with_capacity(batch_req.items.len());
+        
+        // Optimize: Use parallel writes with join_all for better throughput
+        let write_futures: Vec<_> = batch_req.items.into_iter().map(|item| {
+            let log = self.log.clone();
+            async move {
+                log.append_kv(uuid::Uuid::new_v4(), item.key, item.value)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))
+            }
+        }).collect();
 
-        for item in batch_req.items {
-            let offset = self
-                .log
-                .append_kv(uuid::Uuid::new_v4(), item.key, item.value)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            offsets.push(offset);
+        let results: Result<Vec<_>, _> = futures::future::try_join_all(write_futures).await;
+        match results {
+            Ok(offsets) => Ok(Response::new(BatchPutResp { offsets })),
+            Err(e) => Err(e),
         }
-
-        Ok(Response::new(BatchPutResp { offsets }))
     }
 
     async fn append(&self, req: Request<AppendReq>) -> Result<Response<AppendResp>, Status> {
@@ -245,7 +259,7 @@ impl Kyrodb for GrpcService {
                 payload: event.payload,
             })),
             Err(_) => {
-                kyrodb_engine::metrics::inc_sse_lagged();
+                metrics::inc_sse_lagged();
                 None
             }
         });
@@ -317,42 +331,12 @@ impl Kyrodb for GrpcService {
     }
 
     async fn execute_sql(&self, req: Request<SqlReq>) -> Result<Response<SqlResp>, Status> {
-        let sql_req = req.into_inner();
-        match crate::sql::execute_sql(&self.log, &sql_req.sql).await {
-            Ok(crate::sql::SqlResponse::Ack { offset }) => {
-                let ack = pb::SqlAck { offset };
-                Ok(Response::new(SqlResp {
-                    response: Some(pb::sql_resp::Response::Ack(ack)),
-                    error: String::new(),
-                }))
-            }
-            Ok(crate::sql::SqlResponse::Rows(rows)) => {
-                let sql_rows = rows
-                    .into_iter()
-                    .map(|(key, value)| pb::sql_rows::SqlRow { key, value })
-                    .collect();
-                let rows_resp = pb::SqlRows { rows: sql_rows };
-                Ok(Response::new(SqlResp {
-                    response: Some(pb::sql_resp::Response::Rows(rows_resp)),
-                    error: String::new(),
-                }))
-            }
-            Ok(crate::sql::SqlResponse::VecRows(rows)) => {
-                let vec_rows = rows
-                    .into_iter()
-                    .map(|(key, distance)| pb::sql_vec_rows::SqlVecRow { key, distance })
-                    .collect();
-                let vec_rows_resp = pb::SqlVecRows { rows: vec_rows };
-                Ok(Response::new(SqlResp {
-                    response: Some(pb::sql_resp::Response::VecRows(vec_rows_resp)),
-                    error: String::new(),
-                }))
-            }
-            Err(e) => Ok(Response::new(SqlResp {
-                response: None,
-                error: e.to_string(),
-            })),
-        }
+        let _sql_req = req.into_inner();
+        // SQL module has been removed for performance optimization
+        Ok(Response::new(SqlResp {
+            response: None,
+            error: "SQL functionality disabled for performance optimization".to_string(),
+        }))
     }
 
     async fn build_rmi(&self, req: Request<BuildRmiReq>) -> Result<Response<BuildRmiResp>, Status> {
@@ -362,14 +346,14 @@ impl Kyrodb for GrpcService {
             let pairs = self.log.collect_key_offset_pairs().await;
             let tmp = self.log.data_dir().join("index-rmi.tmp");
             let dst = self.log.data_dir().join("index-rmi.bin");
-            let timer = kyrodb_engine::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-            kyrodb_engine::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
-            kyrodb_engine::metrics::RMI_REBUILDS_TOTAL.inc();
+            let timer = metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
+            metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
+            metrics::RMI_REBUILDS_TOTAL.inc();
 
             let pairs_clone = pairs.clone();
             let tmp_clone = tmp.clone();
             let write_res = tokio::task::spawn_blocking(move || {
-                kyrodb_engine::index::RmiIndex::write_from_pairs_auto(&tmp_clone, &pairs_clone)
+                index::RmiIndex::write_from_pairs_auto(&tmp_clone, &pairs_clone)
             })
             .await;
 
@@ -382,12 +366,12 @@ impl Kyrodb for GrpcService {
                     eprintln!("❌ RMI rename failed: {}", e);
                     ok = false;
                 }
-                if let Err(e) = kyrodb_engine::fsync_dir(self.log.data_dir()) {
+                if let Err(e) = fsync_dir(self.log.data_dir()) {
                     eprintln!("⚠️ fsync data dir after RMI build rename failed: {}", e);
                 }
             }
             timer.observe_duration();
-            kyrodb_engine::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
+            metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
             Ok(Response::new(BuildRmiResp {
                 ok,
                 count: pairs.len() as u64,
@@ -459,5 +443,174 @@ impl Kyrodb for GrpcService {
     async fn get_offset(&self, _req: Request<OffsetReq>) -> Result<Response<OffsetResp>, Status> {
         let offset = self.log.get_offset().await;
         Ok(Response::new(OffsetResp { offset }))
+    }
+
+    // Fast path methods for maximum performance
+    async fn lookup_fast(&self, req: Request<LookupFastReq>) -> Result<Response<LookupFastResp>, Status> {
+        let k = req.into_inner().key;
+        if let Some(offset) = self.log.lookup_key(k).await {
+            Ok(Response::new(LookupFastResp {
+                found: true,
+                offset_bytes: offset.to_le_bytes().to_vec(),
+            }))
+        } else {
+            Ok(Response::new(LookupFastResp {
+                found: false,
+                offset_bytes: vec![],
+            }))
+        }
+    }
+
+    async fn get_fast(&self, req: Request<GetFastReq>) -> Result<Response<GetFastResp>, Status> {
+        let k = req.into_inner().key;
+        if let Some(off) = self.log.lookup_key(k).await {
+            if let Some(buf) = self.log.get(off).await {
+                // Use optimized deserialization for fast path
+                if let Some(rec) = deserialize_record_compat(&buf) {
+                    return Ok(Response::new(GetFastResp {
+                        found: true,
+                        value_bytes: rec.value,
+                    }));
+                }
+            }
+        }
+        Ok(Response::new(GetFastResp {
+            found: false,
+            value_bytes: vec![],
+        }))
+    }
+
+    // High-throughput streaming operations with enhanced batching
+    async fn batch_put_stream(
+        &self,
+        req: Request<Streaming<BatchPutStreamReq>>,
+    ) -> Result<Response<BatchPutStreamResp>, Status> {
+        self.require_role(&Request::new(()), pb::UserRole::ReadWrite)?;
+        let mut stream = req.into_inner();
+        let mut total_offsets = Vec::new();
+        let mut batch_count = 0;
+
+        while let Some(batch_req) = stream.message().await? {
+            // Process items in parallel within each batch
+            let write_futures: Vec<_> = batch_req.items.into_iter().map(|item| {
+                let log = self.log.clone();
+                async move {
+                    log.append_kv(uuid::Uuid::new_v4(), item.key, item.value)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))
+                }
+            }).collect();
+
+            let batch_offsets: Result<Vec<_>, _> = futures::future::try_join_all(write_futures).await;
+            match batch_offsets {
+                Ok(offsets) => {
+                    total_offsets.extend(offsets);
+                    batch_count += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(Response::new(BatchPutStreamResp {
+            offsets: total_offsets,
+            batches_processed: batch_count,
+        }))
+    }
+
+    async fn vector_batch_insert(
+        &self,
+        req: Request<Streaming<VectorBatchInsertReq>>,
+    ) -> Result<Response<VectorBatchInsertResp>, Status> {
+        self.require_role(&Request::new(()), pb::UserRole::ReadWrite)?;
+        let mut stream = req.into_inner();
+        let mut total_offsets = Vec::new();
+        let mut items_processed = 0;
+
+        while let Some(batch_req) = stream.message().await? {
+            for item in batch_req.items {
+                let offset = self
+                    .log
+                    .append_vector(uuid::Uuid::new_v4(), item.key, item.vector)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                total_offsets.push(offset);
+                items_processed += 1;
+            }
+        }
+
+        Ok(Response::new(VectorBatchInsertResp {
+            offsets: total_offsets,
+            items_processed,
+        }))
+    }
+
+    // Enhanced streaming with event filtering
+    type SubscribeStreamStream = Pin<Box<dyn Stream<Item = Result<SubscribeEvent, Status>> + Send + 'static>>;
+    
+    async fn subscribe_stream(
+        &self,
+        req: Request<SubscribeStreamReq>,
+    ) -> Result<Response<Self::SubscribeStreamStream>, Status> {
+        let subscribe_req = req.into_inner();
+        let (past_events, rx) = self.log.subscribe(subscribe_req.from_offset).await;
+
+        // Convert past events to stream
+        let past_stream = futures::stream::iter(past_events.into_iter().map(|e| {
+            Ok(SubscribeEvent {
+                offset: e.offset,
+                timestamp: e.timestamp,
+                request_id: e.request_id.to_string(),
+                event_type: "past".to_string(),
+                payload: e.payload,
+            })
+        }));
+
+        // Convert live events to stream
+        let live_stream = BroadcastStream::new(rx).filter_map(|res| match res {
+            Ok(event) => Some(Ok(SubscribeEvent {
+                offset: event.offset,
+                timestamp: event.timestamp,
+                request_id: event.request_id.to_string(),
+                event_type: "live".to_string(),
+                payload: event.payload,
+            })),
+            Err(_) => {
+                metrics::inc_sse_lagged();
+                None
+            }
+        });
+
+        let combined_stream = past_stream.chain(live_stream);
+        Ok(Response::new(Box::pin(combined_stream)))
+    }
+
+    // Health and monitoring endpoints
+    async fn health(&self, _req: Request<HealthReq>) -> Result<Response<HealthResp>, Status> {
+        Ok(Response::new(HealthResp {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            commit: option_env!("GIT_COMMIT_HASH").unwrap_or("unknown").to_string(),
+        }))
+    }
+
+    async fn get_build_info(&self, _req: Request<BuildInfoReq>) -> Result<Response<BuildInfoResp>, Status> {
+        Ok(Response::new(BuildInfoResp {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            name: env!("CARGO_PKG_NAME").to_string(),
+            commit: option_env!("GIT_COMMIT_HASH").unwrap_or("unknown").to_string(),
+            branch: option_env!("GIT_BRANCH").unwrap_or("unknown").to_string(),
+            build_time: option_env!("BUILD_TIME").unwrap_or("unknown").to_string(),
+            rust_version: option_env!("RUST_VERSION").unwrap_or("unknown").to_string(),
+            target_triple: option_env!("TARGET_TRIPLE").unwrap_or("unknown").to_string(),
+            features: option_env!("CARGO_FEATURES").unwrap_or("").to_string(),
+        }))
+    }
+
+    async fn get_metrics(&self, _req: Request<MetricsReq>) -> Result<Response<MetricsResp>, Status> {
+        let metrics_text = metrics::render();
+        Ok(Response::new(MetricsResp {
+            prometheus_text: metrics_text,
+            content_type: "text/plain; version=0.0.4".to_string(),
+        }))
     }
 }

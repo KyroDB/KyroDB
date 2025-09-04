@@ -3,8 +3,12 @@ name = "bench"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["grpc"]
+grpc = ["dep:tonic", "dep:prost", "dep:prost-types"]
+
 [dependencies]
-kyrodb_engine = { package = "kyrodb-engine", path = "../engine", features = ["learned-index"] }
+kyrodb_engine = { package = "kyrodb-engine", path = "../engine", features = ["learned-index", "grpc"] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
@@ -20,7 +24,20 @@ base64 = "0.21"
 anyhow = "1"
 indicatif = "0.17"
 serde = { version = "1", features = ["derive"] }
+rmp-serde = "1.1"  # Added for MessagePack support in bench client
+# gRPC dependencies (feature-gated)
+tonic = { version = "0.11", optional = true, features = ["transport"] }
+prost = { version = "0.12", optional = true }
+prost-types = { version = "0.12", optional = true }
+
+[build-dependencies]
+tonic-build = "0.11"
+protoc-bin-vendored = "3"
 
 [[bench]]
 name = "kv_index"
 harness = false
+
+[[bin]]
+name = "grpc_bench"
+path = "src/grpc_bench.rs"

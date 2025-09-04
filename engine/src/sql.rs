@@ -3,8 +3,8 @@ use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use kyrodb_engine::schema::{SchemaRegistry, TableKind, TableSchema};
-use kyrodb_engine::{PersistentEventLog, Record};
+use crate::schema::{SchemaRegistry, TableKind, TableSchema};
+use crate::{PersistentEventLog, Record};
 use uuid::Uuid;
 
 pub enum SqlResponse {

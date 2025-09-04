@@ -29,6 +29,22 @@ service Kyrodb {
   // SQL operations
   rpc ExecuteSql(SqlReq) returns (SqlResp);
 
+  // Fast path operations (zero-copy when possible)
+  rpc LookupFast(LookupFastReq) returns (LookupFastResp);
+  rpc GetFast(GetFastReq) returns (GetFastResp);
+
+  // High-throughput streaming operations
+  rpc BatchPutStream(stream BatchPutStreamReq) returns (BatchPutStreamResp);
+  rpc VectorBatchInsert(stream VectorBatchInsertReq) returns (VectorBatchInsertResp);
+
+  // Enhanced streaming with filtering
+  rpc SubscribeStream(SubscribeStreamReq) returns (stream SubscribeEvent);
+
+  // Health and monitoring
+  rpc Health(HealthReq) returns (HealthResp);
+  rpc GetBuildInfo(BuildInfoReq) returns (BuildInfoResp);
+  rpc GetMetrics(MetricsReq) returns (MetricsResp);
+
   // RMI operations (feature-gated)
   rpc BuildRmi(BuildRmiReq) returns (BuildRmiResp);
 }
@@ -167,3 +183,80 @@ message SqlVecRows {
 // RMI messages
 message BuildRmiReq {}
 message BuildRmiResp { bool ok = 1; uint64 count = 2; }
+
+// Fast path messages
+message LookupFastReq { uint64 key = 1; }
+message LookupFastResp { 
+  bool found = 1; 
+  bytes offset_bytes = 2;  // 8-byte little-endian u64
+}
+
+message GetFastReq { uint64 key = 1; }
+message GetFastResp { 
+  bool found = 1; 
+  bytes value_bytes = 2;   // Raw value bytes
+}
+
+// High-throughput streaming messages
+message BatchPutStreamReq {
+  message PutItem {
+    uint64 key = 1;
+    bytes value = 2;
+  }
+  repeated PutItem items = 1;
+}
+message BatchPutStreamResp { 
+  repeated uint64 offsets = 1; 
+  uint32 batches_processed = 2;
+}
+
+message VectorBatchInsertReq {
+  message VectorItem {
+    uint64 key = 1;
+    repeated float vector = 2;
+  }
+  repeated VectorItem items = 1;
+}
+message VectorBatchInsertResp { 
+  repeated uint64 offsets = 1; 
+  uint32 items_processed = 2;
+}
+
+// Enhanced subscribe with event filtering
+message SubscribeStreamReq { 
+  uint64 from_offset = 1; 
+  repeated string event_types = 2;  // Filter by event types
+}
+message SubscribeEvent {
+  uint64 offset = 1;
+  uint64 timestamp = 2;
+  string request_id = 3;
+  string event_type = 4;
+  bytes payload = 5;
+}
+
+// Health and monitoring messages
+message HealthReq {}
+message HealthResp {
+  string status = 1;
+  string version = 2;
+  string commit = 3;
+}
+
+message BuildInfoReq {}
+message BuildInfoResp {
+  string version = 1;
+  string name = 2;
+  string commit = 3;
+  string branch = 4;
+  string build_time = 5;
+  string rust_version = 6;
+  string target_triple = 7;
+  string features = 8;
+}
+
+message MetricsReq {}
+message MetricsResp {
+  string prometheus_text = 1;
+  string content_type = 2;
+}

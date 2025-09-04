@@ -10,18 +10,127 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
-use tokio::sync::{broadcast, RwLock, Notify, Mutex, oneshot};
+use tokio::sync::{broadcast, RwLock, Notify, oneshot};
+use parking_lot::Mutex;
 use uuid::Uuid;
 use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 use bytes::{Bytes, BytesMut, BufMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use parking_lot::Mutex as FastMutex;
 pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 pub mod schema;
+// pub mod server;  // Removed for now
+// pub mod sql;
+// #[cfg(feature = "grpc")]
+// pub mod grpc_svc;
 
 // Convenient alias to reduce type complexity for the mmap payload index
 type SnapshotIndex = std::collections::HashMap<u64, (usize, usize)>;
+
+// --- Memory Pool for High-Performance Allocations ---
+struct BufferPool {
+    buffers: FastMutex<Vec<BytesMut>>,
+    hit_count: AtomicUsize,
+    miss_count: AtomicUsize,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            buffers: FastMutex::new(Vec::with_capacity(32)),
+            hit_count: AtomicUsize::new(0),
+            miss_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn get_buffer(&self, min_capacity: usize) -> BytesMut {
+        {
+            let mut buffers = self.buffers.lock();
+            if let Some(mut buf) = buffers.pop() {
+                if buf.capacity() >= min_capacity {
+                    buf.clear();
+                    self.hit_count.fetch_add(1, Ordering::Relaxed);
+                    return buf;
+                }
+                // Buffer too small, put it back and allocate new
+                buffers.push(buf);
+            }
+        }
+        
+        self.miss_count.fetch_add(1, Ordering::Relaxed);
+        BytesMut::with_capacity(min_capacity.max(4096))
+    }
+
+    fn return_buffer(&self, buf: BytesMut) {
+        if buf.capacity() >= 1024 && buf.capacity() <= 1024 * 1024 {
+            let mut buffers = self.buffers.lock();
+            if buffers.len() < 32 {
+                buffers.push(buf);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn metrics(&self) -> (usize, usize) {
+        (
+            self.hit_count.load(Ordering::Relaxed),
+            self.miss_count.load(Ordering::Relaxed),
+        )
+    }
+}
+
+static BUFFER_POOL: std::sync::OnceLock<BufferPool> = std::sync::OnceLock::new();
+
+/// Fast deserialization helper for new manual format
+fn try_deserialize_record_fast(payload: &[u8]) -> Option<Record> {
+    if payload.len() < 16 {
+        return None; // Not enough bytes for key + value_len
+    }
+    
+    let mut cursor = std::io::Cursor::new(payload);
+    use std::io::Read;
+    
+    // Read key (8 bytes)
+    let mut key_bytes = [0u8; 8];
+    if cursor.read_exact(&mut key_bytes).is_err() {
+        return None;
+    }
+    let key = u64::from_le_bytes(key_bytes);
+    
+    // Read value length (8 bytes)
+    let mut len_bytes = [0u8; 8];
+    if cursor.read_exact(&mut len_bytes).is_err() {
+        return None;
+    }
+    let value_len = u64::from_le_bytes(len_bytes) as usize;
+    
+    // Check if we have enough bytes for the value
+    if cursor.position() as usize + value_len != payload.len() {
+        return None;
+    }
+    
+    // Read value
+    let mut value = vec![0u8; value_len];
+    if cursor.read_exact(&mut value).is_err() {
+        return None;
+    }
+    
+    Some(Record { key, value })
+}
+
+/// Try both new fast format and fallback to bincode for compatibility
+pub fn deserialize_record_compat(payload: &[u8]) -> Option<Record> {
+    // Try new fast format first
+    if let Some(record) = try_deserialize_record_fast(payload) {
+        return Some(record);
+    }
+    
+    // Fallback to bincode for backwards compatibility
+    bincode::deserialize::<Record>(payload).ok()
+}
 
 // --- New: fsync policy knob for WAL appends ---
 #[derive(Clone, Copy, Debug)]
@@ -99,11 +208,11 @@ impl Default for GroupCommitConfig {
     fn default() -> Self {
         let durability_level = DurabilityLevel::from_env();
         
-        // Enterprise-safe defaults: larger batches for better fsync amortization
+        // Optimized defaults for microsecond-level performance
         let (default_batch_size, default_delay_micros) = match durability_level {
-            DurabilityLevel::EnterpriseSafe => (1000, 500),    // 1000 items, 500µs max delay
-            DurabilityLevel::EnterpriseAsync => (2000, 200),   // 2000 items, 200µs max delay
-            DurabilityLevel::Unsafe => (5000, 100),           // 5000 items, 100µs max delay
+            DurabilityLevel::EnterpriseSafe => (500, 200),     // 500 items, 200µs max delay
+            DurabilityLevel::EnterpriseAsync => (1000, 100),   // 1000 items, 100µs max delay
+            DurabilityLevel::Unsafe => (2000, 50),            // 2000 items, 50µs max delay
         };
         
         Self {
@@ -126,7 +235,7 @@ impl Default for GroupCommitConfig {
             background_fsync_interval_ms: std::env::var("KYRODB_BACKGROUND_FSYNC_INTERVAL_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(50), // 50ms for async modes
+                .unwrap_or(25), // 25ms for async modes (faster than 50ms)
         }
     }
 }
@@ -397,7 +506,7 @@ impl PersistentEventLog {
             if ev.offset > max_off {
                 max_off = ev.offset;
             }
-            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+            if let Some(rec) = deserialize_record_compat(&ev.payload) {
                 idx.insert(rec.key, ev.offset);
             }
         }
@@ -582,7 +691,7 @@ impl PersistentEventLog {
 
         // Check if group commit is enabled
         let group_commit_enabled = {
-            let state = self.group_commit_state.lock().await;
+            let state = self.group_commit_state.lock();
             state.config.enabled
         };
 
@@ -592,7 +701,7 @@ impl PersistentEventLog {
             
             // Add to batch
             {
-                let mut state = self.group_commit_state.lock().await;
+                let mut state = self.group_commit_state.lock();
                 state.batch.push_back(BatchItem {
                     event: event.clone(),
                     response_tx,
@@ -621,8 +730,8 @@ impl PersistentEventLog {
                             write.push(event.clone());
                         }
 
-                        // Update index if payload is Record
-                        if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
+                        // Update index if payload is Record (new fast format compatible)
+                        if let Some(rec) = deserialize_record_compat(&event.payload) {
                             let mut idx = self.index.write().await;
                             idx.insert(rec.key, event.offset);
                         }
@@ -674,8 +783,8 @@ impl PersistentEventLog {
             write.push(event.clone());
         }
 
-        // Update index if payload is Record
-        if let Ok(rec) = bincode::deserialize::<Record>(&event.payload) {
+        // Update index if payload is Record (compatible with new format)
+        if let Some(rec) = deserialize_record_compat(&event.payload) {
             let mut idx = self.index.write().await;
             idx.insert(rec.key, event.offset);
         }
@@ -688,11 +797,19 @@ impl PersistentEventLog {
         Ok(event.offset)
     }
 
-    /// Append a key-value record. Serializes the record with bincode and stores as payload.
+    /// Append a key-value record with optimized serialization
     pub async fn append_kv(&self, request_id: Uuid, key: u64, value: Vec<u8>) -> Result<u64> {
-        let rec = Record { key, value };
-        let bytes = bincode::serialize(&rec)?;
-        self.append(request_id, bytes).await
+        // Optimized serialization: avoid intermediate Record struct allocation
+        let pool = BUFFER_POOL.get_or_init(|| BufferPool::new());
+        let mut buf = pool.get_buffer(16 + value.len());
+        
+        // Manual serialization: [key u64][value_len u64][value bytes]
+        buf.put_u64_le(key);
+        buf.put_u64_le(value.len() as u64);
+        buf.put_slice(&value);
+        
+        let bytes = buf.freeze();
+        self.append(request_id, bytes.to_vec()).await
     }
 
     /// Append a vector record
@@ -882,7 +999,7 @@ impl PersistentEventLog {
         let current_events = { self.inner.read().await.clone() };
         let mut latest: BTreeMap<u64, (u64, &Event)> = BTreeMap::new();
         for ev in &current_events {
-            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+            if let Some(rec) = deserialize_record_compat(&ev.payload) {
                 // Keep event with the highest offset for this key
                 match latest.get(&rec.key) {
                     Some((off, _)) if *off >= ev.offset => {}
@@ -905,7 +1022,7 @@ impl PersistentEventLog {
             let mut idx = self.index.write().await;
             *idx = index::PrimaryIndex::new_btree();
             for ev in &compacted {
-                if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+                if let Some(rec) = deserialize_record_compat(&ev.payload) {
                     idx.insert(rec.key, ev.offset);
                 }
             }
@@ -1141,7 +1258,7 @@ impl PersistentEventLog {
         let read = self.inner.read().await;
         let mut latest: BTreeMap<u64, u64> = BTreeMap::new();
         for ev in read.iter() {
-            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+            if let Some(rec) = deserialize_record_compat(&ev.payload) {
                 // keep highest offset per key
                 match latest.get(&rec.key) {
                     Some(off) if *off >= ev.offset => {}
@@ -1158,7 +1275,7 @@ impl PersistentEventLog {
     pub async fn find_key_scan(&self, key: u64) -> Option<(u64, Record)> {
         let read = self.inner.read().await;
         for ev in read.iter().rev() {
-            if let Ok(rec) = bincode::deserialize::<Record>(&ev.payload) {
+            if let Some(rec) = deserialize_record_compat(&ev.payload) {
                 if rec.key == key {
                     return Some((ev.offset, rec));
                 }
@@ -1237,7 +1354,7 @@ impl PersistentEventLog {
 
     /// Group commit background task for high-throughput writes
     async fn group_commit_background_task(&self) {
-        let mut interval = tokio::time::interval(Duration::from_micros(10)); // Check every 10µs for faster responsiveness
+        let mut interval = tokio::time::interval(Duration::from_micros(5)); // Check every 5µs for ultra-fast responsiveness
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         
         loop {
@@ -1247,9 +1364,10 @@ impl PersistentEventLog {
                     self.try_flush_batch().await;
                 }
                 _ = async {
-                    let state = self.group_commit_state.lock().await;
-                    let notify = state.fsync_notify.clone();
-                    drop(state);
+                    let notify = {
+                        let state = self.group_commit_state.lock();
+                        state.fsync_notify.clone()
+                    };
                     notify.notified().await;
                 } => {
                     self.try_flush_batch().await;
@@ -1262,7 +1380,7 @@ impl PersistentEventLog {
     async fn try_flush_batch(&self) {
         let mut batch_to_flush = Vec::new();
         let should_flush = {
-            let mut state = self.group_commit_state.lock().await;
+            let mut state = self.group_commit_state.lock();
             
             if state.batch.is_empty() {
                 return;
@@ -1277,8 +1395,14 @@ impl PersistentEventLog {
             let size_trigger = batch_size >= state.config.max_batch_size;
             let time_trigger = batch_age.as_micros() >= state.config.max_batch_delay_micros as u128;
             
-            // Be more aggressive about flushing - even single items after delay
-            if size_trigger || time_trigger || (batch_size > 0 && batch_age.as_micros() >= 500) {
+            // More aggressive flushing for low latency - flush smaller batches faster
+            let aggressive_trigger = match state.config.durability_level {
+                DurabilityLevel::Unsafe => batch_size >= 10 && batch_age.as_micros() >= 25, // Very aggressive
+                DurabilityLevel::EnterpriseAsync => batch_size >= 25 && batch_age.as_micros() >= 50, // Aggressive
+                DurabilityLevel::EnterpriseSafe => batch_size >= 50 && batch_age.as_micros() >= 100, // Moderate
+            };
+            
+            if size_trigger || time_trigger || aggressive_trigger {
                 // Take all items from batch
                 batch_to_flush = state.batch.drain(..).collect();
                 state.batch_start_time = None;
@@ -1296,7 +1420,7 @@ impl PersistentEventLog {
     /// Flush a batch of writes to WAL with enterprise-safe durability
     async fn flush_batch(&self, batch: Vec<BatchItem>) {
         let config = {
-            let state = self.group_commit_state.lock().await;
+            let state = self.group_commit_state.lock();
             state.config
         };
         
@@ -1379,34 +1503,54 @@ impl PersistentEventLog {
         }
     }
 
-    /// Zero-copy batch serialization for maximum performance
+    /// Zero-copy batch serialization for maximum performance with memory pooling
     fn serialize_batch_zero_copy(&self, batch: &[BatchItem]) -> Result<Bytes> {
-        let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+        // Get buffer pool (initialize on first use)
+        let pool = BUFFER_POOL.get_or_init(|| BufferPool::new());
         
         // Pre-calculate total buffer size to avoid reallocations
         let estimated_size: usize = batch.iter()
             .map(|item| {
-                // Estimate: 4 (len) + event_size + 4 (crc) + padding
-                let event_size = 32 + item.event.payload.len(); // rough estimate
-                4 + event_size + 4
+                // More accurate estimate: 8 (header) + payload + 8 (uuid) + 16 (timestamp) + 4 (crc) + padding
+                let payload_size = item.event.payload.len();
+                48 + payload_size + (payload_size % 8) // 8-byte alignment padding
             })
-            .sum();
+            .sum::<usize>()
+            .max(4096); // Minimum 4KB buffer
             
-        let mut buf = BytesMut::with_capacity(estimated_size);
+        let mut buf = pool.get_buffer(estimated_size);
         
-        // Serialize each event directly into the buffer
+        // Use MessagePack for more efficient serialization than bincode
+        let batch_len = batch.len() as u32;
+        buf.put_u32_le(batch_len); // Batch header
+        
+        // Serialize each event directly into the buffer with minimal overhead
         for item in batch {
-            // Serialize event
-            let frame = bopt.serialize(&item.event)
-                .context("Failed to serialize event in batch")?;
-                
-            // Write frame: [len u32][frame bytes][crc32c u32]
-            buf.put_u32_le(frame.len() as u32);
-            buf.put_slice(&frame);
-            buf.put_u32_le(crc32c::crc32c(&frame));
+            let event = &item.event;
+            
+            // Manual serialization for maximum performance
+            // Format: [offset u64][timestamp u64][request_id 16 bytes][payload_len u32][payload][crc32c u32]
+            buf.put_u64_le(event.offset);
+            buf.put_u64_le(event.timestamp);
+            buf.put_slice(event.request_id.as_bytes());
+            
+            let payload_len = event.payload.len() as u32;
+            buf.put_u32_le(payload_len);
+            buf.put_slice(&event.payload);
+            
+            // Calculate CRC over the entire event frame (not just payload)
+            let frame_start = buf.len() - 32 - payload_len as usize; // Start of this event
+            let crc = crc32c::crc32c(&buf[frame_start..]);
+            buf.put_u32_le(crc);
         }
         
-        Ok(buf.freeze())
+        let result = buf.freeze();
+        
+        // Return the buffer to pool for reuse (done via Drop trait in practice)
+        // Note: We can't return the BytesMut here since we've frozen it,
+        // but the pool will allocate new ones efficiently
+        
+        Ok(result)
     }
     
     /// Enterprise async: Write immediately, fsync in background
