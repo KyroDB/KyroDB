@@ -15,7 +15,7 @@ pub trait Index {
 }
 
 /// Naive in-memory BTreeMap based index (single-column primary key).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BTreeIndex {
     map: BTreeMap<u64, u64>,
 }
@@ -1399,6 +1399,84 @@ impl Default for RmiIndex {
     }
 }
 
+#[cfg(feature = "learned-index")]
+impl Clone for RmiIndex {
+    fn clone(&self) -> Self {
+        // For cloning, we only need to clone the delta map and metadata
+        // The backing storage can be shared since it's immutable
+        let backing = match &self.backing {
+            RmiBacking::Owned { sorted_keys, sorted_offsets } => {
+                RmiBacking::Owned {
+                    sorted_keys: sorted_keys.clone(),
+                    sorted_offsets: sorted_offsets.clone(),
+                }
+            }
+            RmiBacking::Mmap { mmap, keys_off, offs_off, count } => {
+                // For memory mapped data, we can't easily clone the mmap
+                // Instead, we'll convert to owned data for the clone
+                // This is safe but may be expensive - however, it's only used during index updates
+                let keys_slice = unsafe {
+                    std::slice::from_raw_parts(
+                        mmap.as_ptr().add(*keys_off) as *const u64,
+                        *count
+                    )
+                };
+                let offsets_slice = unsafe {
+                    std::slice::from_raw_parts(
+                        mmap.as_ptr().add(*offs_off) as *const u64,
+                        *count
+                    )
+                };
+                RmiBacking::Owned {
+                    sorted_keys: keys_slice.to_vec(),
+                    sorted_offsets: offsets_slice.to_vec(),
+                }
+            }
+            RmiBacking::MmapAos { mmap, entries_off, count, off_is_u32, entry_stride } => {
+                // Convert AoS mmap to owned SoA format
+                let mut keys = Vec::with_capacity(*count);
+                let mut offsets = Vec::with_capacity(*count);
+                
+                for i in 0..*count {
+                    let entry_ptr = unsafe { mmap.as_ptr().add(*entries_off + i * *entry_stride) };
+                    let key = unsafe { *(entry_ptr as *const u64) };
+                    let offset = if *off_is_u32 {
+                        unsafe { *(entry_ptr.add(8) as *const u32) as u64 }
+                    } else {
+                        unsafe { *(entry_ptr.add(8) as *const u64) }
+                    };
+                    keys.push(key);
+                    offsets.push(offset);
+                }
+                
+                RmiBacking::Owned {
+                    sorted_keys: keys,
+                    sorted_offsets: offsets,
+                }
+            }
+        };
+
+        Self {
+            delta: self.delta.clone(),
+            leaves: self.leaves.clone(),
+            router: self.router.clone(),
+            router_bits: self.router_bits,
+            backing,
+            fx_shift: self.fx_shift,
+            fx_m: self.fx_m.clone(),
+            fx_b: self.fx_b.clone(),
+            leaf_key_min: self.leaf_key_min.clone(),
+            leaf_key_max: self.leaf_key_max.clone(),
+            leaf_slope: self.leaf_slope.clone(),
+            leaf_intercept: self.leaf_intercept.clone(),
+            leaf_epsilon: self.leaf_epsilon.clone(),
+            leaf_start: self.leaf_start.clone(),
+            leaf_len: self.leaf_len.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum PrimaryIndex {
     BTree(BTreeIndex),
     #[cfg(feature = "learned-index")]

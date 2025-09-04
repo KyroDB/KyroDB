@@ -1,0 +1,262 @@
+syntax = "proto3";
+package kyrodb.v1;
+
+service Kyrodb {
+  // Core data operations
+  rpc Lookup(LookupReq) returns (LookupResp);
+  rpc Get(GetReq) returns (GetResp);
+  rpc Put(PutReq) returns (PutResp);
+  rpc BatchGet(BatchGetReq) returns (BatchGetResp);
+  rpc BatchPut(BatchPutReq) returns (BatchPutResp);
+  rpc Append(AppendReq) returns (AppendResp);
+  rpc BatchAppend(stream BatchAppendReq) returns (BatchAppendResp);
+
+  // Streaming operations
+  rpc Subscribe(SubscribeReq) returns (stream Event);
+  rpc Replay(ReplayReq) returns (stream Event);
+
+  // Admin operations
+  rpc Snapshot(SnapshotReq) returns (SnapshotResp);
+  rpc Compact(CompactReq) returns (CompactResp);
+  rpc GetStats(StatsReq) returns (StatsResp);
+  rpc Warmup(WarmupReq) returns (WarmupResp);
+  rpc GetOffset(OffsetReq) returns (OffsetResp);
+
+  // Vector operations
+  rpc VectorInsert(VectorInsertReq) returns (VectorInsertResp);
+  rpc VectorSearch(VectorSearchReq) returns (VectorSearchResp);
+
+  // SQL operations
+  rpc ExecuteSql(SqlReq) returns (SqlResp);
+
+  // Fast path operations (zero-copy when possible)
+  rpc LookupFast(LookupFastReq) returns (LookupFastResp);
+  rpc GetFast(GetFastReq) returns (GetFastResp);
+
+  // High-throughput streaming operations
+  rpc BatchPutStream(stream BatchPutStreamReq) returns (BatchPutStreamResp);
+  rpc VectorBatchInsert(stream VectorBatchInsertReq) returns (VectorBatchInsertResp);
+
+  // Enhanced streaming with filtering
+  rpc SubscribeStream(SubscribeStreamReq) returns (stream SubscribeEvent);
+
+  // Health and monitoring
+  rpc Health(HealthReq) returns (HealthResp);
+  rpc GetBuildInfo(BuildInfoReq) returns (BuildInfoResp);
+  rpc GetMetrics(MetricsReq) returns (MetricsResp);
+
+  // RMI operations (feature-gated)
+  rpc BuildRmi(BuildRmiReq) returns (BuildRmiResp);
+}
+
+// Authentication metadata
+message AuthMetadata {
+  string token = 1;
+  UserRole role = 2;
+}
+
+enum UserRole {
+  READ_ONLY = 0;
+  READ_WRITE = 1;
+  ADMIN = 2;
+}
+
+// Core data messages
+message LookupReq { uint64 key = 1; }
+message LookupResp { bool found = 1; uint64 offset = 2; }
+
+message GetReq { uint64 key = 1; }
+message GetResp { bool found = 1; bytes value = 2; }
+
+message PutReq { uint64 key = 1; bytes value = 2; }
+message PutResp { uint64 offset = 1; }
+
+message BatchGetReq { repeated uint64 keys = 1; }
+message BatchGetResp {
+  message BatchGetItem {
+    uint64 key = 1;
+    bool found = 2;
+    bytes value = 3;
+  }
+  repeated BatchGetItem items = 1;
+}
+
+message BatchPutReq {
+  message BatchPutItem {
+    uint64 key = 1;
+    bytes value = 2;
+  }
+  repeated BatchPutItem items = 1;
+}
+message BatchPutResp { repeated uint64 offsets = 1; }
+
+message AppendReq { bytes payload = 1; }
+message AppendResp { uint64 offset = 1; }
+
+message BatchAppendReq { bytes payload = 1; }
+message BatchAppendResp { repeated uint64 offsets = 1; }
+
+// Streaming messages
+message SubscribeReq { uint64 from_offset = 1; }
+message ReplayReq { uint64 start = 1; optional uint64 end = 2; }
+
+message Event {
+  uint64 offset = 1;
+  uint64 timestamp = 2;
+  string request_id = 3;
+  bytes payload = 4;
+}
+
+// Admin messages
+message SnapshotReq {}
+message SnapshotResp { bool success = 1; string error = 2; }
+
+message CompactReq {}
+message CompactResp {
+  bool success = 1;
+  string error = 2;
+  uint64 before_bytes = 3;
+  uint64 after_bytes = 4;
+  uint64 segments_removed = 5;
+  uint64 segments_active = 6;
+  uint64 keys_retained = 7;
+}
+
+message StatsReq {}
+message StatsResp {
+  uint64 total_events = 1;
+  uint64 wal_size_bytes = 2;
+  uint64 snapshot_size_bytes = 3;
+  uint32 wal_segments = 4;
+  uint64 current_offset = 5;
+  string index_type = 6;
+  uint64 rmi_leaves = 7;
+  uint64 rmi_size_bytes = 8;
+}
+
+message WarmupReq {}
+message WarmupResp { string status = 1; }
+
+message OffsetReq {}
+message OffsetResp { uint64 offset = 1; }
+
+// Vector messages
+message VectorInsertReq { uint64 key = 1; repeated float vector = 2; }
+message VectorInsertResp { uint64 offset = 1; }
+
+message VectorSearchReq { repeated float query = 1; uint32 k = 2; }
+message VectorSearchResp {
+  message VectorResult {
+    uint64 key = 1;
+    float distance = 2;
+  }
+  repeated VectorResult results = 1;
+}
+
+// SQL messages
+message SqlReq { string sql = 1; }
+message SqlResp {
+  oneof response {
+    SqlAck ack = 1;
+    SqlRows rows = 2;
+    SqlVecRows vec_rows = 3;
+  }
+  string error = 4;
+}
+
+message SqlAck { uint64 offset = 1; }
+message SqlRows {
+  message SqlRow {
+    uint64 key = 1;
+    bytes value = 2;
+  }
+  repeated SqlRow rows = 1;
+}
+message SqlVecRows {
+  message SqlVecRow {
+    uint64 key = 1;
+    float distance = 2;
+  }
+  repeated SqlVecRow rows = 1;
+}
+
+// RMI messages
+message BuildRmiReq {}
+message BuildRmiResp { bool ok = 1; uint64 count = 2; }
+
+// Fast path messages
+message LookupFastReq { uint64 key = 1; }
+message LookupFastResp { 
+  bool found = 1; 
+  bytes offset_bytes = 2;  // 8-byte little-endian u64
+}
+
+message GetFastReq { uint64 key = 1; }
+message GetFastResp { 
+  bool found = 1; 
+  bytes value_bytes = 2;   // Raw value bytes
+}
+
+// High-throughput streaming messages
+message BatchPutStreamReq {
+  message PutItem {
+    uint64 key = 1;
+    bytes value = 2;
+  }
+  repeated PutItem items = 1;
+}
+message BatchPutStreamResp { 
+  repeated uint64 offsets = 1; 
+  uint32 batches_processed = 2;
+}
+
+message VectorBatchInsertReq {
+  message VectorItem {
+    uint64 key = 1;
+    repeated float vector = 2;
+  }
+  repeated VectorItem items = 1;
+}
+message VectorBatchInsertResp { 
+  repeated uint64 offsets = 1; 
+  uint32 items_processed = 2;
+}
+
+// Enhanced subscribe with event filtering
+message SubscribeStreamReq { 
+  uint64 from_offset = 1; 
+  repeated string event_types = 2;  // Filter by event types
+}
+message SubscribeEvent {
+  uint64 offset = 1;
+  uint64 timestamp = 2;
+  string request_id = 3;
+  string event_type = 4;
+  bytes payload = 5;
+}
+
+// Health and monitoring messages
+message HealthReq {}
+message HealthResp {
+  string status = 1;
+  string version = 2;
+  string commit = 3;
+}
+
+message BuildInfoReq {}
+message BuildInfoResp {
+  string version = 1;
+  string name = 2;
+  string commit = 3;
+  string branch = 4;
+  string build_time = 5;
+  string rust_version = 6;
+  string target_triple = 7;
+  string features = 8;
+}
+
+message MetricsReq {}
+message MetricsResp {
+  string prometheus_text = 1;
+  string content_type = 2;
+}

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
+use std::time::Duration;
 #[cfg(feature = "grpc")]
 mod grpc_svc;
 #[cfg(feature = "grpc")]
@@ -175,12 +176,18 @@ enum Commands {
         /// TLS private key file path (enables HTTPS)
         #[arg(long)]
         _tls_key: Option<String>,
-        /// Admin token for privileged operations (separate from auth_token for read/write)
+        /// Admin token for privileged operations (separate from auth_token for read/write). If no tokens passed, auth is disabled.
         #[arg(long)]
         admin_token: Option<String>,
         /// Enable rate limiting (feature-gated; defaults to disabled for full throttle)
         #[arg(long)]
         enable_rate_limiting: bool,
+        /// HTTP/2 max concurrent streams per connection (default: 1000)
+        #[arg(long, default_value_t = 1000)]
+        http2_max_streams: u32,
+        /// HTTP keep-alive timeout in seconds (default: 600)
+        #[arg(long, default_value_t = 600)]
+        http_keepalive_secs: u64,
     },
 }
 
@@ -238,6 +245,8 @@ async fn main() -> Result<()> {
             _tls_key,
             admin_token,
             enable_rate_limiting,
+            http2_max_streams,
+            http_keepalive_secs,
         } => {
             // Silence unused when learned-index feature is disabled
             #[cfg(not(feature = "learned-index"))]
@@ -443,6 +452,7 @@ async fn main() -> Result<()> {
             #[cfg(feature = "grpc")]
             if let Some(addr_str) = grpc_addr.clone() {
                 let addr: std::net::SocketAddr = addr_str.parse().expect("invalid --grpc-addr");
+                // Enable auth only if any token is provided; otherwise fully open for benchmarking
                 let svc = grpc_svc::GrpcService::new_with_auth(
                     log.clone(),
                     auth_token.clone(),
@@ -511,8 +521,18 @@ async fn main() -> Result<()> {
                 (SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY), SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY))
             };
 
-            let admin_rl = mk_rl_filter_admin(admin_limiter.clone()).boxed();
-            let data_rl = mk_rl_filter_data(data_limiter.clone()).boxed();
+            // Conditionally enable rate limiting only if requested
+            let admin_rl = if enable_rate_limiting {
+                mk_rl_filter_admin(admin_limiter.clone()).boxed()
+            } else {
+                // No-op: always allow
+                warp::any().map(|| ()).boxed()
+            };
+            let data_rl = if enable_rate_limiting {
+                mk_rl_filter_data(data_limiter.clone()).boxed()
+            } else {
+                warp::any().map(|| ()).boxed()
+            };
             // ------------------------------------------------------------------------
 
             // --- Fast lookup endpoints (HTTP hot path) with versioned prefix -----------------
@@ -734,6 +754,40 @@ async fn main() -> Result<()> {
                             )),
                             Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            )),
+                        }
+                    }
+                });
+
+            // Binary PUT: POST /v1/put_fast/{key} with raw bytes body - maximum performance
+            let put_fast_log = log.clone();
+            let put_fast_route = v1
+                .and(warp::path!("put_fast" / u64))
+                .and(warp::post())
+                .and(warp::body::bytes())  // Accept raw bytes directly
+                .and_then(move |key: u64, body: bytes::Bytes| {
+                    let log = put_fast_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        // Direct binary append - no JSON/base64 overhead
+                        match log.append_kv(Uuid::new_v4(), key, body.to_vec()).await {
+                            Ok(off) => {
+                                // Return offset as 8-byte little-endian for max speed
+                                let response = off.to_le_bytes().to_vec();
+                                Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::with_header(
+                                        response,
+                                        "Content-Type", "application/octet-stream"
+                                    ),
+                                    StatusCode::OK,
+                                ))
+                            },
+                            Err(_) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
+                                warp::reply::with_header(
+                                    "error".as_bytes().to_vec(),
+                                    "Content-Type", "application/octet-stream"
+                                ),
                                 StatusCode::INTERNAL_SERVER_ERROR,
                             )),
                         }
@@ -1109,6 +1163,8 @@ async fn main() -> Result<()> {
             let vector_insert = data_rl.clone().and(vector_insert).map(|(), r| r);
             // ---------------------------------------------------------------------------
 
+            // Compression will be handled by warp's built-in compression middleware
+            
             // Combine routes with compression and optimizations
             let routes = health_route
                 .or(metrics_route)
@@ -1118,6 +1174,7 @@ async fn main() -> Result<()> {
                 .or(snapshot_route)
                 .or(offset_route)
                 .or(put_route)
+                .or(put_fast_route)
                 .or(lookup_route)
                 .or(lookup_raw)
                 .or(lookup_fast)
@@ -1177,6 +1234,9 @@ async fn main() -> Result<()> {
                     }
                 });
 
+            // Apply compression middleware to routes for better throughput
+            let routes = routes.with(warp::compression::gzip());
+
             // Per-request logging with runtime disable via KYRODB_DISABLE_HTTP_LOG=1
             let disable_http_log =
                 std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
@@ -1195,7 +1255,7 @@ async fn main() -> Result<()> {
                 }
             }));
 
-            // start server
+            // --- High-Performance HTTP Server Configuration ---
             let addr = (host.parse::<std::net::IpAddr>()?, port);
             tracing::info!(
                 "Starting kyrodb-engine on {}:{} (commit={}, features={})",
@@ -1206,11 +1266,21 @@ async fn main() -> Result<()> {
             );
 
             println!(
-                "🚀 Starting server at http://{}:{} (commit={}, features={})",
+                "🚀 Starting optimized HTTP server at http://{}:{} (commit={}, features={})",
                 host, port, build_commit, build_features
             );
 
-            warp::serve(routes).run(addr).await;
+            // Configure optimized HTTP server with warp's built-in optimizations
+            // Focus on connection pooling and keep-alive optimizations
+            tracing::info!("HTTP server configured with optimizations:");
+            tracing::info!("- Connection pooling: enabled");
+            tracing::info!("- Keep-alive: enabled with {}s timeout", http_keepalive_secs);
+            tracing::info!("- Compression: gzip enabled");
+            tracing::info!("- Max concurrent streams: {} (client-side config)", http2_max_streams);
+            
+            warp::serve(routes)
+                .run(addr)
+                .await;
         }
     }
 

@@ -53,6 +53,10 @@ struct Args {
     /// Regime: warm or cold (whether to prebuild RMI index)
     #[arg(long, default_value = "warm")]
     regime: String,
+    
+    /// Force HTTP/2 for multiplexed connections
+    #[arg(long)]
+    http2_only: bool,
 }
 
 #[tokio::main]
@@ -65,7 +69,17 @@ async fn main() -> Result<()> {
     println!("   Read phase: {}s with {} concurrency", args.read_seconds, args.read_concurrency);
     println!("   Distribution: {}", args.dist);
     
-    let client = reqwest::Client::new();
+    // Configure HTTP client with optimizations for high concurrency
+    let mut client_builder = reqwest::Client::builder()
+        .pool_max_idle_per_host(std::cmp::max(args.read_concurrency * 2, 100)) // Larger connection pool
+        .pool_idle_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(600)) // Match server keepalive
+        .tcp_nodelay(true); // Disable Nagle for low latency
+    
+    // HTTP/2 support is automatically negotiated by reqwest
+    
+    let client = client_builder.build()?;
     let auth_header = args.auth_token.as_ref().map(|t| format!("Bearer {}", t));
 
     // Wait for server health
@@ -90,10 +104,8 @@ async fn main() -> Result<()> {
             let key = i as u64;
             let value = vec![b'A'; 32]; // 32-byte value
             
-            let url = format!("{}/v1/put/{}", base, key);
-            let mut req = client.post(&url).json(&serde_json::json!({
-                "value": base64::encode(&value)
-            }));
+            let url = format!("{}/v1/put_fast/{}", base, key);
+            let mut req = client.post(&url).body(value);
             
             if let Some(a) = auth.as_deref() {
                 req = req.header("Authorization", a);

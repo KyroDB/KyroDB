@@ -128,3 +128,4 @@ bench_server.log
 .vscode/settings.json
 .idea/workspace.xml
 .github/copilot-instructions.md
+.cursor/rules/rules.mdc

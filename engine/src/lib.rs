@@ -1,6 +1,7 @@
 //! Durable, crash‑recoverable Event Log with real‑time subscribe.
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use bincode::Options;
 use chrono::Utc;
 #[cfg(feature = "ann-hnsw")]
@@ -121,15 +122,12 @@ fn try_deserialize_record_fast(payload: &[u8]) -> Option<Record> {
     Some(Record { key, value })
 }
 
-/// Try both new fast format and fallback to bincode for compatibility
+/// Fast-only record deserialization - no bincode fallback for maximum performance
+/// Records must be in the optimized fast format: [key u64][value_len u64][value bytes]
 pub fn deserialize_record_compat(payload: &[u8]) -> Option<Record> {
-    // Try new fast format first
-    if let Some(record) = try_deserialize_record_fast(payload) {
-        return Some(record);
-    }
-    
-    // Fallback to bincode for backwards compatibility
-    bincode::deserialize::<Record>(payload).ok()
+    // Use only the fast format for maximum performance
+    // Legacy bincode records will be treated as corrupt and ignored
+    try_deserialize_record_fast(payload)
 }
 
 // --- New: fsync policy knob for WAL appends ---
@@ -349,14 +347,12 @@ pub struct CompactionStats {
 }
 
 /// WAL‑and‑Snapshot durable log with broadcast for live tailing
-#[derive(Clone)]
 pub struct PersistentEventLog {
     inner: Arc<RwLock<Vec<Event>>>,
     wal: Arc<RwLock<BufWriter<File>>>,
     data_dir: PathBuf,
     tx: broadcast::Sender<Event>,
-    index: Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
-    // Replace with epoch-guarded shared pointer for linearizable swaps
+    index: ArcSwap<index::PrimaryIndex>, // primary key → offset (lock-free)
     next_offset: Arc<RwLock<u64>>, // monotonic sequence (not tied to vec length)
     // current WAL segment index for rotation
     wal_seg_index: Arc<RwLock<u32>>,
@@ -563,8 +559,7 @@ impl PersistentEventLog {
             wal,
             data_dir: data_dir.clone(),
             tx,
-            index: Arc::new(RwLock::new(idx)),
-            // TODO: migrate to ArcSwap<index::PrimaryIndex>
+            index: ArcSwap::new(Arc::new(idx)),
             next_offset: Arc::new(RwLock::new(next)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
@@ -710,6 +705,8 @@ impl PersistentEventLog {
                 // Start batch timer if this is the first item
                 if state.batch.len() == 1 {
                     state.batch_start_time = Some(Instant::now());
+                    // Wake background task to start deadline timer immediately
+                    state.fsync_notify.notify_one();
                 }
                 
                 // Check if we should trigger immediate flush
@@ -732,8 +729,11 @@ impl PersistentEventLog {
 
                         // Update index if payload is Record (new fast format compatible)
                         if let Some(rec) = deserialize_record_compat(&event.payload) {
-                            let mut idx = self.index.write().await;
-                            idx.insert(rec.key, event.offset);
+                            // For ArcSwap, we need to clone the index, update it, and swap
+                            let current_index = self.index.load();
+                            let mut new_index = (**current_index).clone();
+                            new_index.insert(rec.key, event.offset);
+                            self.index.store(Arc::new(new_index));
                         }
 
                         // Broadcast to subscribers
@@ -785,8 +785,11 @@ impl PersistentEventLog {
 
         // Update index if payload is Record (compatible with new format)
         if let Some(rec) = deserialize_record_compat(&event.payload) {
-            let mut idx = self.index.write().await;
-            idx.insert(rec.key, event.offset);
+            // For ArcSwap, we need to clone the index, update it, and swap
+            let current_index = self.index.load();
+            let mut new_index = (**current_index).clone();
+            new_index.insert(rec.key, event.offset);
+            self.index.store(Arc::new(new_index));
         }
 
         // Broadcast to subscribers
@@ -820,40 +823,39 @@ impl PersistentEventLog {
     }
 
     /// Get offset for a given key if present via index with delta-first semantics.
+    /// Lock-free implementation using ArcSwap for maximum read performance.
     pub async fn lookup_key(&self, key: u64) -> Option<u64> {
-        // Try index first
-        {
-            let idx = self.index.read().await;
-            match &*idx {
-                index::PrimaryIndex::BTree(b) => return b.get(&key),
-                #[cfg(feature = "learned-index")]
-                index::PrimaryIndex::Rmi(r) => {
-                    if let Some(v) = r.delta_get(&key) {
-                        return Some(v);
-                    }
-                    // Measure RMI lookup latency overall and, if applicable, during rebuild window
-                    let timer_all = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                    #[cfg(not(feature = "bench-no-metrics"))]
-                    let rebuild_timer_opt = if crate::metrics::rmi_rebuild_in_progress() {
-                        Some(
-                            crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer(),
-                        )
-                    } else {
-                        None
-                    };
-                    let res = r.predict_get(&key);
-                    timer_all.observe_duration();
-                    #[cfg(not(feature = "bench-no-metrics"))]
-                    if let Some(t) = rebuild_timer_opt {
-                        t.observe_duration();
-                    }
-                    if let Some(v) = res {
-                        crate::metrics::RMI_HITS_TOTAL.inc();
-                        crate::metrics::RMI_READS_TOTAL.inc();
-                        return Some(v);
-                    } else {
-                        crate::metrics::RMI_MISSES_TOTAL.inc();
-                    }
+        // Lock-free index access - single atomic pointer load
+        let idx = self.index.load();
+        match &**idx {
+            index::PrimaryIndex::BTree(b) => return b.get(&key),
+            #[cfg(feature = "learned-index")]
+            index::PrimaryIndex::Rmi(r) => {
+                if let Some(v) = r.delta_get(&key) {
+                    return Some(v);
+                }
+                // Measure RMI lookup latency overall and, if applicable, during rebuild window
+                let timer_all = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                #[cfg(not(feature = "bench-no-metrics"))]
+                let rebuild_timer_opt = if crate::metrics::rmi_rebuild_in_progress() {
+                    Some(
+                        crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer(),
+                    )
+                } else {
+                    None
+                };
+                let res = r.predict_get(&key);
+                timer_all.observe_duration();
+                #[cfg(not(feature = "bench-no-metrics"))]
+                if let Some(t) = rebuild_timer_opt {
+                    t.observe_duration();
+                }
+                if let Some(v) = res {
+                    crate::metrics::RMI_HITS_TOTAL.inc();
+                    crate::metrics::RMI_READS_TOTAL.inc();
+                    return Some(v);
+                } else {
+                    crate::metrics::RMI_MISSES_TOTAL.inc();
                 }
             }
         }
@@ -870,8 +872,8 @@ impl PersistentEventLog {
         // Warm RMI index if present
         #[cfg(feature = "learned-index")]
         {
-            let idx = self.index.read().await;
-            if let index::PrimaryIndex::Rmi(r) = &*idx {
+            let idx = self.index.load();
+            if let index::PrimaryIndex::Rmi(r) = &**idx {
                 r.warm();
             }
         }
@@ -1019,13 +1021,13 @@ impl PersistentEventLog {
             *w = compacted.clone();
         }
         {
-            let mut idx = self.index.write().await;
-            *idx = index::PrimaryIndex::new_btree();
+            let mut new_idx = index::PrimaryIndex::new_btree();
             for ev in &compacted {
                 if let Some(rec) = deserialize_record_compat(&ev.payload) {
-                    idx.insert(rec.key, ev.offset);
+                    new_idx.insert(rec.key, ev.offset);
                 }
             }
+            self.index.store(Arc::new(new_idx));
         }
 
         // 4) Persist snapshot of compacted state and reset WAL segments
@@ -1124,10 +1126,10 @@ impl PersistentEventLog {
     /// 3. Using atomic swap to minimize lock holding time
     pub async fn swap_primary_index(&self, mut new_index: index::PrimaryIndex) {
         // Step 1: Prepare delta migration outside the critical section
-        // Extract delta pairs from current index without holding write lock
+        // Extract delta pairs from current index without holding any locks
         let delta_pairs: Vec<(u64, u64)> = {
-            let guard = self.index.read().await;
-            match &*guard {
+            let current_index = self.index.load();
+            match &**current_index {
                 index::PrimaryIndex::Rmi(old_rmi) => {
                     old_rmi.delta_pairs()
                 }
@@ -1150,15 +1152,12 @@ impl PersistentEventLog {
             }
         }
         
-        // Step 3: Atomic swap in minimal critical section
-        // Only hold write lock for the actual swap - no computation
-        {
-            let mut guard = self.index.write().await;
-            *guard = new_index;
-        }
+        // Step 3: Atomic swap - no locks needed with ArcSwap
+        // This is truly lock-free and wait-free for readers
+        self.index.store(Arc::new(new_index));
         
-        // Note: No I/O, no expensive operations while holding the write lock
-        // This eliminates the deadlock potential with append operations
+        // Note: No locks, no blocking operations
+        // Readers can continue uninterrupted during index swaps
     }
 
     /// Replay events from `start` (inclusive) to `end` (exclusive). If None, to latest.
@@ -1169,6 +1168,29 @@ impl PersistentEventLog {
             .filter(|e| e.offset >= start && e.offset < end)
             .cloned()
             .collect()
+    }
+}
+
+impl Clone for PersistentEventLog {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            wal: self.wal.clone(),
+            data_dir: self.data_dir.clone(),
+            tx: self.tx.clone(),
+            index: ArcSwap::new(self.index.load().clone()),
+            next_offset: self.next_offset.clone(),
+            wal_seg_index: self.wal_seg_index.clone(),
+            wal_segment_bytes: self.wal_segment_bytes.clone(),
+            wal_max_segments: self.wal_max_segments.clone(),
+            #[cfg(feature = "ann-hnsw")]
+            ann: self.ann.clone(),
+            snapshot_mmap: self.snapshot_mmap.clone(),
+            snapshot_payload_index: self.snapshot_payload_index.clone(),
+            wal_block_cache: self.wal_block_cache.clone(),
+            fsync_policy: self.fsync_policy,
+            group_commit_state: self.group_commit_state.clone(),
+        }
     }
 }
 
@@ -1353,14 +1375,36 @@ impl PersistentEventLog {
     }
 
     /// Group commit background task for high-throughput writes
+    /// Uses event-driven + deadline approach to eliminate CPU spin-polling
     async fn group_commit_background_task(&self) {
-        let mut interval = tokio::time::interval(Duration::from_micros(5)); // Check every 5µs for ultra-fast responsiveness
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        
         loop {
-            // Wait for either interval or flush notification
+            // Wait for the first item to arrive in batch
+            let deadline = {
+                let notify = {
+                    let state = self.group_commit_state.lock();
+                    state.fsync_notify.clone()
+                };
+                notify.notified().await;
+                
+                // Calculate deadline when batch should be flushed
+                let state = self.group_commit_state.lock();
+                if state.batch.is_empty() {
+                    continue; // Spurious wakeup, go back to waiting
+                }
+                
+                // Set deadline based on when the first item entered the batch
+                if let Some(batch_start) = state.batch_start_time {
+                    batch_start + Duration::from_micros(state.config.max_batch_delay_micros)
+                } else {
+                    // If no start time, flush immediately
+                    Instant::now()
+                }
+            };
+            
+            // Now wait for either deadline or immediate flush notification
             tokio::select! {
-                _ = interval.tick() => {
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    // Deadline reached - flush batch
                     self.try_flush_batch().await;
                 }
                 _ = async {
@@ -1370,6 +1414,7 @@ impl PersistentEventLog {
                     };
                     notify.notified().await;
                 } => {
+                    // Immediate flush requested (batch size limit reached)
                     self.try_flush_batch().await;
                 }
             }
@@ -1621,5 +1666,62 @@ impl PersistentEventLog {
     async fn mark_for_background_fsync(&self) {
         // Implementation would track pending fsync operations
         // For now, we'll implement the immediate version
+    }
+
+    /// Ultra-fast batch append leveraging group commit for supreme throughput
+    /// This method is specifically optimized for gRPC batch operations
+    pub async fn append_batch_kv(&self, records: Vec<(Uuid, u64, Vec<u8>)>) -> Result<Vec<u64>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Single record optimization
+        if records.len() == 1 {
+            let (request_id, key, value) = records.into_iter().next().unwrap();
+            let offset = self.append_kv(request_id, key, value).await?;
+            return Ok(vec![offset]);
+        }
+
+        // Batch optimization: Pre-serialize all records to leverage group commit
+        let pool = BUFFER_POOL.get_or_init(|| BufferPool::new());
+        let total_size: usize = records.iter().map(|(_, _, v)| 16 + v.len()).sum();
+        let mut batch_buffer = pool.get_buffer(total_size);
+        let mut request_ids = Vec::with_capacity(records.len());
+        let mut offsets = Vec::with_capacity(records.len());
+        let mut record_sizes = Vec::with_capacity(records.len());
+
+        // Batch serialization for maximum efficiency
+        for (request_id, key, value) in &records {
+            request_ids.push(*request_id);
+            let record_size = 16 + value.len();
+            record_sizes.push(record_size);
+            
+            // Manual serialization: [key u64][value_len u64][value bytes]
+            batch_buffer.put_u64_le(*key);
+            batch_buffer.put_u64_le(value.len() as u64);
+            batch_buffer.put_slice(value);
+        }
+
+        // Split buffer into individual record chunks for group commit
+        let batch_bytes = batch_buffer.freeze();
+        let mut offset_in_batch = 0;
+        
+        for (i, &record_size) in record_sizes.iter().enumerate() {
+            let record_bytes = batch_bytes.slice(offset_in_batch..offset_in_batch + record_size);
+            
+            // Each record gets individual append to leverage group commit batching
+            let offset = self.append(request_ids[i], record_bytes.to_vec()).await?;
+            offsets.push(offset);
+            
+            offset_in_batch += record_size;
+        }
+
+        #[cfg(not(feature = "bench-no-metrics"))]
+        {
+            crate::metrics::BATCH_APPEND_TOTAL.inc();
+            crate::metrics::BATCH_APPEND_SIZE_HISTOGRAM.observe(offsets.len() as f64);
+        }
+
+        Ok(offsets)
     }
 }

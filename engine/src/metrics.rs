@@ -59,6 +59,18 @@ mod shim {
     pub static GROUP_COMMIT_BATCH_SIZE: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static GROUP_COMMIT_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static GROUP_COMMIT_BATCHES_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    
+    // gRPC optimization metrics
+    pub static BATCH_GET_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BATCH_GET_SIZE_HISTOGRAM: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static BATCH_PUT_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BATCH_PUT_SIZE_HISTOGRAM: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static GROUP_COMMIT_UTILIZATION: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static STREAM_BATCHES_PROCESSED_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static STREAM_ITEMS_PROCESSED_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static PUT_OPERATIONS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BATCH_APPEND_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BATCH_APPEND_SIZE_HISTOGRAM: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub fn inc_sse_lagged() {}
     pub fn render() -> String {
         String::new()
@@ -79,6 +91,9 @@ pub use shim::{
     SNAPSHOT_LATENCY_SECONDS, SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL,
     WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, GROUP_COMMIT_BATCH_SIZE,
     GROUP_COMMIT_LATENCY_SECONDS, GROUP_COMMIT_BATCHES_TOTAL,
+    BATCH_GET_TOTAL, BATCH_GET_SIZE_HISTOGRAM, BATCH_PUT_TOTAL, BATCH_PUT_SIZE_HISTOGRAM,
+    GROUP_COMMIT_UTILIZATION, STREAM_BATCHES_PROCESSED_TOTAL, STREAM_ITEMS_PROCESSED_TOTAL,
+    PUT_OPERATIONS_TOTAL, BATCH_APPEND_TOTAL, BATCH_APPEND_SIZE_HISTOGRAM,
 };
 
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -384,4 +399,95 @@ pub static GROUP_COMMIT_BATCHES_TOTAL: Lazy<Counter> = Lazy::new(|| {
         "Total number of group commit batches processed"
     )
     .expect("register kyrodb_group_commit_batches_total")
+});
+
+// gRPC optimization metrics
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BATCH_GET_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_batch_get_total",
+        "Total number of batch get operations"
+    )
+    .expect("register kyrodb_batch_get_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BATCH_GET_SIZE_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_batch_get_size", 
+        "Size of batch get operations"
+    ).buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_batch_get_size")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BATCH_PUT_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_batch_put_total",
+        "Total number of batch put operations"
+    )
+    .expect("register kyrodb_batch_put_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BATCH_PUT_SIZE_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_batch_put_size", 
+        "Size of batch put operations"
+    ).buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_batch_put_size")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static GROUP_COMMIT_UTILIZATION: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_group_commit_utilization", 
+        "Number of operations in group commit batches"
+    ).buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_group_commit_utilization")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static STREAM_BATCHES_PROCESSED_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_stream_batches_processed_total",
+        "Total number of streaming batches processed"
+    )
+    .expect("register kyrodb_stream_batches_processed_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static STREAM_ITEMS_PROCESSED_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_stream_items_processed_total",
+        "Total number of streaming items processed"
+    )
+    .expect("register kyrodb_stream_items_processed_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static PUT_OPERATIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_put_operations_total",
+        "Total number of put operations"
+    )
+    .expect("register kyrodb_put_operations_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BATCH_APPEND_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_batch_append_total",
+        "Total number of batch append operations"
+    )
+    .expect("register kyrodb_batch_append_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BATCH_APPEND_SIZE_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_batch_append_size", 
+        "Size of batch append operations"
+    ).buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_batch_append_size")
 });
