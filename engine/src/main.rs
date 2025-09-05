@@ -1559,6 +1559,240 @@ async fn main() -> Result<()> {
             #[cfg(feature = "phase-b")]
             let hybrid_search_route = data_rl.clone().and(hybrid_search_route).map(|(), r| r);
 
+            // Phase B.2: Multi-modal search routes
+            #[cfg(feature = "multi-modal")]
+            let text_search_log = log.clone();
+            #[cfg(feature = "multi-modal")]
+            let text_search_route = search_base
+                .and(warp::path("text"))
+                .and(warp::path::end())
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = text_search_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        
+                        // Parse text search request
+                        let text = body["text"].as_str().unwrap_or("");
+                        let fields = body["fields"].as_array()
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        let limit = body["limit"].as_u64().unwrap_or(10) as usize;
+                        let fuzzy = body["fuzzy"].as_bool().unwrap_or(false);
+                        let min_score = body["min_score"].as_f64().map(|s| s as f32);
+
+                        if text.is_empty() {
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": "Text query is required"
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            ));
+                        }
+
+                        let query = engine_crate::text::TextQuery {
+                            text: text.to_string(),
+                            fields,
+                            limit,
+                            fuzzy,
+                            min_score,
+                        };
+
+                        match log.text_search(query).await {
+                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "results": results,
+                                    "count": results.len()
+                                })),
+                                StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string()
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        }
+                    }
+                });
+
+            #[cfg(feature = "multi-modal")]
+            let metadata_search_log = log.clone();
+            #[cfg(feature = "multi-modal")]
+            let metadata_search_route = search_base
+                .and(warp::path("metadata"))
+                .and(warp::path::end())
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = metadata_search_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        
+                        // Parse metadata query - simplified for now
+                        let field = body["field"].as_str().unwrap_or("");
+                        let value = body["value"].clone();
+
+                        if field.is_empty() {
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": "Field name is required"
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            ));
+                        }
+
+                        // Convert JSON value to schema::Value
+                        let schema_value = match value {
+                            serde_json::Value::Null => engine_crate::schema::Value::Null,
+                            serde_json::Value::Bool(b) => engine_crate::schema::Value::Bool(b),
+                            serde_json::Value::Number(n) => {
+                                if let Some(i) = n.as_i64() {
+                                    engine_crate::schema::Value::I64(i)
+                                } else if let Some(f) = n.as_f64() {
+                                    engine_crate::schema::Value::F64(f)
+                                } else {
+                                    return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                        warp::reply::json(&serde_json::json!({
+                                            "error": "Invalid number format"
+                                        })),
+                                        StatusCode::BAD_REQUEST,
+                                    ));
+                                }
+                            }
+                            serde_json::Value::String(s) => engine_crate::schema::Value::String(s),
+                            _ => return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": "Unsupported value type"
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        };
+
+                        let query = engine_crate::metadata::MetadataQuery::eq(
+                            field.to_string(),
+                            schema_value
+                        );
+
+                        match log.metadata_search(query).await {
+                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "results": results,
+                                    "count": results.len()
+                                })),
+                                StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_ , warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string()
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        }
+                    }
+                });
+
+            #[cfg(feature = "multi-modal")]
+            let advanced_hybrid_search_log = log.clone();
+            #[cfg(feature = "multi-modal")]
+            let advanced_hybrid_search_route = search_base
+                .and(warp::path("advanced_hybrid"))
+                .and(warp::path::end())
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = advanced_hybrid_search_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        
+                        let collection = body["collection"].as_str().unwrap_or("");
+                        if collection.is_empty() {
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": "Collection name is required"
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            ));
+                        }
+
+                        let limit = body["limit"].as_u64().unwrap_or(10) as usize;
+                        
+                        // Parse vector query (optional)
+                        let vector_query = if let Some(vector_data) = body["vector"].as_array() {
+                            let vector: Vec<f32> = vector_data.iter()
+                                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                .collect();
+                            
+                            if !vector.is_empty() {
+                                Some(engine_crate::vector::VectorQuery {
+                                    vector,
+                                    k: limit,
+                                    distance_metric: engine_crate::schema::DistanceMetric::Euclidean,
+                                    ef: None,
+                                    similarity_threshold: None,
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Parse text query (optional)
+                        let text_query = if let Some(text) = body["text"].as_str() {
+                            if !text.is_empty() {
+                                Some(engine_crate::text::TextQuery {
+                                    text: text.to_string(),
+                                    fields: vec![],
+                                    limit,
+                                    fuzzy: body["fuzzy"].as_bool().unwrap_or(false),
+                                    min_score: None,
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Create hybrid query
+                        let hybrid_query = engine_crate::hybrid::HybridQuery {
+                            collection: collection.to_string(),
+                            vector: vector_query,
+                            text: text_query,
+                            metadata: None, // TODO: Parse metadata query from request
+                            limit,
+                            scoring: engine_crate::hybrid::HybridScoringConfig::default(),
+                            fusion: engine_crate::hybrid::FusionStrategy::default(),
+                        };
+
+                        match log.advanced_hybrid_search(hybrid_query).await {
+                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "results": results,
+                                    "count": results.len()
+                                })),
+                                StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string()
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        }
+                    }
+                });
+
+            // Apply rate limiting to multi-modal routes
+            #[cfg(feature = "multi-modal")]
+            let text_search_route = data_rl.clone().and(text_search_route).map(|(), r| r);
+            #[cfg(feature = "multi-modal")]
+            let metadata_search_route = data_rl.clone().and(metadata_search_route).map(|(), r| r);
+            #[cfg(feature = "multi-modal")]
+            let advanced_hybrid_search_route = data_rl.clone().and(advanced_hybrid_search_route).map(|(), r| r);
+
             // Compression will be handled by warp's built-in compression middleware
             
             // Combine routes with compression and optimizations
@@ -1593,6 +1827,13 @@ async fn main() -> Result<()> {
                 .or(get_document_route)
                 .or(vector_search_route)
                 .or(hybrid_search_route);
+                
+            // Add multi-modal routes if enabled
+            #[cfg(feature = "multi-modal")]
+            let routes = routes
+                .or(text_search_route)
+                .or(metadata_search_route)
+                .or(advanced_hybrid_search_route);
 
             #[cfg(not(feature = "phase-b"))]
             let routes = health_route

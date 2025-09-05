@@ -17,7 +17,7 @@ use anyhow::Result;
 use std::sync::Arc;
 
 /// Vector query parameters for similarity search
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VectorQuery {
     /// Query vector
     pub vector: Vec<f32>,

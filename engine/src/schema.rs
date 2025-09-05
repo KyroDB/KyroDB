@@ -39,6 +39,37 @@ pub enum Value {
     Timestamp(DateTime<Utc>),
 }
 
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Null => {}
+            Value::Bool(b) => b.hash(state),
+            Value::I64(i) => i.hash(state),
+            Value::F64(f) => f.to_bits().hash(state), // Hash the bit representation
+            Value::String(s) => s.hash(state),
+            Value::Bytes(b) => b.hash(state),
+            Value::Array(a) => a.hash(state),
+            Value::Object(o) => {
+                // Hash as a sorted vector of key-value pairs for deterministic hashing
+                let mut pairs: Vec<_> = o.iter().collect();
+                pairs.sort_by_key(|(k, _)| *k);
+                pairs.hash(state);
+            }
+            Value::Vector(v) => {
+                // Hash the bit representation of each float
+                v.len().hash(state);
+                for f in v {
+                    f.to_bits().hash(state);
+                }
+            }
+            Value::Timestamp(ts) => ts.hash(state),
+        }
+    }
+}
+
+impl Eq for Value {}
+
 impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
