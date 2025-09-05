@@ -372,6 +372,11 @@ impl VectorRecord {
             collection: self.collection.clone(),
             text: None, // Text content not stored in VectorRecord
             embedding: Some(self.vector.clone()),
+            vectors: {
+                let mut vectors = HashMap::new();
+                vectors.insert("default".to_string(), self.vector.clone());
+                vectors
+            },
             metadata,
             created_at: Utc::now(), // Will be overridden by actual timestamps
             updated_at: Utc::now(),

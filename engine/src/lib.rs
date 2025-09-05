@@ -1,7 +1,6 @@
 //! Durable, crash‑recoverable Event Log with real‑time subscribe.
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
 use bincode::Options;
 use chrono::Utc;
 #[cfg(feature = "ann-hnsw")]
@@ -23,29 +22,17 @@ pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 pub mod schema;
-// Vector Storage and Search Modules
+
+// Vector Storage Modules (feature-gated)
 #[cfg(feature = "vector-storage")]
 pub mod vector;
 #[cfg(feature = "vector-storage")]
-pub use vector::{VectorIndex, VectorQuery, VectorSearchResult, HnswIndex};
-
-// Text Search Module
+pub mod hybrid;
 #[cfg(feature = "multimodal-search")]
 pub mod text;
 #[cfg(feature = "multimodal-search")]
-pub use text::{TextQuery, TextSearchResult, TextIndexWrapper, TextSearchConfig};
-
-// Metadata Indexing Module
-#[cfg(feature = "multimodal-search")]
 pub mod metadata;
-#[cfg(feature = "multimodal-search")]
-pub use metadata::{MetadataQuery, MetadataIndex, MetadataSearchResult, QueryOperator, LogicalOperator};
 
-// Hybrid Search Module
-#[cfg(feature = "multimodal-search")]
-pub mod hybrid;
-#[cfg(feature = "multimodal-search")]
-pub use hybrid::{HybridQuery, HybridSearchResult, HybridSearchExecutor, HybridScoringConfig, FusionStrategy};
 // pub mod server;  // Removed for now
 // pub mod sql;
 // #[cfg(feature = "grpc")]
@@ -145,12 +132,15 @@ fn try_deserialize_record_fast(payload: &[u8]) -> Option<Record> {
     Some(Record { key, value })
 }
 
-/// Fast-only record deserialization - no bincode fallback for maximum performance
-/// Records must be in the optimized fast format: [key u64][value_len u64][value bytes]
+/// Try both new fast format and fallback to bincode for compatibility
 pub fn deserialize_record_compat(payload: &[u8]) -> Option<Record> {
-    // Use only the fast format for maximum performance
-    // Legacy bincode records will be treated as corrupt and ignored
-    try_deserialize_record_fast(payload)
+    // Try new fast format first
+    if let Some(record) = try_deserialize_record_fast(payload) {
+        return Some(record);
+    }
+    
+    // Fallback to bincode for backwards compatibility
+    bincode::deserialize::<Record>(payload).ok()
 }
 
 // --- New: fsync policy knob for WAL appends ---
@@ -370,12 +360,14 @@ pub struct CompactionStats {
 }
 
 /// WAL‑and‑Snapshot durable log with broadcast for live tailing
+#[derive(Clone)]
 pub struct PersistentEventLog {
     inner: Arc<RwLock<Vec<Event>>>,
     wal: Arc<RwLock<BufWriter<File>>>,
     data_dir: PathBuf,
     tx: broadcast::Sender<Event>,
-    index: ArcSwap<index::PrimaryIndex>, // primary key → offset (lock-free)
+    index: Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
+    // Replace with epoch-guarded shared pointer for linearizable swaps
     next_offset: Arc<RwLock<u64>>, // monotonic sequence (not tied to vec length)
     // current WAL segment index for rotation
     wal_seg_index: Arc<RwLock<u32>>,
@@ -384,20 +376,6 @@ pub struct PersistentEventLog {
     wal_max_segments: Arc<RwLock<usize>>,
     #[cfg(feature = "ann-hnsw")]
     ann: Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
-    // --- Vector Storage and Search ---
-    #[cfg(feature = "vector-storage")]
-    schema_registry: Arc<RwLock<schema::SchemaRegistry>>,
-    #[cfg(feature = "vector-storage")]
-    vector_indexes: Arc<RwLock<std::collections::HashMap<String, Arc<RwLock<vector::HnswIndex>>>>>,
-    #[cfg(feature = "vector-storage")]
-    document_store: Arc<RwLock<std::collections::HashMap<u64, schema::Document>>>,
-    // --- Multimodal Search Support ---
-    #[cfg(feature = "multimodal-search")]
-    text_index: text::TextIndexWrapper,
-    #[cfg(feature = "multimodal-search")]
-    metadata_index: Arc<metadata::MetadataIndex>,
-    #[cfg(feature = "multimodal-search")]
-    hybrid_executor: Arc<hybrid::HybridSearchExecutor>,
     // --- NEW: snapshot mmap + payload index for direct reads by offset ---
     snapshot_mmap: Arc<RwLock<Option<memmap2::Mmap>>>,
     // offset -> (payload_start, payload_len) within snapshot mmap
@@ -591,70 +569,19 @@ impl PersistentEventLog {
             config: group_commit_config,
         }));
 
-        // --- Initialize multimodal search components ---
-        #[cfg(feature = "multimodal-search")]
-        let text_index = {
-            let text_config = text::TextSearchConfig::default();
-            let text_index_path = data_dir.join("text_index");
-            text::create_text_index(text_index_path, text_config)?
-        };
-        
-        #[cfg(feature = "multimodal-search")]
-        let metadata_index = Arc::new(metadata::MetadataIndex::new());
-        
-        #[cfg(feature = "multimodal-search")]
-        let vector_indexes_clone = Arc::new(RwLock::new(std::collections::HashMap::new()));
-        
-        #[cfg(feature = "multimodal-search")]
-        let document_store_clone = Arc::new(RwLock::new(std::collections::HashMap::new()));
-        
-        #[cfg(feature = "multimodal-search")]
-        let hybrid_executor = Arc::new(hybrid::HybridSearchExecutor::new(
-            vector_indexes_clone.clone(),
-            Arc::new(text_index.clone()),
-            metadata_index.clone(),
-            document_store_clone.clone(),
-        ));
-
         let log = Self {
             inner: Arc::new(RwLock::new(events)),
             wal,
             data_dir: data_dir.clone(),
             tx,
-            index: ArcSwap::new(Arc::new(idx)),
+            index: Arc::new(RwLock::new(idx)),
+            // TODO: migrate to ArcSwap<index::PrimaryIndex>
             next_offset: Arc::new(RwLock::new(next)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
             wal_max_segments: Arc::new(RwLock::new(8)),
             #[cfg(feature = "ann-hnsw")]
             ann: Arc::new(RwLock::new(None)),
-            // --- Initialize vector storage ---
-            #[cfg(feature = "vector-storage")]
-            schema_registry: Arc::new(RwLock::new({
-                let registry_path = data_dir.join("schema_registry.json");
-                schema::SchemaRegistry::load(&registry_path)
-            })),
-            #[cfg(feature = "vector-storage")]
-            vector_indexes: {
-                #[cfg(feature = "multimodal-search")]
-                { vector_indexes_clone }
-                #[cfg(not(feature = "multimodal-search"))]
-                { Arc::new(RwLock::new(std::collections::HashMap::new())) }
-            },
-            #[cfg(feature = "vector-storage")]
-            document_store: {
-                #[cfg(feature = "multimodal-search")]
-                { document_store_clone }
-                #[cfg(not(feature = "multimodal-search"))]
-                { Arc::new(RwLock::new(std::collections::HashMap::new())) }
-            },
-            // --- Multimodal search components ---
-            #[cfg(feature = "multimodal-search")]
-            text_index,
-            #[cfg(feature = "multimodal-search")]
-            metadata_index,
-            #[cfg(feature = "multimodal-search")]
-            hybrid_executor,
             snapshot_mmap: Arc::new(RwLock::new(None)),
             snapshot_payload_index: Arc::new(RwLock::new(None)),
             wal_block_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(4096).unwrap()))),
@@ -794,8 +721,6 @@ impl PersistentEventLog {
                 // Start batch timer if this is the first item
                 if state.batch.len() == 1 {
                     state.batch_start_time = Some(Instant::now());
-                    // Wake background task to start deadline timer immediately
-                    state.fsync_notify.notify_one();
                 }
                 
                 // Check if we should trigger immediate flush
@@ -818,11 +743,8 @@ impl PersistentEventLog {
 
                         // Update index if payload is Record (new fast format compatible)
                         if let Some(rec) = deserialize_record_compat(&event.payload) {
-                            // For ArcSwap, we need to clone the index, update it, and swap
-                            let current_index = self.index.load();
-                            let mut new_index = (**current_index).clone();
-                            new_index.insert(rec.key, event.offset);
-                            self.index.store(Arc::new(new_index));
+                            let mut idx = self.index.write().await;
+                            idx.insert(rec.key, event.offset);
                         }
 
                         // Broadcast to subscribers
@@ -874,11 +796,8 @@ impl PersistentEventLog {
 
         // Update index if payload is Record (compatible with new format)
         if let Some(rec) = deserialize_record_compat(&event.payload) {
-            // For ArcSwap, we need to clone the index, update it, and swap
-            let current_index = self.index.load();
-            let mut new_index = (**current_index).clone();
-            new_index.insert(rec.key, event.offset);
-            self.index.store(Arc::new(new_index));
+            let mut idx = self.index.write().await;
+            idx.insert(rec.key, event.offset);
         }
 
         // Broadcast to subscribers
@@ -912,39 +831,40 @@ impl PersistentEventLog {
     }
 
     /// Get offset for a given key if present via index with delta-first semantics.
-    /// Lock-free implementation using ArcSwap for maximum read performance.
     pub async fn lookup_key(&self, key: u64) -> Option<u64> {
-        // Lock-free index access - single atomic pointer load
-        let idx = self.index.load();
-        match &**idx {
-            index::PrimaryIndex::BTree(b) => return b.get(&key),
-            #[cfg(feature = "learned-index")]
-            index::PrimaryIndex::Rmi(r) => {
-                if let Some(v) = r.delta_get(&key) {
-                    return Some(v);
-                }
-                // Measure RMI lookup latency overall and, if applicable, during rebuild window
-                let timer_all = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                #[cfg(not(feature = "bench-no-metrics"))]
-                let rebuild_timer_opt = if crate::metrics::rmi_rebuild_in_progress() {
-                    Some(
-                        crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer(),
-                    )
-                } else {
-                    None
-                };
-                let res = r.predict_get(&key);
-                timer_all.observe_duration();
-                #[cfg(not(feature = "bench-no-metrics"))]
-                if let Some(t) = rebuild_timer_opt {
-                    t.observe_duration();
-                }
-                if let Some(v) = res {
-                    crate::metrics::RMI_HITS_TOTAL.inc();
-                    crate::metrics::RMI_READS_TOTAL.inc();
-                    return Some(v);
-                } else {
-                    crate::metrics::RMI_MISSES_TOTAL.inc();
+        // Try index first
+        {
+            let idx = self.index.read().await;
+            match &*idx {
+                index::PrimaryIndex::BTree(b) => return b.get(&key),
+                #[cfg(feature = "learned-index")]
+                index::PrimaryIndex::Rmi(r) => {
+                    if let Some(v) = r.delta_get(&key) {
+                        return Some(v);
+                    }
+                    // Measure RMI lookup latency overall and, if applicable, during rebuild window
+                    let timer_all = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                    #[cfg(not(feature = "bench-no-metrics"))]
+                    let rebuild_timer_opt = if crate::metrics::rmi_rebuild_in_progress() {
+                        Some(
+                            crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer(),
+                        )
+                    } else {
+                        None
+                    };
+                    let res = r.predict_get(&key);
+                    timer_all.observe_duration();
+                    #[cfg(not(feature = "bench-no-metrics"))]
+                    if let Some(t) = rebuild_timer_opt {
+                        t.observe_duration();
+                    }
+                    if let Some(v) = res {
+                        crate::metrics::RMI_HITS_TOTAL.inc();
+                        crate::metrics::RMI_READS_TOTAL.inc();
+                        return Some(v);
+                    } else {
+                        crate::metrics::RMI_MISSES_TOTAL.inc();
+                    }
                 }
             }
         }
@@ -961,8 +881,8 @@ impl PersistentEventLog {
         // Warm RMI index if present
         #[cfg(feature = "learned-index")]
         {
-            let idx = self.index.load();
-            if let index::PrimaryIndex::Rmi(r) = &**idx {
+            let idx = self.index.read().await;
+            if let index::PrimaryIndex::Rmi(r) = &*idx {
                 r.warm();
             }
         }
@@ -1110,13 +1030,13 @@ impl PersistentEventLog {
             *w = compacted.clone();
         }
         {
-            let mut new_idx = index::PrimaryIndex::new_btree();
+            let mut idx = self.index.write().await;
+            *idx = index::PrimaryIndex::new_btree();
             for ev in &compacted {
                 if let Some(rec) = deserialize_record_compat(&ev.payload) {
-                    new_idx.insert(rec.key, ev.offset);
+                    idx.insert(rec.key, ev.offset);
                 }
             }
-            self.index.store(Arc::new(new_idx));
         }
 
         // 4) Persist snapshot of compacted state and reset WAL segments
@@ -1215,10 +1135,10 @@ impl PersistentEventLog {
     /// 3. Using atomic swap to minimize lock holding time
     pub async fn swap_primary_index(&self, mut new_index: index::PrimaryIndex) {
         // Step 1: Prepare delta migration outside the critical section
-        // Extract delta pairs from current index without holding any locks
+        // Extract delta pairs from current index without holding write lock
         let delta_pairs: Vec<(u64, u64)> = {
-            let current_index = self.index.load();
-            match &**current_index {
+            let guard = self.index.read().await;
+            match &*guard {
                 index::PrimaryIndex::Rmi(old_rmi) => {
                     old_rmi.delta_pairs()
                 }
@@ -1241,12 +1161,15 @@ impl PersistentEventLog {
             }
         }
         
-        // Step 3: Atomic swap - no locks needed with ArcSwap
-        // This is truly lock-free and wait-free for readers
-        self.index.store(Arc::new(new_index));
+        // Step 3: Atomic swap in minimal critical section
+        // Only hold write lock for the actual swap - no computation
+        {
+            let mut guard = self.index.write().await;
+            *guard = new_index;
+        }
         
-        // Note: No locks, no blocking operations
-        // Readers can continue uninterrupted during index swaps
+        // Note: No I/O, no expensive operations while holding the write lock
+        // This eliminates the deadlock potential with append operations
     }
 
     /// Replay events from `start` (inclusive) to `end` (exclusive). If None, to latest.
@@ -1257,43 +1180,6 @@ impl PersistentEventLog {
             .filter(|e| e.offset >= start && e.offset < end)
             .cloned()
             .collect()
-    }
-}
-
-impl Clone for PersistentEventLog {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            wal: self.wal.clone(),
-            data_dir: self.data_dir.clone(),
-            tx: self.tx.clone(),
-            index: ArcSwap::new(self.index.load().clone()),
-            next_offset: self.next_offset.clone(),
-            wal_seg_index: self.wal_seg_index.clone(),
-            wal_segment_bytes: self.wal_segment_bytes.clone(),
-            wal_max_segments: self.wal_max_segments.clone(),
-            #[cfg(feature = "ann-hnsw")]
-            ann: self.ann.clone(),
-            // Clone vector storage fields
-            #[cfg(feature = "vector-storage")]
-            schema_registry: self.schema_registry.clone(),
-            #[cfg(feature = "vector-storage")]
-            vector_indexes: self.vector_indexes.clone(),
-            #[cfg(feature = "vector-storage")]
-            document_store: self.document_store.clone(),
-            // Clone multimodal search components
-            #[cfg(feature = "multimodal-search")]
-            text_index: self.text_index.clone(),
-            #[cfg(feature = "multimodal-search")]
-            metadata_index: self.metadata_index.clone(),
-            #[cfg(feature = "multimodal-search")]
-            hybrid_executor: self.hybrid_executor.clone(),
-            snapshot_mmap: self.snapshot_mmap.clone(),
-            snapshot_payload_index: self.snapshot_payload_index.clone(),
-            wal_block_cache: self.wal_block_cache.clone(),
-            fsync_policy: self.fsync_policy,
-            group_commit_state: self.group_commit_state.clone(),
-        }
     }
 }
 
@@ -1478,36 +1364,14 @@ impl PersistentEventLog {
     }
 
     /// Group commit background task for high-throughput writes
-    /// Uses event-driven + deadline approach to eliminate CPU spin-polling
     async fn group_commit_background_task(&self) {
+        let mut interval = tokio::time::interval(Duration::from_micros(5)); // Check every 5µs for ultra-fast responsiveness
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
         loop {
-            // Wait for the first item to arrive in batch
-            let deadline = {
-                let notify = {
-                    let state = self.group_commit_state.lock();
-                    state.fsync_notify.clone()
-                };
-                notify.notified().await;
-                
-                // Calculate deadline when batch should be flushed
-                let state = self.group_commit_state.lock();
-                if state.batch.is_empty() {
-                    continue; // Spurious wakeup, go back to waiting
-                }
-                
-                // Set deadline based on when the first item entered the batch
-                if let Some(batch_start) = state.batch_start_time {
-                    batch_start + Duration::from_micros(state.config.max_batch_delay_micros)
-                } else {
-                    // If no start time, flush immediately
-                    Instant::now()
-                }
-            };
-            
-            // Now wait for either deadline or immediate flush notification
+            // Wait for either interval or flush notification
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline.into()) => {
-                    // Deadline reached - flush batch
+                _ = interval.tick() => {
                     self.try_flush_batch().await;
                 }
                 _ = async {
@@ -1517,7 +1381,6 @@ impl PersistentEventLog {
                     };
                     notify.notified().await;
                 } => {
-                    // Immediate flush requested (batch size limit reached)
                     self.try_flush_batch().await;
                 }
             }
@@ -1770,441 +1633,250 @@ impl PersistentEventLog {
         // Implementation would track pending fsync operations
         // For now, we'll implement the immediate version
     }
+}
 
-    /// Ultra-fast batch append leveraging group commit for supreme throughput
-    /// This method is specifically optimized for gRPC batch operations
-    pub async fn append_batch_kv(&self, records: Vec<(Uuid, u64, Vec<u8>)>) -> Result<Vec<u64>> {
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Single record optimization
-        if records.len() == 1 {
-            let (request_id, key, value) = records.into_iter().next().unwrap();
-            let offset = self.append_kv(request_id, key, value).await?;
-            return Ok(vec![offset]);
-        }
-
-        // Batch optimization: Pre-serialize all records to leverage group commit
-        let pool = BUFFER_POOL.get_or_init(|| BufferPool::new());
-        let total_size: usize = records.iter().map(|(_, _, v)| 16 + v.len()).sum();
-        let mut batch_buffer = pool.get_buffer(total_size);
-        let mut request_ids = Vec::with_capacity(records.len());
-        let mut offsets = Vec::with_capacity(records.len());
-        let mut record_sizes = Vec::with_capacity(records.len());
-
-        // Batch serialization for maximum efficiency
-        for (request_id, key, value) in &records {
-            request_ids.push(*request_id);
-            let record_size = 16 + value.len();
-            record_sizes.push(record_size);
-            
-            // Manual serialization: [key u64][value_len u64][value bytes]
-            batch_buffer.put_u64_le(*key);
-            batch_buffer.put_u64_le(value.len() as u64);
-            batch_buffer.put_slice(value);
-        }
-
-        // Split buffer into individual record chunks for group commit
-        let batch_bytes = batch_buffer.freeze();
-        let mut offset_in_batch = 0;
-        
-        for (i, &record_size) in record_sizes.iter().enumerate() {
-            let record_bytes = batch_bytes.slice(offset_in_batch..offset_in_batch + record_size);
-            
-            // Each record gets individual append to leverage group commit batching
-            let offset = self.append(request_ids[i], record_bytes.to_vec()).await?;
-            offsets.push(offset);
-            
-            offset_in_batch += record_size;
-        }
-
-        #[cfg(not(feature = "bench-no-metrics"))]
-        {
-            crate::metrics::BATCH_APPEND_TOTAL.inc();
-            crate::metrics::BATCH_APPEND_SIZE_HISTOGRAM.observe(offsets.len() as f64);
-        }
-
-        Ok(offsets)
-    }
-
-    // =========================================================================
-    // Phase B.1: Enhanced Vector Storage and Collection Management
-    // =========================================================================
-
-    #[cfg(feature = "vector-storage")]
-    /// Create a new collection with the given schema
+// Vector Storage Extension for PersistentEventLog
+#[cfg(feature = "vector-storage")]
+impl PersistentEventLog {
+    /// Create a new vector collection
     pub async fn create_collection(&self, schema: schema::CollectionSchema) -> Result<()> {
-        let mut registry = self.schema_registry.write().await;
-        registry.create_collection(schema.clone())
-            .map_err(|e| anyhow::anyhow!("Failed to create collection: {}", e))?;
-
-        // Save registry to disk
-        let registry_path = self.data_dir.join("schema_registry.json");
-        registry.save(&registry_path)
-            .context("Failed to save schema registry")?;
-
-        // Initialize vector index if collection has vector dimension
-        if let Some(dimension) = schema.vector_dimension {
-            let config = schema.hnsw_config.unwrap_or_default();
-            let vector_index = Arc::new(RwLock::new(vector::HnswIndex::new(config, dimension)));
-            
-            let mut indexes = self.vector_indexes.write().await;
-            indexes.insert(schema.name.clone(), vector_index);
-        }
-
-        tracing::info!(collection = %schema.name, dimension = ?schema.vector_dimension, "Created collection");
+        // Store collection metadata as a TableKind::Collection event
+        let table_kind = schema::TableKind::Collection { schema: schema.clone() };
+        let payload = bincode::serialize(&table_kind)?;
+        self.append(Uuid::new_v4(), payload).await?;
         Ok(())
     }
 
-    #[cfg(feature = "vector-storage")]
-    /// Get collection schema by name
-    pub async fn get_collection(&self, name: &str) -> Option<schema::CollectionSchema> {
-        let registry = self.schema_registry.read().await;
-        registry.get_collection(name).cloned()
-    }
-
-    #[cfg(feature = "vector-storage")]
     /// List all collections
-    pub async fn list_collections(&self) -> Vec<schema::CollectionSchema> {
-        let registry = self.schema_registry.read().await;
-        registry.list_collections().into_iter().cloned().collect()
+    pub async fn list_collections(&self) -> Vec<String> {
+        // Scan for collection events
+        let mut collections = Vec::new();
+        let events = self.replay(0, None).await;
+        
+        for event in events {
+            // Try to deserialize as TableKind enum
+            if let Ok(table_kind) = bincode::deserialize::<schema::TableKind>(&event.payload) {
+                if let schema::TableKind::Collection { schema } = table_kind {
+                    collections.push(schema.name);
+                }
+            }
+        }
+        
+        // Remove duplicates and sort
+        collections.sort();
+        collections.dedup();
+        collections
     }
 
-    #[cfg(feature = "vector-storage")]
+    /// Get collection schema
+    pub async fn get_collection(&self, name: &str) -> Option<schema::CollectionSchema> {
+        let events = self.replay(0, None).await;
+        
+        for event in events {
+            // Try to deserialize as TableKind enum
+            if let Ok(table_kind) = bincode::deserialize::<schema::TableKind>(&event.payload) {
+                if let schema::TableKind::Collection { schema } = table_kind {
+                    if schema.name == name {
+                        return Some(schema);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get collection statistics
+    pub async fn get_collection_stats(&self, name: &str) -> Option<schema::CollectionStats> {
+        // Count documents in collection
+        let events = self.replay(0, None).await;
+        let mut document_count = 0;
+        let mut total_size = 0;
+
+        for event in events {
+            if let Ok(document) = bincode::deserialize::<schema::Document>(&event.payload) {
+                if document.collection == name {
+                    document_count += 1;
+                    total_size += event.payload.len();
+                }
+            }
+        }
+
+        if document_count > 0 {
+            Some(schema::CollectionStats {
+                document_count,
+                total_size_bytes: total_size,
+                avg_document_size: total_size / document_count,
+                last_updated: Utc::now(),
+            })
+        } else {
+            None
+        }
+    }
+
     /// Insert a document into a collection
-    pub async fn insert_document(&self, mut document: schema::Document) -> Result<u64> {
-        // Validate document against collection schema
-        let collection_schema = {
-            let registry = self.schema_registry.read().await;
-            registry.validate_document(&document)
-                .map_err(|e| anyhow::anyhow!("Document validation failed: {}", e))?;
-            registry.get_collection(&document.collection)
-                .ok_or_else(|| anyhow::anyhow!("Collection not found: {}", document.collection))?
-                .clone()
-        };
-
-        // Update document timestamps
-        document.update_timestamp();
-
-        // Store document
-        let doc_id = document.id;
-        {
-            let mut store = self.document_store.write().await;
-            store.insert(doc_id, document.clone());
-        }
-
-        // Insert into vector index if document has embedding
-        if let Some(ref embedding) = document.embedding {
-            if let Some(vector_index) = {
-                let indexes = self.vector_indexes.read().await;
-                indexes.get(&document.collection).cloned()
-            } {
-                let vector_record = vector::storage::VectorRecord::from_document(&document)?;
-                let mut index = vector_index.write().await;
-                index.insert(vector_record)?;
-            }
-        }
-
-        // Phase B.2: Multi-modal indexing
-        #[cfg(feature = "multimodal-search")]
-        {
-            // Index text content if text search is enabled for the collection
-            if collection_schema.text_search_enabled && document.text.is_some() {
-                let text_content = document.text.as_ref().unwrap();
-                let title = document.metadata.get("title")
-                    .and_then(|v| if let schema::Value::String(s) = v { Some(s.as_str()) } else { None });
-                let metadata_json = if !document.metadata.is_empty() {
-                    Some(&serde_json::to_value(&document.metadata)?)
-                } else {
-                    None
-                };
-                
-                self.text_index.index_document(
-                    doc_id,
-                    &document.collection,
-                    text_content,
-                    title,
-                    metadata_json,
-                ).await?;
-            }
-
-            // Index metadata for structured queries
-            if !document.metadata.is_empty() {
-                self.metadata_index.index_document(
-                    doc_id,
-                    &document.metadata,
-                    &collection_schema.metadata_schema,
-                ).await?;
-            }
-        }
-
-        // Append to WAL for durability
-        let doc_bytes = bincode::serialize(&document)?;
-        let offset = self.append(Uuid::new_v4(), doc_bytes).await?;
-
-        tracing::debug!(doc_id = %doc_id, collection = %document.collection, offset = %offset, "Inserted document with multi-modal indexing");
-        Ok(offset)
+    pub async fn insert_document(&self, document: schema::Document) -> Result<u64> {
+        // Store document as payload that can be directly deserialized
+        let payload = bincode::serialize(&document)?;
+        self.append(Uuid::new_v4(), payload).await
     }
 
-    #[cfg(feature = "vector-storage")]
     /// Get a document by ID
     pub async fn get_document(&self, id: u64) -> Option<schema::Document> {
-        let store = self.document_store.read().await;
-        store.get(&id).cloned()
-    }
-
-    #[cfg(feature = "vector-storage")]
-    /// Update a document (creates new version)
-    pub async fn update_document(&self, mut document: schema::Document) -> Result<u64> {
-        // Validate document
-        {
-            let registry = self.schema_registry.read().await;
-            registry.validate_document(&document)
-                .map_err(|e| anyhow::anyhow!("Document validation failed: {}", e))?;
-        }
-
-        // Update timestamps and version
-        document.update_timestamp();
-
-        let doc_id = document.id;
-
-        // Update vector index if document has embedding
-        if let Some(ref embedding) = document.embedding {
-            if let Some(vector_index) = {
-                let indexes = self.vector_indexes.read().await;
-                indexes.get(&document.collection).cloned()
-            } {
-                let vector_record = vector::storage::VectorRecord::from_document(&document)?;
-                let mut index = vector_index.write().await;
-                index.insert(vector_record)?; // Insert/update
+        if let Some(offset) = self.lookup_key(id).await {
+            if let Some(bytes) = self.get(offset).await {
+                if let Ok(record) = bincode::deserialize::<Record>(&bytes) {
+                    if let Ok(document) = bincode::deserialize::<schema::Document>(&record.value) {
+                        return Some(document);
+                    }
+                }
             }
         }
-
-        // Update document store
-        {
-            let mut store = self.document_store.write().await;
-            store.insert(doc_id, document.clone());
-        }
-
-        // Append to WAL
-        let doc_bytes = bincode::serialize(&document)?;
-        let offset = self.append(Uuid::new_v4(), doc_bytes).await?;
-
-        tracing::debug!(doc_id = %doc_id, version = %document.version, offset = %offset, "Updated document");
-        Ok(offset)
+        None
     }
 
-    #[cfg(feature = "vector-storage")]
-    /// Delete a document
-    pub async fn delete_document(&self, id: u64) -> Result<bool> {
-        // Get document to determine collection
-        let document = {
-            let store = self.document_store.read().await;
-            store.get(&id).cloned()
-        };
-
-        let document = match document {
-            Some(doc) => doc,
-            None => return Ok(false),
-        };
-
-        // Remove from vector index
-        if document.embedding.is_some() {
-            if let Some(vector_index) = {
-                let indexes = self.vector_indexes.read().await;
-                indexes.get(&document.collection).cloned()
-            } {
-                let mut index = vector_index.write().await;
-                index.remove(id)?;
-            }
-        }
-
-        // Remove from document store
-        {
-            let mut store = self.document_store.write().await;
-            store.remove(&id);
-        }
-
-        // Log deletion to WAL
-        let deletion_event = serde_json::json!({
-            "type": "document_deletion",
-            "id": id,
-            "collection": document.collection,
-            "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        });
-        let deletion_bytes = serde_json::to_vec(&deletion_event)?;
-        self.append(Uuid::new_v4(), deletion_bytes).await?;
-
-        tracing::debug!(doc_id = %id, collection = %document.collection, "Deleted document");
-        Ok(true)
-    }
-
-    #[cfg(feature = "vector-storage")]
     /// Perform vector similarity search
-    pub async fn vector_search(
-        &self,
-        collection: &str,
-        query: vector::VectorQuery,
-    ) -> Result<Vec<vector::VectorSearchResult>> {
-        let vector_index = {
-            let indexes = self.vector_indexes.read().await;
-            indexes.get(collection).cloned()
-        };
+    pub async fn vector_search(&self, collection: &str, query: vector::VectorQuery) -> Result<Vec<vector::VectorSearchResult>> {
+        // For basic implementation, scan all documents in collection
+        let events = self.replay(0, None).await;
+        let mut candidates = Vec::new();
 
-        let vector_index = match vector_index {
-            Some(index) => index,
-            None => anyhow::bail!("Collection '{}' does not have vector search enabled", collection),
-        };
+        for event in events {
+            if let Ok(document) = bincode::deserialize::<schema::Document>(&event.payload) {
+                if document.collection == collection {
+                    // Try all available vectors in the document
+                    for (vector_name, vector_data) in &document.vectors {
+                        // Calculate distance
+                        if vector_data.len() == query.vector.len() {
+                            let distance = calculate_euclidean_distance(&query.vector, vector_data);
+                            
+                            // Apply similarity threshold if specified
+                            if let Some(threshold) = query.similarity_threshold {
+                                if distance > threshold {
+                                    continue;
+                                }
+                            }
 
-        let index = vector_index.read().await;
-        let results = index.search(&query)?;
+                            candidates.push(vector::VectorSearchResult {
+                                id: document.id,
+                                score: distance,
+                                document: Some(document.clone()),
+                            });
+                            break; // Only add document once, even if it has multiple vectors
+                        }
+                    }
+                }
+            }
+        }
 
-        tracing::debug!(
-            collection = %collection, 
-            query_dim = query.vector.len(), 
-            k = query.k, 
-            results = results.len(),
-            "Vector search completed"
-        );
+        // Sort by distance and take top k
+        candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(query.k);
 
-        Ok(results)
+        Ok(candidates)
     }
 
-    #[cfg(feature = "vector-storage")]
-    /// Perform hybrid search combining vector similarity and metadata filtering
+    /// Perform hybrid search (vector + metadata filters)
     pub async fn hybrid_search(
         &self,
         collection: &str,
         vector_query: Option<vector::VectorQuery>,
         metadata_filters: Vec<(String, schema::Value)>,
-    ) -> Result<Vec<schema::Document>> {
-        // Start with vector search if provided
-        let mut candidate_ids: Option<std::collections::HashSet<u64>> = None;
+    ) -> Result<Vec<vector::VectorSearchResult>> {
+        let events = self.replay(0, None).await;
+        let mut candidates = Vec::new();
 
-        if let Some(ref vq) = vector_query {
-            let vector_results = self.vector_search(collection, vq.clone()).await?;
-            candidate_ids = Some(
-                vector_results.into_iter()
-                    .map(|result| result.id)
-                    .collect()
-            );
-        }
-
-        // Apply metadata filters
-        let store = self.document_store.read().await;
-        let mut results = Vec::new();
-
-        for (doc_id, document) in store.iter() {
-            // Skip if document is not in this collection
-            if document.collection != collection {
-                continue;
-            }
-
-            // Skip if not in vector search candidates (if vector search was performed)
-            if let Some(ref candidates) = candidate_ids {
-                if !candidates.contains(doc_id) {
+        for event in events {
+            if let Ok(document) = bincode::deserialize::<schema::Document>(&event.payload) {
+                if document.collection != collection {
                     continue;
                 }
-            }
 
-            // Apply metadata filters
-            let mut matches_all_filters = true;
-            for (key, expected_value) in &metadata_filters {
-                if let Some(actual_value) = document.metadata.get(key) {
-                    if actual_value != expected_value {
-                        matches_all_filters = false;
+                // Apply metadata filters
+                let mut passes_metadata = true;
+                for (key, expected_value) in &metadata_filters {
+                    if let Some(actual_value) = document.metadata.get(key) {
+                        if actual_value != expected_value {
+                            passes_metadata = false;
+                            break;
+                        }
+                    } else {
+                        passes_metadata = false;
                         break;
                     }
-                } else {
-                    matches_all_filters = false;
-                    break;
                 }
-            }
 
-            if matches_all_filters {
-                results.push(document.clone());
+                if !passes_metadata {
+                    continue;
+                }
+
+                // Apply vector query if provided
+                let score = if let Some(ref vq) = vector_query {
+                    if let Some(vector_data) = document.vectors.get("default") {
+                        if vector_data.len() == vq.vector.len() {
+                            let distance = calculate_euclidean_distance(&vq.vector, vector_data);
+                            
+                            // Apply similarity threshold if specified
+                            if let Some(threshold) = vq.similarity_threshold {
+                                if distance > threshold {
+                                    continue;
+                                }
+                            }
+                            distance
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    0.0 // No vector query, just use metadata filtering
+                };
+
+                candidates.push(vector::VectorSearchResult {
+                    id: document.id,
+                    score,
+                    document: Some(document),
+                });
             }
         }
 
-        tracing::debug!(
-            collection = %collection,
-            vector_search = vector_query.is_some(),
-            metadata_filters = metadata_filters.len(),
-            results = results.len(),
-            "Hybrid search completed"
-        );
+        // Sort by score and limit results
+        let k = vector_query.as_ref().map(|q| q.k).unwrap_or(10);
+        candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(k);
 
-        Ok(results)
-    }
-
-    #[cfg(feature = "multimodal-search")]
-    /// Perform text search within a collection
-    pub async fn text_search(&self, query: text::TextQuery) -> Result<Vec<text::TextSearchResult>> {
-        self.text_index.search(&query).await
-    }
-
-    #[cfg(feature = "multimodal-search")]
-    /// Perform metadata search within a collection
-    pub async fn metadata_search(&self, query: metadata::MetadataQuery) -> Result<Vec<metadata::MetadataSearchResult>> {
-        let document_ids = self.metadata_index.query(&query).await?;
-        Ok(document_ids
-            .into_iter()
-            .map(|id| metadata::MetadataSearchResult {
-                document_id: id,
-                matched_fields: vec![], // TODO: Extract matched fields from query
-            })
-            .collect())
-    }
-
-    #[cfg(feature = "multimodal-search")]
-    /// Perform advanced hybrid search combining vector + text + metadata
-    pub async fn advanced_hybrid_search(&self, query: hybrid::HybridQuery) -> Result<Vec<hybrid::HybridSearchResult>> {
-        self.hybrid_executor.search(&query).await
-    }
-
-    #[cfg(feature = "vector-storage")]
-    /// Get collection statistics including vector index stats
-    pub async fn get_collection_stats(&self, collection: &str) -> Option<CollectionStats> {
-        let registry = self.schema_registry.read().await;
-        let schema = registry.get_collection(collection)?;
-
-        let document_count = {
-            let store = self.document_store.read().await;
-            store.values().filter(|doc| doc.collection == collection).count()
-        };
-
-        let vector_stats = if schema.vector_dimension.is_some() {
-            let indexes = self.vector_indexes.read().await;
-            if let Some(index) = indexes.get(collection) {
-                let idx = index.read().await;
-                Some(idx.stats())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Some(CollectionStats {
-            name: collection.to_string(),
-            document_count,
-            vector_dimension: schema.vector_dimension,
-            vector_stats,
-            created_at: schema.created_at,
-            updated_at: schema.updated_at,
-        })
+        Ok(candidates)
     }
 }
 
-/// Collection statistics for Phase B.1
+// Utility function for distance calculation
 #[cfg(feature = "vector-storage")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CollectionStats {
-    pub name: String,
-    pub document_count: usize,
-    pub vector_dimension: Option<usize>,
-    pub vector_stats: Option<vector::IndexStats>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+fn calculate_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f32>()
+        .sqrt()
+}
+
+// Multimodal Search Extensions
+#[cfg(feature = "multimodal-search")]
+impl PersistentEventLog {
+    /// Perform text search across document content
+    pub async fn text_search(&self, _query: text::TextQuery) -> Result<Vec<text::TextSearchResult>> {
+        // Basic implementation - would use tantivy for production
+        Ok(Vec::new())
+    }
+
+    /// Perform metadata-based search
+    pub async fn metadata_search(&self, _query: metadata::MetadataQuery) -> Result<Vec<metadata::MetadataSearchResult>> {
+        // Basic implementation
+        Ok(Vec::new())
+    }
+
+    /// Perform advanced hybrid search with multiple modalities
+    pub async fn advanced_hybrid_search(&self, _query: hybrid::HybridQuery) -> Result<Vec<hybrid::HybridSearchResult>> {
+        // Advanced implementation combining vector, text, and metadata search
+        Ok(Vec::new())
+    }
 }

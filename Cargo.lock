@@ -1179,6 +1179,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "http_bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "clap",
+ "hdrhistogram",
+ "indicatif",
+ "rand 0.8.5",
+ "rand_distr",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2870,29 +2886,6 @@ checksum = "f6ec898e1be717eee4b54a84ff2fc94ecb5a1b992d4ad148ce30575b45745662"
 dependencies = [
  "cfg-if 0.1.10",
  "paste 0.1.18",
-]
-
-[[package]]
-name = "simple_bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "futures",
- "hdrhistogram",
- "indicatif",
- "parking_lot",
- "prost",
- "protoc-bin-vendored",
- "rand 0.8.5",
- "rand_distr",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tonic-build",
 ]
 
 [[package]]

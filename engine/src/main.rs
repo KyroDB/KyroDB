@@ -12,33 +12,6 @@ use warp::http::StatusCode;
 use warp::Filter;
 use std::time::Duration;
 
-// Custom error type for API endpoints
-#[derive(Debug)]
-pub enum ApiError {
-    BadRequest(String),
-    NotFound(String),
-    InternalError(String),
-}
-
-impl warp::reject::Reject for ApiError {}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::BadRequest(msg) => write!(f, "Bad Request: {}", msg),
-            ApiError::NotFound(msg) => write!(f, "Not Found: {}", msg),
-            ApiError::InternalError(msg) => write!(f, "Internal Error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for ApiError {}
-#[cfg(feature = "grpc")]
-mod grpc_svc;
-#[cfg(feature = "grpc")]
-use grpc_svc::pb::kyrodb_server::KyrodbServer;
-// mod sql;
-
 // --- Rate limiting (simple token-bucket per client IP) -----------------------
 use dashmap::DashMap;
 use std::time::Instant;
@@ -1138,11 +1111,18 @@ async fn main() -> Result<()> {
                     async move {
                         use warp::http::StatusCode;
                         
-                        // Parse collection schema from JSON
-                        let schema: engine_crate::schema::CollectionSchema = 
-                            serde_json::from_value(body).map_err(|e| {
-                                warp::reject::custom(ApiError::BadRequest(format!("Invalid schema: {}", e)))
-                            })?;
+                        // Parse collection schema from JSON with simplified error handling
+                        let schema: engine_crate::schema::CollectionSchema = match serde_json::from_value(body) {
+                            Ok(schema) => schema,
+                            Err(e) => {
+                                return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::json(&serde_json::json!({
+                                        "error": format!("Invalid schema: {}", e)
+                                    })),
+                                    StatusCode::BAD_REQUEST,
+                                ));
+                            }
+                        };
 
                         match log.create_collection(schema.clone()).await {
                             Ok(()) => Ok::<_, warp::Rejection>(warp::reply::with_status(
@@ -1152,7 +1132,7 @@ async fn main() -> Result<()> {
                                 })),
                                 StatusCode::CREATED,
                             )),
-                            Err(e) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({
                                     "error": e.to_string()
                                 })),
@@ -1253,11 +1233,18 @@ async fn main() -> Result<()> {
                     async move {
                         use warp::http::StatusCode;
                         
-                        // Parse document from JSON
-                        let mut document: engine_crate::schema::Document = 
-                            serde_json::from_value(body).map_err(|e| {
-                                warp::reject::custom(ApiError::BadRequest(format!("Invalid document: {}", e)))
-                            })?;
+                        // Parse document from JSON with simplified error handling
+                        let mut document: engine_crate::schema::Document = match serde_json::from_value(body) {
+                            Ok(doc) => doc,
+                            Err(e) => {
+                                return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::json(&serde_json::json!({
+                                        "error": format!("Invalid document: {}", e)
+                                    })),
+                                    StatusCode::BAD_REQUEST,
+                                ));
+                            }
+                        };
 
                         // Ensure collection name matches URL parameter
                         document.collection = collection_name;
@@ -1749,7 +1736,7 @@ async fn main() -> Result<()> {
 
             // Build routes with conditional features
             let routes = {
-                let base_routes = health_route
+                let mut all_routes = health_route
                     .or(metrics_route)
                     .or(append_route)
                     .or(replay_route)
@@ -1768,12 +1755,32 @@ async fn main() -> Result<()> {
                     .or(vector_insert)
                     .or(rmi_build)
                     .or(compact_route)
-                    .or(warmup);
+                    .or(warmup)
+                    .or(warp::path("build_info").and(warp::get()).map({
+                        let commit = build_commit;
+                        let features = build_features;
+                        let branch = option_env!("GIT_BRANCH").unwrap_or("unknown");
+                        let build_time = option_env!("BUILD_TIME").unwrap_or("unknown");
+                        let rust_version = option_env!("RUST_VERSION").unwrap_or("unknown");
+                        let target_triple = option_env!("TARGET_TRIPLE").unwrap_or("unknown");
+                        move || {
+                            warp::reply::json(&serde_json::json!({
+                                "commit": commit,
+                                "branch": branch,
+                                "build_time": build_time,
+                                "rust_version": rust_version,
+                                "target_triple": target_triple,
+                                "features": features,
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "name": env!("CARGO_PKG_NAME"),
+                            }))
+                        }
+                    }));
 
-                // Build routes with conditional features
-                #[cfg(all(feature = "vector-storage", feature = "multimodal-search"))]
-                let routes = build_routes!(
-                    base_routes
+                // Add vector storage routes if enabled
+                #[cfg(feature = "vector-storage")]
+                {
+                    all_routes = all_routes
                         .or(create_collection_route)
                         .or(list_collections_route)
                         .or(get_collection_route)
@@ -1781,56 +1788,58 @@ async fn main() -> Result<()> {
                         .or(insert_document_route)
                         .or(get_document_route)
                         .or(vector_search_route)
-                        .or(hybrid_search_route)
+                        .or(hybrid_search_route);
+                }
+
+                // Add multimodal search routes if enabled
+                #[cfg(feature = "multimodal-search")]
+                {
+                    all_routes = all_routes
                         .or(text_search_route)
                         .or(metadata_search_route)
-                        .or(advanced_hybrid_search_route)
-                );
-                
-                #[cfg(all(feature = "vector-storage", not(feature = "multimodal-search")))]
-                let routes = build_routes!(
-                    base_routes
-                        .or(create_collection_route)
-                        .or(list_collections_route)
-                        .or(get_collection_route)
-                        .or(collection_stats_route)
-                        .or(insert_document_route)
-                        .or(get_document_route)
-                        .or(vector_search_route)
-                        .or(hybrid_search_route)
-                );
-                
-                #[cfg(not(feature = "vector-storage"))]
-                let routes = build_routes!(base_routes);
+                        .or(advanced_hybrid_search_route);
+                }
 
-                // Apply error recovery
-                routes.recover(|rej: warp::Rejection| async move {
-                    use warp::http::StatusCode;
-                    if rej.find::<Unauthorized>().is_some() {
-                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
-                            StatusCode::UNAUTHORIZED,
-                        ))
-                    } else if rej.find::<InsufficientPermissions>().is_some() {
-                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error":"insufficient_permissions"})),
-                            StatusCode::FORBIDDEN,
-                        ))
-                    } else if rej.find::<AdminRateLimited>().is_some()
-                        || rej.find::<DataRateLimited>().is_some()
-                    {
-                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
-                            warp::http::StatusCode::TOO_MANY_REQUESTS,
-                        ))
-                    } else {
-                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"error":"not found"})),
-                            warp::http::StatusCode::NOT_FOUND,
-                        ))
-                    }
-                })
+                all_routes
             };
+
+            // Apply error recovery
+            let routes = routes.recover(|rej: warp::Rejection| async move {
+                use warp::http::StatusCode;
+                if rej.find::<Unauthorized>().is_some() {
+                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
+                        StatusCode::UNAUTHORIZED,
+                    ))
+                } else if rej.find::<InsufficientPermissions>().is_some() {
+                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error":"insufficient_permissions"})),
+                        StatusCode::FORBIDDEN,
+                    ))
+                } else if rej.find::<AdminRateLimited>().is_some()
+                    || rej.find::<DataRateLimited>().is_some()
+                {
+                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
+                        warp::http::StatusCode::TOO_MANY_REQUESTS,
+                    ))
+                } else if let Some(api_error) = rej.find::<ApiError>() {
+                    let (status, error_msg) = match api_error {
+                        ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
+                        ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
+                        ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.as_str()),
+                    };
+                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error": error_msg})),
+                        status,
+                    ))
+                } else {
+                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error":"not found"})),
+                        warp::http::StatusCode::NOT_FOUND,
+                    ))
+                }
+            });
 
             // Apply compression middleware to routes for better throughput
             let routes = routes.with(warp::compression::gzip());

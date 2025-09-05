@@ -1,40 +1,20 @@
 [package]
-name = "simple_bench"
+name = "http_bench"
 version = "0.1.0"
 edition = "2021"
-
-[dependencies]
-anyhow = "1.0"
-clap = { version = "4.0", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-base64 = "0.22"
-hdrhistogram = "7.5"
-indicatif = "0.17"
-rand = "0.8"
-rand_distr = "0.4"
-parking_lot = "0.12"
-
-# gRPC dependencies (feature-gated)
-tonic = { version = "0.11", optional = true }
-futures = { version = "0.3", optional = true }
-prost = { version = "0.12", optional = true }
-
-[build-dependencies]
-tonic-build = { version = "0.11", optional = true }
-protoc-bin-vendored = { version = "3.0", optional = true }
-
-[features]
-default = []
-grpc = ["tonic", "futures", "prost", "tonic-build", "protoc-bin-vendored"]
 
 [[bin]]
 name = "http_bench"
 path = "http_bench.rs"
 
-[[bin]]
-name = "grpc_bench"
-path = "grpc_bench.rs"
-required-features = ["grpc"]
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+serde_json = "1"
+hdrhistogram = "7"
+indicatif = "0.17"
+rand = "0.8"
+rand_distr = "0.4"
+base64 = "0.21"

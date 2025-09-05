@@ -178,8 +178,10 @@ pub struct Document {
     pub collection: String,
     /// Optional text content
     pub text: Option<String>,
-    /// Optional vector embedding
+    /// Optional vector embedding (deprecated - use vectors)
     pub embedding: Option<Vec<f32>>,
+    /// Named vector embeddings (supports multiple vectors per document)
+    pub vectors: HashMap<String, Vec<f32>>,
     /// Structured metadata
     pub metadata: HashMap<String, Value>,
     /// Document creation timestamp
@@ -198,6 +200,7 @@ impl Document {
             collection,
             text: None,
             embedding: None,
+            vectors: HashMap::new(),
             metadata: HashMap::new(),
             created_at: now,
             updated_at: now,
@@ -211,7 +214,14 @@ impl Document {
     }
 
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
-        self.embedding = Some(embedding);
+        self.embedding = Some(embedding.clone());
+        // Also add to the vectors map as default
+        self.vectors.insert("default".to_string(), embedding);
+        self
+    }
+
+    pub fn with_vector(mut self, name: String, vector: Vec<f32>) -> Self {
+        self.vectors.insert(name, vector);
         self
     }
 
@@ -224,6 +234,19 @@ impl Document {
         self.updated_at = Utc::now();
         self.version += 1;
     }
+}
+
+/// Collection statistics and metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionStats {
+    /// Number of documents in the collection
+    pub document_count: usize,
+    /// Total size of all documents in bytes
+    pub total_size_bytes: usize,
+    /// Average document size in bytes
+    pub avg_document_size: usize,
+    /// Last update timestamp
+    pub last_updated: DateTime<Utc>,
 }
 
 /// Backward compatibility types
