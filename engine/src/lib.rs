@@ -23,28 +23,28 @@ pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 pub mod schema;
-// Phase B.1 & B.2: Multi-Modal Storage Modules
-#[cfg(feature = "phase-b")]
+// Vector Storage and Search Modules
+#[cfg(feature = "vector-storage")]
 pub mod vector;
-#[cfg(feature = "phase-b")]
+#[cfg(feature = "vector-storage")]
 pub use vector::{VectorIndex, VectorQuery, VectorSearchResult, HnswIndex};
 
-// Phase B.2: Text Search Module
-#[cfg(feature = "multi-modal")]
+// Text Search Module
+#[cfg(feature = "multimodal-search")]
 pub mod text;
-#[cfg(feature = "multi-modal")]
+#[cfg(feature = "multimodal-search")]
 pub use text::{TextQuery, TextSearchResult, TextIndexWrapper, TextSearchConfig};
 
-// Phase B.2: Metadata Indexing Module
-#[cfg(feature = "multi-modal")]
+// Metadata Indexing Module
+#[cfg(feature = "multimodal-search")]
 pub mod metadata;
-#[cfg(feature = "multi-modal")]
+#[cfg(feature = "multimodal-search")]
 pub use metadata::{MetadataQuery, MetadataIndex, MetadataSearchResult, QueryOperator, LogicalOperator};
 
-// Phase B.2: Hybrid Search Module
-#[cfg(feature = "multi-modal")]
+// Hybrid Search Module
+#[cfg(feature = "multimodal-search")]
 pub mod hybrid;
-#[cfg(feature = "multi-modal")]
+#[cfg(feature = "multimodal-search")]
 pub use hybrid::{HybridQuery, HybridSearchResult, HybridSearchExecutor, HybridScoringConfig, FusionStrategy};
 // pub mod server;  // Removed for now
 // pub mod sql;
@@ -384,19 +384,19 @@ pub struct PersistentEventLog {
     wal_max_segments: Arc<RwLock<usize>>,
     #[cfg(feature = "ann-hnsw")]
     ann: Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
-    // --- Phase B.1: Enhanced Vector Storage ---
-    #[cfg(feature = "phase-b")]
+    // --- Vector Storage and Search ---
+    #[cfg(feature = "vector-storage")]
     schema_registry: Arc<RwLock<schema::SchemaRegistry>>,
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     vector_indexes: Arc<RwLock<std::collections::HashMap<String, Arc<RwLock<vector::HnswIndex>>>>>,
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     document_store: Arc<RwLock<std::collections::HashMap<u64, schema::Document>>>,
-    // --- Phase B.2: Multi-Modal Support ---
-    #[cfg(feature = "multi-modal")]
+    // --- Multimodal Search Support ---
+    #[cfg(feature = "multimodal-search")]
     text_index: text::TextIndexWrapper,
-    #[cfg(feature = "multi-modal")]
+    #[cfg(feature = "multimodal-search")]
     metadata_index: Arc<metadata::MetadataIndex>,
-    #[cfg(feature = "multi-modal")]
+    #[cfg(feature = "multimodal-search")]
     hybrid_executor: Arc<hybrid::HybridSearchExecutor>,
     // --- NEW: snapshot mmap + payload index for direct reads by offset ---
     snapshot_mmap: Arc<RwLock<Option<memmap2::Mmap>>>,
@@ -591,24 +591,24 @@ impl PersistentEventLog {
             config: group_commit_config,
         }));
 
-        // --- Phase B.2: Initialize multi-modal components ---
-        #[cfg(feature = "multi-modal")]
+        // --- Initialize multimodal search components ---
+        #[cfg(feature = "multimodal-search")]
         let text_index = {
             let text_config = text::TextSearchConfig::default();
             let text_index_path = data_dir.join("text_index");
             text::create_text_index(text_index_path, text_config)?
         };
         
-        #[cfg(feature = "multi-modal")]
+        #[cfg(feature = "multimodal-search")]
         let metadata_index = Arc::new(metadata::MetadataIndex::new());
         
-        #[cfg(feature = "multi-modal")]
+        #[cfg(feature = "multimodal-search")]
         let vector_indexes_clone = Arc::new(RwLock::new(std::collections::HashMap::new()));
         
-        #[cfg(feature = "multi-modal")]
+        #[cfg(feature = "multimodal-search")]
         let document_store_clone = Arc::new(RwLock::new(std::collections::HashMap::new()));
         
-        #[cfg(feature = "multi-modal")]
+        #[cfg(feature = "multimodal-search")]
         let hybrid_executor = Arc::new(hybrid::HybridSearchExecutor::new(
             vector_indexes_clone.clone(),
             Arc::new(text_index.clone()),
@@ -628,32 +628,32 @@ impl PersistentEventLog {
             wal_max_segments: Arc::new(RwLock::new(8)),
             #[cfg(feature = "ann-hnsw")]
             ann: Arc::new(RwLock::new(None)),
-            // --- Phase B.1: Initialize vector storage ---
-            #[cfg(feature = "phase-b")]
+            // --- Initialize vector storage ---
+            #[cfg(feature = "vector-storage")]
             schema_registry: Arc::new(RwLock::new({
                 let registry_path = data_dir.join("schema_registry.json");
                 schema::SchemaRegistry::load(&registry_path)
             })),
-            #[cfg(feature = "phase-b")]
+            #[cfg(feature = "vector-storage")]
             vector_indexes: {
-                #[cfg(feature = "multi-modal")]
+                #[cfg(feature = "multimodal-search")]
                 { vector_indexes_clone }
-                #[cfg(not(feature = "multi-modal"))]
+                #[cfg(not(feature = "multimodal-search"))]
                 { Arc::new(RwLock::new(std::collections::HashMap::new())) }
             },
-            #[cfg(feature = "phase-b")]
+            #[cfg(feature = "vector-storage")]
             document_store: {
-                #[cfg(feature = "multi-modal")]
+                #[cfg(feature = "multimodal-search")]
                 { document_store_clone }
-                #[cfg(not(feature = "multi-modal"))]
+                #[cfg(not(feature = "multimodal-search"))]
                 { Arc::new(RwLock::new(std::collections::HashMap::new())) }
             },
-            // --- Phase B.2: Multi-modal components ---
-            #[cfg(feature = "multi-modal")]
+            // --- Multimodal search components ---
+            #[cfg(feature = "multimodal-search")]
             text_index,
-            #[cfg(feature = "multi-modal")]
+            #[cfg(feature = "multimodal-search")]
             metadata_index,
-            #[cfg(feature = "multi-modal")]
+            #[cfg(feature = "multimodal-search")]
             hybrid_executor,
             snapshot_mmap: Arc::new(RwLock::new(None)),
             snapshot_payload_index: Arc::new(RwLock::new(None)),
@@ -1274,19 +1274,19 @@ impl Clone for PersistentEventLog {
             wal_max_segments: self.wal_max_segments.clone(),
             #[cfg(feature = "ann-hnsw")]
             ann: self.ann.clone(),
-            // Phase B.1: Clone enhanced vector storage fields
-            #[cfg(feature = "phase-b")]
+            // Clone vector storage fields
+            #[cfg(feature = "vector-storage")]
             schema_registry: self.schema_registry.clone(),
-            #[cfg(feature = "phase-b")]
+            #[cfg(feature = "vector-storage")]
             vector_indexes: self.vector_indexes.clone(),
-            #[cfg(feature = "phase-b")]
+            #[cfg(feature = "vector-storage")]
             document_store: self.document_store.clone(),
-            // Phase B.2: Clone multi-modal components
-            #[cfg(feature = "multi-modal")]
+            // Clone multimodal search components
+            #[cfg(feature = "multimodal-search")]
             text_index: self.text_index.clone(),
-            #[cfg(feature = "multi-modal")]
+            #[cfg(feature = "multimodal-search")]
             metadata_index: self.metadata_index.clone(),
-            #[cfg(feature = "multi-modal")]
+            #[cfg(feature = "multimodal-search")]
             hybrid_executor: self.hybrid_executor.clone(),
             snapshot_mmap: self.snapshot_mmap.clone(),
             snapshot_payload_index: self.snapshot_payload_index.clone(),
@@ -1832,7 +1832,7 @@ impl PersistentEventLog {
     // Phase B.1: Enhanced Vector Storage and Collection Management
     // =========================================================================
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Create a new collection with the given schema
     pub async fn create_collection(&self, schema: schema::CollectionSchema) -> Result<()> {
         let mut registry = self.schema_registry.write().await;
@@ -1857,21 +1857,21 @@ impl PersistentEventLog {
         Ok(())
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Get collection schema by name
     pub async fn get_collection(&self, name: &str) -> Option<schema::CollectionSchema> {
         let registry = self.schema_registry.read().await;
         registry.get_collection(name).cloned()
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// List all collections
     pub async fn list_collections(&self) -> Vec<schema::CollectionSchema> {
         let registry = self.schema_registry.read().await;
         registry.list_collections().into_iter().cloned().collect()
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Insert a document into a collection
     pub async fn insert_document(&self, mut document: schema::Document) -> Result<u64> {
         // Validate document against collection schema
@@ -1907,7 +1907,7 @@ impl PersistentEventLog {
         }
 
         // Phase B.2: Multi-modal indexing
-        #[cfg(feature = "multi-modal")]
+        #[cfg(feature = "multimodal-search")]
         {
             // Index text content if text search is enabled for the collection
             if collection_schema.text_search_enabled && document.text.is_some() {
@@ -1947,14 +1947,14 @@ impl PersistentEventLog {
         Ok(offset)
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Get a document by ID
     pub async fn get_document(&self, id: u64) -> Option<schema::Document> {
         let store = self.document_store.read().await;
         store.get(&id).cloned()
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Update a document (creates new version)
     pub async fn update_document(&self, mut document: schema::Document) -> Result<u64> {
         // Validate document
@@ -1995,7 +1995,7 @@ impl PersistentEventLog {
         Ok(offset)
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Delete a document
     pub async fn delete_document(&self, id: u64) -> Result<bool> {
         // Get document to determine collection
@@ -2040,7 +2040,7 @@ impl PersistentEventLog {
         Ok(true)
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Perform vector similarity search
     pub async fn vector_search(
         &self,
@@ -2071,7 +2071,7 @@ impl PersistentEventLog {
         Ok(results)
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Perform hybrid search combining vector similarity and metadata filtering
     pub async fn hybrid_search(
         &self,
@@ -2138,13 +2138,13 @@ impl PersistentEventLog {
         Ok(results)
     }
 
-    #[cfg(feature = "multi-modal")]
+    #[cfg(feature = "multimodal-search")]
     /// Perform text search within a collection
     pub async fn text_search(&self, query: text::TextQuery) -> Result<Vec<text::TextSearchResult>> {
         self.text_index.search(&query).await
     }
 
-    #[cfg(feature = "multi-modal")]
+    #[cfg(feature = "multimodal-search")]
     /// Perform metadata search within a collection
     pub async fn metadata_search(&self, query: metadata::MetadataQuery) -> Result<Vec<metadata::MetadataSearchResult>> {
         let document_ids = self.metadata_index.query(&query).await?;
@@ -2157,13 +2157,13 @@ impl PersistentEventLog {
             .collect())
     }
 
-    #[cfg(feature = "multi-modal")]
+    #[cfg(feature = "multimodal-search")]
     /// Perform advanced hybrid search combining vector + text + metadata
     pub async fn advanced_hybrid_search(&self, query: hybrid::HybridQuery) -> Result<Vec<hybrid::HybridSearchResult>> {
         self.hybrid_executor.search(&query).await
     }
 
-    #[cfg(feature = "phase-b")]
+    #[cfg(feature = "vector-storage")]
     /// Get collection statistics including vector index stats
     pub async fn get_collection_stats(&self, collection: &str) -> Option<CollectionStats> {
         let registry = self.schema_registry.read().await;
@@ -2198,7 +2198,7 @@ impl PersistentEventLog {
 }
 
 /// Collection statistics for Phase B.1
-#[cfg(feature = "phase-b")]
+#[cfg(feature = "vector-storage")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CollectionStats {
     pub name: String,

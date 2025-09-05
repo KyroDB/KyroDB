@@ -4,7 +4,7 @@
 //! when available, with fallback to scalar implementations.
 
 use crate::schema::DistanceMetric;
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 use wide::f32x8;
 
 /// Trait for distance computation between vectors
@@ -27,7 +27,7 @@ pub struct SIMDDistance;
 impl SIMDDistance {
     /// Create the most optimized distance function for the given metric
     pub fn new(metric: DistanceMetric) -> Box<dyn DistanceFunction> {
-        #[cfg(all(feature = "simd-optimized", any(target_arch = "x86", target_arch = "x86_64")))]
+        #[cfg(all(feature = "simd-optimization", any(target_arch = "x86", target_arch = "x86_64")))]
         {
             if is_x86_feature_detected!("avx2") {
                 return Self::create_avx2(metric);
@@ -38,7 +38,7 @@ impl SIMDDistance {
         Self::create_scalar(metric)
     }
     
-    #[cfg(feature = "simd-optimized")]
+    #[cfg(feature = "simd-optimization")]
     fn create_avx2(metric: DistanceMetric) -> Box<dyn DistanceFunction> {
         match metric {
             DistanceMetric::Euclidean => Box::new(EuclideanSIMD),
@@ -62,10 +62,10 @@ impl SIMDDistance {
 // SIMD Implementations (AVX2)
 // =============================================================================
 
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 pub struct EuclideanSIMD;
 
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 impl DistanceFunction for EuclideanSIMD {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len(), "Vector dimensions must match");
@@ -108,10 +108,10 @@ impl DistanceFunction for EuclideanSIMD {
     }
 }
 
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 pub struct CosineSIMD;
 
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 impl DistanceFunction for CosineSIMD {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len(), "Vector dimensions must match");
@@ -168,10 +168,10 @@ impl DistanceFunction for CosineSIMD {
     }
 }
 
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 pub struct DotProductSIMD;
 
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 impl DistanceFunction for DotProductSIMD {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len(), "Vector dimensions must match");
@@ -211,10 +211,10 @@ impl DistanceFunction for DotProductSIMD {
     }
 }
 
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 pub struct ManhattanSIMD;
 
-#[cfg(feature = "simd-optimized")]
+#[cfg(feature = "simd-optimization")]
 impl DistanceFunction for ManhattanSIMD {
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         debug_assert_eq!(a.len(), b.len(), "Vector dimensions must match");

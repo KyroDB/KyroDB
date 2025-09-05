@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::future::Future;
 use tokio::sync::RwLock;
 
-#[cfg(feature = "text-search")]
+#[cfg(feature = "fulltext-search")]
 use tantivy::{
     collector::TopDocs,
     doc,
@@ -79,7 +79,7 @@ pub struct TextSearchStats {
     pub last_updated: chrono::DateTime<chrono::Utc>,
 }
 
-#[cfg(feature = "text-search")]
+#[cfg(feature = "fulltext-search")]
 /// Tantivy-based text search index
 pub struct TantivyTextIndex {
     index: Index,
@@ -90,7 +90,7 @@ pub struct TantivyTextIndex {
     config: TextSearchConfig,
 }
 
-#[cfg(feature = "text-search")]
+#[cfg(feature = "fulltext-search")]
 struct TextIndexFields {
     document_id: Field,
     collection: Field,
@@ -99,7 +99,7 @@ struct TextIndexFields {
     metadata: Field,
 }
 
-#[cfg(feature = "text-search")]
+#[cfg(feature = "fulltext-search")]
 impl TantivyTextIndex {
     pub fn new<P: AsRef<Path>>(index_path: P, config: TextSearchConfig) -> Result<Self> {
         use tantivy::schema::*;
@@ -349,11 +349,11 @@ impl TantivyTextIndex {
     }
 }
 
-#[cfg(not(feature = "text-search"))]
+#[cfg(not(feature = "fulltext-search"))]
 /// No-op text index when text search is disabled
 pub struct NoOpTextIndex;
 
-#[cfg(not(feature = "text-search"))]
+#[cfg(not(feature = "fulltext-search"))]
 impl NoOpTextIndex {
     pub fn new<P: AsRef<Path>>(_index_path: P, _config: TextSearchConfig) -> Result<Self> {
         Ok(Self)
@@ -403,9 +403,9 @@ impl NoOpTextIndex {
 /// Text index wrapper enum to avoid dyn trait issues
 #[derive(Clone)]
 pub enum TextIndexWrapper {
-    #[cfg(feature = "text-search")]
+    #[cfg(feature = "fulltext-search")]
     Tantivy(Arc<TantivyTextIndex>),
-    #[cfg(not(feature = "text-search"))]
+    #[cfg(not(feature = "fulltext-search"))]
     NoOp(Arc<NoOpTextIndex>),
 }
 
@@ -419,11 +419,11 @@ impl TextIndexWrapper {
         metadata: Option<&serde_json::Value>,
     ) -> Result<()> {
         match self {
-            #[cfg(feature = "text-search")]
+            #[cfg(feature = "fulltext-search")]
             TextIndexWrapper::Tantivy(index) => {
                 index.index_document(document_id, collection, text, title, metadata).await
             }
-            #[cfg(not(feature = "text-search"))]
+            #[cfg(not(feature = "fulltext-search"))]
             TextIndexWrapper::NoOp(index) => {
                 index.index_document(document_id, collection, text, title, metadata).await
             }
@@ -432,18 +432,18 @@ impl TextIndexWrapper {
     
     pub async fn search(&self, query: &TextQuery) -> Result<Vec<TextSearchResult>> {
         match self {
-            #[cfg(feature = "text-search")]
+            #[cfg(feature = "fulltext-search")]
             TextIndexWrapper::Tantivy(index) => index.search(query).await,
-            #[cfg(not(feature = "text-search"))]
+            #[cfg(not(feature = "fulltext-search"))]
             TextIndexWrapper::NoOp(index) => index.search(query).await,
         }
     }
     
     pub async fn stats(&self) -> Result<TextSearchStats> {
         match self {
-            #[cfg(feature = "text-search")]
+            #[cfg(feature = "fulltext-search")]
             TextIndexWrapper::Tantivy(index) => index.stats().await,
-            #[cfg(not(feature = "text-search"))]
+            #[cfg(not(feature = "fulltext-search"))]
             TextIndexWrapper::NoOp(index) => index.stats().await,
         }
     }
@@ -454,13 +454,13 @@ pub fn create_text_index<P: AsRef<Path>>(
     index_path: P,
     config: TextSearchConfig,
 ) -> Result<TextIndexWrapper> {
-    #[cfg(feature = "text-search")]
+    #[cfg(feature = "fulltext-search")]
     {
         let index = TantivyTextIndex::new(index_path, config)?;
         Ok(TextIndexWrapper::Tantivy(Arc::new(index)))
     }
     
-    #[cfg(not(feature = "text-search"))]
+    #[cfg(not(feature = "fulltext-search"))]
     {
         let index = NoOpTextIndex::new(index_path, config)?;
         Ok(TextIndexWrapper::NoOp(Arc::new(index)))
