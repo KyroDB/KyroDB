@@ -13,14 +13,8 @@ async fn rmi_build_and_load_lookup_works() {
 
     // write KV
     let log = PersistentEventLog::open(&path).await.unwrap();
-    let o1 = log
-        .append_kv(Uuid::new_v4(), 10, b"a".to_vec())
-        .await
-        .unwrap();
-    let o2 = log
-        .append_kv(Uuid::new_v4(), 20, b"b".to_vec())
-        .await
-        .unwrap();
+    let o1 = log.append_kv(Uuid::new_v4(), 10, b"a".to_vec()).await.unwrap();
+    let o2 = log.append_kv(Uuid::new_v4(), 20, b"b".to_vec()).await.unwrap();
     log.snapshot().await.unwrap();
 
     // build RMI file from pairs

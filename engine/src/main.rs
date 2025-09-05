@@ -1,5 +1,7 @@
 //! CLI wrapper around PersistentEventLog.
 
+#![recursion_limit = "512"]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures::stream::StreamExt;
@@ -9,6 +11,28 @@ use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
 use std::time::Duration;
+
+// Phase B.1: Custom error type for API endpoints
+#[derive(Debug)]
+pub enum ApiError {
+    BadRequest(String),
+    NotFound(String),
+    InternalError(String),
+}
+
+impl warp::reject::Reject for ApiError {}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::BadRequest(msg) => write!(f, "Bad Request: {}", msg),
+            ApiError::NotFound(msg) => write!(f, "Not Found: {}", msg),
+            ApiError::InternalError(msg) => write!(f, "Internal Error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 #[cfg(feature = "grpc")]
 mod grpc_svc;
 #[cfg(feature = "grpc")]
@@ -1163,9 +1187,414 @@ async fn main() -> Result<()> {
             let vector_insert = data_rl.clone().and(vector_insert).map(|(), r| r);
             // ---------------------------------------------------------------------------
 
+            // =========================================================================
+            // Phase B.1: Enhanced Vector Storage API Endpoints
+            // =========================================================================
+            
+            #[cfg(feature = "phase-b")]
+            let v2 = warp::path("v2");
+
+            // Collection Management Endpoints
+            #[cfg(feature = "phase-b")]
+            let collections_base = v2.and(warp::path("collections"));
+
+            // POST /v2/collections - Create collection
+            #[cfg(feature = "phase-b")]
+            let create_collection_log = log.clone();
+            #[cfg(feature = "phase-b")]
+            let create_collection_route = collections_base
+                .and(warp::path::end())
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = create_collection_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        
+                        // Parse collection schema from JSON
+                        let schema: engine_crate::schema::CollectionSchema = 
+                            serde_json::from_value(body).map_err(|e| {
+                                warp::reject::custom(ApiError::BadRequest(format!("Invalid schema: {}", e)))
+                            })?;
+
+                        match log.create_collection(schema.clone()).await {
+                            Ok(()) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "status": "created",
+                                    "collection": schema.name
+                                })),
+                                StatusCode::CREATED,
+                            )),
+                            Err(e) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string()
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        }
+                    }
+                });
+
+            // GET /v2/collections - List collections
+            #[cfg(feature = "phase-b")]
+            let list_collections_log = log.clone();
+            #[cfg(feature = "phase-b")]
+            let list_collections_route = collections_base
+                .and(warp::path::end())
+                .and(warp::get())
+                .and_then(move || {
+                    let log = list_collections_log.clone();
+                    async move {
+                        let collections = log.list_collections().await;
+                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                            "collections": collections
+                        })))
+                    }
+                });
+
+            // GET /v2/collections/{name} - Get collection schema
+            #[cfg(feature = "phase-b")]
+            let get_collection_log = log.clone();
+            #[cfg(feature = "phase-b")]
+            let get_collection_route = collections_base
+                .and(warp::path::param::<String>())
+                .and(warp::path::end())
+                .and(warp::get())
+                .and_then(move |name: String| {
+                    let log = get_collection_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        match log.get_collection(&name).await {
+                            Some(schema) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&schema),
+                                StatusCode::OK,
+                            )),
+                            None => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": format!("Collection '{}' not found", name)
+                                })),
+                                StatusCode::NOT_FOUND,
+                            )),
+                        }
+                    }
+                });
+
+            // GET /v2/collections/{name}/stats - Get collection statistics
+            #[cfg(feature = "phase-b")]
+            let collection_stats_log = log.clone();
+            #[cfg(feature = "phase-b")]
+            let collection_stats_route = collections_base
+                .and(warp::path::param::<String>())
+                .and(warp::path("stats"))
+                .and(warp::path::end())
+                .and(warp::get())
+                .and_then(move |name: String| {
+                    let log = collection_stats_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        match log.get_collection_stats(&name).await {
+                            Some(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&stats),
+                                StatusCode::OK,
+                            )),
+                            None => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": format!("Collection '{}' not found", name)
+                                })),
+                                StatusCode::NOT_FOUND,
+                            )),
+                        }
+                    }
+                });
+
+            // Document Management Endpoints
+            #[cfg(feature = "phase-b")]
+            let documents_base = collections_base
+                .and(warp::path::param::<String>())
+                .and(warp::path("documents"));
+
+            // POST /v2/collections/{collection}/documents - Insert document
+            #[cfg(feature = "phase-b")]
+            let insert_document_log = log.clone();
+            #[cfg(feature = "phase-b")]
+            let insert_document_route = documents_base
+                .and(warp::path::end())
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |collection_name: String, body: serde_json::Value| {
+                    let log = insert_document_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        
+                        // Parse document from JSON
+                        let mut document: engine_crate::schema::Document = 
+                            serde_json::from_value(body).map_err(|e| {
+                                warp::reject::custom(ApiError::BadRequest(format!("Invalid document: {}", e)))
+                            })?;
+
+                        // Ensure collection name matches URL parameter
+                        document.collection = collection_name;
+
+                        match log.insert_document(document.clone()).await {
+                            Ok(offset) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "status": "inserted",
+                                    "id": document.id,
+                                    "offset": offset
+                                })),
+                                StatusCode::CREATED,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string()
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        }
+                    }
+                });
+
+            // GET /v2/collections/{collection}/documents/{id} - Get document
+            #[cfg(feature = "phase-b")]
+            let get_document_log = log.clone();
+            #[cfg(feature = "phase-b")]
+            let get_document_route = documents_base
+                .and(warp::path::param::<u64>())
+                .and(warp::path::end())
+                .and(warp::get())
+                .and_then(move |_collection_name: String, id: u64| {
+                    let log = get_document_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        match log.get_document(id).await {
+                            Some(document) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&document),
+                                StatusCode::OK,
+                            )),
+                            None => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": format!("Document {} not found", id)
+                                })),
+                                StatusCode::NOT_FOUND,
+                            )),
+                        }
+                    }
+                });
+
+            // Vector Search Endpoints
+            #[cfg(feature = "phase-b")]
+            let search_base = v2.and(warp::path("search"));
+
+            // POST /v2/search/vector - Vector similarity search
+            #[cfg(feature = "phase-b")]
+            let vector_search_log = log.clone();
+            #[cfg(feature = "phase-b")]
+            let vector_search_route = search_base
+                .and(warp::path("vector"))
+                .and(warp::path::end())
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = vector_search_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        
+                        // Parse search request
+                        let collection = body["collection"].as_str().unwrap_or("");
+                        let empty_vec = Vec::new();
+                        let vector_data = body["vector"].as_array().unwrap_or(&empty_vec);
+                        let k = body["k"].as_u64().unwrap_or(10) as usize;
+                        let ef = body["ef"].as_u64().map(|x| x as usize);
+                        let threshold = body["similarity_threshold"].as_f64().map(|x| x as f32);
+
+                        if collection.is_empty() {
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": "Collection name is required"
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            ));
+                        }
+
+                        let vector: Vec<f32> = vector_data.iter()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect();
+
+                        if vector.is_empty() {
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": "Vector is required and must not be empty"
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            ));
+                        }
+
+                        let query = engine_crate::vector::VectorQuery {
+                            vector,
+                            k,
+                            distance_metric: engine_crate::schema::DistanceMetric::Euclidean,
+                            ef,
+                            similarity_threshold: threshold,
+                        };
+
+                        match log.vector_search(collection, query).await {
+                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "results": results,
+                                    "count": results.len()
+                                })),
+                                StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string()
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        }
+                    }
+                });
+
+            // POST /v2/search/hybrid - Hybrid search (vector + metadata filters)
+            #[cfg(feature = "phase-b")]
+            let hybrid_search_log = log.clone();
+            #[cfg(feature = "phase-b")]
+            let hybrid_search_route = search_base
+                .and(warp::path("hybrid"))
+                .and(warp::path::end())
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = hybrid_search_log.clone();
+                    async move {
+                        use warp::http::StatusCode;
+                        
+                        let collection = body["collection"].as_str().unwrap_or("");
+                        if collection.is_empty() {
+                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": "Collection name is required"
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            ));
+                        }
+
+                        // Optional vector query
+                        let vector_query = if let Some(vector_data) = body["vector"].as_array() {
+                            let vector: Vec<f32> = vector_data.iter()
+                                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                .collect();
+                            
+                            if !vector.is_empty() {
+                                Some(engine_crate::vector::VectorQuery {
+                                    vector,
+                                    k: body["k"].as_u64().unwrap_or(10) as usize,
+                                    distance_metric: engine_crate::schema::DistanceMetric::Euclidean,
+                                    ef: body["ef"].as_u64().map(|x| x as usize),
+                                    similarity_threshold: body["similarity_threshold"].as_f64().map(|x| x as f32),
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Metadata filters
+                        let mut metadata_filters = Vec::new();
+                        if let Some(filters) = body["metadata_filters"].as_object() {
+                            for (key, value) in filters {
+                                // Convert JSON value to schema::Value
+                                let schema_value = match value {
+                                    serde_json::Value::Bool(b) => engine_crate::schema::Value::Bool(*b),
+                                    serde_json::Value::Number(n) => {
+                                        if let Some(i) = n.as_i64() {
+                                            engine_crate::schema::Value::I64(i)
+                                        } else if let Some(f) = n.as_f64() {
+                                            engine_crate::schema::Value::F64(f)
+                                        } else {
+                                            continue;
+                                        }
+                                    },
+                                    serde_json::Value::String(s) => engine_crate::schema::Value::String(s.clone()),
+                                    _ => continue,
+                                };
+                                metadata_filters.push((key.clone(), schema_value));
+                            }
+                        }
+
+                        match log.hybrid_search(collection, vector_query, metadata_filters).await {
+                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "results": results,
+                                    "count": results.len()
+                                })),
+                                StatusCode::OK,
+                            )),
+                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "error": e.to_string()
+                                })),
+                                StatusCode::BAD_REQUEST,
+                            )),
+                        }
+                    }
+                });
+
+            // Apply rate limiting to Phase B.1 endpoints
+            #[cfg(feature = "phase-b")]
+            let create_collection_route = admin_rl.clone().and(create_collection_route).map(|(), r| r);
+            #[cfg(feature = "phase-b")]
+            let list_collections_route = data_rl.clone().and(list_collections_route).map(|(), r| r);
+            #[cfg(feature = "phase-b")]
+            let get_collection_route = data_rl.clone().and(get_collection_route).map(|(), r| r);
+            #[cfg(feature = "phase-b")]
+            let collection_stats_route = data_rl.clone().and(collection_stats_route).map(|(), r| r);
+            #[cfg(feature = "phase-b")]
+            let insert_document_route = data_rl.clone().and(insert_document_route).map(|(), r| r);
+            #[cfg(feature = "phase-b")]
+            let get_document_route = data_rl.clone().and(get_document_route).map(|(), r| r);
+            #[cfg(feature = "phase-b")]
+            let vector_search_route = data_rl.clone().and(vector_search_route).map(|(), r| r);
+            #[cfg(feature = "phase-b")]
+            let hybrid_search_route = data_rl.clone().and(hybrid_search_route).map(|(), r| r);
+
             // Compression will be handled by warp's built-in compression middleware
             
             // Combine routes with compression and optimizations
+            #[cfg(feature = "phase-b")]
+            let routes = health_route
+                .or(metrics_route)
+                .or(append_route)
+                .or(replay_route)
+                .or(subscribe_route)
+                .or(snapshot_route)
+                .or(offset_route)
+                .or(put_route)
+                .or(put_fast_route)
+                .or(lookup_route)
+                .or(lookup_raw)
+                .or(lookup_fast)
+                .or(get_fast)
+                .or(batch_put_route)
+                .or(msgpack_put_route)
+                .or(msgpack_get_route)
+                // .or(sql_route)
+                .or(vector_insert)
+                .or(rmi_build)
+                .or(compact_route)
+                .or(warmup)
+                // Phase B.1 routes
+                .or(create_collection_route)
+                .or(list_collections_route)
+                .or(get_collection_route)
+                .or(collection_stats_route)
+                .or(insert_document_route)
+                .or(get_document_route)
+                .or(vector_search_route)
+                .or(hybrid_search_route);
+
+            #[cfg(not(feature = "phase-b"))]
             let routes = health_route
                 .or(metrics_route)
                 .or(append_route)

@@ -23,6 +23,11 @@ pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 pub mod schema;
+// Phase B.1: Vector Storage Module
+#[cfg(feature = "phase-b")]
+pub mod vector;
+#[cfg(feature = "phase-b")]
+pub use vector::{VectorIndex, VectorQuery, VectorSearchResult, HnswIndex};
 // pub mod server;  // Removed for now
 // pub mod sql;
 // #[cfg(feature = "grpc")]
@@ -361,6 +366,13 @@ pub struct PersistentEventLog {
     wal_max_segments: Arc<RwLock<usize>>,
     #[cfg(feature = "ann-hnsw")]
     ann: Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
+    // --- Phase B.1: Enhanced Vector Storage ---
+    #[cfg(feature = "phase-b")]
+    schema_registry: Arc<RwLock<schema::SchemaRegistry>>,
+    #[cfg(feature = "phase-b")]
+    vector_indexes: Arc<RwLock<std::collections::HashMap<String, Arc<RwLock<vector::HnswIndex>>>>>,
+    #[cfg(feature = "phase-b")]
+    document_store: Arc<RwLock<std::collections::HashMap<u64, schema::Document>>>,
     // --- NEW: snapshot mmap + payload index for direct reads by offset ---
     snapshot_mmap: Arc<RwLock<Option<memmap2::Mmap>>>,
     // offset -> (payload_start, payload_len) within snapshot mmap
@@ -566,6 +578,16 @@ impl PersistentEventLog {
             wal_max_segments: Arc::new(RwLock::new(8)),
             #[cfg(feature = "ann-hnsw")]
             ann: Arc::new(RwLock::new(None)),
+            // --- Phase B.1: Initialize vector storage ---
+            #[cfg(feature = "phase-b")]
+            schema_registry: Arc::new(RwLock::new({
+                let registry_path = data_dir.join("schema_registry.json");
+                schema::SchemaRegistry::load(&registry_path)
+            })),
+            #[cfg(feature = "phase-b")]
+            vector_indexes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            #[cfg(feature = "phase-b")]
+            document_store: Arc::new(RwLock::new(std::collections::HashMap::new())),
             snapshot_mmap: Arc::new(RwLock::new(None)),
             snapshot_payload_index: Arc::new(RwLock::new(None)),
             wal_block_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(4096).unwrap()))),
@@ -1185,6 +1207,13 @@ impl Clone for PersistentEventLog {
             wal_max_segments: self.wal_max_segments.clone(),
             #[cfg(feature = "ann-hnsw")]
             ann: self.ann.clone(),
+            // Phase B.1: Clone enhanced vector storage fields
+            #[cfg(feature = "phase-b")]
+            schema_registry: self.schema_registry.clone(),
+            #[cfg(feature = "phase-b")]
+            vector_indexes: self.vector_indexes.clone(),
+            #[cfg(feature = "phase-b")]
+            document_store: self.document_store.clone(),
             snapshot_mmap: self.snapshot_mmap.clone(),
             snapshot_payload_index: self.snapshot_payload_index.clone(),
             wal_block_cache: self.wal_block_cache.clone(),
@@ -1724,4 +1753,323 @@ impl PersistentEventLog {
 
         Ok(offsets)
     }
+
+    // =========================================================================
+    // Phase B.1: Enhanced Vector Storage and Collection Management
+    // =========================================================================
+
+    #[cfg(feature = "phase-b")]
+    /// Create a new collection with the given schema
+    pub async fn create_collection(&self, schema: schema::CollectionSchema) -> Result<()> {
+        let mut registry = self.schema_registry.write().await;
+        registry.create_collection(schema.clone())
+            .map_err(|e| anyhow::anyhow!("Failed to create collection: {}", e))?;
+
+        // Save registry to disk
+        let registry_path = self.data_dir.join("schema_registry.json");
+        registry.save(&registry_path)
+            .context("Failed to save schema registry")?;
+
+        // Initialize vector index if collection has vector dimension
+        if let Some(dimension) = schema.vector_dimension {
+            let config = schema.hnsw_config.unwrap_or_default();
+            let vector_index = Arc::new(RwLock::new(vector::HnswIndex::new(config, dimension)));
+            
+            let mut indexes = self.vector_indexes.write().await;
+            indexes.insert(schema.name.clone(), vector_index);
+        }
+
+        tracing::info!(collection = %schema.name, dimension = ?schema.vector_dimension, "Created collection");
+        Ok(())
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// Get collection schema by name
+    pub async fn get_collection(&self, name: &str) -> Option<schema::CollectionSchema> {
+        let registry = self.schema_registry.read().await;
+        registry.get_collection(name).cloned()
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// List all collections
+    pub async fn list_collections(&self) -> Vec<schema::CollectionSchema> {
+        let registry = self.schema_registry.read().await;
+        registry.list_collections().into_iter().cloned().collect()
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// Insert a document into a collection
+    pub async fn insert_document(&self, mut document: schema::Document) -> Result<u64> {
+        // Validate document against collection schema
+        {
+            let registry = self.schema_registry.read().await;
+            registry.validate_document(&document)
+                .map_err(|e| anyhow::anyhow!("Document validation failed: {}", e))?;
+        }
+
+        // Update document timestamps
+        document.update_timestamp();
+
+        // Store document
+        let doc_id = document.id;
+        {
+            let mut store = self.document_store.write().await;
+            store.insert(doc_id, document.clone());
+        }
+
+        // Insert into vector index if document has embedding
+        if let Some(ref embedding) = document.embedding {
+            if let Some(vector_index) = {
+                let indexes = self.vector_indexes.read().await;
+                indexes.get(&document.collection).cloned()
+            } {
+                let vector_record = vector::storage::VectorRecord::from_document(&document)?;
+                let mut index = vector_index.write().await;
+                index.insert(vector_record)?;
+            }
+        }
+
+        // Append to WAL for durability
+        let doc_bytes = bincode::serialize(&document)?;
+        let offset = self.append(Uuid::new_v4(), doc_bytes).await?;
+
+        tracing::debug!(doc_id = %doc_id, collection = %document.collection, offset = %offset, "Inserted document");
+        Ok(offset)
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// Get a document by ID
+    pub async fn get_document(&self, id: u64) -> Option<schema::Document> {
+        let store = self.document_store.read().await;
+        store.get(&id).cloned()
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// Update a document (creates new version)
+    pub async fn update_document(&self, mut document: schema::Document) -> Result<u64> {
+        // Validate document
+        {
+            let registry = self.schema_registry.read().await;
+            registry.validate_document(&document)
+                .map_err(|e| anyhow::anyhow!("Document validation failed: {}", e))?;
+        }
+
+        // Update timestamps and version
+        document.update_timestamp();
+
+        let doc_id = document.id;
+
+        // Update vector index if document has embedding
+        if let Some(ref embedding) = document.embedding {
+            if let Some(vector_index) = {
+                let indexes = self.vector_indexes.read().await;
+                indexes.get(&document.collection).cloned()
+            } {
+                let vector_record = vector::storage::VectorRecord::from_document(&document)?;
+                let mut index = vector_index.write().await;
+                index.insert(vector_record)?; // Insert/update
+            }
+        }
+
+        // Update document store
+        {
+            let mut store = self.document_store.write().await;
+            store.insert(doc_id, document.clone());
+        }
+
+        // Append to WAL
+        let doc_bytes = bincode::serialize(&document)?;
+        let offset = self.append(Uuid::new_v4(), doc_bytes).await?;
+
+        tracing::debug!(doc_id = %doc_id, version = %document.version, offset = %offset, "Updated document");
+        Ok(offset)
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// Delete a document
+    pub async fn delete_document(&self, id: u64) -> Result<bool> {
+        // Get document to determine collection
+        let document = {
+            let store = self.document_store.read().await;
+            store.get(&id).cloned()
+        };
+
+        let document = match document {
+            Some(doc) => doc,
+            None => return Ok(false),
+        };
+
+        // Remove from vector index
+        if document.embedding.is_some() {
+            if let Some(vector_index) = {
+                let indexes = self.vector_indexes.read().await;
+                indexes.get(&document.collection).cloned()
+            } {
+                let mut index = vector_index.write().await;
+                index.remove(id)?;
+            }
+        }
+
+        // Remove from document store
+        {
+            let mut store = self.document_store.write().await;
+            store.remove(&id);
+        }
+
+        // Log deletion to WAL
+        let deletion_event = serde_json::json!({
+            "type": "document_deletion",
+            "id": id,
+            "collection": document.collection,
+            "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        });
+        let deletion_bytes = serde_json::to_vec(&deletion_event)?;
+        self.append(Uuid::new_v4(), deletion_bytes).await?;
+
+        tracing::debug!(doc_id = %id, collection = %document.collection, "Deleted document");
+        Ok(true)
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// Perform vector similarity search
+    pub async fn vector_search(
+        &self,
+        collection: &str,
+        query: vector::VectorQuery,
+    ) -> Result<Vec<vector::VectorSearchResult>> {
+        let vector_index = {
+            let indexes = self.vector_indexes.read().await;
+            indexes.get(collection).cloned()
+        };
+
+        let vector_index = match vector_index {
+            Some(index) => index,
+            None => anyhow::bail!("Collection '{}' does not have vector search enabled", collection),
+        };
+
+        let index = vector_index.read().await;
+        let results = index.search(&query)?;
+
+        tracing::debug!(
+            collection = %collection, 
+            query_dim = query.vector.len(), 
+            k = query.k, 
+            results = results.len(),
+            "Vector search completed"
+        );
+
+        Ok(results)
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// Perform hybrid search combining vector similarity and metadata filtering
+    pub async fn hybrid_search(
+        &self,
+        collection: &str,
+        vector_query: Option<vector::VectorQuery>,
+        metadata_filters: Vec<(String, schema::Value)>,
+    ) -> Result<Vec<schema::Document>> {
+        // Start with vector search if provided
+        let mut candidate_ids: Option<std::collections::HashSet<u64>> = None;
+
+        if let Some(ref vq) = vector_query {
+            let vector_results = self.vector_search(collection, vq.clone()).await?;
+            candidate_ids = Some(
+                vector_results.into_iter()
+                    .map(|result| result.id)
+                    .collect()
+            );
+        }
+
+        // Apply metadata filters
+        let store = self.document_store.read().await;
+        let mut results = Vec::new();
+
+        for (doc_id, document) in store.iter() {
+            // Skip if document is not in this collection
+            if document.collection != collection {
+                continue;
+            }
+
+            // Skip if not in vector search candidates (if vector search was performed)
+            if let Some(ref candidates) = candidate_ids {
+                if !candidates.contains(doc_id) {
+                    continue;
+                }
+            }
+
+            // Apply metadata filters
+            let mut matches_all_filters = true;
+            for (key, expected_value) in &metadata_filters {
+                if let Some(actual_value) = document.metadata.get(key) {
+                    if actual_value != expected_value {
+                        matches_all_filters = false;
+                        break;
+                    }
+                } else {
+                    matches_all_filters = false;
+                    break;
+                }
+            }
+
+            if matches_all_filters {
+                results.push(document.clone());
+            }
+        }
+
+        tracing::debug!(
+            collection = %collection,
+            vector_search = vector_query.is_some(),
+            metadata_filters = metadata_filters.len(),
+            results = results.len(),
+            "Hybrid search completed"
+        );
+
+        Ok(results)
+    }
+
+    #[cfg(feature = "phase-b")]
+    /// Get collection statistics including vector index stats
+    pub async fn get_collection_stats(&self, collection: &str) -> Option<CollectionStats> {
+        let registry = self.schema_registry.read().await;
+        let schema = registry.get_collection(collection)?;
+
+        let document_count = {
+            let store = self.document_store.read().await;
+            store.values().filter(|doc| doc.collection == collection).count()
+        };
+
+        let vector_stats = if schema.vector_dimension.is_some() {
+            let indexes = self.vector_indexes.read().await;
+            if let Some(index) = indexes.get(collection) {
+                let idx = index.read().await;
+                Some(idx.stats())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Some(CollectionStats {
+            name: collection.to_string(),
+            document_count,
+            vector_dimension: schema.vector_dimension,
+            vector_stats,
+            created_at: schema.created_at,
+            updated_at: schema.updated_at,
+        })
+    }
+}
+
+/// Collection statistics for Phase B.1
+#[cfg(feature = "phase-b")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CollectionStats {
+    pub name: String,
+    pub document_count: usize,
+    pub vector_dimension: Option<usize>,
+    pub vector_stats: Option<vector::IndexStats>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }

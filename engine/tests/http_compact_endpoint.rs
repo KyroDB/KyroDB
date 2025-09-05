@@ -7,6 +7,7 @@ async fn http_compact_endpoint_smoke() {
 
     let dir = tempdir().unwrap();
     let path = dir.path().to_path_buf();
+
     let log = Arc::new(
         kyrodb_engine::PersistentEventLog::open(&path)
             .await
