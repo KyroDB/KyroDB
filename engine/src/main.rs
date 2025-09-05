@@ -12,7 +12,7 @@ use warp::http::StatusCode;
 use warp::Filter;
 use std::time::Duration;
 
-// Phase B.1: Custom error type for API endpoints
+// Custom error type for API endpoints
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
@@ -203,7 +203,7 @@ enum Commands {
         /// Admin token for privileged operations (separate from auth_token for read/write). If no tokens passed, auth is disabled.
         #[arg(long)]
         admin_token: Option<String>,
-        /// Enable rate limiting (feature-gated; defaults to disabled for full throttle)
+        /// Enable rate limiting (defaults to disabled for full throttle)
         #[arg(long)]
         enable_rate_limiting: bool,
         /// HTTP/2 max concurrent streams per connection (default: 1000)
@@ -238,17 +238,6 @@ async fn main() -> Result<()> {
     let log = Arc::new(
         engine_crate::PersistentEventLog::open(std::path::Path::new(&cli.data_dir)).await?,
     );
-
-    // --- Rate limiter configs (env tunables) --------------------------------
-    let admin_rps = env_f64("KYRODB_RL_ADMIN_RPS", 2.0);
-    let admin_burst = env_f64("KYRODB_RL_ADMIN_BURST", 5.0);
-    let data_rps = env_f64("KYRODB_RL_DATA_RPS", 5000.0);
-    let data_burst = env_f64("KYRODB_RL_DATA_BURST", 10000.0);
-    let admin_limiter = SimpleRateLimiter::new(admin_rps, admin_burst);
-    let data_limiter = SimpleRateLimiter::new(data_rps, data_burst);
-    let admin_rl = mk_rl_filter_admin(admin_limiter.clone()).boxed();
-    let data_rl = mk_rl_filter_data(data_limiter.clone()).boxed();
-    // ------------------------------------------------------------------------
 
     match cli.cmd {
         Commands::Serve {
@@ -520,44 +509,31 @@ async fn main() -> Result<()> {
                 )
             };
 
-            // --- Rate limiter configs (env tunables) --------------------------------
-            // Feature-gate rate limiting: Only apply if enabled and feature is active
-            #[cfg(feature = "rate-limiting")]
-            let (admin_limiter, data_limiter) = if enable_rate_limiting {
+            // --- Rate limiting: Conditionally enable only if requested via CLI ---
+            let admin_rl = if enable_rate_limiting {
                 let admin_rps = env_f64("KYRODB_RL_ADMIN_RPS", 2.0);
                 let admin_burst = env_f64("KYRODB_RL_ADMIN_BURST", 5.0);
-                let data_rps = env_f64("KYRODB_RL_DATA_RPS", 5000.0);
-                let data_burst = env_f64("KYRODB_RL_DATA_BURST", 10000.0);
-                (
-                    SimpleRateLimiter::new(admin_rps, admin_burst),
-                    SimpleRateLimiter::new(data_rps, data_burst),
-                )
-            } else {
-                // No-op limiters when disabled
-                (SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY), SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY))
-            };
-
-            #[cfg(not(feature = "rate-limiting"))]
-            let (admin_limiter, data_limiter) = if enable_rate_limiting {
-                eprintln!("⚠️ Rate limiting requested but 'rate-limiting' feature not enabled. Running without limits.");
-                (SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY), SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY))
-            } else {
-                (SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY), SimpleRateLimiter::new(f64::INFINITY, f64::INFINITY))
-            };
-
-            // Conditionally enable rate limiting only if requested
-            let admin_rl = if enable_rate_limiting {
-                mk_rl_filter_admin(admin_limiter.clone()).boxed()
+                let admin_limiter = SimpleRateLimiter::new(admin_rps, admin_burst);
+                mk_rl_filter_admin(admin_limiter).boxed()
             } else {
                 // No-op: always allow
                 warp::any().map(|| ()).boxed()
             };
+            
             let data_rl = if enable_rate_limiting {
-                mk_rl_filter_data(data_limiter.clone()).boxed()
+                let data_rps = env_f64("KYRODB_RL_DATA_RPS", 5000.0);
+                let data_burst = env_f64("KYRODB_RL_DATA_BURST", 10000.0);
+                let data_limiter = SimpleRateLimiter::new(data_rps, data_burst);
+                mk_rl_filter_data(data_limiter).boxed()
             } else {
                 warp::any().map(|| ()).boxed()
             };
-            // ------------------------------------------------------------------------
+            
+            if enable_rate_limiting {
+                println!("⚡ Rate limiting enabled via CLI");
+            } else {
+                println!("🚀 Rate limiting disabled - full throttle mode");
+            }
 
             // --- Fast lookup endpoints (HTTP hot path) with versioned prefix -----------------
             let v1 = warp::path("v1");
@@ -856,54 +832,6 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // POST /v1/sql  { sql: "INSERT ..." | "SELECT ..." }
-            /*
-            let sql_log = log.clone();
-            let sql_route = v1
-                .and(warp::path("sql"))
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = sql_log.clone();
-                    async move {
-                        let stmt = body["sql"].as_str().unwrap_or("");
-                        match sql::execute_sql(&log, stmt).await {
-                            Ok(sql::SqlResponse::Ack { offset }) => Ok::<_, warp::Rejection>(
-                                warp::reply::json(&serde_json::json!({"ack": {"offset": offset}})),
-                            ),
-                            Ok(sql::SqlResponse::Rows(rows)) => {
-                                let resp: Vec<_> = rows
-                                    .into_iter()
-                                    .map(|(k, v)| {
-                                        serde_json::json!({
-                                            "key": k,
-                                            "value": String::from_utf8_lossy(&v)
-                                        })
-                                    })
-                                    .collect();
-                                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
-                            }
-                            Ok(sql::SqlResponse::VecRows(rows)) => {
-                                let resp: Vec<_> = rows
-                                    .into_iter()
-                                    .map(|(k, d)| {
-                                        serde_json::json!({
-                                            "key": k,
-                                            "dist": d
-                                        })
-                                    })
-                                    .collect();
-                                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
-                            }
-                            Err(e) => {
-                                let err = serde_json::json!({"error": e.to_string()});
-                                Ok::<_, warp::Rejection>(warp::reply::json(&err))
-                            }
-                        }
-                    }
-                });
-            */
-
             // --- NEW: Batch PUT endpoint for reduced round-trips -----------------------------
             let batch_put_log = log.clone();
             let batch_put_route = v1
@@ -1183,12 +1111,11 @@ async fn main() -> Result<()> {
             let batch_put_route = data_rl.clone().and(batch_put_route).map(|(), r| r);
             let msgpack_put_route = data_rl.clone().and(msgpack_put_route).map(|(), r| r);
             let msgpack_get_route = data_rl.clone().and(msgpack_get_route).map(|(), r| r);
-            // let sql_route = data_rl.clone().and(sql_route).map(|(), r| r);
             let vector_insert = data_rl.clone().and(vector_insert).map(|(), r| r);
             // ---------------------------------------------------------------------------
 
             // =========================================================================
-            // Phase B.1: Enhanced Vector Storage API Endpoints
+            // Enhanced Vector Storage API Endpoints
             // =========================================================================
             
             #[cfg(feature = "vector-storage")]
@@ -1541,25 +1468,25 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // Apply rate limiting to Phase B.1 endpoints
+            // Apply rate limiting to vector storage endpoints
             #[cfg(feature = "vector-storage")]
-            let create_collection_route_with_rl = admin_rl.clone().and(create_collection_route.clone()).map(|(), r| r);
+            let create_collection_route = admin_rl.clone().and(create_collection_route).map(|(), r| r);
             #[cfg(feature = "vector-storage")]
-            let list_collections_route_with_rl = data_rl.clone().and(list_collections_route).map(|(), r| r);
+            let list_collections_route = data_rl.clone().and(list_collections_route).map(|(), r| r);
             #[cfg(feature = "vector-storage")]
-            let get_collection_route_with_rl = data_rl.clone().and(get_collection_route).map(|(), r| r);
+            let get_collection_route = data_rl.clone().and(get_collection_route).map(|(), r| r);
             #[cfg(feature = "vector-storage")]
-            let collection_stats_route_with_rl = data_rl.clone().and(collection_stats_route).map(|(), r| r);
+            let collection_stats_route = data_rl.clone().and(collection_stats_route).map(|(), r| r);
             #[cfg(feature = "vector-storage")]
-            let insert_document_route_with_rl = data_rl.clone().and(insert_document_route).map(|(), r| r);
+            let insert_document_route = data_rl.clone().and(insert_document_route).map(|(), r| r);
             #[cfg(feature = "vector-storage")]
-            let get_document_route_with_rl = data_rl.clone().and(get_document_route).map(|(), r| r);
+            let get_document_route = data_rl.clone().and(get_document_route).map(|(), r| r);
             #[cfg(feature = "vector-storage")]
-            let vector_search_route_with_rl = data_rl.clone().and(vector_search_route).map(|(), r| r);
+            let vector_search_route = data_rl.clone().and(vector_search_route).map(|(), r| r);
             #[cfg(feature = "vector-storage")]
-            let hybrid_search_route_with_rl = data_rl.clone().and(hybrid_search_route).map(|(), r| r);
+            let hybrid_search_route = data_rl.clone().and(hybrid_search_route).map(|(), r| r);
 
-            // Phase B.2: Multi-modal search routes
+            // Multi-modal search routes
             #[cfg(feature = "multimodal-search")]
             let text_search_log = log.clone();
             #[cfg(feature = "multimodal-search")]
@@ -1787,192 +1714,172 @@ async fn main() -> Result<()> {
 
             // Apply rate limiting to multi-modal routes
             #[cfg(feature = "multimodal-search")]
-            let text_search_route_with_rl = data_rl.clone().and(text_search_route).map(|(), r| r);
+            let text_search_route = data_rl.clone().and(text_search_route).map(|(), r| r);
             #[cfg(feature = "multimodal-search")]
-            let metadata_search_route_with_rl = data_rl.clone().and(metadata_search_route).map(|(), r| r);
+            let metadata_search_route = data_rl.clone().and(metadata_search_route).map(|(), r| r);
             #[cfg(feature = "multimodal-search")]
-            let advanced_hybrid_search_route_with_rl = data_rl.clone().and(advanced_hybrid_search_route).map(|(), r| r);
+            let advanced_hybrid_search_route = data_rl.clone().and(advanced_hybrid_search_route).map(|(), r| r);
 
-            // Compression will be handled by warp's built-in compression middleware
-            
-            // Combine routes with compression and optimizations
-                    // Build routes using a macro to avoid type conflicts
-        macro_rules! build_routes {
-            ($base:expr) => {
-                $base
-                    .or(warp::path("build_info").and(warp::get()).map({
-                        let commit = build_commit;
-                        let features = build_features;
-                        let branch = option_env!("GIT_BRANCH").unwrap_or("unknown");
-                        let build_time = option_env!("BUILD_TIME").unwrap_or("unknown");
-                        let rust_version = option_env!("RUST_VERSION").unwrap_or("unknown");
-                        let target_triple = option_env!("TARGET_TRIPLE").unwrap_or("unknown");
-                        move || {
-                            warp::reply::json(&serde_json::json!({
-                                "commit": commit,
-                                "branch": branch,
-                                "build_time": build_time,
-                                "rust_version": rust_version,
-                                "target_triple": target_triple,
-                                "features": features,
-                                "version": env!("CARGO_PKG_VERSION"),
-                                "name": env!("CARGO_PKG_NAME"),
-                            }))
-                        }
-                    }))
-            };
-        }
-
-        // Build routes with conditional features
-        let routes = {
-            let base_routes = health_route
-                .or(metrics_route)
-                .or(append_route)
-                .or(replay_route)
-                .or(subscribe_route)
-                .or(snapshot_route)
-                .or(offset_route)
-                .or(put_route)
-                .or(put_fast_route)
-                .or(lookup_route)
-                .or(lookup_raw)
-                .or(lookup_fast)
-                .or(get_fast)
-                .or(batch_put_route)
-                .or(msgpack_put_route)
-                .or(msgpack_get_route)
-                // .or(sql_route)
-                .or(vector_insert)
-                .or(rmi_build)
-                .or(compact_route)
-                .or(warmup);
-
-            // Add simple test routes to verify vector storage routes are included
-            #[cfg(feature = "vector-storage")]
-            let vector_test_get_route = warp::path("v2")
-                .and(warp::path("test_vector"))
-                .and(warp::get())
-                .map(|| warp::reply::json(&serde_json::json!({"status": "vector_get_routes_included"})));
-            
-            #[cfg(feature = "vector-storage")]
-            let vector_test_post_route = warp::path("v2")
-                .and(warp::path("test_vector_post"))
-                .and(warp::post())
-                .map(|| warp::reply::json(&serde_json::json!({"status": "vector_post_routes_included"})));
-
-            // Build routes with conditional features - using rate-limited versions
-            #[cfg(all(feature = "vector-storage", feature = "multimodal-search"))]
-            let routes = build_routes!(
-                base_routes
-                    .or(vector_test_get_route)
-                    .or(vector_test_post_route)
-                    .or(create_collection_route_with_rl)
-                    .or(list_collections_route_with_rl)
-                    .or(get_collection_route_with_rl)
-                    .or(collection_stats_route_with_rl)
-                    .or(insert_document_route_with_rl)
-                    .or(get_document_route_with_rl)
-                    .or(vector_search_route_with_rl)
-                    .or(hybrid_search_route_with_rl)
-                    .or(text_search_route_with_rl)
-                    .or(metadata_search_route_with_rl)
-                    .or(advanced_hybrid_search_route_with_rl)
-            );
-            
-            #[cfg(all(feature = "vector-storage", not(feature = "multimodal-search")))]
-            let routes = build_routes!(
-                base_routes
-                    .or(vector_test_get_route)
-                    .or(vector_test_post_route)
-                    .or(create_collection_route_with_rl)
-                    .or(list_collections_route_with_rl)
-                    .or(get_collection_route_with_rl)
-                    .or(collection_stats_route_with_rl)
-                    .or(insert_document_route_with_rl)
-                    .or(get_document_route_with_rl)
-                    .or(vector_search_route_with_rl)
-                    .or(hybrid_search_route_with_rl)
-            );
-            
-            #[cfg(not(feature = "vector-storage"))]
-            let routes = build_routes!(base_routes);
-
-            // Apply error recovery
-            routes.recover(|rej: warp::Rejection| async move {
-                use warp::http::StatusCode;
-                if rej.find::<Unauthorized>().is_some() {
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
-                        StatusCode::UNAUTHORIZED,
-                    ))
-                } else if rej.find::<InsufficientPermissions>().is_some() {
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error":"insufficient_permissions"})),
-                        StatusCode::FORBIDDEN,
-                    ))
-                } else if rej.find::<AdminRateLimited>().is_some()
-                    || rej.find::<DataRateLimited>().is_some()
-                {
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
-                        warp::http::StatusCode::TOO_MANY_REQUESTS,
-                    ))
-                } else {
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error":"not found"})),
-                        warp::http::StatusCode::NOT_FOUND,
-                    ))
-                }
-            })
-        };
-
-        // Apply compression middleware to routes for better throughput
-        let routes = routes.with(warp::compression::gzip());
-
-        // Per-request logging with runtime disable via KYRODB_DISABLE_HTTP_LOG=1
-        let disable_http_log =
-            std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
-        let routes = routes.with(warp::log::custom({
-            move |info: warp::log::Info| {
-                if disable_http_log {
-                    return;
-                }
-                tracing::info!(
-                    target: "kyrodb",
-                    method = %info.method(),
-                    path = info.path(),
-                    status = info.status().as_u16(),
-                    elapsed_ms = info.elapsed().as_millis()
-                );
+            // Build routes using a macro to avoid type conflicts
+            macro_rules! build_routes {
+                ($base:expr) => {
+                    $base
+                        .or(warp::path("build_info").and(warp::get()).map({
+                            let commit = build_commit;
+                            let features = build_features;
+                            let branch = option_env!("GIT_BRANCH").unwrap_or("unknown");
+                            let build_time = option_env!("BUILD_TIME").unwrap_or("unknown");
+                            let rust_version = option_env!("RUST_VERSION").unwrap_or("unknown");
+                            let target_triple = option_env!("TARGET_TRIPLE").unwrap_or("unknown");
+                            move || {
+                                warp::reply::json(&serde_json::json!({
+                                    "commit": commit,
+                                    "branch": branch,
+                                    "build_time": build_time,
+                                    "rust_version": rust_version,
+                                    "target_triple": target_triple,
+                                    "features": features,
+                                    "version": env!("CARGO_PKG_VERSION"),
+                                    "name": env!("CARGO_PKG_NAME"),
+                                }))
+                            }
+                        }))
+                };
             }
-        }));
 
-        // --- High-Performance HTTP Server Configuration ---
-        let addr = (host.parse::<std::net::IpAddr>()?, port);
-        tracing::info!(
-            "Starting kyrodb-engine on {}:{} (commit={}, features={})",
-            host,
-            port,
-            build_commit,
-            build_features
-        );
+            // Build routes with conditional features
+            let routes = {
+                let base_routes = health_route
+                    .or(metrics_route)
+                    .or(append_route)
+                    .or(replay_route)
+                    .or(subscribe_route)
+                    .or(snapshot_route)
+                    .or(offset_route)
+                    .or(put_route)
+                    .or(put_fast_route)
+                    .or(lookup_route)
+                    .or(lookup_raw)
+                    .or(lookup_fast)
+                    .or(get_fast)
+                    .or(batch_put_route)
+                    .or(msgpack_put_route)
+                    .or(msgpack_get_route)
+                    .or(vector_insert)
+                    .or(rmi_build)
+                    .or(compact_route)
+                    .or(warmup);
 
-        println!(
-            "🚀 Starting optimized HTTP server at http://{}:{} (commit={}, features={})",
-            host, port, build_commit, build_features
-        );
+                // Build routes with conditional features
+                #[cfg(all(feature = "vector-storage", feature = "multimodal-search"))]
+                let routes = build_routes!(
+                    base_routes
+                        .or(create_collection_route)
+                        .or(list_collections_route)
+                        .or(get_collection_route)
+                        .or(collection_stats_route)
+                        .or(insert_document_route)
+                        .or(get_document_route)
+                        .or(vector_search_route)
+                        .or(hybrid_search_route)
+                        .or(text_search_route)
+                        .or(metadata_search_route)
+                        .or(advanced_hybrid_search_route)
+                );
+                
+                #[cfg(all(feature = "vector-storage", not(feature = "multimodal-search")))]
+                let routes = build_routes!(
+                    base_routes
+                        .or(create_collection_route)
+                        .or(list_collections_route)
+                        .or(get_collection_route)
+                        .or(collection_stats_route)
+                        .or(insert_document_route)
+                        .or(get_document_route)
+                        .or(vector_search_route)
+                        .or(hybrid_search_route)
+                );
+                
+                #[cfg(not(feature = "vector-storage"))]
+                let routes = build_routes!(base_routes);
 
-        // Configure optimized HTTP server with warp's built-in optimizations
-        // Focus on connection pooling and keep-alive optimizations
-        tracing::info!("HTTP server configured with optimizations:");
-        tracing::info!("- Connection pooling: enabled");
-        tracing::info!("- Keep-alive: enabled with {}s timeout", http_keepalive_secs);
-        tracing::info!("- Compression: gzip enabled");
-        tracing::info!("- Max concurrent streams: {} (client-side config)", http2_max_streams);
-        
-        warp::serve(routes)
-            .run(addr)
-            .await;
+                // Apply error recovery
+                routes.recover(|rej: warp::Rejection| async move {
+                    use warp::http::StatusCode;
+                    if rej.find::<Unauthorized>().is_some() {
+                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
+                            StatusCode::UNAUTHORIZED,
+                        ))
+                    } else if rej.find::<InsufficientPermissions>().is_some() {
+                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"insufficient_permissions"})),
+                            StatusCode::FORBIDDEN,
+                        ))
+                    } else if rej.find::<AdminRateLimited>().is_some()
+                        || rej.find::<DataRateLimited>().is_some()
+                    {
+                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
+                            warp::http::StatusCode::TOO_MANY_REQUESTS,
+                        ))
+                    } else {
+                        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"error":"not found"})),
+                            warp::http::StatusCode::NOT_FOUND,
+                        ))
+                    }
+                })
+            };
+
+            // Apply compression middleware to routes for better throughput
+            let routes = routes.with(warp::compression::gzip());
+
+            // Per-request logging with runtime disable via KYRODB_DISABLE_HTTP_LOG=1
+            let disable_http_log =
+                std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
+            let routes = routes.with(warp::log::custom({
+                move |info: warp::log::Info| {
+                    if disable_http_log {
+                        return;
+                    }
+                    tracing::info!(
+                        target: "kyrodb",
+                        method = %info.method(),
+                        path = info.path(),
+                        status = info.status().as_u16(),
+                        elapsed_ms = info.elapsed().as_millis()
+                    );
+                }
+            }));
+
+            // --- High-Performance HTTP Server Configuration ---
+            let addr = (host.parse::<std::net::IpAddr>()?, port);
+            tracing::info!(
+                "Starting kyrodb-engine on {}:{} (commit={}, features={})",
+                host,
+                port,
+                build_commit,
+                build_features
+            );
+
+            println!(
+                "🚀 Starting optimized HTTP server at http://{}:{} (commit={}, features={})",
+                host, port, build_commit, build_features
+            );
+
+            // Configure optimized HTTP server with warp's built-in optimizations
+            // Focus on connection pooling and keep-alive optimizations
+            tracing::info!("HTTP server configured with optimizations:");
+            tracing::info!("- Connection pooling: enabled");
+            tracing::info!("- Keep-alive: enabled with {}s timeout", http_keepalive_secs);
+            tracing::info!("- Compression: gzip enabled");
+            tracing::info!("- Rate limiting: {}", if enable_rate_limiting { "enabled" } else { "disabled" });
+            tracing::info!("- Max concurrent streams: {} (client-side config)", http2_max_streams);
+            
+            warp::serve(routes)
+                .run(addr)
+                .await;
         }
     }
 
