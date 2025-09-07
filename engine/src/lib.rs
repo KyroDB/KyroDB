@@ -1,10 +1,14 @@
-//! Durable, crash‑recoverable Event Log with real‑time subscribe.
+//! KyroDB: High-performance, durable key-value database engine with learned indexes (RMI)
+//! 
+//! This is a production-ready database engine focusing on:
+//! - Predictable tail latency through bounded RMI performance 
+//! - Lock-free concurrency to eliminate deadlocks
+//! - Enterprise-grade durability with group commit
+//! - Memory management with allocation tracking and limits
 
 use anyhow::{Context, Result};
 use bincode::Options;
 use chrono::Utc;
-#[cfg(feature = "ann-hnsw")]
-use hora::core::ann_index::ANNIndex;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -18,29 +22,17 @@ use std::collections::VecDeque;
 use bytes::{Bytes, BytesMut, BufMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::Mutex as FastMutex;
+
+// Core modules
 pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
-pub mod schema;
+
+// Phase 0 foundation modules
 #[cfg(feature = "learned-index")]
 pub mod concurrency;
 #[cfg(feature = "learned-index")]
 pub mod memory;
-
-// Vector Storage Modules (feature-gated)
-#[cfg(feature = "vector-storage")]
-pub mod vector;
-#[cfg(feature = "vector-storage")]
-pub mod hybrid;
-#[cfg(feature = "multimodal-search")]
-pub mod text;
-#[cfg(feature = "multimodal-search")]
-pub mod metadata;
-
-// pub mod server;  // Removed for now
-// pub mod sql;
-// #[cfg(feature = "grpc")]
-// pub mod grpc_svc;
 
 // Convenient alias to reduce type complexity for the mmap payload index
 type SnapshotIndex = std::collections::HashMap<u64, (usize, usize)>;
@@ -337,13 +329,6 @@ pub struct Record {
     pub value: Vec<u8>,
 }
 
-/// A vector record stored as event payload for exact similarity search
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VectorRecord {
-    pub key: u64,
-    pub vector: Vec<f32>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub schema_version: u8,
@@ -378,8 +363,6 @@ pub struct PersistentEventLog {
     // rotation config
     wal_segment_bytes: Arc<RwLock<Option<u64>>>,
     wal_max_segments: Arc<RwLock<usize>>,
-    #[cfg(feature = "ann-hnsw")]
-    ann: Arc<RwLock<Option<hora::index::hnsw_idx::HNSWIndex<f32, u64>>>>,
     // --- NEW: snapshot mmap + payload index for direct reads by offset ---
     snapshot_mmap: Arc<RwLock<Option<memmap2::Mmap>>>,
     // offset -> (payload_start, payload_len) within snapshot mmap
@@ -584,8 +567,6 @@ impl PersistentEventLog {
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
             wal_max_segments: Arc::new(RwLock::new(8)),
-            #[cfg(feature = "ann-hnsw")]
-            ann: Arc::new(RwLock::new(None)),
             snapshot_mmap: Arc::new(RwLock::new(None)),
             snapshot_payload_index: Arc::new(RwLock::new(None)),
             wal_block_cache: Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(4096).unwrap()))),
@@ -825,13 +806,6 @@ impl PersistentEventLog {
         
         let bytes = buf.freeze();
         self.append(request_id, bytes.to_vec()).await
-    }
-
-    /// Append a vector record
-    pub async fn append_vector(&self, request_id: Uuid, key: u64, vector: Vec<f32>) -> Result<u64> {
-        let rec = VectorRecord { key, vector };
-        let bytes = bincode::serialize(&rec)?;
-        self.append(request_id, bytes).await
     }
 
     /// Get offset for a given key if present via index with delta-first semantics.
@@ -1322,39 +1296,25 @@ impl PersistentEventLog {
         let mut seen: HashSet<u64> = HashSet::new();
         let read = self.inner.read().await;
         for ev in read.iter().rev() {
-            if let Ok(vr) = bincode::deserialize::<VectorRecord>(&ev.payload) {
-                if seen.contains(&vr.key) {
+            if let Ok(vr) = bincode::deserialize::<(u64, Vec<f32>)>(&ev.payload) {
+                if seen.contains(&vr.0) {
                     continue;
                 }
-                if vr.vector.len() != query.len() {
+                if vr.1.len() != query.len() {
                     continue;
                 }
-                seen.insert(vr.key);
+                seen.insert(vr.0);
                 let mut dist = 0.0f32;
-                for (a, b) in vr.vector.iter().zip(query.iter()) {
+                for (a, b) in vr.1.iter().zip(query.iter()) {
                     let d = a - b;
                     dist += d * d;
                 }
-                out.push((vr.key, dist));
+                out.push((vr.0, dist));
             }
         }
         out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         out.truncate(k);
         out
-    }
-
-    /// Approximate ANN search when HNSW index is available; falls back to L2 scan otherwise.
-    pub async fn search_vector_ann(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        #[cfg(feature = "ann-hnsw")]
-        {
-            if let Some(idx) = self.ann.read().await.as_ref() {
-                // hora's search returns Vec<u64> (just the IDs), we need to add dummy distances
-                let res = idx.search(query, k);
-                return res.into_iter().map(|id| (id, 0.0)).collect();
-            }
-        }
-        // Fallback if ANN disabled or not built
-        self.search_vector_l2(query, k).await
     }
 
     /// Get data directory path (for internal use)
@@ -1636,251 +1596,5 @@ impl PersistentEventLog {
     async fn mark_for_background_fsync(&self) {
         // Implementation would track pending fsync operations
         // For now, we'll implement the immediate version
-    }
-}
-
-// Vector Storage Extension for PersistentEventLog
-#[cfg(feature = "vector-storage")]
-impl PersistentEventLog {
-    /// Create a new vector collection
-    pub async fn create_collection(&self, schema: schema::CollectionSchema) -> Result<()> {
-        // Store collection metadata as a TableKind::Collection event
-        let table_kind = schema::TableKind::Collection { schema: schema.clone() };
-        let payload = bincode::serialize(&table_kind)?;
-        self.append(Uuid::new_v4(), payload).await?;
-        Ok(())
-    }
-
-    /// List all collections
-    pub async fn list_collections(&self) -> Vec<String> {
-        // Scan for collection events
-        let mut collections = Vec::new();
-        let events = self.replay(0, None).await;
-        
-        for event in events {
-            // Try to deserialize as TableKind enum
-            if let Ok(table_kind) = bincode::deserialize::<schema::TableKind>(&event.payload) {
-                if let schema::TableKind::Collection { schema } = table_kind {
-                    collections.push(schema.name);
-                }
-            }
-        }
-        
-        // Remove duplicates and sort
-        collections.sort();
-        collections.dedup();
-        collections
-    }
-
-    /// Get collection schema
-    pub async fn get_collection(&self, name: &str) -> Option<schema::CollectionSchema> {
-        let events = self.replay(0, None).await;
-        
-        for event in events {
-            // Try to deserialize as TableKind enum
-            if let Ok(table_kind) = bincode::deserialize::<schema::TableKind>(&event.payload) {
-                if let schema::TableKind::Collection { schema } = table_kind {
-                    if schema.name == name {
-                        return Some(schema);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Get collection statistics
-    pub async fn get_collection_stats(&self, name: &str) -> Option<schema::CollectionStats> {
-        // Count documents in collection
-        let events = self.replay(0, None).await;
-        let mut document_count = 0;
-        let mut total_size = 0;
-
-        for event in events {
-            if let Ok(document) = bincode::deserialize::<schema::Document>(&event.payload) {
-                if document.collection == name {
-                    document_count += 1;
-                    total_size += event.payload.len();
-                }
-            }
-        }
-
-        if document_count > 0 {
-            Some(schema::CollectionStats {
-                document_count,
-                total_size_bytes: total_size,
-                avg_document_size: total_size / document_count,
-                last_updated: Utc::now(),
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Insert a document into a collection
-    pub async fn insert_document(&self, document: schema::Document) -> Result<u64> {
-        // Store document as payload that can be directly deserialized
-        let payload = bincode::serialize(&document)?;
-        self.append(Uuid::new_v4(), payload).await
-    }
-
-    /// Get a document by ID
-    pub async fn get_document(&self, id: u64) -> Option<schema::Document> {
-        if let Some(offset) = self.lookup_key(id).await {
-            if let Some(bytes) = self.get(offset).await {
-                if let Ok(record) = bincode::deserialize::<Record>(&bytes) {
-                    if let Ok(document) = bincode::deserialize::<schema::Document>(&record.value) {
-                        return Some(document);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Perform vector similarity search
-    pub async fn vector_search(&self, collection: &str, query: vector::VectorQuery) -> Result<Vec<vector::VectorSearchResult>> {
-        // For basic implementation, scan all documents in collection
-        let events = self.replay(0, None).await;
-        let mut candidates = Vec::new();
-
-        for event in events {
-            if let Ok(document) = bincode::deserialize::<schema::Document>(&event.payload) {
-                if document.collection == collection {
-                    // Try all available vectors in the document
-                    for (vector_name, vector_data) in &document.vectors {
-                        // Calculate distance
-                        if vector_data.len() == query.vector.len() {
-                            let distance = calculate_euclidean_distance(&query.vector, vector_data);
-                            
-                            // Apply similarity threshold if specified
-                            if let Some(threshold) = query.similarity_threshold {
-                                if distance > threshold {
-                                    continue;
-                                }
-                            }
-
-                            candidates.push(vector::VectorSearchResult {
-                                id: document.id,
-                                score: distance,
-                                document: Some(document.clone()),
-                            });
-                            break; // Only add document once, even if it has multiple vectors
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort by distance and take top k
-        candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.truncate(query.k);
-
-        Ok(candidates)
-    }
-
-    /// Perform hybrid search (vector + metadata filters)
-    pub async fn hybrid_search(
-        &self,
-        collection: &str,
-        vector_query: Option<vector::VectorQuery>,
-        metadata_filters: Vec<(String, schema::Value)>,
-    ) -> Result<Vec<vector::VectorSearchResult>> {
-        let events = self.replay(0, None).await;
-        let mut candidates = Vec::new();
-
-        for event in events {
-            if let Ok(document) = bincode::deserialize::<schema::Document>(&event.payload) {
-                if document.collection != collection {
-                    continue;
-                }
-
-                // Apply metadata filters
-                let mut passes_metadata = true;
-                for (key, expected_value) in &metadata_filters {
-                    if let Some(actual_value) = document.metadata.get(key) {
-                        if actual_value != expected_value {
-                            passes_metadata = false;
-                            break;
-                        }
-                    } else {
-                        passes_metadata = false;
-                        break;
-                    }
-                }
-
-                if !passes_metadata {
-                    continue;
-                }
-
-                // Apply vector query if provided
-                let score = if let Some(ref vq) = vector_query {
-                    if let Some(vector_data) = document.vectors.get("default") {
-                        if vector_data.len() == vq.vector.len() {
-                            let distance = calculate_euclidean_distance(&vq.vector, vector_data);
-                            
-                            // Apply similarity threshold if specified
-                            if let Some(threshold) = vq.similarity_threshold {
-                                if distance > threshold {
-                                    continue;
-                                }
-                            }
-                            distance
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                } else {
-                    0.0 // No vector query, just use metadata filtering
-                };
-
-                candidates.push(vector::VectorSearchResult {
-                    id: document.id,
-                    score,
-                    document: Some(document),
-                });
-            }
-        }
-
-        // Sort by score and limit results
-        let k = vector_query.as_ref().map(|q| q.k).unwrap_or(10);
-        candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.truncate(k);
-
-        Ok(candidates)
-    }
-}
-
-// Utility function for distance calculation
-#[cfg(feature = "vector-storage")]
-fn calculate_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
-}
-
-// Multimodal Search Extensions
-#[cfg(feature = "multimodal-search")]
-impl PersistentEventLog {
-    /// Perform text search across document content
-    pub async fn text_search(&self, _query: text::TextQuery) -> Result<Vec<text::TextSearchResult>> {
-        // Basic implementation - would use tantivy for production
-        Ok(Vec::new())
-    }
-
-    /// Perform metadata-based search
-    pub async fn metadata_search(&self, _query: metadata::MetadataQuery) -> Result<Vec<metadata::MetadataSearchResult>> {
-        // Basic implementation
-        Ok(Vec::new())
-    }
-
-    /// Perform advanced hybrid search with multiple modalities
-    pub async fn advanced_hybrid_search(&self, _query: hybrid::HybridQuery) -> Result<Vec<hybrid::HybridSearchResult>> {
-        // Advanced implementation combining vector, text, and metadata search
-        Ok(Vec::new())
     }
 }

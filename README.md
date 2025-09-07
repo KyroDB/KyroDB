@@ -1,283 +1,59 @@
-# KyroDB — Durable KV with a Production Recursive Model Index (RMI)
+# KyroDB — High-Performance Key-Value Database with Learned Indexes
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
-[![Go](https://img.shields.io/badge/Go-1.21%2B-00ADD8)](https://golang.org/)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED)](https://www.docker.com/)
 [![CI](https://github.com/vatskishan03/KyroDB/actions/workflows/ci.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
-[![Cross-Platform](https://github.com/vatskishan03/KyroDB/actions/workflows/test-matrix.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
-[![Fuzz](https://github.com/vatskishan03/KyroDB/actions/workflows/fuzz.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
-[![Concurrency](https://github.com/vatskishan03/KyroDB/actions/workflows/concurrency-tests.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
-[![codecov](https://codecov.io/gh/vatskishan03/KyroDB/branch/main/graph/badge.svg)](https://codecov.io/gh/vatskishan03/KyroDB)
 
-**Status: Alpha** (focused scope: KV + RMI) | **Latest: v0.1.0**
+**Status: Phase 0 Development** - Foundation-first approach to building a production-ready database with learned indexing.
 
-KyroDB is a durable, append-only key-value engine with a production-grade learned index (RMI) for ultra-fast point lookups and predictable tail latency.
+KyroDB is a high-performance, durable key-value database engine featuring Recursive Model Index (RMI) for predictable sub-millisecond lookups.
 
-- ⚡ **Default read path**: RMI (learned-index) with SIMD-accelerated probing
-- 🛡️ **Durability**: WAL + snapshot durability, fast recovery, compaction controls
-- 🌐 **Simple HTTP API**: RESTful endpoints under `/v1`, Prometheus metrics at `/metrics`
-- 📊 **Observability**: Built-in metrics, health checks, and performance monitoring
-- 🐳 **Production Ready**: Docker support, rate limiting, authentication
+## 🚀 Core Features
 
----
+- ⚡ **Learned Indexing (RMI)**: 2-stage models with SIMD-accelerated probing for O(1) expected lookup time
+- 🛡️ **ACID Durability**: WAL + snapshots with atomic operations and fast crash recovery  
+- 🔒 **Lock-Free Concurrency**: Eliminates deadlocks while maintaining high throughput
+- 📊 **Enterprise Monitoring**: Prometheus metrics, health checks, structured logging
+- 🌐 **HTTP API**: RESTful endpoints optimized for maximum performance
 
-## Table of Contents
-- [Quickstart](#quickstart)
-- [Benchmarks](#benchmarks)
-- [API Reference](#api-reference)
-- [Operations](#operations)
-- [Architecture](#architecture)
-- [Contributing](#contributing)
-- [License](#license)
+## 📈 Performance Targets (Phase 0)
+
+- **P99 Latency**: < 1ms for point lookups
+- **Throughput**: > 100K QPS sustained
+- **Memory Efficiency**: Bounded usage with predictable performance
+- **Zero Deadlocks**: Lock-free architecture eliminates concurrency issues
 
 ---
 
-## Quickstart
+## Quick Start
 
 ### Prerequisites
-- Rust toolchain (1.70+)
-- Go (1.21+) - optional, for CLI
-- Python (3.8+) - optional, for plotting
+- Rust 1.70+ 
+- 8GB+ RAM (for large datasets)
 
 ### Installation & Run
 ```bash
-# Clone repository
+# Clone and build
 git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
-
-# Build and run (basic)
 cargo build -p kyrodb-engine --release
-./target/release/kyrodb-engine serve 127.0.0.1 3030
 
-# Run with TLS and authentication
-./target/release/kyrodb-engine serve 127.0.0.1 3030 \
-  --tls-cert cert.pem \
-  --tls-key key.pem \
-  --auth-token "rw-token-123" \
-  --admin-token "admin-token-456"
+# Start server
+./target/release/kyrodb-engine serve 127.0.0.1 3030
 ```
 
 ### Basic Operations
 ```bash
-# Health check
-curl -s http://127.0.0.1:3030/health
+# Put key-value
+curl -X POST http://localhost:3030/v1/put -H "Content-Type: application/json" \
+  -d '{"key": 123, "value": "hello world"}'
 
-# Put data
-curl -X POST http://127.0.0.1:3030/v1/put \
-  -H 'Content-Type: application/json' \
-  -d '{"key": 123, "value": "hello"}'
+# Get value by key  
+curl "http://localhost:3030/v1/lookup?key=123"
 
-# Get data (ultra-fast RMI lookup)
-curl -s http://127.0.0.1:3030/v1/get_fast/123
-
-# View metrics
-curl -s http://127.0.0.1:3030/metrics | head -20
-```
-
-### Docker
-```bash
-# Quick start with Docker
-docker run -p 3030:3030 ghcr.io/vatskishan03/kyrodb:latest
-
-# Or use docker-compose
-docker-compose up -d
-```
-
----
-
-## Benchmarks
-
-### Microbenchmarks (Engine)
-Compare raw key-lookup latency for RMI vs B-Tree:
-
-```bash
-# Run comparison benchmark
-cargo bench -p bench --bench kv_index
-
-# Scale test (1M, 10M, 50M keys)
-KYRO_BENCH_N=10000000 cargo bench -p bench --bench kv_index
-```
-
-### HTTP Workload (End-to-End)
-```bash
-# Load 1M keys, run 64-concurrent uniform reads for 30s
-cargo run -p bench --release -- \
-  --base http://127.0.0.1:3030 \
-  --load-n 1000000 \
-  --val-bytes 64 \
-  --read-concurrency 64 \
-  --read-seconds 30 \
-  --dist uniform
-```
-
-### Headline Results
-
-**RMI vs B-Tree Lookup Latency** (engine microbenchmark):
-![RMI vs B-Tree](bench/rmi_vs_btree.png)
-
-**HTTP Read Performance** (1M keys, 64B values, uniform distribution):
-- **Throughput**: 150K+ ops/sec sustained
-- **P99 Latency**: <2.2ms consistently
-- **Stability**: Predictable tail latency across scales
-
-### Large-Scale Testing
-```bash
-# Run comprehensive benchmark suite (10M/50M keys)
-./bench/scripts/run_large_benchmarks.sh
-
-# Generate performance plots
-python3 bench/scripts/generate_plots.py
-```
-
-**Key Findings**:
-- ✅ RMI provides 2-5x faster lookups than B-Tree at scale
-- ✅ Sub-millisecond p99 latency maintained across 50M+ keys
-- ✅ SIMD optimizations deliver significant performance gains
-- ✅ Predictable performance regardless of dataset size
-
----
-
-## API Reference
-
-### Data Operations
-```http
-# Fast RMI-based lookup (recommended)
-GET /v1/get_fast/{key} → value bytes or 404
-
-# Standard lookup with metadata
-GET /v1/lookup?key=123 → {"value": "...", "offset": 456}
-
-# Insert/Update
-POST /v1/put → {"offset": 789}
-Content-Type: application/json
-{"key": 123, "value": "data"}
-```
-
-### Administrative
-```http
-# Build/optimize RMI index
-POST /v1/rmi/build → {"ok": true, "count": 1000000}
-
-# Create snapshot
-POST /v1/snapshot → {"status": "ok"}
-
-# Warm up system (preload indexes)
-POST /v1/warmup → {"status": "ok"}
-
-# Get current offset
-GET /v1/offset → {"offset": 1234567}
-```
-
-### Monitoring
-```http
-# Prometheus metrics
-GET /metrics
-
-# Health check
-GET /health → {"status": "ok"}
-
-# Build information
-GET /build_info → {
-  "commit": "abc123",
-  "branch": "main", 
-  "build_time": "2024-01-15T10:30:00Z",
-  "rust_version": "rustc 1.75.0",
-  "target_triple": "x86_64-unknown-linux-gnu",
-  "features": ["learned-index", "grpc"],
-  "version": "0.1.0",
-  "name": "kyrodb-engine"
-}
-```
-
-### Authentication
-```bash
-# Enable with role-based access control
-export KYRODB_AUTH_TOKEN="rw-token-123"      # Read/write access
-export KYRODB_ADMIN_TOKEN="admin-token-456"  # Admin access
-
-# Use in requests
-curl -H "Authorization: Bearer rw-token-123" \
-  http://127.0.0.1:3030/v1/put -d '{"key":1,"value":"data"}'
-
-# Admin operations require admin token
-curl -H "Authorization: Bearer admin-token-456" \
-  -X POST http://127.0.0.1:3030/v1/snapshot
-```
-
-### TLS/HTTPS
-```bash
-# Generate certificates
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
-
-# Run with HTTPS
-./target/release/kyrodb-engine serve 127.0.0.1 3030 \
-  --tls-cert cert.pem \
-  --tls-key key.pem
-```
-
----
-
-## Operations
-
-### Configuration
-```bash
-# Core settings
-KYRODB_PORT=3030
-KYRODB_DATA_DIR=./data
-
-# Security
-KYRODB_AUTH_TOKEN=rw-token-123     # Read/write operations
-KYRODB_ADMIN_TOKEN=admin-token-456 # Admin operations
-# TLS certificates (optional, enables HTTPS)
-KYRODB_TLS_CERT=/path/to/cert.pem
-KYRODB_TLS_KEY=/path/to/key.pem
-
-# Performance tuning
-KYRODB_WARM_ON_START=1          # Preload indexes on startup
-KYRODB_RMI_ROUTER_BITS=10       # RMI router configuration
-KYRODB_FSYNC_POLICY=data        # WAL fsync policy
-
-# Rate limiting (per IP)
-KYRODB_RL_DATA_RPS=5000         # Data operations per second
-KYRODB_RL_DATA_BURST=10000      # Burst capacity
-KYRODB_RL_ADMIN_RPS=2           # Admin operations per second
-
-# Observability
-KYRODB_DISABLE_HTTP_LOG=1       # Reduce request logging
-```
-
-### Production Deployment
-```bash
-# Using systemd
-sudo cp docs/systemd/kyrodb-engine.service /etc/systemd/system/
-sudo systemctl enable kyrodb-engine
-sudo systemctl start kyrodb-engine
-
-# Using Docker Compose (recommended)
-docker-compose -f docker-compose.yaml up -d
-
-# Behind reverse proxy (Caddy example)
-caddy reverse_proxy localhost:3030
-```
-
-### Monitoring & Alerting
-- **Metrics Endpoint**: `/metrics` (Prometheus format)
-- **Health Checks**: `/health` (Kubernetes compatible)
-- **Logging**: Structured JSON logs to stdout
-- **Performance**: Built-in latency histograms and throughput counters
-
-### Backup & Recovery
-```bash
-# Manual snapshot
-curl -X POST http://127.0.0.1:3030/v1/snapshot
-
-# Files to backup
-data/snapshot.bin      # Latest consistent snapshot
-data/wal.*            # Write-ahead logs
-data/index-rmi.bin    # Learned index (rebuildable)
-
-# Recovery: restart service (automatic)
+# High-performance binary API
+curl -X POST http://localhost:3030/v1/put_fast/456 --data-binary "binary data"
+curl http://localhost:3030/v1/get_fast/456
 ```
 
 ---
@@ -296,52 +72,131 @@ data/index-rmi.bin    # Learned index (rebuildable)
 └─────────────────┘    └──────────────────┘    └─────────────────┘
 ```
 
-### Data Flow
-1. **Write Path**: HTTP → Validation → WAL append → In-memory delta → Response
-2. **Read Path**: HTTP → RMI predict → SIMD probe → Value lookup → Response
-3. **Background**: Compaction, index rebuilding, metrics collection
-
 ### Key Technologies
-- **Rust**: Memory safety, zero-cost abstractions, high performance
-- **SIMD**: AVX2/AVX-512/NEON for probe acceleration
-- **Learned Index**: RMI with ε-bounded predictions
-- **Durability**: WAL + atomic snapshots with fsync
-- **Observability**: Prometheus metrics, structured logging
+- **RMI (Recursive Model Index)**: Learned data structures that predict key locations
+- **Lock-Free Concurrency**: ArcSwap and atomic operations eliminate deadlocks
+- **Memory-Mapped I/O**: Zero-copy reads for maximum throughput
+- **SIMD Acceleration**: AVX2/AVX512 vectorized search operations
 
-### Performance Characteristics
-- **Latency**: Sub-millisecond p99 for point lookups
-- **Throughput**: 100K+ ops/sec sustained
-- **Scalability**: Linear performance with dataset size
-- **Reliability**: Crash-safe with fast recovery (<1s)
+---
+
+## API Reference
+
+### Core Operations
+```http
+# Key-value operations
+POST /v1/put {"key": u64, "value": string}
+GET  /v1/lookup?key=123
+POST /v1/put_fast/{key}  # Binary body for max performance
+GET  /v1/get_fast/{key}  # Binary response
+
+# Administrative
+POST /v1/snapshot       # Trigger manual snapshot
+POST /v1/compact        # Trigger compaction
+POST /v1/rmi/build      # Rebuild RMI index
+POST /v1/warmup         # Warm up caches
+
+# Monitoring  
+GET  /health            # Health check
+GET  /metrics           # Prometheus metrics
+GET  /build_info        # Version and build info
+```
+
+---
+
+## Operations
+
+### Production Deployment
+```bash
+# Optimized for production
+./kyrodb-engine serve 0.0.0.0 3030 \
+  --auto-snapshot-secs 3600 \
+  --wal-max-bytes 1073741824 \
+  --rmi-rebuild-appends 100000 \
+  --enable-rate-limiting
+
+# With environment tuning
+RUST_LOG=info \
+KYRODB_WARM_ON_START=1 \
+KYRODB_RL_RPS=50000 \
+./kyrodb-engine serve 0.0.0.0 3030
+```
+
+### Monitoring & Metrics
+```bash
+# Health check
+curl http://localhost:3030/health
+
+# Key metrics to monitor
+curl http://localhost:3030/metrics | grep kyrodb_
+# - kyrodb_rmi_reads_total
+# - kyrodb_rmi_probe_length_histogram  
+# - kyrodb_appends_total
+# - kyrodb_snapshot_duration_seconds
+```
+
+---
+
+## Development
+
+### Build & Test
+```bash
+# Full test suite
+cargo test -p kyrodb-engine
+
+# Benchmarks
+cd bench && cargo run --release
+
+# Fuzzing (requires nightly)
+cargo +nightly fuzz run rmi_probe
+```
+
+### Performance Validation
+```bash
+# End-to-end benchmark
+cd bench
+cargo run --release -- --load-n 1000000 --read-seconds 30
+
+# Check for O(n) fallbacks (should be zero)
+curl http://localhost:3030/metrics | grep kyrodb_btree_reads_total
+```
+
+---
+
+## Phase 0 Goals
+
+**Current Focus**: Foundation rescue mission to achieve production-ready performance.
+
+### Critical Issues Being Fixed
+- ❌ **O(n) Performance Catastrophe**: Eliminating linear scan fallbacks
+- ❌ **Concurrency Deadlocks**: Replacing RwLocks with lock-free structures  
+- ❌ **Memory Leaks**: Implementing bounded resource usage
+- ❌ **Inconsistent Performance**: Guaranteeing bounded RMI performance
+
+### Success Criteria
+- ✅ **Zero O(n) fallbacks** under normal operation
+- ✅ **Sub-1ms P99 latency** on 10M+ keys
+- ✅ **No deadlocks** under concurrent load testing
+- ✅ **Bounded memory usage** with predictable performance
+- ✅ **10x PostgreSQL performance** on RMI-favorable workloads
 
 ---
 
 ## Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+We welcome contributions focused on Phase 0 foundation work:
 
-### Quick Development Setup
+- 🚀 **Performance**: RMI optimizations, SIMD improvements
+- 🔒 **Concurrency**: Lock-free data structures, deadlock elimination  
+- 🧪 **Testing**: Property-based tests, chaos testing, fuzzing
+- 📊 **Benchmarking**: Performance validation, regression detection
+
 ```bash
-# Clone and setup
+# Development setup
 git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
-
-# Run tests
 cargo test -p kyrodb-engine
-
-# Run fuzzing (nightly required)
-cargo +nightly fuzz run rmi_probe
-
-# Build docs
-cargo doc --open
 ```
-
-### Areas for Contribution
-- 🚀 **Performance**: SIMD optimizations, algorithmic improvements
-- 🧪 **Testing**: Additional fuzz targets, chaos testing
-- 📚 **Documentation**: Tutorials, examples, API docs
-- 🔧 **Tooling**: CLI improvements, monitoring integrations
-- 🎯 **Features**: Vector search, clustering, advanced queries
 
 ---
 
@@ -351,23 +206,4 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for detai
 
 ---
 
-## Community & Support
-
-- 🐛 **Issues**: [GitHub Issues](https://github.com/vatskishan03/KyroDB/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/vatskishan03/KyroDB/discussions)
-- 📧 **Email**: kishanvats2003@gmail.com
-
----
-
-## Roadmap
-
-See [visiondocument.md](visiondocument.md) for our ambitious roadmap including:
-- 🚀 **Multi-node clustering** and replication
-- 🔍 **Advanced vector search** with HNSW optimizations
-- ⚡ **Query processing** with SQL extensions
-- 📊 **Advanced analytics** and time-series support
-- ☁️ **Cloud-native** deployment and auto-scaling
-
----
-
-*KyroDB: Where machine learning meets database performance* 🚀
+**KyroDB: Foundation-first approach to the world's fastest learned-index database** 🚀

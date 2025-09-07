@@ -1,18 +1,17 @@
-//! CLI wrapper around PersistentEventLog.
-
-#![recursion_limit = "512"]
+//! KyroDB Engine - High-performance CLI and HTTP server
+//! 
+//! Optimized for maximum throughput and minimal latency with learned indexes,
+//! lock-free concurrency, and enterprise-grade durability.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use futures::stream::StreamExt;
 use kyrodb_engine as engine_crate;
 use std::sync::Arc;
 use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
-use std::time::Duration;
 
-// --- Rate limiting (simple token-bucket per client IP) -----------------------
+// Rate limiting (simple token-bucket per client IP)
 use dashmap::DashMap;
 use std::time::Instant;
 
@@ -31,6 +30,7 @@ impl SimpleRateLimiter {
             buckets: Arc::new(DashMap::new()),
         }
     }
+    
     fn allow(&self, key: &str, cost: f64) -> bool {
         let now = Instant::now();
         let mut entry = self
@@ -54,28 +54,8 @@ impl SimpleRateLimiter {
 }
 
 #[derive(Debug)]
-struct AdminRateLimited;
-impl warp::reject::Reject for AdminRateLimited {}
-#[derive(Debug)]
-struct DataRateLimited;
-impl warp::reject::Reject for DataRateLimited {}
-
-// Authorization filter (optional)
-#[derive(Debug)]
-struct Unauthorized;
-impl warp::reject::Reject for Unauthorized {}
-
-// Role-based access control
-#[derive(Debug, Clone, PartialEq)]
-enum UserRole {
-    Admin,
-    ReadWrite,
-    ReadOnly,
-}
-
-#[derive(Debug)]
-struct InsufficientPermissions;
-impl warp::reject::Reject for InsufficientPermissions {}
+struct RateLimited;
+impl warp::reject::Reject for RateLimited {}
 
 fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
@@ -84,7 +64,7 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn mk_rl_filter_admin(
+fn mk_rl_filter(
     limiter: SimpleRateLimiter,
 ) -> impl Filter<Extract = ((),), Error = warp::Rejection> + Clone {
     warp::addr::remote().and_then(move |addr: Option<std::net::SocketAddr>| {
@@ -94,30 +74,14 @@ fn mk_rl_filter_admin(
             if limiter.allow(&key, 1.0) {
                 Ok(())
             } else {
-                Err(warp::reject::custom(AdminRateLimited))
+                Err(warp::reject::custom(RateLimited))
             }
         }
     })
 }
-fn mk_rl_filter_data(
-    limiter: SimpleRateLimiter,
-) -> impl Filter<Extract = ((),), Error = warp::Rejection> + Clone {
-    warp::addr::remote().and_then(move |addr: Option<std::net::SocketAddr>| {
-        let limiter = limiter.clone();
-        async move {
-            let key = addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
-            if limiter.allow(&key, 1.0) {
-                Ok(())
-            } else {
-                Err(warp::reject::custom(DataRateLimited))
-            }
-        }
-    })
-}
-// ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "kyrodb-engine", about = "KyroDB Engine")]
+#[command(name = "kyrodb-engine", about = "KyroDB Engine - High-performance KV Database")]
 struct Cli {
     /// Directory for data files (snapshots + WAL)
     #[arg(short, long, default_value = "./data")]
@@ -136,61 +100,48 @@ enum Commands {
         /// Automatically trigger snapshot every N seconds
         #[arg(long)]
         auto_snapshot_secs: Option<u64>,
-
-        /// Bearer token required for protected HTTP endpoints (Authorization: Bearer <token>)
-        #[arg(long)]
-        auth_token: Option<String>,
+        
         /// Trigger snapshot when N new events have been appended since last snapshot
         #[arg(long)]
         snapshot_every_n_appends: Option<u64>,
+        
         /// Rotate/compact when WAL reaches this many bytes
         #[arg(long)]
         wal_max_bytes: Option<u64>,
+        
         /// Rebuild RMI when N appends since last build
         #[arg(long)]
         rmi_rebuild_appends: Option<u64>,
+        
         /// Rebuild RMI when delta/total ratio exceeds R (0.0-1.0)
         #[arg(long)]
         rmi_rebuild_ratio: Option<f64>,
+        
         /// WAL rotation: per-segment max bytes
         #[arg(long)]
         wal_segment_bytes: Option<u64>,
+        
         /// WAL retention: max segments to keep
         #[arg(long, default_value_t = 8)]
         wal_max_segments: usize,
+        
         /// Background compaction every N seconds (0 to disable)
         #[arg(long, default_value_t = 0)]
         compact_interval_secs: u64,
+        
         /// Compact when WAL bytes exceed this threshold (0 to disable)
         #[arg(long, default_value_t = 0)]
         compact_when_wal_bytes: u64,
-        /// Optional gRPC bind address (e.g., 0.0.0.0:50051). If set, start gRPC data-plane.
-        #[arg(long)]
-        grpc_addr: Option<String>,
-        /// TLS certificate file path (enables HTTPS)
-        #[arg(long)]
-        _tls_cert: Option<String>,
-        /// TLS private key file path (enables HTTPS)
-        #[arg(long)]
-        _tls_key: Option<String>,
-        /// Admin token for privileged operations (separate from auth_token for read/write). If no tokens passed, auth is disabled.
-        #[arg(long)]
-        admin_token: Option<String>,
+        
         /// Enable rate limiting (defaults to disabled for full throttle)
         #[arg(long)]
         enable_rate_limiting: bool,
-        /// HTTP/2 max concurrent streams per connection (default: 1000)
-        #[arg(long, default_value_t = 1000)]
-        http2_max_streams: u32,
-        /// HTTP keep-alive timeout in seconds (default: 600)
-        #[arg(long, default_value_t = 600)]
-        http_keepalive_secs: u64,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // init structured JSON logs with env-based filter (RUST_LOG)
+    // Initialize structured JSON logs with env-based filter (RUST_LOG)
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -217,7 +168,6 @@ async fn main() -> Result<()> {
             host,
             port,
             auto_snapshot_secs,
-            auth_token,
             snapshot_every_n_appends,
             wal_max_bytes,
             rmi_rebuild_appends,
@@ -226,13 +176,7 @@ async fn main() -> Result<()> {
             wal_max_segments,
             compact_interval_secs,
             compact_when_wal_bytes,
-            grpc_addr,
-            _tls_cert,
-            _tls_key,
-            admin_token,
             enable_rate_limiting,
-            http2_max_streams,
-            http_keepalive_secs,
         } => {
             // Silence unused when learned-index feature is disabled
             #[cfg(not(feature = "learned-index"))]
@@ -321,6 +265,7 @@ async fn main() -> Result<()> {
                     });
                 }
             }
+            
             if let Some(n) = snapshot_every_n_appends {
                 if n > 0 {
                     let snap_log = log.clone();
@@ -374,7 +319,6 @@ async fn main() -> Result<()> {
                             let rebuild_timer =
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
-                            // Track rebuild stall
                             engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
                             // Write index on blocking thread
                             let pairs_clone = pairs.clone();
@@ -434,72 +378,13 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // Start gRPC data-plane server if requested (lookup/get fast paths)
-            #[cfg(feature = "grpc")]
-            if let Some(addr_str) = grpc_addr.clone() {
-                let addr: std::net::SocketAddr = addr_str.parse().expect("invalid --grpc-addr");
-                // Enable auth only if any token is provided; otherwise fully open for benchmarking
-                let svc = grpc_svc::GrpcService::new_with_auth(
-                    log.clone(),
-                    auth_token.clone(),
-                    admin_token.clone(),
-                );
-
-                // TLS configuration for gRPC
-                let server = if let (Some(_cert_path), Some(_key_path)) = (&_tls_cert, &_tls_key) {
-                    #[cfg(feature = "tls")]
-                    {
-                        // TLS is not currently supported in this build
-                        panic!("TLS feature is enabled but not properly implemented for current tonic version");
-                    }
-                    #[cfg(not(feature = "tls"))]
-                    {
-                        eprintln!("⚠️ TLS requested but TLS feature not enabled");
-                        KyrodbServer::new(svc)
-                    }
-                } else {
-                    KyrodbServer::new(svc)
-                };
-
-                tokio::spawn(async move {
-                    println!("📡 gRPC serving on {} (TLS: {})", addr, _tls_cert.is_some());
-                    tonic::transport::Server::builder()
-                        .add_service(server)
-                        .serve(addr)
-                        .await
-                        .expect("gRPC server failed");
-                });
-            }
-
-            // --- Metrics to count RMI vs BTree reads ---
-            #[cfg(not(feature = "bench-no-metrics"))]
-            let (_rmi_reads_counter, _btree_reads_counter) = {
-                use prometheus::register_counter;
-                (
-                    register_counter!("kyrodb_rmi_reads_total", "Total reads served by RMI").ok(),
-                    register_counter!("kyrodb_btree_reads_total", "Total reads served by BTree")
-                        .ok(),
-                )
-            };
-
-            // --- Rate limiting: Conditionally enable only if requested via CLI ---
-            let admin_rl = if enable_rate_limiting {
-                let admin_rps = env_f64("KYRODB_RL_ADMIN_RPS", 2.0);
-                let admin_burst = env_f64("KYRODB_RL_ADMIN_BURST", 5.0);
-                let admin_limiter = SimpleRateLimiter::new(admin_rps, admin_burst);
-                mk_rl_filter_admin(admin_limiter).boxed()
+            // Rate limiting setup
+            let rate_limiter = if enable_rate_limiting {
+                let data_rps = env_f64("KYRODB_RL_RPS", 5000.0);
+                let data_burst = env_f64("KYRODB_RL_BURST", 10000.0);
+                Some(SimpleRateLimiter::new(data_rps, data_burst))
             } else {
-                // No-op: always allow
-                warp::any().map(|| ()).boxed()
-            };
-            
-            let data_rl = if enable_rate_limiting {
-                let data_rps = env_f64("KYRODB_RL_DATA_RPS", 5000.0);
-                let data_burst = env_f64("KYRODB_RL_DATA_BURST", 10000.0);
-                let data_limiter = SimpleRateLimiter::new(data_rps, data_burst);
-                mk_rl_filter_data(data_limiter).boxed()
-            } else {
-                warp::any().map(|| ()).boxed()
+                None
             };
             
             if enable_rate_limiting {
@@ -508,168 +393,37 @@ async fn main() -> Result<()> {
                 println!("🚀 Rate limiting disabled - full throttle mode");
             }
 
-            // --- Fast lookup endpoints (HTTP hot path) with versioned prefix -----------------
+            // Core HTTP API endpoints
             let v1 = warp::path("v1");
 
-            let raw_log = log.clone();
-            let lookup_raw = v1
-                .and(warp::path("lookup_raw"))
-                .and(warp::get())
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = raw_log.clone();
-                    async move {
-                        use warp::http::{Response, StatusCode};
-                        if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
-                            if log.lookup_key(k).await.is_some() {
-                                let resp = Response::builder()
-                                    .status(StatusCode::NO_CONTENT)
-                                    .body("")
-                                    .map_err(|_| warp::reject::reject())?;
-                                return Ok::<_, warp::Rejection>(resp);
-                            }
-                        }
-                        let resp = Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body("")
-                            .map_err(|_| warp::reject::reject())?;
-                        Ok::<_, warp::Rejection>(resp)
-                    }
-                });
-
-            let fast_log = log.clone();
-            let lookup_fast = v1
-                .and(warp::path!("lookup_fast" / u64))
-                .and(warp::get())
-                .and_then(move |k: u64| {
-                    let log = fast_log.clone();
-                    async move {
-                        use warp::http::{Response, StatusCode};
-                        if let Some(off) = log.lookup_key(k).await {
-                            let body = off.to_le_bytes().to_vec();
-                            let resp = Response::builder()
-                                .status(StatusCode::OK)
-                                .header("Content-Type", "application/octet-stream")
-                                .body(body)
-                                .map_err(|_| warp::reject::reject())?;
-                            return Ok::<_, warp::Rejection>(resp);
-                        }
-                        let resp = Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Vec::new())
-                            .map_err(|_| warp::reject::reject())?;
-                        Ok::<_, warp::Rejection>(resp)
-                    }
-                });
-
-            let fast_val_log = log.clone();
-            let get_fast = v1
-                .and(warp::path!("get_fast" / u64))
-                .and(warp::get())
-                .and_then(move |k: u64| {
-                    let log = fast_val_log.clone();
-                    async move {
-                        use warp::http::{Response, StatusCode};
-                        if let Some(off) = log.lookup_key(k).await {
-                            if let Some(bytes) = log.get(off).await {
-                                if let Ok(rec) =
-                                    bincode::deserialize::<kyrodb_engine::Record>(&bytes)
-                                {
-                                    let resp = Response::builder()
-                                        .status(StatusCode::OK)
-                                        .header("Content-Type", "application/octet-stream")
-                                        .body(rec.value)
-                                        .map_err(|_| warp::reject::reject())?;
-                                    return Ok::<_, warp::Rejection>(resp);
-                                }
-                            }
-                        }
-                        let resp = Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Vec::new())
-                            .map_err(|_| warp::reject::reject())?;
-                        Ok::<_, warp::Rejection>(resp)
-                    }
-                });
-
-            let append_log = log.clone();
-            let append_route = v1
-                .and(warp::path("append"))
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = append_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        let payload = body["payload"].as_str().unwrap_or("").as_bytes().to_vec();
-                        match log.append(Uuid::new_v4(), payload).await {
-                            Ok(offset) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "offset": offset })),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )),
-                        }
-                    }
-                });
-
-            // --- NEW: Health check endpoint ----------------------------------------------------
+            // Health check endpoint
             let health_route = warp::path("health")
                 .and(warp::get())
                 .map(|| warp::reply::json(&serde_json::json!({ "status": "ok" })));
 
-            // --- NEW: Snapshot trigger endpoint -----------------------------------------------
-            let snapshot_log = log.clone();
-            let snapshot_route =
-                v1.and(warp::path("snapshot"))
-                    .and(warp::post())
-                    .and_then(move || {
-                        let log = snapshot_log.clone();
-                        async move {
-                            if let Err(e) = log.snapshot().await {
-                                eprintln!("❌ Snapshot failed: {}", e);
-                                return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::json(
-                                        &serde_json::json!({ "error": e.to_string() }),
-                                    ),
-                                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                ));
-                            }
-                            Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
-                                StatusCode::OK,
-                            ))
-                        }
-                    });
+            // Build info endpoint
+            let build_info_route = warp::path("build_info").and(warp::get()).map({
+                let commit = build_commit;
+                let features = build_features;
+                let branch = option_env!("GIT_BRANCH").unwrap_or("unknown");
+                let build_time = option_env!("BUILD_TIME").unwrap_or("unknown");
+                let rust_version = option_env!("RUST_VERSION").unwrap_or("unknown");
+                let target_triple = option_env!("TARGET_TRIPLE").unwrap_or("unknown");
+                move || {
+                    warp::reply::json(&serde_json::json!({
+                        "commit": commit,
+                        "branch": branch,
+                        "build_time": build_time,
+                        "rust_version": rust_version,
+                        "target_triple": target_triple,
+                        "features": features,
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "name": env!("CARGO_PKG_NAME"),
+                    }))
+                }
+            });
 
-            // --- NEW: Compaction endpoint -----------------------------------------------------
-            let compact_log = log.clone();
-            let compact_route =
-                v1.and(warp::path("compact"))
-                    .and(warp::post())
-                    .and_then(move || {
-                        let log = compact_log.clone();
-                        async move {
-                            match log.compact_keep_latest_and_snapshot_stats().await {
-                                Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::json(
-                                        &serde_json::json!({ "compact": "ok", "stats": stats }),
-                                    ),
-                                    StatusCode::OK,
-                                )),
-                                Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::json(
-                                        &serde_json::json!({ "error": e.to_string() }),
-                                    ),
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                )),
-                            }
-                        }
-                    });
-
-            // --- NEW: Offset endpoint ---------------------------------------------------------
+            // Offset endpoint
             let offset_log = log.clone();
             let offset_route = v1
                 .and(warp::path("offset"))
@@ -684,30 +438,6 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            let replay_log = log.clone();
-            let replay_route = v1
-                .and(warp::path("replay"))
-                .and(warp::get())
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = replay_log.clone();
-                    async move {
-                        let start = q.get("start").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let end = q.get("end").and_then(|s| s.parse().ok());
-                        let evs = log.replay(start, end).await;
-                        let resp: Vec<_> = evs
-                            .into_iter()
-                            .map(|e| {
-                                serde_json::json!({
-                                    "offset": e.offset,
-                                    "payload": String::from_utf8_lossy(&e.payload)
-                                })
-                            })
-                            .collect();
-                        Ok::<_, warp::Rejection>(warp::reply::json(&resp))
-                    }
-                });
-
             // KV PUT: POST /v1/put { key: u64, value: string }
             let put_log = log.clone();
             let put_route = v1
@@ -717,7 +447,6 @@ async fn main() -> Result<()> {
                 .and_then(move |body: serde_json::Value| {
                     let log = put_log.clone();
                     async move {
-                        use warp::http::StatusCode;
                         let key = body["key"].as_u64().unwrap_or(0);
                         let value = body["value"].as_str().unwrap_or("").as_bytes().to_vec();
                         match log.append_kv(Uuid::new_v4(), key, value).await {
@@ -725,7 +454,7 @@ async fn main() -> Result<()> {
                                 warp::reply::json(&serde_json::json!({ "offset": off })),
                                 StatusCode::OK,
                             )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            Err(e) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
                                 warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
                                 StatusCode::INTERNAL_SERVER_ERROR,
                             )),
@@ -738,15 +467,12 @@ async fn main() -> Result<()> {
             let put_fast_route = v1
                 .and(warp::path!("put_fast" / u64))
                 .and(warp::post())
-                .and(warp::body::bytes())  // Accept raw bytes directly
+                .and(warp::body::bytes())
                 .and_then(move |key: u64, body: bytes::Bytes| {
                     let log = put_fast_log.clone();
                     async move {
-                        use warp::http::StatusCode;
-                        // Direct binary append - no JSON/base64 overhead
                         match log.append_kv(Uuid::new_v4(), key, body.to_vec()).await {
                             Ok(off) => {
-                                // Return offset as 8-byte little-endian for max speed
                                 let response = off.to_le_bytes().to_vec();
                                 Ok::<_, warp::Rejection>(warp::reply::with_status(
                                     warp::reply::with_header(
@@ -778,7 +504,6 @@ async fn main() -> Result<()> {
                     async move {
                         if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
                             if let Some(offset) = log.lookup_key(k).await {
-                                // Fetch payload via mmap-backed snapshot (with WAL/memory fallback)
                                 if let Some(bytes) = log.get(offset).await {
                                     if let Ok(rec) =
                                         bincode::deserialize::<kyrodb_engine::Record>(&bytes)
@@ -805,100 +530,179 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // --- NEW: Batch PUT endpoint for reduced round-trips -----------------------------
-            let batch_put_log = log.clone();
-            let batch_put_route = v1
-                .and(warp::path("batch_put"))
-                .and(warp::post())
-                .and(warp::body::bytes())  // Zero-copy bytes
-                .and_then(move |body: bytes::Bytes| {
-                    let log = batch_put_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        // Deserialize from MessagePack (faster than JSON)
-                        let items: Vec<(u64, Vec<u8>)> = rmp_serde::from_slice(&body).map_err(|_| warp::reject::reject())?;
-                        let mut offsets = Vec::new();
-                        for (key, value) in items {
-                            if let Ok(off) = log.append_kv(Uuid::new_v4(), key, value).await {
-                                offsets.push(off);
-                            }
-                        }
-                        // Return MessagePack for speed
-                        let response = rmp_serde::to_vec(&offsets).unwrap();
-                        Ok::<_, warp::Rejection>(warp::reply::with_header(
-                            response, "Content-Type", "application/msgpack"
-                        ))
-                    }
-                });
-
-            // --- NEW: MessagePack PUT endpoint -----------------------------------------------
-            let msgpack_put_log = log.clone();
-            let msgpack_put_route = v1
-                .and(warp::path("put"))
-                .and(warp::post())
-                .and(warp::header::exact("content-type", "application/msgpack"))  // Detect format
-                .and(warp::body::bytes())  // Zero-copy bytes
-                .and_then(move |body: bytes::Bytes| {
-                    let log = msgpack_put_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        // Deserialize from MessagePack
-                        let (key, value): (u64, Vec<u8>) = rmp_serde::from_slice(&body).map_err(|_| warp::reject::reject())?;
-                        match log.append_kv(Uuid::new_v4(), key, value).await {
-                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::with_header(
-                                    rmp_serde::to_vec(&serde_json::json!({ "offset": off })).unwrap(),  // Or return binary
-                                    "Content-Type", "application/msgpack"
-                                ),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::with_header(
-                                    rmp_serde::to_vec(&serde_json::json!({ "error": e.to_string() })).unwrap(),
-                                    "Content-Type", "application/msgpack"
-                                ),
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )),
-                        }
-                    }
-                });
-
-            // --- NEW: MessagePack GET endpoint -----------------------------------------------
-            let msgpack_get_log = log.clone();
-            let msgpack_get_route = v1
-                .and(warp::path("lookup"))
+            // Fast lookup endpoints for maximum performance
+            let lookup_fast_log = log.clone();
+            let lookup_fast = v1
+                .and(warp::path!("lookup_fast" / u64))
                 .and(warp::get())
-                .and(warp::header::exact("accept", "application/msgpack"))  // Detect format
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = msgpack_get_log.clone();
+                .and_then(move |k: u64| {
+                    let log = lookup_fast_log.clone();
                     async move {
-                        if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
-                            if let Some(offset) = log.lookup_key(k).await {
-                                if let Some(bytes) = log.get(offset).await {
-                                    if let Ok(rec) =
-                                        bincode::deserialize::<kyrodb_engine::Record>(&bytes)
-                                    {
-                                        // Return MessagePack for speed
-                                        let response = rmp_serde::to_vec(&serde_json::json!({
-                                            "key": rec.key,
-                                            "value": rec.value  // Raw bytes, no string conversion
-                                        })).unwrap();
-                                        return Ok::<_, warp::Rejection>(warp::reply::with_header(
-                                            response, "Content-Type", "application/msgpack"
-                                        ));
-                                    }
+                        if let Some(off) = log.lookup_key(k).await {
+                            let body = off.to_le_bytes().to_vec();
+                            let resp = warp::http::Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/octet-stream")
+                                .body(body)
+                                .map_err(|_| warp::reject::reject())?;
+                            return Ok::<_, warp::Rejection>(resp);
+                        }
+                        let resp = warp::http::Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Vec::new())
+                            .map_err(|_| warp::reject::reject())?;
+                        Ok::<_, warp::Rejection>(resp)
+                    }
+                });
+
+            let get_fast_log = log.clone();
+            let get_fast = v1
+                .and(warp::path!("get_fast" / u64))
+                .and(warp::get())
+                .and_then(move |k: u64| {
+                    let log = get_fast_log.clone();
+                    async move {
+                        if let Some(off) = log.lookup_key(k).await {
+                            if let Some(bytes) = log.get(off).await {
+                                if let Ok(rec) =
+                                    bincode::deserialize::<kyrodb_engine::Record>(&bytes)
+                                {
+                                    let resp = warp::http::Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header("Content-Type", "application/octet-stream")
+                                        .body(rec.value)
+                                        .map_err(|_| warp::reject::reject())?;
+                                    return Ok::<_, warp::Rejection>(resp);
                                 }
                             }
                         }
-                        let response = rmp_serde::to_vec(&serde_json::json!({"error":"not found"})).unwrap();
-                        Ok::<_, warp::Rejection>(warp::reply::with_header(
-                            response, "Content-Type", "application/msgpack"
-                        ))
+                        let resp = warp::http::Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Vec::new())
+                            .map_err(|_| warp::reject::reject())?;
+                        Ok::<_ ,warp::Rejection>(resp)
                     }
                 });
 
-            // --- Cache warmup endpoint --------------------------------------------------------
+            // Snapshot endpoint
+            let snapshot_log = log.clone();
+            let snapshot_route =
+                v1.and(warp::path("snapshot"))
+                    .and(warp::post())
+                    .and_then(move || {
+                        let log = snapshot_log.clone();
+                        async move {
+                            if let Err(e) = log.snapshot().await {
+                                eprintln!("❌ Snapshot failed: {}", e);
+                                return Ok::<_ ,warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::json(
+                                        &serde_json::json!({ "error": e.to_string() }),
+                                    ),
+                                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                ));
+                            }
+                            Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
+                                StatusCode::OK,
+                            ))
+                        }
+                    });
+
+            // Compaction endpoint
+            let compact_log = log.clone();
+            let compact_route =
+                v1.and(warp::path("compact"))
+                    .and(warp::post())
+                    .and_then(move || {
+                        let log = compact_log.clone();
+                        async move {
+                            match log.compact_keep_latest_and_snapshot_stats().await {
+                                Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::json(
+                                        &serde_json::json!({ "compact": "ok", "stats": stats }),
+                                    ),
+                                    StatusCode::OK,
+                                )),
+                                Err(e) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
+                                    warp::reply::json(
+                                        &serde_json::json!({ "error": e.to_string() }),
+                                    ),
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                )),
+                            }
+                        }
+                    });
+
+            // RMI build endpoint (feature-gated)
+            #[cfg(feature = "learned-index")]
+            let rmi_build = {
+                let data_dir = cli.data_dir.clone();
+                let build_log = log.clone();
+                v1.and(warp::path!("rmi" / "build"))
+                    .and(warp::post())
+                    .and_then(move || {
+                        let log = build_log.clone();
+                        let data_dir = data_dir.clone();
+                        async move {
+                            let pairs = log.collect_key_offset_pairs().await;
+                            let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
+                            let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
+                            let timer =
+                                engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
+                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
+                            engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
+                            let pairs_clone = pairs.clone();
+                            let tmp_clone = tmp.clone();
+                            let write_res = tokio::task::spawn_blocking(move || {
+                                engine_crate::index::RmiIndex::write_from_pairs_auto(
+                                    &tmp_clone,
+                                    &pairs_clone,
+                                )
+                            })
+                            .await;
+                            let mut ok = matches!(write_res, Ok(Ok(())));
+                            if ok {
+                                if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
+                                    let _ = f.sync_all();
+                                }
+                                if let Err(e) = std::fs::rename(&tmp, &dst) {
+                                    eprintln!("❌ RMI rename failed: {}", e);
+                                    ok = false;
+                                }
+                                if let Err(e) =
+                                    engine_crate::fsync_dir(std::path::Path::new(&data_dir))
+                                {
+                                    eprintln!(
+                                        "⚠️ fsync data dir after RMI build rename failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            timer.observe_duration();
+                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
+                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
+                                "ok": ok,
+                                "count": pairs.len()
+                            })))
+                        }
+                    })
+            };
+
+            #[cfg(not(feature = "learned-index"))]
+            let rmi_build = {
+                v1.and(warp::path!("rmi" / "build"))
+                    .and(warp::post())
+                    .map(|| {
+                        warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({
+                                "error": "learned-index feature not enabled"
+                            })),
+                            StatusCode::NOT_IMPLEMENTED,
+                        )
+                    })
+            };
+
+            // Cache warmup endpoint
             let warmup_log = log.clone();
             let warmup = v1
                 .and(warp::path("warmup"))
@@ -913,36 +717,7 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // --- Vector insert endpoint ---------------------------------------------------
-            let vector_log = log.clone();
-            let vector_insert = v1
-                .and(warp::path("vector_insert"))
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = vector_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        let key = body["key"].as_u64().unwrap_or(0);
-                        let vector = body["vector"].as_array().unwrap_or(&Vec::new())
-                            .iter()
-                            .filter_map(|v| v.as_f64())
-                            .collect::<Vec<f64>>();
-                        let value = bincode::serialize(&vector).unwrap_or_default();
-                        match log.append_kv(Uuid::new_v4(), key, value).await {
-                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "offset": off })),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )),
-                        }
-                    }
-                });
-
-            // --- Metrics endpoint ---------------------------------------------------------
+            // Metrics endpoint
             let metrics_route = warp::path("metrics")
                 .and(warp::get())
                 .map(|| {
@@ -974,864 +749,46 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // --- Subscribe endpoint -------------------------------------------------------
-            let subscribe_log = log.clone();
-            let subscribe_route = v1
-                .and(warp::path("subscribe"))
-                .and(warp::get())
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = subscribe_log.clone();
-                    async move {
-                        let start = q.get("start").and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let evs = log.replay(start, None).await;
-                        let stream = futures::stream::iter(evs.into_iter().map(|e| {
-                            Ok::<_, warp::Error>(warp::sse::Event::default().json_data(serde_json::json!({
-                                "offset": e.offset,
-                                "payload": String::from_utf8_lossy(&e.payload)
-                            })).unwrap())
-                        }));
-                        Ok::<_, warp::Rejection>(warp::sse::reply(warp::sse::keep_alive().stream(stream)))
-                    }
-                });
-
-            // --- RMI build: POST /v1/rmi/build  (feature-gated)
-            #[cfg(feature = "learned-index")]
-            let rmi_build = {
-                let data_dir = cli.data_dir.clone();
-                let build_log = log.clone();
-                v1.and(warp::path!("rmi" / "build"))
-                    .and(warp::post())
-                    .and_then(move || {
-                        let log = build_log.clone();
-                        let data_dir = data_dir.clone();
-                        async move {
-                            let pairs = log.collect_key_offset_pairs().await;
-                            let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
-                            let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
-                            let timer =
-                                engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
-                            // Track rebuild stall
-                            engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                            // Write index on a blocking thread to avoid starving the reactor
-                            let pairs_clone = pairs.clone();
-                            let tmp_clone = tmp.clone();
-                            let write_res = tokio::task::spawn_blocking(move || {
-                                engine_crate::index::RmiIndex::write_from_pairs_auto(
-                                    &tmp_clone,
-                                    &pairs_clone,
-                                )
-                            })
-                            .await;
-                            let mut ok = matches!(write_res, Ok(Ok(())));
-                            if ok {
-                                if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-                                    let _ = f.sync_all();
-                                }
-                                if let Err(e) = std::fs::rename(&tmp, &dst) {
-                                    eprintln!("❌ RMI rename failed: {}", e);
-                                    ok = false;
-                                }
-                                // Ensure directory metadata is durable after rename
-                                if let Err(e) =
-                                    engine_crate::fsync_dir(std::path::Path::new(&data_dir))
-                                {
-                                    eprintln!(
-                                        "⚠️ fsync data dir after RMI build rename failed: {}",
-                                        e
-                                    );
-                                }
-                            }
-                            timer.observe_duration();
-                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
-                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                                "ok": ok,
-                                "count": pairs.len()
-                            })))
-                        }
-                    })
-            };
-
-            #[cfg(not(feature = "learned-index"))]
-            let rmi_build = {
-                use warp::http::StatusCode;
-                v1.and(warp::path!("rmi" / "build"))
-                    .and(warp::post())
-                    .map(|| {
-                        warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({
-                                "error": "learned-index feature not enabled"
-                            })),
-                            StatusCode::NOT_IMPLEMENTED,
-                        )
-                    })
-            };
-
-            // --- Attach rate limits ------------------------------------------------------
-            // Admin RL for sensitive operations
-            let snapshot_route = admin_rl.clone().and(snapshot_route).map(|(), r| r);
-            let compact_route = admin_rl.clone().and(compact_route).map(|(), r| r);
-            let rmi_build = admin_rl.clone().and(rmi_build).map(|(), r| r);
-            let warmup = admin_rl.clone().and(warmup).map(|(), r| r);
-            let replay_route = admin_rl.clone().and(replay_route).map(|(), r| r);
-            // Data RL for common read/write paths
-            let put_route = data_rl.clone().and(put_route).map(|(), r| r);
-            let lookup_route = data_rl.clone().and(lookup_route).map(|(), r| r);
-            let lookup_raw = data_rl.clone().and(lookup_raw).map(|(), r| r);
-            let lookup_fast = data_rl.clone().and(lookup_fast).map(|(), r| r);
-            let get_fast = data_rl.clone().and(get_fast).map(|(), r| r);
-            let batch_put_route = data_rl.clone().and(batch_put_route).map(|(), r| r);
-            let msgpack_put_route = data_rl.clone().and(msgpack_put_route).map(|(), r| r);
-            let msgpack_get_route = data_rl.clone().and(msgpack_get_route).map(|(), r| r);
-            let vector_insert = data_rl.clone().and(vector_insert).map(|(), r| r);
-            // ---------------------------------------------------------------------------
-
-            // =========================================================================
-            // Enhanced Vector Storage API Endpoints
-            // =========================================================================
-            
-            #[cfg(feature = "vector-storage")]
-            let v2 = warp::path("v2");
-
-            // Collection Management Endpoints
-            #[cfg(feature = "vector-storage")]
-            let collections_base = v2.and(warp::path("collections"));
-
-            // POST /v2/collections - Create collection
-            #[cfg(feature = "vector-storage")]
-            let create_collection_log = log.clone();
-            #[cfg(feature = "vector-storage")]
-            let create_collection_route = collections_base
-                .and(warp::path::end())
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = create_collection_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        
-                        // Parse collection schema from JSON with simplified error handling
-                        let schema: engine_crate::schema::CollectionSchema = match serde_json::from_value(body) {
-                            Ok(schema) => schema,
-                            Err(e) => {
-                                return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::json(&serde_json::json!({
-                                        "error": format!("Invalid schema: {}", e)
-                                    })),
-                                    StatusCode::BAD_REQUEST,
-                                ));
-                            }
-                        };
-
-                        match log.create_collection(schema.clone()).await {
-                            Ok(()) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "status": "created",
-                                    "collection": schema.name
-                                })),
-                                StatusCode::CREATED,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": e.to_string()
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            )),
-                        }
-                    }
-                });
-
-            // GET /v2/collections - List collections
-            #[cfg(feature = "vector-storage")]
-            let list_collections_log = log.clone();
-            #[cfg(feature = "vector-storage")]
-            let list_collections_route = collections_base
-                .and(warp::path::end())
-                .and(warp::get())
-                .and_then(move || {
-                    let log = list_collections_log.clone();
-                    async move {
-                        let collections = log.list_collections().await;
-                        Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                            "collections": collections
-                        })))
-                    }
-                });
-
-            // GET /v2/collections/{name} - Get collection schema
-            #[cfg(feature = "vector-storage")]
-            let get_collection_log = log.clone();
-            #[cfg(feature = "vector-storage")]
-            let get_collection_route = collections_base
-                .and(warp::path::param::<String>())
-                .and(warp::path::end())
-                .and(warp::get())
-                .and_then(move |name: String| {
-                    let log = get_collection_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        match log.get_collection(&name).await {
-                            Some(schema) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&schema),
-                                StatusCode::OK,
-                            )),
-                            None => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": format!("Collection '{}' not found", name)
-                                })),
-                                StatusCode::NOT_FOUND,
-                            )),
-                        }
-                    }
-                });
-
-            // GET /v2/collections/{name}/stats - Get collection statistics
-            #[cfg(feature = "vector-storage")]
-            let collection_stats_log = log.clone();
-            #[cfg(feature = "vector-storage")]
-            let collection_stats_route = collections_base
-                .and(warp::path::param::<String>())
-                .and(warp::path("stats"))
-                .and(warp::path::end())
-                .and(warp::get())
-                .and_then(move |name: String| {
-                    let log = collection_stats_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        match log.get_collection_stats(&name).await {
-                            Some(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&stats),
-                                StatusCode::OK,
-                            )),
-                            None => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": format!("Collection '{}' not found", name)
-                                })),
-                                StatusCode::NOT_FOUND,
-                            )),
-                        }
-                    }
-                });
-
-            // Document Management Endpoints
-            #[cfg(feature = "vector-storage")]
-            let documents_base = collections_base
-                .and(warp::path::param::<String>())
-                .and(warp::path("documents"));
-
-            // POST /v2/collections/{collection}/documents - Insert document
-            #[cfg(feature = "vector-storage")]
-            let insert_document_log = log.clone();
-            #[cfg(feature = "vector-storage")]
-            let insert_document_route = documents_base
-                .and(warp::path::end())
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |collection_name: String, body: serde_json::Value| {
-                    let log = insert_document_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        
-                        // Parse document from JSON with simplified error handling
-                        let mut document: engine_crate::schema::Document = match serde_json::from_value(body) {
-                            Ok(doc) => doc,
-                            Err(e) => {
-                                return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::json(&serde_json::json!({
-                                        "error": format!("Invalid document: {}", e)
-                                    })),
-                                    StatusCode::BAD_REQUEST,
-                                ));
-                            }
-                        };
-
-                        // Ensure collection name matches URL parameter
-                        document.collection = collection_name;
-
-                        match log.insert_document(document.clone()).await {
-                            Ok(offset) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "status": "inserted",
-                                    "id": document.id,
-                                    "offset": offset
-                                })),
-                                StatusCode::CREATED,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": e.to_string()
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            )),
-                        }
-                    }
-                });
-
-            // GET /v2/collections/{collection}/documents/{id} - Get document
-            #[cfg(feature = "vector-storage")]
-            let get_document_log = log.clone();
-            #[cfg(feature = "vector-storage")]
-            let get_document_route = documents_base
-                .and(warp::path::param::<u64>())
-                .and(warp::path::end())
-                .and(warp::get())
-                .and_then(move |_collection_name: String, id: u64| {
-                    let log = get_document_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        match log.get_document(id).await {
-                            Some(document) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&document),
-                                StatusCode::OK,
-                            )),
-                            None => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": format!("Document {} not found", id)
-                                })),
-                                StatusCode::NOT_FOUND,
-                            )),
-                        }
-                    }
-                });
-
-            // Vector Search Endpoints
-            #[cfg(feature = "vector-storage")]
-            let search_base = v2.and(warp::path("search"));
-
-            // POST /v2/search/vector - Vector similarity search
-            #[cfg(feature = "vector-storage")]
-            let vector_search_log = log.clone();
-            #[cfg(feature = "vector-storage")]
-            let vector_search_route = search_base
-                .and(warp::path("vector"))
-                .and(warp::path::end())
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = vector_search_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        
-                        // Parse search request
-                        let collection = body["collection"].as_str().unwrap_or("");
-                        let empty_vec = Vec::new();
-                        let vector_data = body["vector"].as_array().unwrap_or(&empty_vec);
-                        let k = body["k"].as_u64().unwrap_or(10) as usize;
-                        let ef = body["ef"].as_u64().map(|x| x as usize);
-                        let threshold = body["similarity_threshold"].as_f64().map(|x| x as f32);
-
-                        if collection.is_empty() {
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": "Collection name is required"
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            ));
-                        }
-
-                        let vector: Vec<f32> = vector_data.iter()
-                            .filter_map(|v| v.as_f64().map(|f| f as f32))
-                            .collect();
-
-                        if vector.is_empty() {
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": "Vector is required and must not be empty"
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            ));
-                        }
-
-                        let query = engine_crate::vector::VectorQuery {
-                            vector,
-                            k,
-                            distance_metric: engine_crate::schema::DistanceMetric::Euclidean,
-                            ef,
-                            similarity_threshold: threshold,
-                        };
-
-                        match log.vector_search(collection, query).await {
-                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "results": results,
-                                    "count": results.len()
-                                })),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": e.to_string()
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            )),
-                        }
-                    }
-                });
-
-            // POST /v2/search/hybrid - Hybrid search (vector + metadata filters)
-            #[cfg(feature = "vector-storage")]
-            let hybrid_search_log = log.clone();
-            #[cfg(feature = "vector-storage")]
-            let hybrid_search_route = search_base
-                .and(warp::path("hybrid"))
-                .and(warp::path::end())
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = hybrid_search_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        
-                        let collection = body["collection"].as_str().unwrap_or("");
-                        if collection.is_empty() {
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": "Collection name is required"
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            ));
-                        }
-
-                        // Optional vector query
-                        let vector_query = if let Some(vector_data) = body["vector"].as_array() {
-                            let vector: Vec<f32> = vector_data.iter()
-                                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                .collect();
-                            
-                            if !vector.is_empty() {
-                                Some(engine_crate::vector::VectorQuery {
-                                    vector,
-                                    k: body["k"].as_u64().unwrap_or(10) as usize,
-                                    distance_metric: engine_crate::schema::DistanceMetric::Euclidean,
-                                    ef: body["ef"].as_u64().map(|x| x as usize),
-                                    similarity_threshold: body["similarity_threshold"].as_f64().map(|x| x as f32),
-                                })
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        // Metadata filters
-                        let mut metadata_filters = Vec::new();
-                        if let Some(filters) = body["metadata_filters"].as_object() {
-                            for (key, value) in filters {
-                                // Convert JSON value to schema::Value
-                                let schema_value = match value {
-                                    serde_json::Value::Bool(b) => engine_crate::schema::Value::Bool(*b),
-                                    serde_json::Value::Number(n) => {
-                                        if let Some(i) = n.as_i64() {
-                                            engine_crate::schema::Value::I64(i)
-                                        } else if let Some(f) = n.as_f64() {
-                                            engine_crate::schema::Value::F64(f)
-                                        } else {
-                                            continue;
-                                        }
-                                    },
-                                    serde_json::Value::String(s) => engine_crate::schema::Value::String(s.clone()),
-                                    _ => continue,
-                                };
-                                metadata_filters.push((key.clone(), schema_value));
-                            }
-                        }
-
-                        match log.hybrid_search(collection, vector_query, metadata_filters).await {
-                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "results": results,
-                                    "count": results.len()
-                                })),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": e.to_string()
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            )),
-                        }
-                    }
-                });
-
-            // Apply rate limiting to vector storage endpoints
-            #[cfg(feature = "vector-storage")]
-            let create_collection_route = admin_rl.clone().and(create_collection_route).map(|(), r| r);
-            #[cfg(feature = "vector-storage")]
-            let list_collections_route = data_rl.clone().and(list_collections_route).map(|(), r| r);
-            #[cfg(feature = "vector-storage")]
-            let get_collection_route = data_rl.clone().and(get_collection_route).map(|(), r| r);
-            #[cfg(feature = "vector-storage")]
-            let collection_stats_route = data_rl.clone().and(collection_stats_route).map(|(), r| r);
-            #[cfg(feature = "vector-storage")]
-            let insert_document_route = data_rl.clone().and(insert_document_route).map(|(), r| r);
-            #[cfg(feature = "vector-storage")]
-            let get_document_route = data_rl.clone().and(get_document_route).map(|(), r| r);
-            #[cfg(feature = "vector-storage")]
-            let vector_search_route = data_rl.clone().and(vector_search_route).map(|(), r| r);
-            #[cfg(feature = "vector-storage")]
-            let hybrid_search_route = data_rl.clone().and(hybrid_search_route).map(|(), r| r);
-
-            // Multi-modal search routes
-            #[cfg(feature = "multimodal-search")]
-            let text_search_log = log.clone();
-            #[cfg(feature = "multimodal-search")]
-            let text_search_route = search_base
-                .and(warp::path("text"))
-                .and(warp::path::end())
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = text_search_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        
-                        // Parse text search request
-                        let text = body["text"].as_str().unwrap_or("");
-                        let fields = body["fields"].as_array()
-                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
-                        let limit = body["limit"].as_u64().unwrap_or(10) as usize;
-                        let fuzzy = body["fuzzy"].as_bool().unwrap_or(false);
-                        let min_score = body["min_score"].as_f64().map(|s| s as f32);
-
-                        if text.is_empty() {
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": "Text query is required"
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            ));
-                        }
-
-                        let query = engine_crate::text::TextQuery {
-                            text: text.to_string(),
-                            fields,
-                            limit,
-                            fuzzy,
-                            min_score,
-                        };
-
-                        match log.text_search(query).await {
-                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "results": results,
-                                    "count": results.len()
-                                })),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": e.to_string()
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            )),
-                        }
-                    }
-                });
-
-            #[cfg(feature = "multimodal-search")]
-            let metadata_search_log = log.clone();
-            #[cfg(feature = "multimodal-search")]
-            let metadata_search_route = search_base
-                .and(warp::path("metadata"))
-                .and(warp::path::end())
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = metadata_search_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        
-                        // Parse metadata query - simplified for now
-                        let field = body["field"].as_str().unwrap_or("");
-                        let value = body["value"].clone();
-
-                        if field.is_empty() {
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": "Field name is required"
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            ));
-                        }
-
-                        // Convert JSON value to schema::Value
-                        let schema_value = match value {
-                            serde_json::Value::Null => engine_crate::schema::Value::Null,
-                            serde_json::Value::Bool(b) => engine_crate::schema::Value::Bool(b),
-                            serde_json::Value::Number(n) => {
-                                if let Some(i) = n.as_i64() {
-                                    engine_crate::schema::Value::I64(i)
-                                } else if let Some(f) = n.as_f64() {
-                                    engine_crate::schema::Value::F64(f)
-                                } else {
-                                    return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                        warp::reply::json(&serde_json::json!({
-                                            "error": "Invalid number format"
-                                        })),
-                                        StatusCode::BAD_REQUEST,
-                                    ));
-                                }
-                            }
-                            serde_json::Value::String(s) => engine_crate::schema::Value::String(s),
-                            _ => return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": "Unsupported value type"
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            )),
-                        };
-
-                        let query = engine_crate::metadata::MetadataQuery::eq(
-                            field.to_string(),
-                            schema_value
-                        );
-
-                        match log.metadata_search(query).await {
-                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "results": results,
-                                    "count": results.len()
-                                })),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_ , warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": e.to_string()
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            )),
-                        }
-                    }
-                });
-
-            #[cfg(feature = "multimodal-search")]
-            let advanced_hybrid_search_log = log.clone();
-            #[cfg(feature = "multimodal-search")]
-            let advanced_hybrid_search_route = search_base
-                .and(warp::path("advanced_hybrid"))
-                .and(warp::path::end())
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = advanced_hybrid_search_log.clone();
-                    async move {
-                        use warp::http::StatusCode;
-                        
-                        let collection = body["collection"].as_str().unwrap_or("");
-                        if collection.is_empty() {
-                            return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": "Collection name is required"
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            ));
-                        }
-
-                        let limit = body["limit"].as_u64().unwrap_or(10) as usize;
-                        
-                        // Parse vector query (optional)
-                        let vector_query = if let Some(vector_data) = body["vector"].as_array() {
-                            let vector: Vec<f32> = vector_data.iter()
-                                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                .collect();
-                            
-                            if !vector.is_empty() {
-                                Some(engine_crate::vector::VectorQuery {
-                                    vector,
-                                    k: limit,
-                                    distance_metric: engine_crate::schema::DistanceMetric::Euclidean,
-                                    ef: None,
-                                    similarity_threshold: None,
-                                })
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        // Parse text query (optional)
-                        let text_query = if let Some(text) = body["text"].as_str() {
-                            if !text.is_empty() {
-                                Some(engine_crate::text::TextQuery {
-                                    text: text.to_string(),
-                                    fields: vec![],
-                                    limit,
-                                    fuzzy: body["fuzzy"].as_bool().unwrap_or(false),
-                                    min_score: None,
-                                })
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        // Create hybrid query
-                        let hybrid_query = engine_crate::hybrid::HybridQuery {
-                            collection: collection.to_string(),
-                            vector: vector_query,
-                            text: text_query,
-                            metadata: None, // TODO: Parse metadata query from request
-                            limit,
-                            scoring: engine_crate::hybrid::HybridScoringConfig::default(),
-                            fusion: engine_crate::hybrid::FusionStrategy::default(),
-                        };
-
-                        match log.advanced_hybrid_search(hybrid_query).await {
-                            Ok(results) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "results": results,
-                                    "count": results.len()
-                                })),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({
-                                    "error": e.to_string()
-                                })),
-                                StatusCode::BAD_REQUEST,
-                            )),
-                        }
-                    }
-                });
-
-            // Apply rate limiting to multi-modal routes
-            #[cfg(feature = "multimodal-search")]
-            let text_search_route = data_rl.clone().and(text_search_route).map(|(), r| r);
-            #[cfg(feature = "multimodal-search")]
-            let metadata_search_route = data_rl.clone().and(metadata_search_route).map(|(), r| r);
-            #[cfg(feature = "multimodal-search")]
-            let advanced_hybrid_search_route = data_rl.clone().and(advanced_hybrid_search_route).map(|(), r| r);
-
-            // Build routes using a macro to avoid type conflicts
-            macro_rules! build_routes {
-                ($base:expr) => {
-                    $base
-                        .or(warp::path("build_info").and(warp::get()).map({
-                            let commit = build_commit;
-                            let features = build_features;
-                            let branch = option_env!("GIT_BRANCH").unwrap_or("unknown");
-                            let build_time = option_env!("BUILD_TIME").unwrap_or("unknown");
-                            let rust_version = option_env!("RUST_VERSION").unwrap_or("unknown");
-                            let target_triple = option_env!("TARGET_TRIPLE").unwrap_or("unknown");
-                            move || {
-                                warp::reply::json(&serde_json::json!({
-                                    "commit": commit,
-                                    "branch": branch,
-                                    "build_time": build_time,
-                                    "rust_version": rust_version,
-                                    "target_triple": target_triple,
-                                    "features": features,
-                                    "version": env!("CARGO_PKG_VERSION"),
-                                    "name": env!("CARGO_PKG_NAME"),
-                                }))
-                            }
-                        }))
-                };
-            }
-
-            // Build routes with conditional features
-            let routes = {
-                let mut all_routes = health_route
+            // Apply rate limiting to routes if enabled
+            let routes = if let Some(limiter) = rate_limiter {
+                let rl_filter = mk_rl_filter(limiter);
+                put_route.and(rl_filter.clone()).map(|r, ()| r)
+                    .or(put_fast_route.and(rl_filter.clone()).map(|r, ()| r))
+                    .or(lookup_route.and(rl_filter.clone()).map(|r, ()| r))
+                    .or(lookup_fast.and(rl_filter.clone()).map(|r, ()| r))
+                    .or(get_fast.and(rl_filter.clone()).map(|r, ()| r))
+                    .or(snapshot_route.and(rl_filter.clone()).map(|r, ()| r))
+                    .or(compact_route.and(rl_filter.clone()).map(|r, ()| r))
+                    .or(rmi_build.and(rl_filter.clone()).map(|r, ()| r))
+                    .or(warmup.and(rl_filter).map(|r, ()| r))
+                    .or(health_route)
+                    .or(build_info_route)
                     .or(metrics_route)
-                    .or(append_route)
-                    .or(replay_route)
-                    .or(subscribe_route)
-                    .or(snapshot_route)
                     .or(offset_route)
-                    .or(put_route)
+                    .boxed()
+            } else {
+                put_route
                     .or(put_fast_route)
                     .or(lookup_route)
-                    .or(lookup_raw)
                     .or(lookup_fast)
                     .or(get_fast)
-                    .or(batch_put_route)
-                    .or(msgpack_put_route)
-                    .or(msgpack_get_route)
-                    .or(vector_insert)
-                    .or(rmi_build)
+                    .or(snapshot_route)
                     .or(compact_route)
+                    .or(rmi_build)
                     .or(warmup)
-                    .or(warp::path("build_info").and(warp::get()).map({
-                        let commit = build_commit;
-                        let features = build_features;
-                        let branch = option_env!("GIT_BRANCH").unwrap_or("unknown");
-                        let build_time = option_env!("BUILD_TIME").unwrap_or("unknown");
-                        let rust_version = option_env!("RUST_VERSION").unwrap_or("unknown");
-                        let target_triple = option_env!("TARGET_TRIPLE").unwrap_or("unknown");
-                        move || {
-                            warp::reply::json(&serde_json::json!({
-                                "commit": commit,
-                                "branch": branch,
-                                "build_time": build_time,
-                                "rust_version": rust_version,
-                                "target_triple": target_triple,
-                                "features": features,
-                                "version": env!("CARGO_PKG_VERSION"),
-                                "name": env!("CARGO_PKG_NAME"),
-                            }))
-                        }
-                    }));
-
-                // Add vector storage routes if enabled
-                #[cfg(feature = "vector-storage")]
-                {
-                    all_routes = all_routes
-                        .or(create_collection_route)
-                        .or(list_collections_route)
-                        .or(get_collection_route)
-                        .or(collection_stats_route)
-                        .or(insert_document_route)
-                        .or(get_document_route)
-                        .or(vector_search_route)
-                        .or(hybrid_search_route);
-                }
-
-                // Add multimodal search routes if enabled
-                #[cfg(feature = "multimodal-search")]
-                {
-                    all_routes = all_routes
-                        .or(text_search_route)
-                        .or(metadata_search_route)
-                        .or(advanced_hybrid_search_route);
-                }
-
-                all_routes
+                    .or(health_route)
+                    .or(build_info_route)
+                    .or(metrics_route)
+                    .or(offset_route)
+                    .boxed()
             };
 
             // Apply error recovery
             let routes = routes.recover(|rej: warp::Rejection| async move {
-                use warp::http::StatusCode;
-                if rej.find::<Unauthorized>().is_some() {
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error":"unauthorized"})),
-                        StatusCode::UNAUTHORIZED,
-                    ))
-                } else if rej.find::<InsufficientPermissions>().is_some() {
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error":"insufficient_permissions"})),
-                        StatusCode::FORBIDDEN,
-                    ))
-                } else if rej.find::<AdminRateLimited>().is_some()
-                    || rej.find::<DataRateLimited>().is_some()
-                {
+                if rej.find::<RateLimited>().is_some() {
                     Ok::<_, std::convert::Infallible>(warp::reply::with_status(
                         warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
                         warp::http::StatusCode::TOO_MANY_REQUESTS,
-                    ))
-                } else if let Some(api_error) = rej.find::<ApiError>() {
-                    let (status, error_msg) = match api_error {
-                        ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.as_str()),
-                        ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
-                        ApiError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.as_str()),
-                    };
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error": error_msg})),
-                        status,
                     ))
                 } else {
                     Ok::<_, std::convert::Infallible>(warp::reply::with_status(
@@ -1841,10 +798,10 @@ async fn main() -> Result<()> {
                 }
             });
 
-            // Apply compression middleware to routes for better throughput
+            // Apply compression middleware
             let routes = routes.with(warp::compression::gzip());
 
-            // Per-request logging with runtime disable via KYRODB_DISABLE_HTTP_LOG=1
+            // Per-request logging (runtime disable via KYRODB_DISABLE_HTTP_LOG=1)
             let disable_http_log =
                 std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
             let routes = routes.with(warp::log::custom({
@@ -1862,7 +819,7 @@ async fn main() -> Result<()> {
                 }
             }));
 
-            // --- High-Performance HTTP Server Configuration ---
+            // Start optimized HTTP server
             let addr = (host.parse::<std::net::IpAddr>()?, port);
             tracing::info!(
                 "Starting kyrodb-engine on {}:{} (commit={}, features={})",
@@ -1877,18 +834,7 @@ async fn main() -> Result<()> {
                 host, port, build_commit, build_features
             );
 
-            // Configure optimized HTTP server with warp's built-in optimizations
-            // Focus on connection pooling and keep-alive optimizations
-            tracing::info!("HTTP server configured with optimizations:");
-            tracing::info!("- Connection pooling: enabled");
-            tracing::info!("- Keep-alive: enabled with {}s timeout", http_keepalive_secs);
-            tracing::info!("- Compression: gzip enabled");
-            tracing::info!("- Rate limiting: {}", if enable_rate_limiting { "enabled" } else { "disabled" });
-            tracing::info!("- Max concurrent streams: {} (client-side config)", http2_max_streams);
-            
-            warp::serve(routes)
-                .run(addr)
-                .await;
+            warp::serve(routes).run(addr).await;
         }
     }
 

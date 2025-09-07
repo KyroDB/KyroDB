@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "engine",
     "bench",
-    "simple_bench",
 ]
 exclude = [
     "engine/fuzz",
@@ -21,6 +20,6 @@ edition = "2021"
 authors = ["KyroDB Team <kishanvats2003@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/vatskishan03/KyroDB"
-keywords = ["database", "kv", "learned-index", "rmi", "vector-search"]
+keywords = ["database", "kv", "learned-index", "rmi", "performance"]
 categories = ["database-implementations", "data-structures"]
-description = "KyroDB: A high-performance, durable key-value database with learned indexes (RMI) and vector search capabilities"
+description = "KyroDB: A high-performance, durable key-value database with learned indexes (RMI)"
