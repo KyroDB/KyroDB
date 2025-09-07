@@ -25,6 +25,9 @@ async fn rmi_rebuild_by_appends_threshold() {
     for i in 1000..1105u64 {
         let _ = log.append_kv(Uuid::new_v4(), i, vec![1u8]).await.unwrap();
     }
+    
+    // Ensure all appends are persisted before rebuild
+    log.snapshot().await.unwrap();
 
     // Manually trigger rebuild logic from main would require running server; instead emulate by writing new file again
     let pairs2 = log.collect_key_offset_pairs().await;

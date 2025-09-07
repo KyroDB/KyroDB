@@ -11,6 +11,7 @@ async fn snapshot_tmp_is_ignored_if_not_renamed() {
     {
         let log = PersistentEventLog::open(&path).await.unwrap();
         let _ = log.append(Uuid::new_v4(), b"x".to_vec()).await.unwrap();
+        log.snapshot().await.unwrap();
     }
 
     // Write a snapshot.tmp manually but don't rename

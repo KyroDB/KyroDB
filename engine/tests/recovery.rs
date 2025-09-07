@@ -24,6 +24,8 @@ async fn test_recovery_after_restart() {
         assert_eq!(log.get_offset().await, 2);
         let id3 = Uuid::new_v4();
         assert_eq!(log.append(id3, b"c".to_vec()).await.unwrap(), 2);
+        // Ensure persistence before dropping
+        log.snapshot().await.unwrap();
     }
 
     // 3rd run: recover full state

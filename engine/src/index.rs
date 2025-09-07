@@ -1023,7 +1023,14 @@ impl RmiIndex {
             return None;
         }
         
-        let leaf_id = self.router[router_idx] as usize;
+        let leaf_id = self.router[router_idx];
+        
+        // Check for uninitialized router entry
+        if leaf_id == u32::MAX {
+            return None;
+        }
+        
+        let leaf_id = leaf_id as usize;
         
         // Verify leaf_id is valid
         if leaf_id >= self.leaf_len.len() 
@@ -1359,6 +1366,27 @@ impl RmiIndex {
     #[inline]
     pub fn debug_probe_only(&self, key: u64, lo: usize, hi: usize) -> Option<u64> {
         self.small_window_probe(key, lo, hi)
+    }
+
+    // Additional debug methods for RMI investigation
+    pub fn debug_router_bits(&self) -> u8 {
+        self.router_bits
+    }
+
+    pub fn debug_router_length(&self) -> usize {
+        self.router.len()
+    }
+
+    pub fn debug_leaf_count(&self) -> usize {
+        self.leaf_len.len()
+    }
+
+    pub fn debug_router_value(&self, idx: usize) -> Option<u32> {
+        self.router.get(idx).copied()
+    }
+
+    pub fn debug_count(&self) -> usize {
+        self.count()
     }
 
     // In predict_get, swap to the fast predictor and keep your SIMD + fallback search:

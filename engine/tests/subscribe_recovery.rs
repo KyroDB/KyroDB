@@ -13,6 +13,7 @@ async fn subscribe_streams_past_and_live_after_restart() {
         for _ in 0..3 {
             let _ = log.append(Uuid::new_v4(), b"x".to_vec()).await.unwrap();
         }
+        log.snapshot().await.unwrap();
     }
 
     // Second run: subscribe from 0, ensure past delivered, then live gets one more
