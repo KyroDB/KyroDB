@@ -24,6 +24,8 @@ pub mod metrics;
 pub mod schema;
 #[cfg(feature = "learned-index")]
 pub mod concurrency;
+#[cfg(feature = "learned-index")]
+pub mod memory;
 
 // Vector Storage Modules (feature-gated)
 #[cfg(feature = "vector-storage")]
