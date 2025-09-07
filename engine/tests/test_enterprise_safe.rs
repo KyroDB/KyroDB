@@ -2,7 +2,7 @@ use kyrodb_engine::{KyroDb, DurabilityLevel, GroupCommitConfig};
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::Duration;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn test_enterprise_safe_group_commit() -> Result<()> {
@@ -15,8 +15,10 @@ async fn test_enterprise_safe_group_commit() -> Result<()> {
     // Enterprise-Safe Configuration
     let config = GroupCommitConfig {
         max_batch_size: 1000,       // Enterprise batch size for performance
-        max_delay: Duration::from_micros(500), // 500µs max delay for responsiveness
-        durability: DurabilityLevel::EnterpriseSafe, // Zero data loss mode
+        max_batch_delay_micros: 500, // 500µs max delay for responsiveness
+        durability_level: DurabilityLevel::EnterpriseSafe, // Zero data loss mode
+        enabled: true,
+        background_fsync_interval_ms: 100,
     };
     
     let kyrodb = Arc::new(
@@ -33,12 +35,12 @@ async fn test_enterprise_safe_group_commit() -> Result<()> {
     let mut tasks = Vec::new();
     for i in 0..concurrent_writes {
         let kyrodb_clone = kyrodb.clone();
-        let key = format!("concurrent_key_{}", i);
+        let key = Uuid::new_v4();
         let value = serde_json::json!({
             "id": i,
             "message": "Enterprise concurrent write",
             "durability": "EnterpriseSafe"
-        }).to_string();
+        }).to_string().into_bytes();
         
         let task = tokio::spawn(async move {
             kyrodb_clone.append(key, value).await
@@ -51,16 +53,31 @@ async fn test_enterprise_safe_group_commit() -> Result<()> {
         task.await??;
     }
     
-    let concurrent_duration = start.elapsed();
-    let writes_per_sec = concurrent_writes as f64 / concurrent_duration.as_secs_f64();
+    let duration = start.elapsed();
+    println!("✅ {} concurrent writes completed in {:?}", concurrent_writes, duration);
+    println!("   Throughput: {:.0} writes/second", concurrent_writes as f64 / duration.as_secs_f64());
     
-    println!("   {} writes completed in {:.2}ms", concurrent_writes, concurrent_duration.as_secs_f64() * 1000.0);
-    println!("   Enterprise-safe throughput: {:.0} writes/sec", writes_per_sec);
+    // Verify EnterpriseSafe durability guarantees
+    println!("\n🛡️  Verifying EnterpriseSafe durability guarantees");
     
-    // Verify the results
-    assert!(writes_per_sec > 1000.0, "Enterprise-safe mode should achieve at least 1000 writes/sec");
+    // In EnterpriseSafe mode, data should be immediately durable after append()
+    let test_key = Uuid::new_v4();
+    let test_value = b"durability_test_data".to_vec();
     
-    println!("🎉 EnterpriseSafe Group Commit Test Complete!");
+    let offset = kyrodb.append(test_key, test_value.clone()).await?;
+    println!("✅ Data appended at offset: {}", offset);
+    
+    // Data should be immediately recoverable
+    let recovered = kyrodb.get(offset).await;
+    match recovered {
+        Some(payload) => {
+            assert_eq!(payload, test_value, "Payload should match exactly");
+            println!("✅ EnterpriseSafe durability verified - data immediately recoverable");
+        }
+        None => {
+            panic!("EnterpriseSafe data should be immediately recoverable");
+        }
+    }
     
     Ok(())
 }

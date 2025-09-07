@@ -1,6 +1,5 @@
 use kyrodb_engine::PersistentEventLog;
 use uuid::Uuid;
-use std::fs;
 
 #[tokio::test]
 async fn test_recovery_after_restart() {

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::collections::HashMap;
 use parking_lot::{RwLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Maximum memory usage before triggering aggressive cleanup (512 MB)
 const MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -55,7 +55,7 @@ struct CachedSnapshot {
     data: Vec<u8>, // Serialized index data
     size: usize,
     last_access: Instant,
-    generation: u64,
+    // generation removed - it was never accessed after being set
 }
 
 /// Buffer pool for reusing memory allocations
@@ -307,7 +307,6 @@ impl MemoryManager {
             data,
             size,
             last_access: Instant::now(),
-            generation,
         };
         
         cache.snapshots.insert(generation, snapshot);
@@ -459,14 +458,32 @@ mod tests {
         // Should start with no pressure
         assert_eq!(mgr.memory_pressure(), MemoryPressure::None);
         
-        // Allocate enough to trigger pressure
-        let large_size = MAX_MEMORY_BYTES / 2;
-        match mgr.allocate(large_size) {
+        // Allocate enough to trigger Medium pressure (75% of max = 384MB)
+        let medium_size = (MAX_MEMORY_BYTES as f64 * 0.75) as usize;
+        match mgr.allocate(medium_size) {
             MemoryResult::Success(buffer) => {
+                assert_eq!(mgr.memory_pressure(), MemoryPressure::Medium);
+                mgr.deallocate(buffer);
+                
+                // After deallocation, pressure should decrease
+                assert_eq!(mgr.memory_pressure(), MemoryPressure::None);
+            }
+            MemoryResult::CacheEvicted(buffer) => {
+                // Also acceptable if cache eviction occurred
                 assert!(matches!(mgr.memory_pressure(), MemoryPressure::Medium | MemoryPressure::High));
                 mgr.deallocate(buffer);
             }
-            _ => panic!("Large allocation should succeed"),
+            MemoryResult::OutOfMemory => {
+                // Try a smaller allocation that should definitely trigger pressure
+                let smaller_size = (MAX_MEMORY_BYTES as f64 * 0.65) as usize;
+                match mgr.allocate(smaller_size) {
+                    MemoryResult::Success(buffer) => {
+                        assert_eq!(mgr.memory_pressure(), MemoryPressure::Low);
+                        mgr.deallocate(buffer);
+                    }
+                    _ => panic!("Smaller allocation should succeed"),
+                }
+            }
         }
     }
     

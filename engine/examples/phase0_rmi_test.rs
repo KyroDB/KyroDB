@@ -1,5 +1,4 @@
 // Simple standalone benchmark to test Phase 0 RMI fixes
-use std::time::Instant;
 
 fn main() {
     // Create a simple test to verify our bounded RMI performance

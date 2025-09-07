@@ -314,6 +314,10 @@ mod crash_recovery_tests {
             log.append(uuid::Uuid::new_v4(), payload).await.unwrap();
         }
 
+        // Ensure all data is flushed to disk before dropping
+        // This is crucial for recovery correctness
+        log.snapshot().await.unwrap();
+
         drop(log);
 
         // Recover

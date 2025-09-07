@@ -34,6 +34,9 @@ pub mod concurrency;
 #[cfg(feature = "learned-index")]
 pub mod memory;
 
+// Export main types for public API
+pub use PersistentEventLog as KyroDb;  // Alias for backward compatibility with tests
+
 // Convenient alias to reduce type complexity for the mmap payload index
 type SnapshotIndex = std::collections::HashMap<u64, (usize, usize)>;
 
@@ -71,14 +74,8 @@ impl BufferPool {
         BytesMut::with_capacity(min_capacity.max(4096))
     }
 
-    fn return_buffer(&self, buf: BytesMut) {
-        if buf.capacity() >= 1024 && buf.capacity() <= 1024 * 1024 {
-            let mut buffers = self.buffers.lock();
-            if buffers.len() < 32 {
-                buffers.push(buf);
-            }
-        }
-    }
+    // TODO: Implement buffer return for memory pool optimization
+    // fn return_buffer(&self, buf: BytesMut) - currently unused
 
     #[allow(dead_code)]
     fn metrics(&self) -> (usize, usize) {
@@ -598,6 +595,17 @@ impl PersistentEventLog {
         }
 
         Ok(log)
+    }
+
+    /// Create a new log with custom group commit configuration (for testing)
+    pub async fn with_group_commit(data_dir: impl Into<PathBuf>, config: GroupCommitConfig) -> Result<Self> {
+        // Set environment variables to override defaults
+        std::env::set_var("KYRODB_GROUP_COMMIT_DELAY_MICROS", config.max_batch_delay_micros.to_string());
+        std::env::set_var("KYRODB_GROUP_COMMIT_BATCH_SIZE", config.max_batch_size.to_string());
+        std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", if config.enabled { "1" } else { "0" });
+        
+        // Use the regular open method which will pick up the env vars
+        Self::open(data_dir).await
     }
 
     // Parse snapshot.data layout: repeating records of [offset u64][len u64][payload bytes]

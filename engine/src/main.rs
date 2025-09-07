@@ -723,7 +723,6 @@ async fn main() -> Result<()> {
                 .map(|| {
                     #[cfg(not(feature = "bench-no-metrics"))]
                     {
-                        use prometheus::Encoder;
                         let encoder = prometheus::TextEncoder::new();
                         let metric_families = prometheus::gather();
                         match encoder.encode_to_string(&metric_families) {

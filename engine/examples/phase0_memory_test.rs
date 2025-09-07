@@ -3,7 +3,7 @@
 //! This example demonstrates the bounded memory management system that tracks
 //! allocations, implements LRU caching, and enforces resource limits.
 
-use kyrodb_engine::memory::{MemoryManager, MemoryResult, MemoryPressure};
+use kyrodb_engine::memory::{MemoryManager, MemoryResult};
 use std::thread;
 use std::sync::Arc;
 
