@@ -172,8 +172,17 @@ impl RmiIndex {
 
     #[inline]
     fn router_index(&self, key: u64) -> usize {
-        let shift = 64 - self.router_bits as u32;
-        ((key >> shift) & ((1u64 << self.router_bits) - 1)) as usize
+        // PHASE 0 FIX: Add bounds checking to router index calculation
+        if self.router_bits == 0 {
+            return 0;
+        }
+        
+        let shift = 64u32.saturating_sub(self.router_bits as u32);
+        let mask = (1u64 << self.router_bits).saturating_sub(1);
+        let idx = ((key >> shift) & mask) as usize;
+        
+        // Ensure index is within router bounds
+        idx.min(self.router.len().saturating_sub(1))
     }
 
     // --- helpers unified across backings ---
@@ -924,28 +933,114 @@ impl RmiIndex {
     // Use SoA predictor data in fast clamp
     #[inline(always)]
     fn predict_clamp_fast(&self, leaf_id: usize, key: u64) -> (usize, usize) {
+        // PHASE 0 FIX: Bounded RMI with guaranteed maximum search window
+        const MAX_SEARCH_WINDOW: i64 = 64; // Strict bound: never search more than 64 elements
+        
         let m = unsafe { *self.fx_m.get_unchecked(leaf_id) };
         let b = unsafe { *self.fx_b.get_unchecked(leaf_id) };
         let eps = unsafe { *self.leaf_epsilon.get_unchecked(leaf_id) } as i64;
         let start = unsafe { *self.leaf_start.get_unchecked(leaf_id) } as i64;
         let len = unsafe { *self.leaf_len.get_unchecked(leaf_id) } as i64;
-        let pred = (((m * (key as i128)) >> self.fx_shift) as i64) + b;
+        
+        // Safe prediction calculation with overflow protection
+        let pred = match self.safe_predict_position(m, b, key) {
+            Some(p) => p as i64,
+            None => start + len / 2, // Fallback to middle of leaf
+        };
+        
         let leaf_lo = start;
         let leaf_hi = start + len - 1;
-        let mut lo = (pred - eps).clamp(leaf_lo, leaf_hi);
-        let mut hi = (pred + eps).clamp(leaf_lo, leaf_hi);
-        // widen a touch to absorb rounding errors
+        
+        // Apply bounded epsilon (never exceed max window size)
+        let bounded_eps = eps.min(MAX_SEARCH_WINDOW / 2);
+        
+        let mut lo = (pred - bounded_eps).clamp(leaf_lo, leaf_hi);
+        let mut hi = (pred + bounded_eps).clamp(leaf_lo, leaf_hi);
+        
+        // Enforce global maximum window size
+        let window_size = hi - lo;
+        if window_size > MAX_SEARCH_WINDOW {
+            // Trim window to maximum allowed size, centered on prediction
+            let center = pred.clamp(leaf_lo, leaf_hi);
+            let half_window = MAX_SEARCH_WINDOW / 2;
+            lo = (center - half_window).clamp(leaf_lo, leaf_hi);
+            hi = (center + half_window).clamp(leaf_lo, leaf_hi);
+        }
+        
+        // Final bounds check and minimal widening
         lo = (lo - 1).max(leaf_lo);
         hi = (hi + 1).min(leaf_hi);
+        
+        // Ensure we never return an invalid range
+        if lo > hi {
+            lo = leaf_lo;
+            hi = (leaf_lo + MAX_SEARCH_WINDOW - 1).min(leaf_hi);
+        }
+        
         (lo as usize, hi as usize)
+    }
+    
+    // Safe prediction calculation with overflow protection
+    #[inline]
+    fn safe_predict_position(&self, m: i128, b: i64, key: u64) -> Option<usize> {
+        // Check for potential overflow in multiplication
+        if m.abs() > (i128::MAX / (u64::MAX as i128)) {
+            return None;
+        }
+        
+        // Perform calculation with bounds checking
+        let key_i128 = key as i128;
+        let scaled = match m.checked_mul(key_i128) {
+            Some(s) => s,
+            None => return None,
+        };
+        
+        let shifted = (scaled >> self.fx_shift) as i64;
+        let prediction = match shifted.checked_add(b) {
+            Some(p) => p,
+            None => return None,
+        };
+        
+        // Ensure prediction is within valid range
+        if prediction >= 0 && prediction <= usize::MAX as i64 {
+            Some(prediction as usize)
+        } else {
+            None
+        }
     }
 
     // Router lookup using dynamic bits
     fn find_leaf_index(&self, key: u64) -> Option<usize> {
-        if self.leaf_len.is_empty() {
+        // PHASE 0 FIX: Comprehensive bounds checking for leaf lookup
+        if self.leaf_len.is_empty() || self.router.is_empty() {
             return None;
         }
-        Some(self.router[self.router_index(key)] as usize)
+        
+        let router_idx = self.router_index(key);
+        
+        // Bounds check router access
+        if router_idx >= self.router.len() {
+            return None;
+        }
+        
+        let leaf_id = self.router[router_idx] as usize;
+        
+        // Verify leaf_id is valid
+        if leaf_id >= self.leaf_len.len() 
+           || leaf_id >= self.leaf_start.len()
+           || leaf_id >= self.fx_m.len()
+           || leaf_id >= self.fx_b.len()
+           || leaf_id >= self.leaf_epsilon.len() {
+            return None;
+        }
+        
+        // Verify leaf has valid range
+        let leaf_len = self.leaf_len[leaf_id];
+        if leaf_len == 0 {
+            return None;
+        }
+        
+        Some(leaf_id)
     }
 
     // --- probe helpers ---
@@ -1272,20 +1367,43 @@ impl RmiIndex {
         if self.count() == 0 {
             return None;
         }
+        
         let leaf_id = self.find_leaf_index(*key)?;
         let (lo, hi) = self.predict_clamp_fast(leaf_id, *key);
+        
+        // PHASE 0 FIX: Track window size for performance monitoring
+        let window_size = hi.saturating_sub(lo);
+        
         self.prefetch_window(lo);
+        
+        // Try SIMD probe first (fast path)
         if let Some(v) = self.small_window_probe(*key, lo, hi) {
             // Record a short probe length (SIMD found within window)
             crate::metrics::RMI_PROBE_LEN.observe(1.0);
             return Some(v);
         }
+        
+        // Fallback to bounded binary search with strict iteration limit
         let mut l = lo;
         let mut r = hi;
         let mut steps: u32 = 0;
-        while l <= r {
+        let max_steps = (window_size.max(1) as u32).ilog2() + 2; // log2(window) + safety margin
+        
+        while l <= r && steps < max_steps {
             steps = steps.saturating_add(1);
+            
+            // Bounds check before accessing
+            if l >= self.count() || r >= self.count() {
+                break;
+            }
+            
             let m = l + ((r - l) >> 1);
+            
+            // Additional bounds check for mid point
+            if m >= self.count() {
+                break;
+            }
+            
             let km = self.key_at(m);
             if km < *key {
                 l = m + 1;
@@ -1299,9 +1417,20 @@ impl RmiIndex {
                 return Some(self.off_at(m));
             }
         }
-        // Miss inside predicted window counts as a mispredict
+        
+        // Track performance metrics
         crate::metrics::RMI_PROBE_LEN.observe(steps.max(1) as f64);
-        crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
+        
+        // Track epsilon bound violations (large search windows indicate poor predictions)
+        if window_size > 64 {
+            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
+        }
+        
+        // If we hit max steps, this indicates an epsilon bound violation
+        if steps >= max_steps {
+            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
+        }
+        
         None
     }
 

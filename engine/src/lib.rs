@@ -22,6 +22,8 @@ pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 pub mod schema;
+#[cfg(feature = "learned-index")]
+pub mod concurrency;
 
 // Vector Storage Modules (feature-gated)
 #[cfg(feature = "vector-storage")]

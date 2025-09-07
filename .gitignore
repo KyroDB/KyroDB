@@ -129,3 +129,6 @@ bench_server.log
 .idea/workspace.xml
 .github/copilot-instructions.md
 .cursor/rules/rules.mdc
+Implementation.md
+visiondocument.md
+PHASE0_IMPLEMENTATION.md
