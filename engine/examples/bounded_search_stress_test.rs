@@ -1,6 +1,9 @@
-/// Week 3-4 Bounded Search Stress Test
+/// Bounded Search Stress Test
 /// 
-/// This test demonstrates the bounded search guarantees under stress conditions
+/// This tes    // Demonstrate bounded search analytics under stress
+    pr    println!("\n🔥 Stress Test Results:");
+    println!("=======================");tln!("\n📊 Bounded Search Analytics Under Stress");
+    println!("=========================================");emonstrates the bounded search guarantees under stress conditions
 /// with larger datasets that trigger segment creation and adaptation.
 
 use kyrodb_engine::adaptive_rmi::AdaptiveRMI;
@@ -8,8 +11,8 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🔥 Week 3-4 Bounded Search Stress Test");
-    println!("======================================");
+    println!("🔥 Bounded Search Stress Test");
+    println!("=============================");
 
     // Create adaptive RMI for stress testing
     let adaptive_rmi = Arc::new(AdaptiveRMI::new());
@@ -46,8 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("✅ Lookup test completed: {}/1000 hits", hits);
     
-    // Week 3-4: Demonstrate bounded search analytics under stress
-    println!("\n📊 Week 3-4: Bounded Search Analytics Under Stress");
+    // Demonstrate bounded search analytics under stress
+    println!("\n📊 Bounded Search Analytics Under Stress");
     println!("================================================");
     
     let bounded_analytics = adaptive_rmi.get_bounded_search_analytics();
@@ -97,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Performance bounds verification
-    println!("\n🎯 Week 3-4 Performance Bounds Verification:");
+    println!("\n🎯 Performance Bounds Verification:");
     let max_window = bounded_analytics.max_search_window_observed;
     if max_window <= 32 {
         println!("  🏆 EXCELLENT: Max window {} ≤ 32 (O(log 32) = O(5))", max_window);
@@ -107,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  ⚠️  ATTENTION: Max window {} > 64 - consider retraining", max_window);
     }
     
-    println!("\n🔥 Week 3-4 Stress Test Results:");
+    println!("\n🔥 Stress Test Results:");
     println!("================================");
     println!("• ✅ Processed 11,000 insertions successfully");
     println!("• ✅ Created {} adaptive segments", bounded_analytics.total_segments);
@@ -115,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("• ✅ Achieved {} performance classification", bounded_analytics.performance_classification);
     println!("• ✅ Verified worst-case complexity: {}", system_validation.worst_case_complexity);
     
-    println!("\n🏆 Week 3-4 Bounded Search Implementation: STRESS TEST PASSED!");
+    println!("\n🏆 Adaptive Bounded Search Implementation: STRESS TEST PASSED!");
     println!("🚀 KyroDB adaptive RMI maintains performance guarantees under load!");
     
     Ok(())

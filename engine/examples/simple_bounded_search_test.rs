@@ -1,4 +1,4 @@
-/// Simple Week 3-4 Bounded Search Test
+/// Simple Bounded Search Test
 /// 
 /// This test demonstrates bounded search with forced segment creation.
 
@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🔒 Week 3-4 Bounded Search Validation Test");
-    println!("==========================================");
+    println!("🔒 Bounded Search Validation Test");
+    println!("======================================");;
 
     // Create adaptive RMI with initial data to force segment creation
     println!("📝 Creating RMI with initial segment data...");
@@ -38,9 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("✅ Lookup test: {}/100 hits", hits);
     
-    // Week 3-4: Show bounded search analytics
-    println!("\n📊 Week 3-4: Bounded Search Analytics");
-    println!("====================================");
+    // Show bounded search analytics
+    println!("\n📊 Bounded Search Analytics");
+    println!("==========================");;
     
     let bounded_analytics = adaptive_rmi.get_bounded_search_analytics();
     println!("• Total segments: {}", bounded_analytics.total_segments);
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\n🏆 Week 3-4 Bounded Search Features Validated!");
+    println!("\n🏆 Bounded Search Features Validated!");
     println!("• ✅ Guaranteed O(log 64) performance bounds");
     println!("• ✅ Real-time performance monitoring");
     println!("• ✅ Adaptive model retraining");

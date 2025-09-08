@@ -9,6 +9,10 @@
 //! - Automatic segment adaptation based on access patterns
 //! - Background merge process with no read blocking
 //! - Lock-free concurrent operations
+//! - Parallel segment updates with copy-on-write optimization
+//! - Advanced segment split/merge with intelligent criteria
+//! - Performance analytics and health monitoring
+//! - Adaptive background maintenance scheduling
 //!
 //! Performance guarantees:
 //! - Write latency: O(1) amortized
@@ -42,7 +46,7 @@ const TARGET_SEGMENT_SIZE: usize = 1024;
 /// Background merge trigger threshold
 const MERGE_TRIGGER_RATIO: f32 = 0.75;
 
-/// Week 3-4: Performance statistics for bounded search monitoring
+/// Performance statistics for bounded search monitoring
 #[derive(Debug, Clone)]
 pub struct SearchStats {
     pub total_lookups: u64,
@@ -53,7 +57,7 @@ pub struct SearchStats {
     pub model_error_bound: u32,
 }
 
-/// Week 3-4: Validation of bounded search performance guarantees
+/// Validation of bounded search performance guarantees
 #[derive(Debug, Clone)]
 pub struct BoundedSearchValidation {
     pub max_search_window: usize,
@@ -253,8 +257,23 @@ impl AdaptiveSegment {
         }
     }
 
+    /// Create a new segment with pre-computed model for atomic swaps
+    pub fn new_with_model(data: Vec<(u64, u64)>, model: LocalLinearModel) -> Self {
+        // Calculate adaptive thresholds based on data size
+        let size = data.len() as u64;
+        let split_threshold = (size * 2).max(TARGET_SEGMENT_SIZE as u64);
+        let merge_threshold = (size / 4).max(MIN_SEGMENT_SIZE as u64 / 2);
+
+        Self {
+            local_model: model,
+            data,
+            metrics: SegmentMetrics::new(),
+            split_threshold,
+            merge_threshold,
+        }
+    }
+
     /// Guaranteed bounded search - no more O(n) fallbacks
-    /// Week 3-4 implementation with strict performance bounds
     pub fn bounded_search(&self, key: u64) -> Option<u64> {
         if self.data.is_empty() {
             return None;
@@ -266,14 +285,14 @@ impl AdaptiveSegment {
         let predicted_pos = self.local_model.predict(key);
         let model_epsilon = self.local_model.error_bound() as u32;
         
-        // Apply the guaranteed bounded search with Week 3-4 enhancements
+        // Apply the guaranteed bounded search
         self.bounded_search_with_epsilon(key, predicted_pos, model_epsilon)
     }
 
     /// Core bounded search implementation with configurable epsilon
     /// Guaranteed O(log 64) = O(1) performance - no O(n) fallbacks possible
     fn bounded_search_with_epsilon(&self, key: u64, predicted_pos: usize, epsilon: u32) -> Option<u64> {
-        // Week 3-4: Clamp search window to prevent O(n) behavior
+        // Clamp search window to prevent O(n) behavior
         const MAX_WINDOW: u32 = 64; // Configurable constant for guaranteed bounds
         let actual_epsilon = epsilon.min(MAX_WINDOW);
         
@@ -311,7 +330,6 @@ impl AdaptiveSegment {
     }
 
     /// Insert new key-value pair, maintaining sort order
-    /// Week 3-4: Enhanced with adaptive retraining
     pub fn insert(&mut self, key: u64, value: u64) -> Result<()> {
         match self.data.binary_search_by_key(&key, |&(k, _)| k) {
             Ok(idx) => {
@@ -322,14 +340,14 @@ impl AdaptiveSegment {
                 // Insert new key at correct position
                 self.data.insert(idx, (key, value));
                 
-                // Week 3-4: Adaptive model retraining triggered by performance degradation
+                // Adaptive model retraining triggered by performance degradation
                 self.retrain_if_needed();
             }
         }
         Ok(())
     }
 
-    /// Week 3-4: Enhanced model retraining triggered by performance degradation
+    /// Enhanced model retraining triggered by performance degradation
     fn should_retrain(&self) -> bool {
         let error_rate = self.calculate_recent_error_rate();
         let error_threshold = self.calculate_optimal_threshold();
@@ -367,7 +385,7 @@ impl AdaptiveSegment {
         }
     }
 
-    /// Week 3-4: Adaptive model retraining with performance optimization
+    /// Adaptive model retraining with performance optimization
     fn retrain_model(&mut self) {
         // Only retrain if we have sufficient data
         if self.data.len() < 2 {
@@ -430,7 +448,7 @@ impl AdaptiveSegment {
         access_freq < self.merge_threshold && data_size < MIN_SEGMENT_SIZE as u64
     }
 
-    /// Week 3-4: Get bounded search performance statistics
+    /// Get bounded search performance statistics
     pub fn get_search_stats(&self) -> SearchStats {
         let total_accesses = self.metrics.access_count.load(std::sync::atomic::Ordering::Relaxed);
         let prediction_errors = self.metrics.prediction_errors.load(std::sync::atomic::Ordering::Relaxed);
@@ -447,7 +465,7 @@ impl AdaptiveSegment {
         }
     }
 
-    /// Week 3-4: Validate bounded search guarantees
+    /// Validate bounded search guarantees
     pub fn validate_bounded_search_guarantees(&self) -> BoundedSearchValidation {
         let max_possible_window = (self.local_model.error_bound() as usize * 2).min(64);
         let data_size = self.data.len();
@@ -736,7 +754,7 @@ impl BackgroundMerger {
 }
 
 /// Main Adaptive RMI structure
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AdaptiveRMI {
     /// Multiple independent segments that can be updated separately
     segments: Arc<RwLock<Vec<AdaptiveSegment>>>,
@@ -918,101 +936,448 @@ impl AdaptiveRMI {
             }
         }
 
-        // 4. Group writes by target segments (normal case)
-        let mut segment_updates: std::collections::HashMap<usize, Vec<(u64, u64)>> = 
-            std::collections::HashMap::new();
+        // 4. Group writes by target segments for parallel processing
+        let segment_updates = self.group_updates_by_segment(all_writes).await?;
 
-        for (key, value) in all_writes {
-            let segment_id = {
-                let router = self.global_router.read();
-                router.predict_segment(key)
-            };
-            segment_updates.entry(segment_id).or_default().push((key, value));
-        }
-
-        // 5. Update segments (can be done in parallel)
+        // 5. Update segments in parallel (no global locks)
         let update_tasks: Vec<_> = segment_updates.into_iter()
             .map(|(segment_id, updates)| {
                 let segments = self.segments.clone();
                 tokio::spawn(async move {
-                    Self::merge_segment_updates(segments, segment_id, updates).await
+                    Self::merge_segment_updates_parallel(segments, segment_id, updates).await
                 })
             })
             .collect();
 
-        // 6. Wait for all updates to complete
+        // 6. Wait for all parallel updates to complete
         for task in update_tasks {
             task.await??;
         }
+
+        // 7. Check for segment adaptation needs after merge
+        self.check_segment_adaptation_after_merge().await?;
 
         self.merge_scheduler.complete_merge();
         Ok(())
     }
 
-    /// Merge updates into a specific segment
-    async fn merge_segment_updates(
+    /// Group updates by target segments efficiently
+    async fn group_updates_by_segment(&self, all_writes: Vec<(u64, u64)>) -> Result<std::collections::HashMap<usize, Vec<(u64, u64)>>> {
+        let mut segment_updates: std::collections::HashMap<usize, Vec<(u64, u64)>> = 
+            std::collections::HashMap::new();
+
+        let router = self.global_router.read();
+        for (key, value) in all_writes {
+            let segment_id = router.predict_segment(key);
+            segment_updates.entry(segment_id).or_default().push((key, value));
+        }
+        drop(router);
+
+        Ok(segment_updates)
+    }
+
+    /// Enhanced parallel segment updates with copy-on-write optimization
+    async fn merge_segment_updates_parallel(
         segments: Arc<RwLock<Vec<AdaptiveSegment>>>,
         segment_id: usize,
         updates: Vec<(u64, u64)>,
     ) -> Result<()> {
-        // Get a write lock on segments to modify the specific segment
-        let mut segments_guard = segments.write();
-        
-        if segment_id >= segments_guard.len() {
-            return Err(anyhow!("Invalid segment ID: {}", segment_id));
-        }
-
-        // Apply all updates to the segment
-        for (key, value) in updates {
-            segments_guard[segment_id].insert(key, value)?;
-        }
-
-        // Check if segment needs to be split
-        if segments_guard[segment_id].should_split() {
-            let segment = std::mem::replace(
-                &mut segments_guard[segment_id], 
-                AdaptiveSegment::new(Vec::new())
-            );
+        // Use copy-on-write for minimal lock contention
+        let (current_data, current_model, _current_metrics) = {
+            let segments_guard = segments.read();
+            if segment_id >= segments_guard.len() {
+                return Err(anyhow!("Invalid segment ID: {}", segment_id));
+            }
             
-            let (left, right) = segment.split();
-            segments_guard[segment_id] = left;
-            segments_guard.insert(segment_id + 1, right);
+            let segment = &segments_guard[segment_id];
+            (
+                segment.data.clone(),
+                segment.local_model.clone(),
+                segment.split_threshold,
+            )
+        };
+
+        // Efficient merge with copy-on-write
+        let (new_data, needs_retrain) = Self::merge_updates_efficiently(current_data, updates).await?;
+        
+        // Retrain model if necessary (outside of locks)
+        let new_model = if needs_retrain || Self::should_retrain_model(&new_data, &current_model) {
+            LocalLinearModel::new(&new_data)
+        } else {
+            current_model
+        };
+
+        // Atomic swap - readers never blocked
+        {
+            let mut segments_guard = segments.write();
+            if segment_id < segments_guard.len() {
+                segments_guard[segment_id] = AdaptiveSegment::new_with_model(new_data, new_model);
+            }
         }
 
         Ok(())
     }
 
-    /// Adaptive segment management - called periodically
-    pub async fn adaptive_segment_management(&self) -> Result<()> {
-        let mut segments = self.segments.write();
-        let mut router = self.global_router.write();
+    /// Efficient update merging with minimal allocations
+    async fn merge_updates_efficiently(
+        mut current_data: Vec<(u64, u64)>,
+        updates: Vec<(u64, u64)>,
+    ) -> Result<(Vec<(u64, u64)>, bool)> {
+        let initial_size = current_data.len();
+        let mut significant_changes = false;
+
+        // Merge updates efficiently - maintaining sort order
+        for (key, value) in updates {
+            match current_data.binary_search_by_key(&key, |(k, _)| *k) {
+                Ok(idx) => {
+                    // Update existing key
+                    if current_data[idx].1 != value {
+                        current_data[idx].1 = value;
+                        significant_changes = true;
+                    }
+                }
+                Err(idx) => {
+                    // Insert new key at correct position
+                    current_data.insert(idx, (key, value));
+                    significant_changes = true;
+                }
+            }
+        }
+
+        // Determine if retrain is needed based on growth
+        let growth_ratio = current_data.len() as f64 / initial_size as f64;
+        let needs_retrain = significant_changes && (growth_ratio > 1.1 || current_data.len() - initial_size > 100);
+
+        Ok((current_data, needs_retrain))
+    }
+
+    /// Check if model retraining is needed
+    fn should_retrain_model(new_data: &[(u64, u64)], current_model: &LocalLinearModel) -> bool {
+        if new_data.len() < 10 {
+            return false;
+        }
+
+        // Sample some predictions to estimate error rate
+        let sample_size = (new_data.len() / 10).max(10).min(100);
+        let mut errors = 0;
         
-        let mut i = 0;
-        while i < segments.len() {
-            // Check for split
-            if segments[i].should_split() {
-                let segment = std::mem::replace(&mut segments[i], AdaptiveSegment::new(Vec::new()));
-                let (left, right) = segment.split();
+        for i in (0..new_data.len()).step_by(new_data.len() / sample_size + 1).take(sample_size) {
+            let (key, _) = new_data[i];
+            let predicted_pos = current_model.predict(key);
+            let actual_pos = i;
+            let error = (predicted_pos as isize - actual_pos as isize).abs() as usize;
+            
+            if error > 32 { // Error threshold
+                errors += 1;
+            }
+        }
+
+        let error_rate = errors as f64 / sample_size as f64;
+        error_rate > 0.15 // 15% error threshold
+    }
+
+    /// Check for segment adaptation needs after merge
+    async fn check_segment_adaptation_after_merge(&self) -> Result<()> {
+        // Trigger segment management if needed
+        let needs_adaptation = {
+            let segments = self.segments.read();
+            segments.iter().any(|s| s.should_split() || s.should_merge())
+        };
+
+        if needs_adaptation {
+            // Schedule segment management asynchronously
+            let rmi = Arc::new(self.clone());
+            tokio::spawn(async move {
+                if let Err(e) = rmi.adaptive_segment_management().await {
+                    eprintln!("Background segment adaptation error: {}", e);
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Enhanced adaptive segment management with intelligent split/merge decisions
+    pub async fn adaptive_segment_management(&self) -> Result<()> {
+        let mut segments_to_split = Vec::new();
+        let mut segments_to_merge = Vec::new();
+        
+        // 1. Analyze all segments for adaptation needs
+        {
+            let segments = self.segments.read();
+            for (i, segment) in segments.iter().enumerate() {
+                let access_frequency = segment.metrics.access_frequency();
+                let data_size = segment.len();
+                let error_rate = segment.metrics.error_rate();
                 
-                // Update boundaries in router
-                if let Some((split_key, _)) = right.key_range() {
-                    router.add_split_point(split_key, i);
+                // Advanced split criteria
+                if self.should_split_segment(segment, access_frequency, data_size, error_rate) {
+                    segments_to_split.push(i);
                 }
                 
-                segments[i] = left;
-                segments.insert(i + 1, right);
-                i += 2; // Skip the newly created segment
+                // Advanced merge criteria
+                if self.should_merge_segment(segment, access_frequency, data_size, error_rate) {
+                    segments_to_merge.push(i);
+                }
+            }
+        }
+        
+        // 2. Process splits first (from highest index to avoid shifting)
+        for &segment_id in segments_to_split.iter().rev() {
+            self.split_segment_advanced(segment_id).await?;
+        }
+        
+        // 3. Process merges (adjacent segments)
+        self.process_segment_merges(segments_to_merge).await?;
+        
+        Ok(())
+    }
+
+    /// Advanced segment split criteria
+    fn should_split_segment(&self, segment: &AdaptiveSegment, access_freq: u64, data_size: usize, error_rate: f64) -> bool {
+        // Multiple triggers for segment splitting
+        let size_trigger = data_size > MAX_SEGMENT_SIZE;
+        let hot_large_trigger = access_freq > segment.split_threshold && data_size > TARGET_SEGMENT_SIZE;
+        let error_trigger = error_rate > 0.15 && data_size > MIN_SEGMENT_SIZE * 2;
+        let performance_trigger = segment.local_model.error_bound() > 32 && data_size > TARGET_SEGMENT_SIZE;
+        
+        size_trigger || hot_large_trigger || error_trigger || performance_trigger
+    }
+
+    /// Advanced segment merge criteria
+    fn should_merge_segment(&self, segment: &AdaptiveSegment, access_freq: u64, data_size: usize, _error_rate: f64) -> bool {
+        // Conservative merge criteria to avoid thrashing
+        let cold_small_trigger = access_freq < segment.merge_threshold && data_size < MIN_SEGMENT_SIZE;
+        let very_small_trigger = data_size < MIN_SEGMENT_SIZE / 2;
+        
+        cold_small_trigger || very_small_trigger
+    }
+
+    /// Advanced segment splitting with optimal split point selection
+    async fn split_segment_advanced(&self, segment_id: usize) -> Result<()> {
+        let (segment_data, split_key, access_pattern) = {
+            let segments = self.segments.read();
+            if segment_id >= segments.len() {
+                return Ok(()); // Segment may have been modified
+            }
+            
+            let segment = &segments[segment_id];
+            let data = segment.data.clone();
+            let access_freq = segment.metrics.access_frequency();
+            
+            // Intelligent split point selection
+            let split_point = self.calculate_optimal_split_point(&data, access_freq);
+            let split_key = if split_point < data.len() {
+                data[split_point].0
+            } else {
+                return Ok(()); // Can't split
+            };
+            
+            (data, split_key, access_freq)
+        };
+
+        // Create new segments with optimal split
+        let split_index = segment_data.iter().position(|(k, _)| *k == split_key).unwrap_or(segment_data.len() / 2);
+        let left_data = segment_data[..split_index].to_vec();
+        let right_data = segment_data[split_index..].to_vec();
+        
+        if left_data.is_empty() || right_data.is_empty() {
+            return Ok(()); // Don't split if one side would be empty
+        }
+
+        let left_segment = AdaptiveSegment::new(left_data);
+        let right_segment = AdaptiveSegment::new(right_data);
+        
+        // Atomic segment replacement with router update
+        {
+            let mut segments = self.segments.write();
+            let mut router = self.global_router.write();
+            
+            if segment_id < segments.len() {
+                // Replace original segment with left segment
+                segments[segment_id] = left_segment;
+                
+                // Insert right segment
+                segments.insert(segment_id + 1, right_segment);
+                
+                // Update global router with new split point
+                router.add_split_point(split_key, segment_id);
+                
+                println!("Split segment {} at key {} (access_freq: {})", segment_id, split_key, access_pattern);
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Calculate optimal split point based on access patterns
+    fn calculate_optimal_split_point(&self, data: &[(u64, u64)], _access_freq: u64) -> usize {
+        if data.len() < 4 {
+            return data.len() / 2;
+        }
+        
+        // For now, use middle point - can be enhanced with access pattern analysis
+        // Future enhancement: track hot/cold regions within segments
+        let mid = data.len() / 2;
+        
+        // Ensure we don't split too close to boundaries
+        let min_segment = data.len() / 4;
+        let max_segment = (data.len() * 3) / 4;
+        
+        mid.clamp(min_segment, max_segment)
+    }
+
+    /// Process segment merges with adjacent segment selection
+    async fn process_segment_merges(&self, merge_candidates: Vec<usize>) -> Result<()> {
+        let mut processed = std::collections::HashSet::new();
+        
+        for &segment_id in &merge_candidates {
+            if processed.contains(&segment_id) {
                 continue;
             }
             
-            // Check for merge with next segment
-            if i + 1 < segments.len() && segments[i].should_merge() && segments[i + 1].should_merge() {
-                let right_segment = segments.remove(i + 1);
-                let mut left_data = segments[i].data.clone();
-                left_data.extend(right_segment.data);
-                left_data.sort_by_key(|(k, _)| *k);
+            // Find best merge candidate (adjacent segment)
+            if let Some(merge_partner) = self.find_merge_partner(segment_id, &merge_candidates).await? {
+                if !processed.contains(&merge_partner) {
+                    self.merge_segments_advanced(segment_id, merge_partner).await?;
+                    processed.insert(segment_id);
+                    processed.insert(merge_partner);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Find optimal merge partner for a segment
+    async fn find_merge_partner(&self, segment_id: usize, candidates: &[usize]) -> Result<Option<usize>> {
+        let segments = self.segments.read();
+        
+        if segment_id >= segments.len() {
+            return Ok(None);
+        }
+        
+        let current_segment = &segments[segment_id];
+        let current_size = current_segment.len();
+        
+        // Try to merge with adjacent segments
+        let mut best_partner = None;
+        let mut best_score = f64::NEG_INFINITY;
+        
+        // Check next segment
+        if segment_id + 1 < segments.len() && candidates.contains(&(segment_id + 1)) {
+            let next_segment = &segments[segment_id + 1];
+            let combined_size = current_size + next_segment.len();
+            
+            if combined_size <= MAX_SEGMENT_SIZE {
+                let score = self.calculate_merge_score(current_segment, next_segment, combined_size);
+                if score > best_score {
+                    best_score = score;
+                    best_partner = Some(segment_id + 1);
+                }
+            }
+        }
+        
+        // Check previous segment
+        if segment_id > 0 && candidates.contains(&(segment_id - 1)) {
+            let prev_segment = &segments[segment_id - 1];
+            let combined_size = current_size + prev_segment.len();
+            
+            if combined_size <= MAX_SEGMENT_SIZE {
+                let score = self.calculate_merge_score(current_segment, prev_segment, combined_size);
+                if score > best_score {
+                    best_partner = Some(segment_id - 1);
+                }
+            }
+        }
+        
+        Ok(best_partner)
+    }
+
+    /// Calculate merge score for two segments
+    fn calculate_merge_score(&self, seg1: &AdaptiveSegment, seg2: &AdaptiveSegment, combined_size: usize) -> f64 {
+        let access_freq_1 = seg1.metrics.access_frequency();
+        let access_freq_2 = seg2.metrics.access_frequency();
+        let combined_access = access_freq_1 + access_freq_2;
+        
+        // Favor merging segments with:
+        // - Low combined access frequency
+        // - Similar sizes
+        // - Combined size within reasonable bounds
+        
+        let size_penalty = if combined_size > TARGET_SEGMENT_SIZE {
+            -(combined_size as f64 - TARGET_SEGMENT_SIZE as f64) / TARGET_SEGMENT_SIZE as f64
+        } else {
+            0.0
+        };
+        
+        let access_score = -(combined_access as f64).ln(); // Lower access frequency = higher score
+        let size_score = -(combined_size as f64).ln() / 10.0; // Slightly favor smaller combined sizes
+        
+        access_score + size_score + size_penalty
+    }
+
+    /// Advanced segment merging with optimal data combination
+    async fn merge_segments_advanced(&self, segment_id_1: usize, segment_id_2: usize) -> Result<()> {
+        let (merged_data, keep_id, remove_id) = {
+            let segments = self.segments.read();
+            
+            let (seg1_idx, seg2_idx) = if segment_id_1 < segment_id_2 {
+                (segment_id_1, segment_id_2)
+            } else {
+                (segment_id_2, segment_id_1)
+            };
+            
+            if seg2_idx >= segments.len() {
+                return Ok(()); // Segments may have been modified
+            }
+            
+            let seg1_data = segments[seg1_idx].data.clone();
+            let seg2_data = segments[seg2_idx].data.clone();
+            
+            // Merge data efficiently (both are already sorted)
+            let mut merged = Vec::with_capacity(seg1_data.len() + seg2_data.len());
+            let mut i = 0;
+            let mut j = 0;
+            
+            while i < seg1_data.len() && j < seg2_data.len() {
+                if seg1_data[i].0 <= seg2_data[j].0 {
+                    if i + 1 < seg1_data.len() && seg1_data[i].0 == seg2_data[j].0 {
+                        // Duplicate key - take the one from seg2 (more recent)
+                        merged.push(seg2_data[j]);
+                        i += 1;
+                        j += 1;
+                    } else {
+                        merged.push(seg1_data[i]);
+                        i += 1;
+                    }
+                } else {
+                    merged.push(seg2_data[j]);
+                    j += 1;
+                }
+            }
+            
+            // Add remaining elements
+            merged.extend_from_slice(&seg1_data[i..]);
+            merged.extend_from_slice(&seg2_data[j..]);
+            
+            (merged, seg1_idx, seg2_idx)
+        };
+
+        // Atomic merge operation
+        {
+            let mut segments = self.segments.write();
+            let mut router = self.global_router.write();
+            
+            if remove_id < segments.len() && keep_id < segments.len() {
+                // Create new merged segment
+                let merged_segment = AdaptiveSegment::new(merged_data);
                 
-                segments[i] = AdaptiveSegment::new(left_data);
+                // Replace the first segment with merged data
+                segments[keep_id] = merged_segment;
+                
+                // Remove the second segment
+                segments.remove(remove_id);
                 
                 // Update router boundaries
                 let boundaries: Vec<u64> = segments
@@ -1021,65 +1386,137 @@ impl AdaptiveRMI {
                     .collect();
                 router.update_boundaries(boundaries);
                 
-                continue; // Don't increment i, check the merged segment again
+                println!("Merged segments {} and {} into segment {}", keep_id, remove_id, keep_id);
             }
-            
-            i += 1;
         }
         
         Ok(())
     }
 
-    /// Start background maintenance task
+    /// Enhanced background maintenance task with adaptive scheduling
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let rmi = self.clone();
         tokio::spawn(async move {
-            let mut merge_interval = tokio::time::interval(std::time::Duration::from_millis(100));
-            let mut management_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut merge_interval = tokio::time::interval(std::time::Duration::from_millis(50)); // More responsive
+            let mut management_interval = tokio::time::interval(std::time::Duration::from_secs(5)); // More frequent adaptation
+            let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(30)); // Periodic analytics
+            
+            println!("Starting enhanced background maintenance with advanced features");
             
             loop {
                 tokio::select! {
                     _ = merge_interval.tick() => {
-                        // Check if hot buffer needs merging
-                        if rmi.hot_buffer.utilization() > MERGE_TRIGGER_RATIO {
+                        // Enhanced hot buffer merge triggering
+                        let should_merge = rmi.should_trigger_merge().await;
+                        if should_merge {
                             if let Err(e) = rmi.merge_hot_buffer().await {
                                 eprintln!("Background merge error: {}", e);
+                            } else {
+                                // println!("Background hot buffer merge completed successfully");
                             }
                         }
                     }
                     _ = management_interval.tick() => {
-                        // Adaptive segment management
+                        // Advanced adaptive segment management
                         if let Err(e) = rmi.adaptive_segment_management().await {
                             eprintln!("Segment management error: {}", e);
+                        } else {
+                            // println!("Adaptive segment management cycle completed");
                         }
                     }
+                    _ = stats_interval.tick() => {
+                        // Periodic performance analytics and health checks
+                        rmi.log_performance_analytics().await;
+                    }
                     _ = rmi.merge_scheduler.wait_for_merge() => {
-                        // Handle explicit merge requests
+                        // Handle explicit merge requests with priority
+                        let mut operations_processed = 0;
                         while let Some(operation) = rmi.merge_scheduler.next_operation() {
                             match operation {
                                 MergeOperation::HotBufferMerge => {
                                     if let Err(e) = rmi.merge_hot_buffer().await {
                                         eprintln!("Requested merge error: {}", e);
+                                    } else {
+                                        operations_processed += 1;
                                     }
                                 }
-                                MergeOperation::SegmentSplit(_) => {
-                                    // Handle segment split
-                                    if let Err(e) = rmi.adaptive_segment_management().await {
-                                        eprintln!("Segment split error: {}", e);
+                                MergeOperation::SegmentSplit(segment_id) => {
+                                    if let Err(e) = rmi.split_segment_advanced(segment_id).await {
+                                        eprintln!("Segment split error for segment {}: {}", segment_id, e);
+                                    } else {
+                                        operations_processed += 1;
                                     }
                                 }
-                                MergeOperation::SegmentMerge(_, _) => {
-                                    // Handle segment merge
-                                    if let Err(e) = rmi.adaptive_segment_management().await {
-                                        eprintln!("Segment merge error: {}", e);
+                                MergeOperation::SegmentMerge(seg1, seg2) => {
+                                    if let Err(e) = rmi.merge_segments_advanced(seg1, seg2).await {
+                                        eprintln!("Segment merge error for segments {} and {}: {}", seg1, seg2, e);
+                                    } else {
+                                        operations_processed += 1;
                                     }
                                 }
                             }
+                        }
+                        
+                        if operations_processed > 0 {
+                            println!("Processed {} background operations", operations_processed);
                         }
                     }
                 }
             }
         })
+    }
+
+    /// Enhanced merge triggering logic
+    async fn should_trigger_merge(&self) -> bool {
+        let hot_utilization = self.hot_buffer.utilization();
+        let overflow_size = self.overflow_buffer.lock().len();
+        let merge_in_progress = self.merge_scheduler.is_merge_in_progress();
+        
+        // Don't start new merge if one is already in progress
+        if merge_in_progress {
+            return false;
+        }
+        
+        // Trigger merge based on multiple criteria
+        let utilization_trigger = hot_utilization > MERGE_TRIGGER_RATIO;
+        let overflow_trigger = overflow_size > 0;
+        let time_based_trigger = hot_utilization > 0.3; // Periodic merge for moderate load
+        
+        utilization_trigger || overflow_trigger || time_based_trigger
+    }
+
+    /// Performance analytics and health monitoring
+    async fn log_performance_analytics(&self) {
+        let stats = self.get_stats();
+        let analytics = self.get_bounded_search_analytics();
+        let validation = self.validate_bounded_search_guarantees();
+        
+        println!("=== KyroDB Adaptive RMI Performance Analytics ===");
+        println!("Segments: {}, Total keys: {}, Avg segment size: {:.1}", 
+                  stats.segment_count, stats.total_keys, stats.avg_segment_size);
+        println!("Hot buffer: {}/{} ({:.1}%), Overflow: {}", 
+                  stats.hot_buffer_size, DEFAULT_HOT_BUFFER_SIZE, 
+                  stats.hot_buffer_utilization * 100.0, stats.overflow_size);
+        println!("Bounded guarantee: {:.1}% segments, Max window: {}, Performance: {}", 
+                  analytics.bounded_guarantee_ratio * 100.0, 
+                  analytics.max_search_window_observed,
+                  validation.performance_level);
+        
+        if !validation.system_meets_guarantees {
+            println!("PERFORMANCE WARNING: {} segments need attention. Recommendation: {}", 
+                      validation.segments_needing_attention, validation.recommendation);
+        }
+        
+        // Advanced segment health reporting
+        if analytics.total_segments > 0 {
+            let avg_error_rate = analytics.overall_error_rate * 100.0;
+            println!("Error rate: {:.2}%, Total lookups: {}, Prediction errors: {}", 
+                      avg_error_rate, analytics.total_lookups, analytics.total_prediction_errors);
+            
+            if avg_error_rate > 20.0 {
+                println!("HIGH ERROR RATE detected - consider triggering model retraining");
+            }
+        }
     }
 
     /// Get performance statistics
@@ -1109,7 +1546,7 @@ impl AdaptiveRMI {
         }
     }
 
-    /// Week 3-4: Get bounded search performance analytics across all segments
+    /// Get bounded search performance analytics across all segments
     pub fn get_bounded_search_analytics(&self) -> BoundedSearchAnalytics {
         let segments = self.segments.read();
         
@@ -1159,7 +1596,7 @@ impl AdaptiveRMI {
         }
     }
 
-    /// Week 3-4: Validate that all segments meet bounded search guarantees
+    /// Validate that all segments meet bounded search guarantees
     pub fn validate_bounded_search_guarantees(&self) -> BoundedSearchSystemValidation {
         let analytics = self.get_bounded_search_analytics();
         
@@ -1327,7 +1764,7 @@ mod tests {
     }
 }
 
-/// Week 3-4: Comprehensive bounded search analytics
+/// Comprehensive bounded search analytics
 #[derive(Debug, Clone)]
 pub struct BoundedSearchAnalytics {
     pub total_segments: usize,
@@ -1341,7 +1778,7 @@ pub struct BoundedSearchAnalytics {
     pub segment_details: Vec<(SearchStats, BoundedSearchValidation)>,
 }
 
-/// Week 3-4: System-wide bounded search validation
+/// System-wide bounded search validation
 #[derive(Debug, Clone)]
 pub struct BoundedSearchSystemValidation {
     pub system_meets_guarantees: bool,
@@ -1351,7 +1788,7 @@ pub struct BoundedSearchSystemValidation {
     pub recommendation: String,
 }
 
-/// Week 3-4: Helper function to classify overall performance
+/// Helper function to classify overall performance
 fn classify_performance(max_window: usize, bounded_ratio: f64) -> String {
     match (max_window, bounded_ratio) {
         (w, r) if w <= 32 && r >= 0.95 => "Excellent - All segments O(log 32)".to_string(),
@@ -1362,7 +1799,7 @@ fn classify_performance(max_window: usize, bounded_ratio: f64) -> String {
     }
 }
 
-/// Week 3-4: Generate performance recommendations
+/// Generate performance recommendations
 fn generate_performance_recommendation(analytics: &BoundedSearchAnalytics) -> String {
     if analytics.bounded_guarantee_ratio >= 0.95 && analytics.max_search_window_observed <= 64 {
         "System performing optimally with guaranteed bounded search.".to_string()

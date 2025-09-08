@@ -1,4 +1,6 @@
-/// Example demonstrating the Adaptive Segmented RMI implementation
+/// Example demonstrating the Adaptive Segmented RMI implemen    // Demonstrate bounded search guarantees
+    println!("\n🔒 Bounded Search Performance Validation");
+    println!("======================================");ion
 /// 
 /// This example shows how the new adaptive RMI provides:
 /// - Bounded O(log ε) performance with ε ≤ 64
@@ -59,8 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("❌ Unexpectedly found non-existent key");
     }
 
-    // Week 3-4: Demonstrate bounded search guarantees
-    println!("\n🔒 Week 3-4: Bounded Search Performance Validation");
+    // Demonstrate bounded search guarantees
+    println!("\n🔒 Bounded Search Performance Validation");
     println!("================================================");
     
     let bounded_analytics = adaptive_rmi.get_bounded_search_analytics();
@@ -102,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("• Background merge: Automatic segment maintenance");
     println!("• Memory overhead: Minimal per-segment metadata");
     
-    println!("\n🎯 Week 3-4 Bounded Search Implementation:");
+    println!("\n🎯 Bounded Search Implementation:");
     println!("• ✅ Guaranteed O(log 64) = O(1) performance - NO O(n) fallbacks possible");
     println!("• ✅ Configurable maximum search window (64 elements)");
     println!("• ✅ Adaptive model retraining triggered by performance degradation");
@@ -116,9 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("• ✅ Bounded memory usage");
     println!("• ✅ Automatic adaptation to data distribution");
     println!("• ✅ Background maintenance without read blocking");
-    println!("• ✅ Week 3-4: Strict performance bounds with validation");
+    println!("• ✅ Strict performance bounds with validation");
     
-    println!("\n🏆 Adaptive RMI Week 3-4 implementation completed successfully!");
+    println!("\n🏆 Adaptive RMI implementation completed successfully!");
     println!("Ready for production workloads with guaranteed bounded search!");
     println!("🚀 KyroDB is now 'the best KV engine' with provable performance bounds!");
     
