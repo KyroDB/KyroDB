@@ -1638,6 +1638,8 @@ pub enum PrimaryIndex {
     BTree(BTreeIndex),
     #[cfg(feature = "learned-index")]
     Rmi(RmiIndex),
+    #[cfg(feature = "learned-index")]
+    AdaptiveRmi(std::sync::Arc<crate::adaptive_rmi::AdaptiveRMI>),
 }
 
 impl PrimaryIndex {
@@ -1650,12 +1652,30 @@ impl PrimaryIndex {
         PrimaryIndex::Rmi(RmiIndex::new())
     }
 
+    #[cfg(feature = "learned-index")]
+    pub fn new_adaptive_rmi() -> Self {
+        PrimaryIndex::AdaptiveRmi(std::sync::Arc::new(crate::adaptive_rmi::AdaptiveRMI::new()))
+    }
+
+    #[cfg(feature = "learned-index")]
+    pub fn new_adaptive_rmi_from_pairs(pairs: &[(u64, u64)]) -> Self {
+        PrimaryIndex::AdaptiveRmi(std::sync::Arc::new(
+            crate::adaptive_rmi::AdaptiveRMI::build_from_pairs(pairs)
+        ))
+    }
+
     pub fn insert(&mut self, key: u64, offset: u64) {
         match self {
             PrimaryIndex::BTree(b) => b.insert(key, offset),
             #[cfg(feature = "learned-index")]
             PrimaryIndex::Rmi(r) => {
                 r.insert_delta(key, offset);
+            }
+            #[cfg(feature = "learned-index")]
+            PrimaryIndex::AdaptiveRmi(ar) => {
+                if let Err(e) = ar.insert(key, offset) {
+                    eprintln!("AdaptiveRMI insert error: {}", e);
+                }
             }
         }
     }
@@ -1687,6 +1707,78 @@ impl PrimaryIndex {
                 }
                 res
             }
+            #[cfg(feature = "learned-index")]
+            PrimaryIndex::AdaptiveRmi(ar) => {
+                let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                let res = ar.lookup(*key);
+                timer.observe_duration();
+                if res.is_some() {
+                    crate::metrics::RMI_HITS_TOTAL.inc();
+                    crate::metrics::RMI_READS_TOTAL.inc();
+                } else {
+                    crate::metrics::RMI_MISSES_TOTAL.inc();
+                }
+                res
+            }
+        }
+    }
+
+    /// Check if this is an adaptive RMI index
+    #[cfg(feature = "learned-index")]
+    pub fn is_adaptive_rmi(&self) -> bool {
+        matches!(self, PrimaryIndex::AdaptiveRmi(_))
+    }
+
+    /// Start background maintenance for adaptive RMI
+    #[cfg(feature = "learned-index")]
+    pub fn start_background_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
+        match self {
+            PrimaryIndex::AdaptiveRmi(ar) => {
+                Some(ar.clone().start_background_maintenance())
+            }
+            _ => None,
+        }
+    }
+
+    /// Get adaptive RMI statistics
+    #[cfg(feature = "learned-index")]
+    pub fn get_adaptive_stats(&self) -> Option<crate::adaptive_rmi::AdaptiveRMIStats> {
+        match self {
+            PrimaryIndex::AdaptiveRmi(ar) => Some(ar.get_stats()),
+            _ => None,
+        }
+    }
+
+    /// Migrate from legacy RMI to AdaptiveRMI
+    #[cfg(feature = "learned-index")]
+    pub fn migrate_to_adaptive(&mut self) -> anyhow::Result<()> {
+        let new_index = match self {
+            PrimaryIndex::Rmi(old_rmi) => {
+                // Collect all data from old RMI
+                let mut pairs = old_rmi.delta_pairs();
+                
+                // Also collect data from the main index if present
+                // Note: This is a simplified migration - in production we'd need
+                // to handle the full RMI data structure
+                
+                pairs.sort_by_key(|(k, _)| *k);
+                PrimaryIndex::AdaptiveRmi(std::sync::Arc::new(
+                    crate::adaptive_rmi::AdaptiveRMI::build_from_pairs(&pairs)
+                ))
+            }
+            _ => return Err(anyhow::anyhow!("Cannot migrate non-RMI index to adaptive")),
+        };
+
+        *self = new_index;
+        Ok(())
+    }
+
+    /// Force merge of hot buffer (for testing/debugging)
+    #[cfg(feature = "learned-index")]
+    pub async fn force_merge(&self) -> anyhow::Result<()> {
+        match self {
+            PrimaryIndex::AdaptiveRmi(ar) => ar.merge_hot_buffer().await,
+            _ => Ok(()),
         }
     }
 }

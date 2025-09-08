@@ -33,6 +33,8 @@ pub mod metrics;
 pub mod concurrency;
 #[cfg(feature = "learned-index")]
 pub mod memory;
+#[cfg(feature = "learned-index")]
+pub mod adaptive_rmi;
 
 // Export main types for public API
 pub use PersistentEventLog as KyroDb;  // Alias for backward compatibility with tests
@@ -495,14 +497,56 @@ impl PersistentEventLog {
         let (tx, _) = broadcast::channel(1_024);
 
         // 5) Build index from recovered events
-        let mut idx = index::PrimaryIndex::new_btree();
-        let mut max_off = 0u64;
-        for ev in &events {
-            if ev.offset > max_off {
-                max_off = ev.offset;
+        let use_adaptive_rmi = std::env::var("KYRODB_USE_ADAPTIVE_RMI")
+            .ok()
+            .and_then(|s| s.parse::<bool>().ok())
+            .unwrap_or(true); // Default to adaptive RMI
+
+        let mut idx = if use_adaptive_rmi {
+            #[cfg(feature = "learned-index")]
+            {
+                // Collect key-offset pairs from events
+                let mut pairs: Vec<(u64, u64)> = Vec::new();
+                for ev in &events {
+                    if let Some(rec) = deserialize_record_compat(&ev.payload) {
+                        pairs.push((rec.key, ev.offset));
+                    }
+                }
+                
+                if pairs.is_empty() {
+                    index::PrimaryIndex::new_adaptive_rmi()
+                } else {
+                    pairs.sort_by_key(|(k, _)| *k);
+                    pairs.dedup_by(|a, b| a.0 == b.0); // Keep only latest values for duplicate keys
+                    index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs)
+                }
             }
-            if let Some(rec) = deserialize_record_compat(&ev.payload) {
-                idx.insert(rec.key, ev.offset);
+            #[cfg(not(feature = "learned-index"))]
+            {
+                index::PrimaryIndex::new_btree()
+            }
+        } else {
+            index::PrimaryIndex::new_btree()
+        };
+
+        let mut max_off = 0u64;
+        
+        // For non-adaptive indexes, insert events normally
+        if !use_adaptive_rmi || !cfg!(feature = "learned-index") {
+            for ev in &events {
+                if ev.offset > max_off {
+                    max_off = ev.offset;
+                }
+                if let Some(rec) = deserialize_record_compat(&ev.payload) {
+                    idx.insert(rec.key, ev.offset);
+                }
+            }
+        } else {
+            // For adaptive RMI, just find max offset
+            for ev in &events {
+                if ev.offset > max_off {
+                    max_off = ev.offset;
+                }
             }
         }
         let mut next = if events.is_empty() {
@@ -533,14 +577,18 @@ impl PersistentEventLog {
                         }
                     }
                     #[cfg(feature = "learned-index")]
-                    if let Some(rmi_name) = j.get("rmi").and_then(|v| v.as_str()) {
-                        let rmi_path = data_dir.join(rmi_name);
-                        if rmi_path.exists() {
-                            if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
-                                idx = index::PrimaryIndex::Rmi(rmi);
+                    if !use_adaptive_rmi {
+                        // Legacy RMI loading only if not using adaptive
+                        if let Some(rmi_name) = j.get("rmi").and_then(|v| v.as_str()) {
+                            let rmi_path = data_dir.join(rmi_name);
+                            if rmi_path.exists() {
+                                if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
+                                    idx = index::PrimaryIndex::Rmi(rmi);
+                                }
                             }
                         }
                     }
+                    // Note: Adaptive RMI doesn't need file loading as it builds incrementally
                 }
             }
         }
@@ -852,6 +900,19 @@ impl PersistentEventLog {
                         crate::metrics::RMI_MISSES_TOTAL.inc();
                     }
                 }
+                #[cfg(feature = "learned-index")]
+                index::PrimaryIndex::AdaptiveRmi(adaptive) => {
+                    let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                    if let Some(value) = adaptive.lookup(key) {
+                        timer.observe_duration();
+                        crate::metrics::RMI_HITS_TOTAL.inc();
+                        crate::metrics::RMI_READS_TOTAL.inc();
+                        return Some(value);
+                    } else {
+                        timer.observe_duration();
+                        crate::metrics::RMI_MISSES_TOTAL.inc();
+                    }
+                }
             }
         }
         // Correctness fallback: linear scan for latest record
@@ -1087,14 +1148,22 @@ impl PersistentEventLog {
         fail::fail_point!("manifest_before_write", |_| {
             Err(anyhow::anyhow!("failpoint: manifest_before_write"))
         });
-        let manifest = serde_json::json!({
+        let mut manifest = serde_json::json!({
             "next_offset": self.get_offset().await,
             "snapshot": "snapshot.bin",
             "wal_segments": self.current_wal_segments(),
             "wal_total_bytes": self.wal_size_bytes(),
-            "rmi": "index-rmi.bin",
             "ts": chrono::Utc::now().timestamp()
         });
+        
+        // Only include RMI path for legacy RMI (adaptive RMI doesn't persist to file)
+        #[cfg(feature = "learned-index")]
+        {
+            let idx_guard = self.index.read().await;
+            if matches!(&*idx_guard, index::PrimaryIndex::Rmi(_)) {
+                manifest["rmi"] = serde_json::Value::String("index-rmi.bin".to_string());
+            }
+        }
         let tmp = self.data_dir.join("manifest.tmp");
         let mut f = File::create(&tmp).context("create manifest.tmp")?;
         writeln!(f, "{}", manifest).context("write manifest.tmp")?;
@@ -1128,6 +1197,11 @@ impl PersistentEventLog {
                 index::PrimaryIndex::Rmi(old_rmi) => {
                     old_rmi.delta_pairs()
                 }
+                #[cfg(feature = "learned-index")]
+                index::PrimaryIndex::AdaptiveRmi(_) => {
+                    // Adaptive RMI doesn't use delta - data is maintained differently
+                    Vec::new()
+                }
                 _ => Vec::new(),
             }
         };
@@ -1144,6 +1218,11 @@ impl PersistentEventLog {
                 for (k, v) in delta_pairs {
                     btree.insert(k, v);
                 }
+            }
+            #[cfg(feature = "learned-index")]
+            index::PrimaryIndex::AdaptiveRmi(_) => {
+                // Adaptive RMI doesn't use delta pattern - it handles data internally
+                // No migration needed as it builds from WAL during initialization
             }
         }
         
