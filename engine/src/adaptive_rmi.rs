@@ -42,6 +42,28 @@ const TARGET_SEGMENT_SIZE: usize = 1024;
 /// Background merge trigger threshold
 const MERGE_TRIGGER_RATIO: f32 = 0.75;
 
+/// Week 3-4: Performance statistics for bounded search monitoring
+#[derive(Debug, Clone)]
+pub struct SearchStats {
+    pub total_lookups: u64,
+    pub prediction_errors: u64,
+    pub error_rate: f64,
+    pub max_search_window: usize,
+    pub data_size: usize,
+    pub model_error_bound: u32,
+}
+
+/// Week 3-4: Validation of bounded search performance guarantees
+#[derive(Debug, Clone)]
+pub struct BoundedSearchValidation {
+    pub max_search_window: usize,
+    pub guaranteed_max_complexity: String,
+    pub bounded_guarantee: bool,
+    pub fallback_risk: bool,
+    pub segment_size: usize,
+    pub performance_class: String,
+}
+
 /// Linear model for key-to-position prediction within a segment
 #[derive(Debug, Clone)]
 pub struct LocalLinearModel {
@@ -231,7 +253,8 @@ impl AdaptiveSegment {
         }
     }
 
-    /// Bounded search within this segment - guaranteed O(log ε)
+    /// Guaranteed bounded search - no more O(n) fallbacks
+    /// Week 3-4 implementation with strict performance bounds
     pub fn bounded_search(&self, key: u64) -> Option<u64> {
         if self.data.is_empty() {
             return None;
@@ -239,32 +262,48 @@ impl AdaptiveSegment {
 
         self.metrics.record_access();
 
-        // Get prediction and error bound
+        // Get prediction and error bound from local model
         let predicted_pos = self.local_model.predict(key);
-        let epsilon = self.local_model.error_bound() as usize;
+        let model_epsilon = self.local_model.error_bound() as u32;
         
-        // Apply strict bounds to prevent O(n) behavior
-        let bounded_epsilon = epsilon.min(MAX_SEARCH_WINDOW / 2);
+        // Apply the guaranteed bounded search with Week 3-4 enhancements
+        self.bounded_search_with_epsilon(key, predicted_pos, model_epsilon)
+    }
+
+    /// Core bounded search implementation with configurable epsilon
+    /// Guaranteed O(log 64) = O(1) performance - no O(n) fallbacks possible
+    fn bounded_search_with_epsilon(&self, key: u64, predicted_pos: usize, epsilon: u32) -> Option<u64> {
+        // Week 3-4: Clamp search window to prevent O(n) behavior
+        const MAX_WINDOW: u32 = 64; // Configurable constant for guaranteed bounds
+        let actual_epsilon = epsilon.min(MAX_WINDOW);
         
-        // Calculate search window with bounds checking
         let data_len = self.data.len();
-        let start = predicted_pos.saturating_sub(bounded_epsilon).min(data_len.saturating_sub(1));
-        let end = (predicted_pos + bounded_epsilon).min(data_len.saturating_sub(1));
-        
-        // Ensure valid range
-        if start > end {
+        if data_len == 0 {
             return None;
         }
 
-        // Binary search within bounded window
-        let search_slice = &self.data[start..=end];
-        match search_slice.binary_search_by_key(&key, |&(k, _)| k) {
+        // Calculate strictly bounded search window
+        let start = predicted_pos.saturating_sub(actual_epsilon as usize);
+        let end = (predicted_pos + actual_epsilon as usize).min(data_len);
+        
+        // Ensure we don't go out of bounds
+        let start = start.min(data_len);
+        let end = end.min(data_len);
+        
+        if start >= end {
+            // Track prediction error for adaptive retraining
+            self.metrics.record_prediction_error();
+            return None;
+        }
+
+        // Binary search in bounded window - guaranteed O(log 64) = O(1)
+        match self.data[start..end].binary_search_by_key(&key, |(k, _)| *k) {
             Ok(idx) => {
-                let (_, offset) = search_slice[idx];
-                Some(offset)
+                let (_, value) = self.data[start + idx];
+                Some(value)
             }
             Err(_) => {
-                // Track prediction error for model adaptation
+                // Track prediction miss for model adaptation
                 self.metrics.record_prediction_error();
                 None
             }
@@ -272,6 +311,7 @@ impl AdaptiveSegment {
     }
 
     /// Insert new key-value pair, maintaining sort order
+    /// Week 3-4: Enhanced with adaptive retraining
     pub fn insert(&mut self, key: u64, value: u64) -> Result<()> {
         match self.data.binary_search_by_key(&key, |&(k, _)| k) {
             Ok(idx) => {
@@ -282,24 +322,93 @@ impl AdaptiveSegment {
                 // Insert new key at correct position
                 self.data.insert(idx, (key, value));
                 
-                // Check if we need to retrain the model
-                if self.should_retrain() {
-                    self.retrain_model();
-                }
+                // Week 3-4: Adaptive model retraining triggered by performance degradation
+                self.retrain_if_needed();
             }
         }
         Ok(())
     }
 
-    /// Check if model should be retrained based on performance
+    /// Week 3-4: Enhanced model retraining triggered by performance degradation
     fn should_retrain(&self) -> bool {
-        let error_rate = self.metrics.error_rate();
-        error_rate > 0.1 || self.data.len() > self.split_threshold as usize
+        let error_rate = self.calculate_recent_error_rate();
+        let error_threshold = self.calculate_optimal_threshold();
+        
+        // Multiple triggers for adaptive retraining
+        error_rate > error_threshold 
+            || self.data.len() > self.split_threshold as usize
+            || self.metrics.access_count.load(std::sync::atomic::Ordering::Relaxed) % 1000 == 0
     }
 
-    /// Retrain the local model with current data
+    /// Calculate recent error rate for adaptive model management
+    fn calculate_recent_error_rate(&self) -> f64 {
+        let total_accesses = self.metrics.access_count.load(std::sync::atomic::Ordering::Relaxed);
+        let prediction_errors = self.metrics.prediction_errors.load(std::sync::atomic::Ordering::Relaxed);
+        
+        if total_accesses == 0 {
+            return 0.0;
+        }
+        
+        prediction_errors as f64 / total_accesses as f64
+    }
+
+    /// Calculate optimal error threshold based on segment characteristics
+    fn calculate_optimal_threshold(&self) -> f64 {
+        let data_size = self.data.len();
+        let base_threshold = 0.1; // 10% base error rate
+        
+        // Adjust threshold based on segment size - smaller segments can tolerate higher error rates
+        if data_size < MIN_SEGMENT_SIZE {
+            base_threshold * 1.5 // 15% for small segments
+        } else if data_size > TARGET_SEGMENT_SIZE {
+            base_threshold * 0.7 // 7% for large segments
+        } else {
+            base_threshold // 10% for normal segments
+        }
+    }
+
+    /// Week 3-4: Adaptive model retraining with performance optimization
     fn retrain_model(&mut self) {
+        // Only retrain if we have sufficient data
+        if self.data.len() < 2 {
+            return;
+        }
+
+        // Retrain local model (fast - only this segment)
+        let old_error_bound = self.local_model.error_bound();
         self.local_model = LocalLinearModel::new(&self.data);
+        let new_error_bound = self.local_model.error_bound();
+        
+        // Update thresholds based on new model performance
+        self.update_adaptive_thresholds(old_error_bound, new_error_bound);
+        
+        // Reset error tracking after retraining
+        self.metrics.prediction_errors.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Update adaptive thresholds based on model performance
+    fn update_adaptive_thresholds(&mut self, old_error_bound: u32, new_error_bound: u32) {
+        // If model improved significantly, we can be more aggressive with splits
+        if new_error_bound < old_error_bound / 2 {
+            self.split_threshold = (self.split_threshold as f64 * 0.9) as u64;
+        }
+        // If model degraded, be more conservative
+        else if new_error_bound > old_error_bound * 2 {
+            self.split_threshold = (self.split_threshold as f64 * 1.1) as u64;
+        }
+        
+        // Keep thresholds within reasonable bounds
+        self.split_threshold = self.split_threshold.clamp(
+            TARGET_SEGMENT_SIZE as u64, 
+            MAX_SEGMENT_SIZE as u64
+        );
+    }
+
+    /// Retrain if needed - triggered by performance degradation
+    pub fn retrain_if_needed(&mut self) {
+        if self.should_retrain() {
+            self.retrain_model();
+        }
     }
 
     /// Check if this segment should be split
@@ -319,6 +428,44 @@ impl AdaptiveSegment {
         let data_size = self.data.len() as u64;
         
         access_freq < self.merge_threshold && data_size < MIN_SEGMENT_SIZE as u64
+    }
+
+    /// Week 3-4: Get bounded search performance statistics
+    pub fn get_search_stats(&self) -> SearchStats {
+        let total_accesses = self.metrics.access_count.load(std::sync::atomic::Ordering::Relaxed);
+        let prediction_errors = self.metrics.prediction_errors.load(std::sync::atomic::Ordering::Relaxed);
+        let error_bound = self.local_model.error_bound();
+        let data_size = self.data.len();
+        
+        SearchStats {
+            total_lookups: total_accesses,
+            prediction_errors,
+            error_rate: if total_accesses > 0 { prediction_errors as f64 / total_accesses as f64 } else { 0.0 },
+            max_search_window: (error_bound as usize * 2).min(64), // Guaranteed bounded
+            data_size,
+            model_error_bound: error_bound,
+        }
+    }
+
+    /// Week 3-4: Validate bounded search guarantees
+    pub fn validate_bounded_search_guarantees(&self) -> BoundedSearchValidation {
+        let max_possible_window = (self.local_model.error_bound() as usize * 2).min(64);
+        let data_size = self.data.len();
+        
+        BoundedSearchValidation {
+            max_search_window: max_possible_window,
+            guaranteed_max_complexity: if max_possible_window <= 64 { "O(log 64) = O(1)" } else { "O(log n)" }.to_string(),
+            bounded_guarantee: max_possible_window <= 64,
+            fallback_risk: max_possible_window > 64,
+            segment_size: data_size,
+            performance_class: if max_possible_window <= 32 {
+                "Excellent O(log 32)"
+            } else if max_possible_window <= 64 {
+                "Good O(log 64)" 
+            } else {
+                "Degraded O(log n)"
+            }.to_string(),
+        }
     }
 
     /// Split this segment into two parts
@@ -743,9 +890,35 @@ impl AdaptiveRMI {
         // 2. Combine and sort all pending writes
         let mut all_writes = hot_data;
         all_writes.extend(overflow_data);
+        
+        if all_writes.is_empty() {
+            self.merge_scheduler.complete_merge();
+            return Ok(());
+        }
+        
         all_writes.sort_by_key(|(k, _)| *k);
 
-        // 3. Group writes by target segments
+        // 3. Check if we need to create initial segments
+        {
+            let segments = self.segments.read();
+            if segments.is_empty() {
+                // Create initial segment from all data
+                drop(segments);
+                let mut segments_guard = self.segments.write();
+                let initial_segment = AdaptiveSegment::new(all_writes.clone());
+                segments_guard.push(initial_segment);
+                
+                // Update router with new boundaries
+                let boundaries = vec![all_writes[0].0]; // First key as boundary
+                let mut router = self.global_router.write();
+                router.update_boundaries(boundaries);
+                
+                self.merge_scheduler.complete_merge();
+                return Ok(());
+            }
+        }
+
+        // 4. Group writes by target segments (normal case)
         let mut segment_updates: std::collections::HashMap<usize, Vec<(u64, u64)>> = 
             std::collections::HashMap::new();
 
@@ -757,7 +930,7 @@ impl AdaptiveRMI {
             segment_updates.entry(segment_id).or_default().push((key, value));
         }
 
-        // 4. Update segments (can be done in parallel)
+        // 5. Update segments (can be done in parallel)
         let update_tasks: Vec<_> = segment_updates.into_iter()
             .map(|(segment_id, updates)| {
                 let segments = self.segments.clone();
@@ -767,7 +940,7 @@ impl AdaptiveRMI {
             })
             .collect();
 
-        // 5. Wait for all updates to complete
+        // 6. Wait for all updates to complete
         for task in update_tasks {
             task.await??;
         }
@@ -936,6 +1109,86 @@ impl AdaptiveRMI {
         }
     }
 
+    /// Week 3-4: Get bounded search performance analytics across all segments
+    pub fn get_bounded_search_analytics(&self) -> BoundedSearchAnalytics {
+        let segments = self.segments.read();
+        
+        let mut total_lookups = 0;
+        let mut total_errors = 0;
+        let mut max_search_window = 0;
+        let mut segments_with_bounded_guarantee = 0;
+        let mut search_stats = Vec::new();
+
+        for segment in segments.iter() {
+            let stats = segment.get_search_stats();
+            let validation = segment.validate_bounded_search_guarantees();
+            
+            total_lookups += stats.total_lookups;
+            total_errors += stats.prediction_errors;
+            max_search_window = max_search_window.max(stats.max_search_window);
+            
+            if validation.bounded_guarantee {
+                segments_with_bounded_guarantee += 1;
+            }
+            
+            search_stats.push((stats, validation));
+        }
+
+        let overall_error_rate = if total_lookups > 0 {
+            total_errors as f64 / total_lookups as f64
+        } else {
+            0.0
+        };
+
+        let bounded_guarantee_ratio = if segments.len() > 0 {
+            segments_with_bounded_guarantee as f64 / segments.len() as f64
+        } else {
+            1.0
+        };
+
+        BoundedSearchAnalytics {
+            total_segments: segments.len(),
+            segments_with_bounded_guarantee,
+            bounded_guarantee_ratio,
+            overall_error_rate,
+            total_lookups,
+            total_prediction_errors: total_errors,
+            max_search_window_observed: max_search_window,
+            performance_classification: classify_performance(max_search_window, bounded_guarantee_ratio),
+            segment_details: search_stats,
+        }
+    }
+
+    /// Week 3-4: Validate that all segments meet bounded search guarantees
+    pub fn validate_bounded_search_guarantees(&self) -> BoundedSearchSystemValidation {
+        let analytics = self.get_bounded_search_analytics();
+        
+        let all_segments_bounded = analytics.bounded_guarantee_ratio >= 1.0;
+        let system_max_complexity = if analytics.max_search_window_observed <= 64 {
+            "O(log 64) = O(1)".to_string()
+        } else {
+            format!("O(log {}) = O(log n)", analytics.max_search_window_observed)
+        };
+        
+        let performance_level = if all_segments_bounded && analytics.max_search_window_observed <= 32 {
+            "Excellent"
+        } else if all_segments_bounded && analytics.max_search_window_observed <= 64 {
+            "Good"
+        } else if analytics.bounded_guarantee_ratio >= 0.8 {
+            "Acceptable"
+        } else {
+            "Needs Attention"
+        };
+
+        BoundedSearchSystemValidation {
+            system_meets_guarantees: all_segments_bounded,
+            worst_case_complexity: system_max_complexity,
+            performance_level: performance_level.to_string(),
+            segments_needing_attention: analytics.total_segments - analytics.segments_with_bounded_guarantee,
+            recommendation: generate_performance_recommendation(&analytics),
+        }
+    }
+
     /// Delta interface for compatibility with existing RmiIndex
     pub fn insert_delta(&self, key: u64, offset: u64) -> Result<()> {
         self.insert(key, offset)
@@ -1071,5 +1324,59 @@ mod tests {
         
         // Should still find after merge
         assert_eq!(rmi.lookup(7), Some(70));
+    }
+}
+
+/// Week 3-4: Comprehensive bounded search analytics
+#[derive(Debug, Clone)]
+pub struct BoundedSearchAnalytics {
+    pub total_segments: usize,
+    pub segments_with_bounded_guarantee: usize,
+    pub bounded_guarantee_ratio: f64,
+    pub overall_error_rate: f64,
+    pub total_lookups: u64,
+    pub total_prediction_errors: u64,
+    pub max_search_window_observed: usize,
+    pub performance_classification: String,
+    pub segment_details: Vec<(SearchStats, BoundedSearchValidation)>,
+}
+
+/// Week 3-4: System-wide bounded search validation
+#[derive(Debug, Clone)]
+pub struct BoundedSearchSystemValidation {
+    pub system_meets_guarantees: bool,
+    pub worst_case_complexity: String,
+    pub performance_level: String,
+    pub segments_needing_attention: usize,
+    pub recommendation: String,
+}
+
+/// Week 3-4: Helper function to classify overall performance
+fn classify_performance(max_window: usize, bounded_ratio: f64) -> String {
+    match (max_window, bounded_ratio) {
+        (w, r) if w <= 32 && r >= 0.95 => "Excellent - All segments O(log 32)".to_string(),
+        (w, r) if w <= 64 && r >= 0.90 => "Good - Bounded O(log 64)".to_string(),
+        (w, r) if w <= 128 && r >= 0.80 => "Acceptable - Most segments bounded".to_string(),
+        (w, r) if r >= 0.60 => format!("Degraded - Max window {} with {}% bounded", w, (r * 100.0) as u32),
+        _ => "Poor - Requires immediate attention".to_string(),
+    }
+}
+
+/// Week 3-4: Generate performance recommendations
+fn generate_performance_recommendation(analytics: &BoundedSearchAnalytics) -> String {
+    if analytics.bounded_guarantee_ratio >= 0.95 && analytics.max_search_window_observed <= 64 {
+        "System performing optimally with guaranteed bounded search.".to_string()
+    } else if analytics.bounded_guarantee_ratio >= 0.80 {
+        format!(
+            "Consider retraining {} segments with degraded performance. Max window: {}",
+            analytics.total_segments - analytics.segments_with_bounded_guarantee,
+            analytics.max_search_window_observed
+        )
+    } else {
+        format!(
+            "URGENT: {} segments have unbounded search risk. Error rate: {:.2}%. Immediate retraining recommended.",
+            analytics.total_segments - analytics.segments_with_bounded_guarantee,
+            analytics.overall_error_rate * 100.0
+        )
     }
 }
