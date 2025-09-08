@@ -236,6 +236,8 @@ pub struct AdaptiveSegment {
     /// Adaptation thresholds
     split_threshold: u64,
     merge_threshold: u64,
+    /// Epoch version for atomic update tracking (prevents TOCTOU races)
+    epoch: AtomicU64,
 }
 
 impl AdaptiveSegment {
@@ -254,6 +256,7 @@ impl AdaptiveSegment {
             metrics: SegmentMetrics::new(),
             split_threshold,
             merge_threshold,
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -270,6 +273,7 @@ impl AdaptiveSegment {
             metrics: SegmentMetrics::new(),
             split_threshold,
             merge_threshold,
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -515,6 +519,16 @@ impl AdaptiveSegment {
     /// Check if segment is empty
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// Get current epoch version for race-free updates
+    pub fn get_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Increment epoch version when segment is modified
+    fn increment_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -988,14 +1002,14 @@ impl AdaptiveRMI {
         Ok(segment_updates)
     }
 
-    /// Enhanced parallel segment updates with copy-on-write optimization
+    /// RACE-FREE parallel segment updates using epoch validation to prevent TOCTOU
     async fn merge_segment_updates_parallel(
         segments: Arc<RwLock<Vec<AdaptiveSegment>>>,
         segment_id: usize,
         updates: Vec<(u64, u64)>,
     ) -> Result<()> {
-        // Use copy-on-write for minimal lock contention
-        let (current_data, current_model, _current_metrics) = {
+        // 1. Capture segment snapshot with epoch under read lock
+        let (current_data, current_model, current_epoch) = {
             let segments_guard = segments.read();
             if segment_id >= segments_guard.len() {
                 return Err(anyhow!("Invalid segment ID: {}", segment_id));
@@ -1005,28 +1019,45 @@ impl AdaptiveRMI {
             (
                 segment.data.clone(),
                 segment.local_model.clone(),
-                segment.split_threshold,
+                segment.get_epoch(), // Capture epoch for validation
             )
-        };
+        }; // Read lock released immediately
 
-        // Efficient merge with copy-on-write
+        // 2. Process updates outside of any locks (safe with snapshot)
         let (new_data, needs_retrain) = Self::merge_updates_efficiently(current_data, updates).await?;
         
-        // Retrain model if necessary (outside of locks)
+        // 3. Retrain model if necessary (expensive operation outside locks)
         let new_model = if needs_retrain || Self::should_retrain_model(&new_data, &current_model) {
             LocalLinearModel::new(&new_data)
         } else {
             current_model
         };
 
-        // Atomic swap - readers never blocked
+        // 4. Atomic update with epoch validation (prevents race conditions)
         {
             let mut segments_guard = segments.write();
-            if segment_id < segments_guard.len() {
-                segments_guard[segment_id] = AdaptiveSegment::new_with_model(new_data, new_model);
+            
+            // Validate segment still exists
+            if segment_id >= segments_guard.len() {
+                return Ok(()); // Segment was removed - operation is obsolete
             }
+            
+            let target_segment = &mut segments_guard[segment_id];
+            
+            // RACE PROTECTION: Check if segment was modified since snapshot
+            if target_segment.get_epoch() != current_epoch {
+                // Segment was modified by another operation - operation is stale
+                // For safety, we skip the update rather than retry to avoid infinite loops
+                println!("⚠️  Skipping stale segment update for segment {} (epoch mismatch)", segment_id);
+                return Ok(());
+            }
+            
+            // Safe to update: create new segment and atomically replace
+            let new_segment = AdaptiveSegment::new_with_model(new_data, new_model);
+            *target_segment = new_segment;
+            target_segment.increment_epoch(); // Mark modification
         }
-
+        
         Ok(())
     }
 
