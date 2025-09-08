@@ -163,25 +163,6 @@ curl http://localhost:3030/metrics | grep kyrodb_btree_reads_total
 
 ---
 
-## Phase 0 Goals
-
-**Current Focus**: Foundation rescue mission to achieve production-ready performance.
-
-### Critical Issues Being Fixed
-- ❌ **O(n) Performance Catastrophe**: Eliminating linear scan fallbacks
-- ❌ **Concurrency Deadlocks**: Replacing RwLocks with lock-free structures  
-- ❌ **Memory Leaks**: Implementing bounded resource usage
-- ❌ **Inconsistent Performance**: Guaranteeing bounded RMI performance
-
-### Success Criteria
-- ✅ **Zero O(n) fallbacks** under normal operation
-- ✅ **Sub-1ms P99 latency** on 10M+ keys
-- ✅ **No deadlocks** under concurrent load testing
-- ✅ **Bounded memory usage** with predictable performance
-- ✅ **10x PostgreSQL performance** on RMI-favorable workloads
-
----
-
 ## Contributing
 
 We welcome contributions focused on Phase 0 foundation work:

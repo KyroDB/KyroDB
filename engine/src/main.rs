@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
             // Background RMI rebuild triggers (feature-gated)
             #[cfg(feature = "learned-index")]
             if rmi_rebuild_appends.unwrap_or(0) > 0 || rmi_rebuild_ratio.unwrap_or(0.0) > 0.0 {
-                let data_dir = cli.data_dir.clone();
+                let _data_dir = cli.data_dir.clone();
                 let rebuild_log = log.clone();
                 let app_thresh = rmi_rebuild_appends.unwrap_or(0);
                 let ratio_thresh = rmi_rebuild_ratio.unwrap_or(0.0);
@@ -514,7 +514,7 @@ async fn main() -> Result<()> {
                     .and(warp::post())
                     .and_then(move || {
                         let log = build_log.clone();
-                        let data_dir = data_dir.clone();
+                        let _data_dir = data_dir.clone();
                         async move {
                             let pairs = log.collect_key_offset_pairs().await;
                             let timer =
