@@ -53,6 +53,7 @@ mod shim {
     pub static RMI_READS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static BTREE_READS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static LOOKUP_FALLBACK_SCAN_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static INDEX_FALLBACK_SCANS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static RMI_REBUILD_IN_PROGRESS: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
     #[allow(dead_code)]
     pub static RMI_REBUILD_STALLS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
@@ -72,6 +73,7 @@ mod shim {
 pub use shim::{
     inc_sse_lagged, render, rmi_rebuild_in_progress, APPENDS_TOTAL, APPEND_LATENCY_SECONDS,
     BTREE_READS_TOTAL, COMPACTIONS_TOTAL, COMPACTION_DURATION_SECONDS, LOOKUP_FALLBACK_SCAN_TOTAL,
+    INDEX_FALLBACK_SCANS_TOTAL,
     RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL, RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES,
     RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS, RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL,
     RMI_MISSES_TOTAL, RMI_PROBE_LEN, RMI_READS_TOTAL, RMI_REBUILDS_TOTAL,
@@ -315,6 +317,15 @@ pub static LOOKUP_FALLBACK_SCAN_TOTAL: Lazy<Counter> = Lazy::new(|| {
         "Total number of times we fell back to linear scan after RMI miss"
     )
     .expect("register kyrodb_lookup_fallback_scan_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static INDEX_FALLBACK_SCANS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_index_fallback_scans_total",
+        "Total number of emergency WAL scans when index corruption is suspected"
+    )
+    .expect("register kyrodb_index_fallback_scans_total")
 });
 
 #[cfg(not(feature = "bench-no-metrics"))]

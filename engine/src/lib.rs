@@ -30,7 +30,7 @@ pub mod metrics;
 
 // Phase 0 foundation modules
 #[cfg(feature = "learned-index")]
-pub mod concurrency;
+
 #[cfg(feature = "learned-index")]
 pub mod memory;
 #[cfg(feature = "learned-index")]
@@ -577,18 +577,10 @@ impl PersistentEventLog {
                         }
                     }
                     #[cfg(feature = "learned-index")]
-                    if !use_adaptive_rmi {
-                        // Legacy RMI loading only if not using adaptive
-                        if let Some(rmi_name) = j.get("rmi").and_then(|v| v.as_str()) {
-                            let rmi_path = data_dir.join(rmi_name);
-                            if rmi_path.exists() {
-                                if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
-                                    idx = index::PrimaryIndex::Rmi(rmi);
-                                }
-                            }
-                        }
+                    {
+                        // Note: Legacy RMI loading removed - only AdaptiveRMI is supported
+                        // AdaptiveRMI builds incrementally and doesn't need file loading
                     }
-                    // Note: Adaptive RMI doesn't need file loading as it builds incrementally
                 }
             }
         }
@@ -866,71 +858,140 @@ impl PersistentEventLog {
 
     /// Get offset for a given key if present via index with delta-first semantics.
     pub async fn lookup_key(&self, key: u64) -> Option<u64> {
-        // Try index first
-        {
-            let idx = self.index.read().await;
-            match &*idx {
-                index::PrimaryIndex::BTree(b) => return b.get(&key),
-                #[cfg(feature = "learned-index")]
-                index::PrimaryIndex::Rmi(r) => {
-                    if let Some(v) = r.delta_get(&key) {
-                        return Some(v);
-                    }
-                    // Measure RMI lookup latency overall and, if applicable, during rebuild window
-                    let timer_all = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                    #[cfg(not(feature = "bench-no-metrics"))]
-                    let rebuild_timer_opt = if crate::metrics::rmi_rebuild_in_progress() {
-                        Some(
-                            crate::metrics::RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS.start_timer(),
-                        )
-                    } else {
-                        None
-                    };
-                    let res = r.predict_get(&key);
-                    timer_all.observe_duration();
-                    #[cfg(not(feature = "bench-no-metrics"))]
-                    if let Some(t) = rebuild_timer_opt {
-                        t.observe_duration();
-                    }
-                    if let Some(v) = res {
-                        crate::metrics::RMI_HITS_TOTAL.inc();
-                        crate::metrics::RMI_READS_TOTAL.inc();
-                        return Some(v);
-                    } else {
-                        crate::metrics::RMI_MISSES_TOTAL.inc();
+        // Try index first - but prepare for corruption detection
+        let mut index_attempts = 0;
+        let mut suspicious_misses = 0;
+        
+        loop {
+            index_attempts += 1;
+            
+            // Try the primary index
+            let index_result = {
+                let idx = self.index.read().await;
+                match &*idx {
+                    index::PrimaryIndex::BTree(b) => b.get(&key),
+                    #[cfg(feature = "learned-index")]
+                    index::PrimaryIndex::AdaptiveRmi(adaptive) => {
+                        let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                        let result = adaptive.lookup(key);
+                        timer.observe_duration();
+                        
+                        if result.is_some() {
+                            crate::metrics::RMI_HITS_TOTAL.inc();
+                            crate::metrics::RMI_READS_TOTAL.inc();
+                        } else {
+                            crate::metrics::RMI_MISSES_TOTAL.inc();
+                        }
+                        result
                     }
                 }
-                #[cfg(feature = "learned-index")]
-                index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                    let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                    if let Some(value) = adaptive.lookup(key) {
-                        timer.observe_duration();
-                        crate::metrics::RMI_HITS_TOTAL.inc();
-                        crate::metrics::RMI_READS_TOTAL.inc();
-                        return Some(value);
-                    } else {
-                        timer.observe_duration();
-                        crate::metrics::RMI_MISSES_TOTAL.inc();
+            };
+            
+            // If we found something in the index, return it
+            if let Some(offset) = index_result {
+                return Some(offset);
+            }
+            
+            // Index miss - check if we should suspect corruption
+            suspicious_misses += 1;
+            
+            if self.should_suspect_index_corruption(index_attempts, suspicious_misses) {
+                // Index might be corrupted - perform emergency WAL scan
+                crate::metrics::INDEX_FALLBACK_SCANS_TOTAL.inc();
+                return self.emergency_wal_scan(key).await;
+            }
+            
+            // Try normal fallback scan first
+            crate::metrics::LOOKUP_FALLBACK_SCAN_TOTAL.inc();
+            if let Some((offset, _rec)) = self.find_key_scan(key).await {
+                return Some(offset);
+            }
+            
+            // If we've tried multiple times and still no luck, give up
+            if index_attempts >= 3 {
+                return None;
+            }
+        }
+    }
+
+    /// Determine if we should suspect index corruption based on lookup patterns
+    fn should_suspect_index_corruption(&self, attempts: u32, misses: u32) -> bool {
+        // Simple heuristic: if we've had multiple attempts with misses, suspect corruption
+        attempts > 1 && misses > 2
+    }
+
+    /// Emergency WAL scan when index corruption is suspected
+    async fn emergency_wal_scan(&self, target_key: u64) -> Option<u64> {
+        use std::io::{BufReader, Read};
+        use std::collections::HashMap;
+        
+        // Scan all WAL segments to find the latest record for the target key
+        let segments = Self::list_wal_segments(&self.data_dir);
+        let mut key_offsets: HashMap<u64, u64> = HashMap::new();
+        
+        for (_, segment_path) in segments {
+            if let Ok(file) = File::open(&segment_path) {
+                let mut reader = BufReader::new(file);
+                
+                // WAL format: [len:u32][frame][crc:u32]
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    if reader.read_exact(&mut len_buf).is_err() {
+                        break;
+                    }
+                    
+                    let len = u32::from_le_bytes(len_buf) as usize;
+                    if len > 16 * 1024 * 1024 {
+                        break; // Sanity check
+                    }
+                    
+                    let mut frame_buf = vec![0u8; len];
+                    if reader.read_exact(&mut frame_buf).is_err() {
+                        break;
+                    }
+                    
+                    let mut crc_buf = [0u8; 4];
+                    if reader.read_exact(&mut crc_buf).is_err() {
+                        break;
+                    }
+                    
+                    let crc_read = u32::from_le_bytes(crc_buf);
+                    let crc_calc = crc32c::crc32c(&frame_buf);
+                    
+                    if crc_read != crc_calc {
+                        break; // Corruption detected
+                    }
+                    
+                    // Try to deserialize event
+                    let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+                    if let Ok(event) = bopt.deserialize::<Event>(&frame_buf) {
+                        if let Some(record) = deserialize_record_compat(&event.payload) {
+                            // Keep the latest offset for each key
+                            match key_offsets.get(&record.key) {
+                                Some(existing_offset) if *existing_offset >= event.offset => {}
+                                _ => {
+                                    key_offsets.insert(record.key, event.offset);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        // Correctness fallback: linear scan for latest record
-        crate::metrics::LOOKUP_FALLBACK_SCAN_TOTAL.inc();
-        if let Some((off, _rec)) = self.find_key_scan(key).await {
-            return Some(off);
-        }
-        None
+        
+        // Return the offset for our target key if found
+        key_offsets.get(&target_key).copied()
     }
 
     /// Best-effort warmup: fault-in index pages and snapshot mmap.
     pub async fn warmup(&self) {
-        // Warm RMI index if present
+        // Warm AdaptiveRMI index if present
         #[cfg(feature = "learned-index")]
         {
             let idx = self.index.read().await;
-            if let index::PrimaryIndex::Rmi(r) = &*idx {
-                r.warm();
+            if let index::PrimaryIndex::AdaptiveRmi(_adaptive) = &*idx {
+                // AdaptiveRMI warms up automatically during operation
+                // No explicit warming needed
             }
         }
         // Touch snapshot mmap pages to reduce first access latency
@@ -1148,7 +1209,7 @@ impl PersistentEventLog {
         fail::fail_point!("manifest_before_write", |_| {
             Err(anyhow::anyhow!("failpoint: manifest_before_write"))
         });
-        let mut manifest = serde_json::json!({
+        let manifest = serde_json::json!({
             "next_offset": self.get_offset().await,
             "snapshot": "snapshot.bin",
             "wal_segments": self.current_wal_segments(),
@@ -1156,13 +1217,11 @@ impl PersistentEventLog {
             "ts": chrono::Utc::now().timestamp()
         });
         
-        // Only include RMI path for legacy RMI (adaptive RMI doesn't persist to file)
+        // Note: AdaptiveRMI doesn't persist to file, so no RMI entry needed
         #[cfg(feature = "learned-index")]
         {
-            let idx_guard = self.index.read().await;
-            if matches!(&*idx_guard, index::PrimaryIndex::Rmi(_)) {
-                manifest["rmi"] = serde_json::Value::String("index-rmi.bin".to_string());
-            }
+            // Legacy RMI support removed - AdaptiveRMI only
+            // AdaptiveRMI builds incrementally and doesn't need manifest entries
         }
         let tmp = self.data_dir.join("manifest.tmp");
         let mut f = File::create(&tmp).context("create manifest.tmp")?;
@@ -1194,35 +1253,31 @@ impl PersistentEventLog {
         let delta_pairs: Vec<(u64, u64)> = {
             let guard = self.index.read().await;
             match &*guard {
-                index::PrimaryIndex::Rmi(old_rmi) => {
-                    old_rmi.delta_pairs()
+                index::PrimaryIndex::BTree(_) => {
+                    // BTree doesn't maintain deltas
+                    Vec::new()
                 }
                 #[cfg(feature = "learned-index")]
                 index::PrimaryIndex::AdaptiveRmi(_) => {
                     // Adaptive RMI doesn't use delta - data is maintained differently
                     Vec::new()
                 }
-                _ => Vec::new(),
             }
         };
         
         // Step 2: Apply delta to new index outside critical section
         // This is the expensive operation that was causing deadlocks
         match &mut new_index {
-            index::PrimaryIndex::Rmi(new_rmi) => {
-                for (k, v) in delta_pairs {
-                    new_rmi.insert_delta(k, v);
-                }
-            }
             index::PrimaryIndex::BTree(btree) => {
                 for (k, v) in delta_pairs {
                     btree.insert(k, v);
                 }
             }
             #[cfg(feature = "learned-index")]
-            index::PrimaryIndex::AdaptiveRmi(_) => {
-                // Adaptive RMI doesn't use delta pattern - it handles data internally
-                // No migration needed as it builds from WAL during initialization
+            index::PrimaryIndex::AdaptiveRmi(adaptive) => {
+                // AdaptiveRMI handles updates differently - rebuild from scratch
+                let all_pairs = self.collect_key_offset_pairs().await;
+                *adaptive = Arc::new(crate::adaptive_rmi::AdaptiveRMI::build_from_pairs(&all_pairs));
             }
         }
         

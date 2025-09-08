@@ -1,7 +1,7 @@
 //! KyroDB Engine - High-performance CLI and HTTP server
 //! 
-//! Optimized for maximum throughput and minimal latency with learned indexes,
-//! lock-free concurrency, and enterprise-grade durability.
+//! Raw performance mode: No authentication, no rate limiting.
+//! Pure database engine focused on maximum throughput and minimal latency.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -10,75 +10,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
-
-// Rate limiting (simple token-bucket per client IP)
-use dashmap::DashMap;
-use std::time::Instant;
-
-#[derive(Clone)]
-struct SimpleRateLimiter {
-    capacity: f64,
-    refill_per_sec: f64,
-    buckets: Arc<DashMap<String, (f64, Instant)>>,
-}
-
-impl SimpleRateLimiter {
-    fn new(rps: f64, burst: f64) -> Self {
-        Self {
-            capacity: burst.max(1.0),
-            refill_per_sec: rps.max(0.1),
-            buckets: Arc::new(DashMap::new()),
-        }
-    }
-    
-    fn allow(&self, key: &str, cost: f64) -> bool {
-        let now = Instant::now();
-        let mut entry = self
-            .buckets
-            .entry(key.to_string())
-            .or_insert_with(|| (self.capacity, now));
-        let (ref mut tokens, ref mut last) = *entry;
-        let elapsed = now.duration_since(*last).as_secs_f64();
-        if elapsed > 0.0 {
-            let new_tokens = (*tokens + elapsed * self.refill_per_sec).min(self.capacity);
-            *tokens = new_tokens;
-            *last = now;
-        }
-        if *tokens >= cost {
-            *tokens -= cost;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-#[derive(Debug)]
-struct RateLimited;
-impl warp::reject::Reject for RateLimited {}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(default)
-}
-
-fn mk_rl_filter(
-    limiter: SimpleRateLimiter,
-) -> impl Filter<Extract = ((),), Error = warp::Rejection> + Clone {
-    warp::addr::remote().and_then(move |addr: Option<std::net::SocketAddr>| {
-        let limiter = limiter.clone();
-        async move {
-            let key = addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
-            if limiter.allow(&key, 1.0) {
-                Ok(())
-            } else {
-                Err(warp::reject::custom(RateLimited))
-            }
-        }
-    })
-}
 
 #[derive(Parser)]
 #[command(name = "kyrodb-engine", about = "KyroDB Engine - High-performance KV Database")]
@@ -132,10 +63,6 @@ enum Commands {
         /// Compact when WAL bytes exceed this threshold (0 to disable)
         #[arg(long, default_value_t = 0)]
         compact_when_wal_bytes: u64,
-        
-        /// Enable rate limiting (defaults to disabled for full throttle)
-        #[arg(long)]
-        enable_rate_limiting: bool,
     },
 }
 
@@ -176,7 +103,6 @@ async fn main() -> Result<()> {
             wal_max_segments,
             compact_interval_secs,
             compact_when_wal_bytes,
-            enable_rate_limiting,
         } => {
             // Silence unused when learned-index feature is disabled
             #[cfg(not(feature = "learned-index"))]
@@ -314,84 +240,30 @@ async fn main() -> Result<()> {
                         if (app_thresh > 0 && appended >= app_thresh)
                             || (ratio_thresh > 0.0 && ratio >= ratio_thresh)
                         {
-                            let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
-                            let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
                             let rebuild_timer =
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
                             engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                            // Write index on blocking thread
-                            let pairs_clone = pairs.clone();
-                            let tmp_clone = tmp.clone();
-                            let write_res = tokio::task::spawn_blocking(move || {
-                                engine_crate::index::RmiIndex::write_from_pairs_auto(
-                                    &tmp_clone,
-                                    &pairs_clone,
-                                )
-                            })
-                            .await;
-                            if let Ok(Err(e)) = write_res {
-                                eprintln!("❌ RMI rebuild write failed: {}", e);
-                                rebuild_timer.observe_duration();
-                                engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
-                                continue;
-                            }
-                            if write_res.is_err() {
-                                eprintln!("❌ RMI rebuild task panicked");
-                                rebuild_timer.observe_duration();
-                                engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
-                                continue;
-                            }
-                            if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-                                let _ = f.sync_all();
-                            }
-                            if let Err(e) = std::fs::rename(&tmp, &dst) {
-                                eprintln!("❌ RMI rename failed: {}", e);
-                                rebuild_timer.observe_duration();
-                                engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
-                                continue;
-                            }
-                            // Ensure directory metadata is durable after rename
-                            if let Err(e) = engine_crate::fsync_dir(std::path::Path::new(&data_dir))
-                            {
-                                eprintln!(
-                                    "⚠️ fsync data dir after RMI rebuild rename failed: {}",
-                                    e
-                                );
-                            }
-                            if let Some(rmi) = engine_crate::index::RmiIndex::load_from_file(&dst) {
-                                rebuild_log
-                                    .swap_primary_index(engine_crate::index::PrimaryIndex::Rmi(rmi))
-                                    .await;
-                                last_built = cur;
-                                engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                                rebuild_timer.observe_duration();
-                                let _ = rebuild_log.write_manifest().await;
-                                println!("✅ RMI rebuilt, swapped, and manifest committed (appended={}, ratio={:.3})", appended, ratio);
-                            } else {
-                                eprintln!("❌ RMI reload failed after rebuild");
-                                rebuild_timer.observe_duration();
-                            }
+                            
+                            // Build new AdaptiveRMI from current data
+                            let new_index = engine_crate::index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
+                            
+                            // Swap to the new index
+                            rebuild_log.swap_primary_index(new_index).await;
+                            
+                            last_built = cur;
+                            rebuild_timer.observe_duration();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
+                            let _ = rebuild_log.write_manifest().await;
+                            println!("✅ AdaptiveRMI rebuilt successfully (appended={}, ratio={:.3})", appended, ratio);
                         }
                     }
                 });
             }
 
-            // Rate limiting setup
-            let rate_limiter = if enable_rate_limiting {
-                let data_rps = env_f64("KYRODB_RL_RPS", 5000.0);
-                let data_burst = env_f64("KYRODB_RL_BURST", 10000.0);
-                Some(SimpleRateLimiter::new(data_rps, data_burst))
-            } else {
-                None
-            };
-            
-            if enable_rate_limiting {
-                println!("⚡ Rate limiting enabled via CLI");
-            } else {
-                println!("🚀 Rate limiting disabled - full throttle mode");
-            }
+            println!("🚀 KyroDB Engine - Raw Performance Mode");
+            println!("📍 Data directory: {}", cli.data_dir);
+            println!("💾 Full throttle - no rate limiting, no authentication");
 
             // Core HTTP API endpoints
             let v1 = warp::path("v1");
@@ -645,39 +517,19 @@ async fn main() -> Result<()> {
                         let data_dir = data_dir.clone();
                         async move {
                             let pairs = log.collect_key_offset_pairs().await;
-                            let tmp = std::path::Path::new(&data_dir).join("index-rmi.tmp");
-                            let dst = std::path::Path::new(&data_dir).join("index-rmi.bin");
                             let timer =
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
                             engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                            let pairs_clone = pairs.clone();
-                            let tmp_clone = tmp.clone();
-                            let write_res = tokio::task::spawn_blocking(move || {
-                                engine_crate::index::RmiIndex::write_from_pairs_auto(
-                                    &tmp_clone,
-                                    &pairs_clone,
-                                )
-                            })
-                            .await;
-                            let mut ok = matches!(write_res, Ok(Ok(())));
-                            if ok {
-                                if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp) {
-                                    let _ = f.sync_all();
-                                }
-                                if let Err(e) = std::fs::rename(&tmp, &dst) {
-                                    eprintln!("❌ RMI rename failed: {}", e);
-                                    ok = false;
-                                }
-                                if let Err(e) =
-                                    engine_crate::fsync_dir(std::path::Path::new(&data_dir))
-                                {
-                                    eprintln!(
-                                        "⚠️ fsync data dir after RMI build rename failed: {}",
-                                        e
-                                    );
-                                }
-                            }
+                            
+                            // Build new AdaptiveRMI from current data
+                            let new_index = engine_crate::index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
+                            
+                            // Swap to the new index
+                            log.swap_primary_index(new_index).await;
+                            
+                            let ok = true; // AdaptiveRMI build always succeeds
+                            
                             timer.observe_duration();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
                             Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
@@ -748,53 +600,27 @@ async fn main() -> Result<()> {
                     }
                 });
 
-            // Apply rate limiting to routes if enabled
-            let routes = if let Some(limiter) = rate_limiter {
-                let rl_filter = mk_rl_filter(limiter);
-                put_route.and(rl_filter.clone()).map(|r, ()| r)
-                    .or(put_fast_route.and(rl_filter.clone()).map(|r, ()| r))
-                    .or(lookup_route.and(rl_filter.clone()).map(|r, ()| r))
-                    .or(lookup_fast.and(rl_filter.clone()).map(|r, ()| r))
-                    .or(get_fast.and(rl_filter.clone()).map(|r, ()| r))
-                    .or(snapshot_route.and(rl_filter.clone()).map(|r, ()| r))
-                    .or(compact_route.and(rl_filter.clone()).map(|r, ()| r))
-                    .or(rmi_build.and(rl_filter.clone()).map(|r, ()| r))
-                    .or(warmup.and(rl_filter).map(|r, ()| r))
-                    .or(health_route)
-                    .or(build_info_route)
-                    .or(metrics_route)
-                    .or(offset_route)
-                    .boxed()
-            } else {
-                put_route
-                    .or(put_fast_route)
-                    .or(lookup_route)
-                    .or(lookup_fast)
-                    .or(get_fast)
-                    .or(snapshot_route)
-                    .or(compact_route)
-                    .or(rmi_build)
-                    .or(warmup)
-                    .or(health_route)
-                    .or(build_info_route)
-                    .or(metrics_route)
-                    .or(offset_route)
-                    .boxed()
-            };
+            // Clean routes without rate limiting
+            let routes = put_route
+                .or(put_fast_route)
+                .or(lookup_route)
+                .or(lookup_fast)
+                .or(get_fast)
+                .or(snapshot_route)
+                .or(compact_route)
+                .or(rmi_build)
+                .or(warmup)
+                .or(health_route)
+                .or(build_info_route)
+                .or(metrics_route)
+                .or(offset_route);
 
-            // Apply error recovery
-            let routes = routes.recover(|rej: warp::Rejection| async move {
-                if rej.find::<RateLimited>().is_some() {
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error":"rate_limited"})),
-                        warp::http::StatusCode::TOO_MANY_REQUESTS,
-                    ))
-                } else {
-                    Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"error":"not found"})),
-                        warp::http::StatusCode::NOT_FOUND,
-                    ))
-                }
+            // Simple error recovery
+            let routes = routes.recover(|_rej: warp::Rejection| async move {
+                Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({"error":"not found"})),
+                    warp::http::StatusCode::NOT_FOUND,
+                ))
             });
 
             // Apply compression middleware
