@@ -11,6 +11,79 @@ use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
 
+/// Adaptive system load detection for background task throttling
+fn detect_system_load_multiplier() -> u64 {
+    let mut load_signals = 0;
+
+    // Signal 1: Check container CPU throttling (if available)
+    if let Ok(cpu_stat) = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.stat") {
+        for line in cpu_stat.lines() {
+            if line.starts_with("nr_throttled") {
+                if let Some(value_str) = line.split_whitespace().nth(1) {
+                    if let Ok(throttled) = value_str.parse::<u64>() {
+                        if throttled > 0 {
+                            load_signals += 1; // Container CPU throttling detected
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Signal 2: Check system load average
+    if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
+        if let Some(load_str) = loadavg.split_whitespace().next() {
+            if let Ok(load) = load_str.parse::<f64>() {
+                let cpu_count = std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1) as f64;
+                let load_ratio = load / cpu_count;
+                
+                if load_ratio > 2.0 {
+                    load_signals += 2; // Very high load
+                } else if load_ratio > 1.0 {
+                    load_signals += 1; // High load
+                }
+            }
+        }
+    }
+
+    // Signal 3: Check memory pressure
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        let mut available_kb = 0u64;
+        let mut total_kb = 0u64;
+        
+        for line in meminfo.lines() {
+            if line.starts_with("MemAvailable:") {
+                if let Some(value) = line.split_whitespace().nth(1) {
+                    available_kb = value.parse().unwrap_or(0);
+                }
+            } else if line.starts_with("MemTotal:") {
+                if let Some(value) = line.split_whitespace().nth(1) {
+                    total_kb = value.parse().unwrap_or(0);
+                }
+            }
+        }
+        
+        if total_kb > 0 {
+            let available_ratio = available_kb as f64 / total_kb as f64;
+            if available_ratio < 0.1 {
+                load_signals += 2; // Very low memory
+            } else if available_ratio < 0.25 {
+                load_signals += 1; // Low memory
+            }
+        }
+    }
+
+    // Calculate interval multiplier based on load signals
+    match load_signals {
+        0 => 1,      // No pressure - normal intervals
+        1 => 2,      // Low pressure - 2x slower
+        2..=3 => 4,  // Medium pressure - 4x slower  
+        _ => 8,      // High pressure - 8x slower
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "kyrodb-engine", about = "KyroDB Engine - High-performance KV Database")]
 struct Cli {
@@ -121,27 +194,59 @@ async fn main() -> Result<()> {
                     .await;
             }
 
-            // Background, size-based compaction trigger
+            // Background, size-based compaction trigger with adaptive monitoring
             if let Some(maxb) = wal_max_bytes {
                 if maxb > 0 {
                     let log_for_size = log.clone();
                     tokio::spawn(async move {
-                        let mut interval =
-                            tokio::time::interval(tokio::time::Duration::from_secs(2));
+                        let mut base_check_interval = 2u64; 
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(base_check_interval));
+                        let mut last_load_check = std::time::Instant::now();
+                        let mut consecutive_failures = 0;
+                        
                         loop {
                             interval.tick().await;
+                            
+                            // Adapt check frequency based on system load every 60 seconds
+                            let now = std::time::Instant::now();
+                            if now.duration_since(last_load_check).as_secs() >= 60 {
+                                last_load_check = now;
+                                let load_multiplier = detect_system_load_multiplier();
+                                let new_interval = base_check_interval * load_multiplier;
+                                
+                                if new_interval != interval.period().as_secs() {
+                                    println!("🔧 Adapting WAL size check interval: {}s -> {}s", 
+                                        interval.period().as_secs(), new_interval);
+                                    interval = tokio::time::interval(tokio::time::Duration::from_secs(new_interval));
+                                }
+                            }
+                            
                             let size = log_for_size.wal_size_bytes();
                             if size >= maxb {
                                 println!(
                                     "📦 Size-based compaction: wal={} bytes >= {}",
                                     size, maxb
                                 );
-                                if let Err(e) =
-                                    log_for_size.compact_keep_latest_and_snapshot().await
-                                {
-                                    eprintln!("❌ Size-based compaction failed: {}", e);
-                                } else {
-                                    println!("✅ Size-based compaction complete.");
+                                
+                                // Yield to foreground operations before heavy compaction
+                                tokio::task::yield_now().await;
+                                
+                                match log_for_size.compact_keep_latest_and_snapshot().await {
+                                    Ok(_) => {
+                                        println!("✅ Size-based compaction complete.");
+                                        consecutive_failures = 0;
+                                    }
+                                    Err(e) => {
+                                        consecutive_failures += 1;
+                                        eprintln!("❌ Size-based compaction failed (attempt {}): {}", consecutive_failures, e);
+                                        
+                                        // Back off after repeated failures to prevent resource exhaustion
+                                        if consecutive_failures > 2 {
+                                            let backoff_duration = std::cmp::min(consecutive_failures * 10, 120); // Max 2 minutes
+                                            println!("🔄 Backing off size-based compaction for {} seconds", backoff_duration);
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_duration)).await;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -149,23 +254,58 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Background interval compaction
+            // Background interval compaction with adaptive resource management
             if compact_interval_secs > 0 {
                 let log_for_compact = log.clone();
                 tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
-                        compact_interval_secs,
-                    ));
+                    let mut base_interval = compact_interval_secs;
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(base_interval));
+                    let mut last_cpu_check = std::time::Instant::now();
+                    let mut error_count = 0;
+                    
                     loop {
                         interval.tick().await;
+                        
+                        // Adaptive interval adjustment based on system load every 30 seconds
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_cpu_check).as_secs() >= 30 {
+                            last_cpu_check = now;
+                            
+                            // Check system load and adapt interval
+                            let load_multiplier = detect_system_load_multiplier();
+                            let new_interval = base_interval * load_multiplier;
+                            
+                            if new_interval != interval.period().as_secs() {
+                                println!("🔧 Adapting compaction interval: {}s -> {}s (load factor: {}x)", 
+                                    interval.period().as_secs(), new_interval, load_multiplier);
+                                interval = tokio::time::interval(tokio::time::Duration::from_secs(new_interval));
+                            }
+                        }
+                        
+                        // Check if compaction should run based on conditions
                         if compact_when_wal_bytes == 0
                             || log_for_compact.wal_size_bytes() >= compact_when_wal_bytes
                         {
-                            if let Err(e) = log_for_compact.compact_keep_latest_and_snapshot().await
-                            {
-                                eprintln!("❌ Interval compaction failed: {}", e);
-                            } else {
-                                println!("✅ Interval compaction complete.");
+                            // Yield to other tasks before heavy operation
+                            tokio::task::yield_now().await;
+                            
+                            match log_for_compact.compact_keep_latest_and_snapshot().await {
+                                Ok(_) => {
+                                    println!("✅ Interval compaction complete.");
+                                    error_count = 0; // Reset error count on success
+                                }
+                                Err(e) => {
+                                    error_count += 1;
+                                    eprintln!("❌ Interval compaction failed (attempt {}): {}", error_count, e);
+                                    
+                                    // Implement exponential backoff for repeated failures
+                                    if error_count > 3 {
+                                        let backoff_secs = std::cmp::min(error_count * 30, 300); // Max 5 minutes
+                                        println!("🔄 Backing off compaction for {} seconds due to repeated failures", backoff_secs);
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                                        error_count = 0; // Reset after backoff
+                                    }
+                                }
                             }
                         }
                     }

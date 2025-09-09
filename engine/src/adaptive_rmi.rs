@@ -39,6 +39,75 @@ const BASE_MANAGEMENT_INTERVAL_SEC: u64 = 5;
 const BASE_STATS_INTERVAL_SEC: u64 = 30;
 const MAX_INTERVAL_MULTIPLIER: u64 = 8; // Maximum slowdown under high CPU pressure
 
+/// Centralized error handler for background operations
+#[derive(Debug)]
+struct BackgroundErrorHandler {
+    merge_errors: AtomicUsize,
+    management_errors: AtomicUsize,
+    last_error_time: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl BackgroundErrorHandler {
+    fn new() -> Self {
+        Self {
+            merge_errors: AtomicUsize::new(0),
+            management_errors: AtomicUsize::new(0),
+            last_error_time: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Handle background merge errors with exponential backoff
+    async fn handle_merge_error(&self, error: anyhow::Error) -> bool {
+        let error_count = self.merge_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        
+        // Update last error time
+        {
+            let mut last_time = self.last_error_time.lock().unwrap();
+            *last_time = Some(std::time::Instant::now());
+        }
+        
+        eprintln!("❌ Background merge error #{}: {}", error_count, error);
+        
+        // Exponential backoff: 1s, 2s, 4s, 8s, max 60s
+        if error_count > 1 {
+            let backoff_secs = std::cmp::min(2_u64.pow((error_count - 1) as u32), 60);
+            println!("🔄 Backing off merge operations for {} seconds", backoff_secs);
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        }
+        
+        // Stop retrying after 10 consecutive errors
+        error_count < 10
+    }
+
+    /// Handle management operation errors
+    fn handle_management_error(&self, error: anyhow::Error) {
+        let error_count = self.management_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!("❌ Background management error #{}: {}", error_count, error);
+        
+        // Reset error count after successful operations
+        if error_count > 5 {
+            println!("⚠️  Too many management errors, may need manual intervention");
+        }
+    }
+
+    /// Reset error counts on successful operations
+    fn reset_merge_errors(&self) {
+        self.merge_errors.store(0, Ordering::Relaxed);
+    }
+
+    fn reset_management_errors(&self) {
+        self.management_errors.store(0, Ordering::Relaxed);
+    }
+
+    /// Get error statistics
+    fn stats(&self) -> (usize, usize) {
+        (
+            self.merge_errors.load(Ordering::Relaxed),
+            self.management_errors.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Maximum search window size - strict bound to prevent O(n) behavior
 const MAX_SEARCH_WINDOW: usize = 64;
 
@@ -1863,10 +1932,11 @@ impl AdaptiveRMI {
     }
     */
 
-    /// Enhanced background maintenance task with adaptive scheduling and CPU pressure detection
+    /// Enhanced background maintenance task with adaptive scheduling and robust error handling
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut cpu_detector = CPUPressureDetector::new();
+            let error_handler = BackgroundErrorHandler::new();
             
             // Initial intervals (will adapt based on CPU pressure)
             let mut merge_interval = tokio::time::interval(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS));
@@ -1875,7 +1945,7 @@ impl AdaptiveRMI {
             
             let mut last_pressure_check = std::time::Instant::now();
             
-            println!("Starting adaptive background maintenance with CPU pressure detection");
+            println!("🚀 Starting adaptive background maintenance with CPU pressure detection and robust error handling");
             
             loop {
                 // Periodically adjust intervals based on CPU pressure
@@ -1886,7 +1956,7 @@ impl AdaptiveRMI {
                     let multiplier = cpu_detector.interval_multiplier(pressure);
                     
                     if multiplier > 1 {
-                        println!("CPU pressure detected (level {}), adjusting background task intervals by {}x", pressure, multiplier);
+                        println!("🔧 CPU pressure detected (level {}), adjusting background task intervals by {}x", pressure, multiplier);
                         
                         // Create new intervals with adapted timing
                         merge_interval = tokio::time::interval(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS * multiplier));
@@ -1915,8 +1985,20 @@ impl AdaptiveRMI {
                         };
                         
                         if should_merge {
-                            if let Err(e) = self.merge_hot_buffer().await {
-                                eprintln!("Background merge error: {}", e);
+                            // Yield to foreground operations before heavy merge
+                            tokio::task::yield_now().await;
+                            
+                            match self.merge_hot_buffer().await {
+                                Ok(_) => {
+                                    error_handler.reset_merge_errors();
+                                }
+                                Err(e) => {
+                                    let should_continue = error_handler.handle_merge_error(e).await;
+                                    if !should_continue {
+                                        eprintln!("🛑 Too many merge errors, stopping background maintenance");
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1927,16 +2009,26 @@ impl AdaptiveRMI {
                             continue; // Skip this management cycle under high pressure
                         }
                         
-                        // Advanced adaptive segment management
-                        if let Err(e) = self.adaptive_segment_management().await {
-                            eprintln!("Segment management error: {}", e);
-                        } else {
-                            // println!("Adaptive segment management cycle completed");
+                        // Advanced adaptive segment management with error handling
+                        match self.adaptive_segment_management().await {
+                            Ok(_) => {
+                                error_handler.reset_management_errors();
+                            }
+                            Err(e) => {
+                                error_handler.handle_management_error(e);
+                            }
                         }
                     }
                     _ = stats_interval.tick() => {
                         // Periodic performance analytics and health checks
                         self.log_performance_analytics().await;
+                        
+                        // Log error statistics
+                        let (merge_errors, mgmt_errors) = error_handler.stats();
+                        if merge_errors > 0 || mgmt_errors > 0 {
+                            println!("📊 Background error stats: {} merge errors, {} management errors", 
+                                merge_errors, mgmt_errors);
+                        }
                     }
                 }
             }

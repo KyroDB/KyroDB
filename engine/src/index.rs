@@ -113,12 +113,26 @@ impl PrimaryIndex {
         matches!(self, PrimaryIndex::AdaptiveRmi(_))
     }
 
-    /// Start background maintenance for adaptive RMI
+    /// Start background maintenance for adaptive RMI (single instance protection)
     #[cfg(feature = "learned-index")]
     pub fn start_background_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
         match self {
             PrimaryIndex::AdaptiveRmi(ar) => {
-                Some(ar.clone().start_background_maintenance())
+                // Only start if not already running - prevent multiple background tasks
+                static MAINTENANCE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                
+                if MAINTENANCE_STARTED.compare_exchange(
+                    false, 
+                    true, 
+                    std::sync::atomic::Ordering::SeqCst, 
+                    std::sync::atomic::Ordering::SeqCst
+                ).is_ok() {
+                    println!("🚀 Starting single adaptive RMI background maintenance task");
+                    Some(ar.clone().start_background_maintenance())
+                } else {
+                    println!("⚠️  Background maintenance already running, skipping duplicate start");
+                    None
+                }
             }
             _ => None,
         }
