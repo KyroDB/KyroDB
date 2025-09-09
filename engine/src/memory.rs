@@ -138,10 +138,31 @@ impl MemoryManager {
         }
     }
     
-    /// Allocate memory with bounds checking and pressure monitoring
+    /// Allocate memory with enhanced pool-first strategy and robust back-pressure
     pub fn allocate(&self, size: usize) -> MemoryResult<Vec<u8>> {
         if size == 0 {
             return MemoryResult::Success(Vec::new());
+        }
+        
+        // ENHANCEMENT: Always check pool first, regardless of pressure level
+        if let Ok(buffer) = self.try_from_pool_enhanced(size) {
+            self.track_allocation(size);
+            return MemoryResult::Success(buffer);
+        }
+        
+        // Check memory pressure and handle accordingly
+        let current_pressure = self.memory_pressure();
+        
+        if current_pressure == MemoryPressure::High {
+            // ENHANCEMENT: Implement forced eviction under critical pressure
+            if let Ok(_) = self.force_eviction(size) {
+                // Try pool again after forced eviction
+                if let Ok(buffer) = self.try_from_pool_enhanced(size) {
+                    self.track_allocation(size);
+                    return MemoryResult::Success(buffer);
+                }
+            }
+            return MemoryResult::OutOfMemory;
         }
         
         // Check if allocation would exceed limits
@@ -183,6 +204,81 @@ impl MemoryManager {
         }
     }
     
+    /// Enhanced pool access that always tries pool first regardless of pressure
+    fn try_from_pool_enhanced(&self, size: usize) -> Result<Vec<u8>, MemoryError> {
+        let mut pool = self.buffer_pool.lock();
+        
+        // Always try pool first, even under pressure (principle: reuse before allocate)
+        let buffer = match size {
+            0..=4096 => pool.small_buffers.pop_front().map(|tb| tb.buffer),
+            4097..=65536 => pool.medium_buffers.pop_front().map(|tb| tb.buffer),
+            _ => pool.large_buffers.pop_front().map(|tb| tb.buffer),
+        };
+        
+        if let Some(mut buf) = buffer {
+            buf.clear();
+            buf.resize(size, 0);
+            pool.total_pooled = pool.total_pooled.saturating_sub(buf.capacity());
+            pool.pool_hits += 1;
+            Ok(buf)
+        } else {
+            pool.pool_misses += 1;
+            Err(MemoryError::PoolExhausted)
+        }
+    }
+    
+    /// Force eviction of buffers and cache to free memory for critical allocations
+    fn force_eviction(&self, needed_size: usize) -> Result<(), MemoryError> {
+        let mut total_freed = 0;
+        
+        // Force pool eviction first
+        {
+            let mut pool = self.buffer_pool.lock();
+            
+            // Calculate how many buffers to evict from each pool
+            let small_to_evict = pool.small_buffers.len() / 2;  // Evict half
+            let medium_to_evict = pool.medium_buffers.len() / 2;
+            let large_to_evict = pool.large_buffers.len() / 2;
+            
+            // Evict small buffers
+            for _ in 0..small_to_evict {
+                if let Some(buffer) = pool.small_buffers.pop_front() {
+                    total_freed += buffer.buffer.capacity();
+                    pool.total_pooled = pool.total_pooled.saturating_sub(buffer.buffer.capacity());
+                    pool.eviction_count += 1;
+                }
+            }
+            
+            // Evict medium buffers
+            for _ in 0..medium_to_evict {
+                if let Some(buffer) = pool.medium_buffers.pop_front() {
+                    total_freed += buffer.buffer.capacity();
+                    pool.total_pooled = pool.total_pooled.saturating_sub(buffer.buffer.capacity());
+                    pool.eviction_count += 1;
+                }
+            }
+            
+            // Evict large buffers (these free the most memory)
+            for _ in 0..large_to_evict {
+                if let Some(buffer) = pool.large_buffers.pop_front() {
+                    total_freed += buffer.buffer.capacity();
+                    pool.total_pooled = pool.total_pooled.saturating_sub(buffer.buffer.capacity());
+                    pool.eviction_count += 1;
+                }
+            }
+        }
+        
+        // Force cache eviction for additional memory
+        let cache_freed = self.try_cache_eviction(needed_size).map(|_| needed_size).unwrap_or(0);
+        total_freed += cache_freed;
+        
+        if total_freed >= needed_size {
+            Ok(())
+        } else {
+            Err(MemoryError::CacheEvictionFailed)
+        }
+    }
+
     /// Robust buffer pool access that respects memory pressure
     fn try_buffer_pool_robust(&self, size: usize, pressure: MemoryPressure) -> Result<Vec<u8>, MemoryError> {
         let mut pool = self.buffer_pool.lock();

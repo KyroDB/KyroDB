@@ -47,6 +47,98 @@ struct BackgroundErrorHandler {
     last_error_time: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
+/// Enhanced adaptive interval controller for background tasks
+#[derive(Debug)]
+struct AdaptiveInterval {
+    base_duration: std::time::Duration,
+    current_duration: std::time::Duration,
+    min_duration: std::time::Duration,
+    max_duration: std::time::Duration,
+    last_completion_time: Option<std::time::Duration>,
+    consecutive_errors: usize,
+    performance_history: VecDeque<std::time::Duration>,
+}
+
+impl AdaptiveInterval {
+    fn new(base_duration: std::time::Duration) -> Self {
+        let min_duration = base_duration / 4;  // 4x faster minimum
+        let max_duration = base_duration * 8;  // 8x slower maximum
+        
+        Self {
+            base_duration,
+            current_duration: base_duration,
+            min_duration,
+            max_duration,
+            last_completion_time: None,
+            consecutive_errors: 0,
+            performance_history: VecDeque::with_capacity(10),
+        }
+    }
+    
+    /// Increase interval due to errors (exponential backoff)
+    fn increase_interval(&mut self) {
+        self.consecutive_errors += 1;
+        
+        // Exponential backoff with jitter
+        let multiplier = 2_u32.pow(std::cmp::min(self.consecutive_errors, 3) as u32);
+        let new_duration = self.base_duration * multiplier;
+        
+        self.current_duration = std::cmp::min(new_duration, self.max_duration);
+        println!("📈 Increased background interval to {:?} due to {} consecutive errors", 
+                self.current_duration, self.consecutive_errors);
+    }
+    
+    /// Optimize interval based on task completion time
+    fn optimize_interval(&mut self, completion_time: std::time::Duration) {
+        self.last_completion_time = Some(completion_time);
+        self.consecutive_errors = 0; // Reset error count on success
+        
+        // Add to performance history
+        self.performance_history.push_back(completion_time);
+        if self.performance_history.len() > 10 {
+            self.performance_history.pop_front();
+        }
+        
+        // Calculate adaptive interval based on recent performance
+        if self.performance_history.len() >= 3 {
+            let avg_completion: std::time::Duration = 
+                self.performance_history.iter().sum::<std::time::Duration>() / self.performance_history.len() as u32;
+            
+            // Adaptive logic: if tasks complete quickly, we can run more frequently
+            let new_duration = if avg_completion < self.base_duration / 4 {
+                // Tasks are very fast, increase frequency (decrease interval)
+                std::cmp::max(self.current_duration * 3 / 4, self.min_duration)
+            } else if avg_completion > self.base_duration {
+                // Tasks are slow, decrease frequency (increase interval)
+                std::cmp::min(self.current_duration * 5 / 4, self.max_duration)
+            } else {
+                // Tasks are normal speed, gradually return to base
+                if self.current_duration > self.base_duration {
+                    std::cmp::max(self.current_duration * 9 / 10, self.base_duration)
+                } else {
+                    std::cmp::min(self.current_duration * 11 / 10, self.base_duration)
+                }
+            };
+            
+            if new_duration != self.current_duration {
+                println!("⚡ Optimized background interval: {:?} -> {:?} (avg completion: {:?})", 
+                        self.current_duration, new_duration, avg_completion);
+                self.current_duration = new_duration;
+            }
+        }
+    }
+    
+    /// Sleep for the current adaptive interval
+    async fn sleep(&self) {
+        tokio::time::sleep(self.current_duration).await;
+    }
+    
+    /// Get current interval duration
+    fn current(&self) -> std::time::Duration {
+        self.current_duration
+    }
+}
+
 impl BackgroundErrorHandler {
     fn new() -> Self {
         Self {
@@ -1932,23 +2024,23 @@ impl AdaptiveRMI {
     }
     */
 
-    /// Enhanced background maintenance task with adaptive scheduling and robust error handling
+    /// Enhanced background maintenance task with advanced adaptive scheduling and robust error handling
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut cpu_detector = CPUPressureDetector::new();
             let error_handler = BackgroundErrorHandler::new();
             
-            // Initial intervals (will adapt based on CPU pressure)
-            let mut merge_interval = tokio::time::interval(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS));
-            let mut management_interval = tokio::time::interval(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC));
-            let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC));
+            // Enhanced adaptive intervals with dynamic optimization
+            let mut merge_adaptive = AdaptiveInterval::new(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS));
+            let mut management_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC));
+            let mut stats_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC));
             
             let mut last_pressure_check = std::time::Instant::now();
             
-            println!("🚀 Starting adaptive background maintenance with CPU pressure detection and robust error handling");
+            println!("🚀 Starting enhanced adaptive background maintenance with dynamic interval optimization");
             
             loop {
-                // Periodically adjust intervals based on CPU pressure
+                // Periodically adjust base intervals based on CPU pressure
                 let now = std::time::Instant::now();
                 if now.duration_since(last_pressure_check).as_secs() >= 10 {
                     last_pressure_check = now;
@@ -1956,17 +2048,19 @@ impl AdaptiveRMI {
                     let multiplier = cpu_detector.interval_multiplier(pressure);
                     
                     if multiplier > 1 {
-                        println!("🔧 CPU pressure detected (level {}), adjusting background task intervals by {}x", pressure, multiplier);
+                        println!("🔧 CPU pressure detected (level {}), base intervals scaled by {}x", pressure, multiplier);
                         
-                        // Create new intervals with adapted timing
-                        merge_interval = tokio::time::interval(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS * multiplier));
-                        management_interval = tokio::time::interval(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC * multiplier));
-                        stats_interval = tokio::time::interval(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC * multiplier));
+                        // Update base durations for all adaptive intervals
+                        merge_adaptive = AdaptiveInterval::new(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS * multiplier));
+                        management_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC * multiplier));
+                        stats_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC * multiplier));
                     }
                 }
                 
                 tokio::select! {
-                    _ = merge_interval.tick() => {
+                    _ = tokio::time::sleep(merge_adaptive.current()) => {
+                        let merge_start = std::time::Instant::now();
+                        
                         // Check CPU pressure before doing work
                         let current_pressure = cpu_detector.current_pressure();
                         
@@ -1990,9 +2084,12 @@ impl AdaptiveRMI {
                             
                             match self.merge_hot_buffer().await {
                                 Ok(_) => {
+                                    let completion_time = merge_start.elapsed();
+                                    merge_adaptive.optimize_interval(completion_time);
                                     error_handler.reset_merge_errors();
                                 }
                                 Err(e) => {
+                                    merge_adaptive.increase_interval();
                                     let should_continue = error_handler.handle_merge_error(e).await;
                                     if !should_continue {
                                         eprintln!("🛑 Too many merge errors, stopping background maintenance");
@@ -2002,7 +2099,9 @@ impl AdaptiveRMI {
                             }
                         }
                     }
-                    _ = management_interval.tick() => {
+                    _ = tokio::time::sleep(management_adaptive.current()) => {
+                        let mgmt_start = std::time::Instant::now();
+                        
                         // Skip heavy management tasks under high CPU pressure
                         let current_pressure = cpu_detector.current_pressure();
                         if current_pressure >= 3 {
@@ -2012,23 +2111,35 @@ impl AdaptiveRMI {
                         // Advanced adaptive segment management with error handling
                         match self.adaptive_segment_management().await {
                             Ok(_) => {
+                                let completion_time = mgmt_start.elapsed();
+                                management_adaptive.optimize_interval(completion_time);
                                 error_handler.reset_management_errors();
                             }
                             Err(e) => {
+                                management_adaptive.increase_interval();
                                 error_handler.handle_management_error(e);
                             }
                         }
                     }
-                    _ = stats_interval.tick() => {
+                    _ = tokio::time::sleep(stats_adaptive.current()) => {
+                        let stats_start = std::time::Instant::now();
+                        
                         // Periodic performance analytics and health checks
                         self.log_performance_analytics().await;
                         
-                        // Log error statistics
+                        // Log error statistics and interval performance
                         let (merge_errors, mgmt_errors) = error_handler.stats();
                         if merge_errors > 0 || mgmt_errors > 0 {
                             println!("📊 Background error stats: {} merge errors, {} management errors", 
                                 merge_errors, mgmt_errors);
                         }
+                        
+                        // Log current adaptive intervals
+                        println!("⏱️  Current adaptive intervals - merge: {:?}, mgmt: {:?}, stats: {:?}",
+                            merge_adaptive.current(), management_adaptive.current(), stats_adaptive.current());
+                        
+                        let completion_time = stats_start.elapsed();
+                        stats_adaptive.optimize_interval(completion_time);
                     }
                 }
             }
