@@ -630,6 +630,8 @@ pub struct GlobalRoutingModel {
     router_bits: u8,
     /// Router table mapping key prefixes to segment IDs
     router: Vec<u32>,
+    /// Routing generation for consistency validation
+    generation: AtomicU64,
 }
 
 impl GlobalRoutingModel {
@@ -640,6 +642,7 @@ impl GlobalRoutingModel {
             boundaries,
             router_bits,
             router,
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -684,13 +687,24 @@ impl GlobalRoutingModel {
         self.router[idx] as usize
     }
 
-    /// Update routing model with new boundaries
+    /// Update routing model with new boundaries (atomic operation)
     pub fn update_boundaries(&mut self, boundaries: Vec<u64>) {
         self.boundaries = boundaries;
         self.router = Self::build_router(&self.boundaries, self.router_bits);
+        self.generation.fetch_add(1, Ordering::Release); // Mark router update
     }
 
-    /// Add a split point to the routing model
+    /// Get current router generation for consistency validation
+    pub fn get_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Validate that router is still consistent with expected generation
+    pub fn validate_generation(&self, expected_generation: u64) -> bool {
+        self.generation.load(Ordering::Acquire) == expected_generation
+    }
+
+    /// Add a split point to the routing model (atomic operation)
     pub fn add_split_point(&mut self, split_key: u64, _segment_id: usize) {
         // Insert new boundary at the correct position
         match self.boundaries.binary_search(&split_key) {
@@ -703,11 +717,12 @@ impl GlobalRoutingModel {
             }
         }
         
-        // Rebuild router with new boundaries
+        // Rebuild router with new boundaries and increment generation
         self.router = Self::build_router(&self.boundaries, self.router_bits);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
-    /// Remove a split point from the routing model (for merge operations)
+    /// Remove a split point from the routing model (atomic operation)
     pub fn remove_split_point(&mut self, segment_id: usize) {
         // Remove boundary at the segment boundary (if it exists)
         // This is called during merge operations to clean up obsolete boundaries
@@ -716,6 +731,7 @@ impl GlobalRoutingModel {
             // The exact logic depends on which segments were merged
             // For now, just rebuild the router to ensure consistency
             self.router = Self::build_router(&self.boundaries, self.router_bits);
+            self.generation.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -977,7 +993,7 @@ impl AdaptiveRMI {
         Ok(())
     }
 
-    /// Read path checks hot buffer + segments
+    /// Read path checks hot buffer + segments with router consistency validation
     pub fn lookup(&self, key: u64) -> Option<u64> {
         // 1. Check hot buffer first (most recent data)
         if let Some(value) = self.hot_buffer.get(key) {
@@ -994,10 +1010,12 @@ impl AdaptiveRMI {
             }
         }
 
-        // 3. Route to appropriate segment
-        let segment_id = {
+        // 3. Route to appropriate segment with consistency validation
+        let (segment_id, router_generation) = {
             let router = self.global_router.read();
-            router.predict_segment(key)
+            let segment_id = router.predict_segment(key);
+            let generation = router.get_generation();
+            (segment_id, generation)
         };
 
         let segments = self.segments.read();
@@ -1005,8 +1023,66 @@ impl AdaptiveRMI {
             return None;
         }
 
-        // 4. Search in the predicted segment
+        // 4. Validate router is still consistent before search
+        {
+            let router = self.global_router.read();
+            if !router.validate_generation(router_generation) {
+                // Router was updated during our lookup - retry with fresh routing
+                drop(segments);
+                drop(router);
+                return self.lookup_with_retry(key, 1);
+            }
+        }
+
+        // 5. Search in the predicted segment
         segments[segment_id].bounded_search(key)
+    }
+
+    /// Retry lookup with fresh routing (prevents infinite retries)
+    fn lookup_with_retry(&self, key: u64, retry_count: usize) -> Option<u64> {
+        if retry_count > 3 {
+            // Too many retries, fall back to linear search across all segments
+            return self.fallback_linear_search(key);
+        }
+
+        // Retry with fresh routing
+        let (segment_id, router_generation) = {
+            let router = self.global_router.read();
+            let segment_id = router.predict_segment(key);
+            let generation = router.get_generation();
+            (segment_id, generation)
+        };
+
+        let segments = self.segments.read();
+        if segment_id >= segments.len() {
+            return None;
+        }
+
+        // Validate consistency again
+        {
+            let router = self.global_router.read();
+            if !router.validate_generation(router_generation) {
+                drop(segments);
+                drop(router);
+                return self.lookup_with_retry(key, retry_count + 1);
+            }
+        }
+
+        segments[segment_id].bounded_search(key)
+    }
+
+    /// Fallback linear search when router consistency cannot be maintained
+    fn fallback_linear_search(&self, key: u64) -> Option<u64> {
+        let segments = self.segments.read();
+        
+        // Search all segments if router is inconsistent
+        for segment in segments.iter() {
+            if let Some(value) = segment.bounded_search(key) {
+                return Some(value);
+            }
+        }
+        
+        None
     }
 
     /// Background merge operation - called by background task
