@@ -28,6 +28,17 @@ use crossbeam_queue::SegQueue;
 use tokio::sync::Notify;
 use anyhow::{Result, anyhow};
 
+/// Maximum overflow buffer capacity to prevent unbounded growth
+const MAX_OVERFLOW_CAPACITY: usize = 10_000;
+/// Pressure threshold to start rejecting writes (90% of max capacity)
+const OVERFLOW_PRESSURE_THRESHOLD: usize = (MAX_OVERFLOW_CAPACITY * 9) / 10;
+
+/// Adaptive timing constants for CPU pressure detection
+const BASE_MERGE_INTERVAL_MS: u64 = 50;
+const BASE_MANAGEMENT_INTERVAL_SEC: u64 = 5;  
+const BASE_STATS_INTERVAL_SEC: u64 = 30;
+const MAX_INTERVAL_MULTIPLIER: u64 = 8; // Maximum slowdown under high CPU pressure
+
 /// Maximum search window size - strict bound to prevent O(n) behavior
 const MAX_SEARCH_WINDOW: usize = 64;
 
@@ -882,6 +893,220 @@ impl BackgroundMerger {
     pub fn complete_merge(&self) {
         self.merge_in_progress.fetch_sub(1, Ordering::Relaxed);
     }
+
+    /// Schedule urgent merge due to overflow pressure
+    pub fn schedule_urgent_merge(&self) -> bool {
+        // Only allow urgent merge if no merge is currently in progress
+        if self.merge_in_progress.load(Ordering::Relaxed) == 0 {
+            self.schedule_merge_async();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Bounded overflow buffer to prevent unbounded memory growth
+#[derive(Debug)]
+pub struct BoundedOverflowBuffer {
+    /// Buffer storage with strict capacity limit
+    data: VecDeque<(u64, u64)>,
+    /// Maximum capacity - hard limit
+    max_capacity: usize,
+    /// Rejection counter for back-pressure signaling
+    rejected_writes: AtomicUsize,
+    /// Pressure level indicator
+    pressure_level: AtomicUsize, // 0=none, 1=low, 2=medium, 3=high
+}
+
+impl BoundedOverflowBuffer {
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            data: VecDeque::new(),
+            max_capacity,
+            rejected_writes: AtomicUsize::new(0),
+            pressure_level: AtomicUsize::new(0),
+        }
+    }
+
+    /// Try to insert with back-pressure handling
+    pub fn try_insert(&mut self, key: u64, value: u64) -> Result<bool> {
+        let current_size = self.data.len();
+        
+        // Update pressure level based on current size
+        let pressure = if current_size == 0 {
+            0 // none
+        } else if current_size < self.max_capacity / 3 {
+            1 // low
+        } else if current_size < (self.max_capacity * 2) / 3 {
+            2 // medium
+        } else {
+            3 // high
+        };
+        self.pressure_level.store(pressure, Ordering::Relaxed);
+
+        // Reject if at capacity
+        if current_size >= self.max_capacity {
+            self.rejected_writes.fetch_add(1, Ordering::Relaxed);
+            return Ok(false); // Signal back-pressure - caller should retry later
+        }
+
+        // Reject early if under high pressure (90%+ capacity)
+        if current_size >= OVERFLOW_PRESSURE_THRESHOLD {
+            self.rejected_writes.fetch_add(1, Ordering::Relaxed);
+            return Ok(false); // Early rejection to prevent hitting hard limit
+        }
+
+        // Accept the write
+        self.data.push_back((key, value));
+        Ok(true)
+    }
+
+    /// Search for a key in the buffer (LIFO order for recency)
+    pub fn get(&self, key: u64) -> Option<u64> {
+        for &(k, v) in self.data.iter().rev() {
+            if k == key {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Drain all data for merge operations
+    pub fn drain_all(&mut self) -> Vec<(u64, u64)> {
+        let drained: Vec<_> = self.data.drain(..).collect();
+        self.pressure_level.store(0, Ordering::Relaxed);
+        drained
+    }
+
+    /// Get buffer statistics
+    pub fn stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.data.len(),
+            self.max_capacity,
+            self.rejected_writes.load(Ordering::Relaxed),
+            self.pressure_level.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Check if buffer is under pressure
+    pub fn is_under_pressure(&self) -> bool {
+        self.pressure_level.load(Ordering::Relaxed) >= 2 // medium or high pressure
+    }
+}
+
+/// CPU pressure detection for adaptive timing in container environments
+struct CPUPressureDetector {
+    last_check: std::time::Instant,
+    pressure_level: AtomicUsize, // 0=none, 1=low, 2=medium, 3=high
+}
+
+impl CPUPressureDetector {
+    fn new() -> Self {
+        Self {
+            last_check: std::time::Instant::now(),
+            pressure_level: AtomicUsize::new(0),
+        }
+    }
+
+    /// Detect CPU pressure using multiple signals
+    fn detect_pressure(&mut self) -> usize {
+        let now = std::time::Instant::now();
+        
+        // Only check pressure every 5 seconds to avoid overhead
+        if now.duration_since(self.last_check).as_secs() < 5 {
+            return self.pressure_level.load(Ordering::Relaxed);
+        }
+        
+        self.last_check = now;
+        let mut pressure_signals = 0;
+
+        // Signal 1: Check container CPU throttling (if available)
+        if let Ok(throttling) = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.stat") {
+            if let Some(line) = throttling.lines().find(|l| l.starts_with("nr_throttled")) {
+                if let Some(value_str) = line.split_whitespace().nth(1) {
+                    if let Ok(throttled) = value_str.parse::<u64>() {
+                        if throttled > 0 {
+                            pressure_signals += 1; // Container CPU throttling detected
+                        }
+                    }
+                }
+            }
+        }
+
+        // Signal 2: Check system load (simplified heuristic)
+        if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
+            if let Some(load_str) = loadavg.split_whitespace().next() {
+                if let Ok(load) = load_str.parse::<f64>() {
+                    // Fallback CPU count detection
+                    let cpu_count = std::thread::available_parallelism()
+                        .map(|p| p.get())
+                        .unwrap_or(1) as f64;
+                    let load_ratio = load / cpu_count;
+                    
+                    if load_ratio > 2.0 {
+                        pressure_signals += 2; // Very high load
+                    } else if load_ratio > 1.5 {
+                        pressure_signals += 1; // High load
+                    }
+                }
+            }
+        }
+
+        // Signal 3: Memory pressure indicator
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            let mut available_kb = 0u64;
+            let mut total_kb = 0u64;
+            
+            for line in meminfo.lines() {
+                if line.starts_with("MemAvailable:") {
+                    if let Some(value) = line.split_whitespace().nth(1) {
+                        available_kb = value.parse().unwrap_or(0);
+                    }
+                } else if line.starts_with("MemTotal:") {
+                    if let Some(value) = line.split_whitespace().nth(1) {
+                        total_kb = value.parse().unwrap_or(0);
+                    }
+                }
+            }
+            
+            if total_kb > 0 {
+                let available_ratio = available_kb as f64 / total_kb as f64;
+                if available_ratio < 0.1 {
+                    pressure_signals += 2; // Very low memory
+                } else if available_ratio < 0.2 {
+                    pressure_signals += 1; // Low memory
+                }
+            }
+        }
+
+        // Determine pressure level based on accumulated signals
+        let pressure = match pressure_signals {
+            0 => 0,      // No pressure
+            1 => 1,      // Low pressure  
+            2..=3 => 2,  // Medium pressure
+            _ => 3,      // High pressure
+        };
+
+        self.pressure_level.store(pressure, Ordering::Relaxed);
+        pressure
+    }
+
+    /// Get current pressure level without detection
+    fn current_pressure(&self) -> usize {
+        self.pressure_level.load(Ordering::Relaxed)
+    }
+
+    /// Calculate interval multiplier based on pressure
+    fn interval_multiplier(&self, pressure: usize) -> u64 {
+        match pressure {
+            0 => 1,  // No pressure - normal intervals
+            1 => 2,  // Low pressure - 2x slower
+            2 => 4,  // Medium pressure - 4x slower
+            3 => MAX_INTERVAL_MULTIPLIER, // High pressure - 8x slower
+            _ => MAX_INTERVAL_MULTIPLIER,
+        }
+    }
 }
 
 /// Main Adaptive RMI structure
@@ -895,8 +1120,8 @@ pub struct AdaptiveRMI {
     hot_buffer: Arc<BoundedHotBuffer>,
     /// Background merge coordinator
     merge_scheduler: Arc<BackgroundMerger>,
-    /// Overflow buffer for when hot buffer is full
-    overflow_buffer: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// Overflow buffer for when hot buffer is full - now bounded to prevent memory exhaustion
+    overflow_buffer: Arc<Mutex<BoundedOverflowBuffer>>,
 }
 
 impl AdaptiveRMI {
@@ -918,7 +1143,7 @@ impl AdaptiveRMI {
             global_router: Arc::new(RwLock::new(GlobalRoutingModel::new(Vec::new(), router_bits))),
             hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
-            overflow_buffer: Arc::new(Mutex::new(Vec::new())),
+            overflow_buffer: Arc::new(Mutex::new(BoundedOverflowBuffer::new(MAX_OVERFLOW_CAPACITY))),
         }
     }
 
@@ -970,7 +1195,7 @@ impl AdaptiveRMI {
             global_router: Arc::new(RwLock::new(global_router)),
             hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
-            overflow_buffer: Arc::new(Mutex::new(Vec::new())),
+            overflow_buffer: Arc::new(Mutex::new(BoundedOverflowBuffer::new(MAX_OVERFLOW_CAPACITY))),
         }
     }
 
@@ -984,13 +1209,34 @@ impl AdaptiveRMI {
         // 2. If hot buffer full, trigger background merge
         self.merge_scheduler.schedule_merge_async();
 
-        // 3. Temporarily store in overflow buffer
+        // 3. Try to store in bounded overflow buffer with back-pressure
         {
             let mut overflow = self.overflow_buffer.lock();
-            overflow.push((key, value));
+            match overflow.try_insert(key, value)? {
+                true => {
+                    // Successfully buffered
+                    return Ok(());
+                }
+                false => {
+                    // Buffer full - check pressure before applying back-pressure
+                    let is_under_pressure = overflow.is_under_pressure();
+                    drop(overflow); // Release lock before yielding
+                    
+                    // Signal urgent merge needed due to overflow pressure
+                    if self.merge_scheduler.schedule_urgent_merge() {
+                        // Try one more time after scheduling urgent merge
+                        let mut overflow = self.overflow_buffer.lock();
+                        if overflow.try_insert(key, value)? {
+                            return Ok(());
+                        }
+                    }
+                    
+                    // All buffers exhausted - reject write to prevent memory exhaustion
+                    return Err(anyhow!("Write rejected: system under extreme memory pressure. Please retry in {}ms", 
+                        if is_under_pressure { 100 } else { 50 }));
+                }
+            }
         }
-
-        Ok(())
     }
 
     /// Read path checks hot buffer + segments with router consistency validation
@@ -1003,10 +1249,8 @@ impl AdaptiveRMI {
         // 2. Check overflow buffer
         {
             let overflow = self.overflow_buffer.lock();
-            for &(k, v) in overflow.iter().rev() {
-                if k == key {
-                    return Some(v);
-                }
+            if let Some(value) = overflow.get(key) {
+                return Some(value);
             }
         }
 
@@ -1093,7 +1337,7 @@ impl AdaptiveRMI {
         let hot_data = self.hot_buffer.drain_atomic();
         let overflow_data = {
             let mut overflow = self.overflow_buffer.lock();
-            std::mem::take(&mut *overflow)
+            overflow.drain_all()
         };
 
         // 2. Combine and sort all pending writes
@@ -1619,18 +1863,51 @@ impl AdaptiveRMI {
     }
     */
 
-    /// Enhanced background maintenance task with adaptive scheduling
+    /// Enhanced background maintenance task with adaptive scheduling and CPU pressure detection
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut merge_interval = tokio::time::interval(std::time::Duration::from_millis(50)); // More responsive
-            let mut management_interval = tokio::time::interval(std::time::Duration::from_secs(5)); // More frequent adaptation
-            let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(30)); // Periodic analytics
+            let mut cpu_detector = CPUPressureDetector::new();
             
-            println!("Starting enhanced background maintenance with advanced features");
+            // Initial intervals (will adapt based on CPU pressure)
+            let mut merge_interval = tokio::time::interval(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS));
+            let mut management_interval = tokio::time::interval(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC));
+            let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC));
+            
+            let mut last_pressure_check = std::time::Instant::now();
+            
+            println!("Starting adaptive background maintenance with CPU pressure detection");
             
             loop {
+                // Periodically adjust intervals based on CPU pressure
+                let now = std::time::Instant::now();
+                if now.duration_since(last_pressure_check).as_secs() >= 10 {
+                    last_pressure_check = now;
+                    let pressure = cpu_detector.detect_pressure();
+                    let multiplier = cpu_detector.interval_multiplier(pressure);
+                    
+                    if multiplier > 1 {
+                        println!("CPU pressure detected (level {}), adjusting background task intervals by {}x", pressure, multiplier);
+                        
+                        // Create new intervals with adapted timing
+                        merge_interval = tokio::time::interval(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS * multiplier));
+                        management_interval = tokio::time::interval(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC * multiplier));
+                        stats_interval = tokio::time::interval(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC * multiplier));
+                    }
+                }
+                
                 tokio::select! {
                     _ = merge_interval.tick() => {
+                        // Check CPU pressure before doing work
+                        let current_pressure = cpu_detector.current_pressure();
+                        
+                        // Skip merge under high CPU pressure unless overflow buffer is critical
+                        if current_pressure >= 3 {
+                            let (overflow_size, overflow_cap, _, _) = self.overflow_buffer.lock().stats();
+                            if overflow_size < overflow_cap * 3 / 4 {
+                                continue; // Skip this merge cycle
+                            }
+                        }
+                        
                         // Enhanced hot buffer merge triggering - check without holding locks
                         let should_merge = {
                             let current_size = self.hot_buffer.size.load(std::sync::atomic::Ordering::Relaxed);
@@ -1644,6 +1921,12 @@ impl AdaptiveRMI {
                         }
                     }
                     _ = management_interval.tick() => {
+                        // Skip heavy management tasks under high CPU pressure
+                        let current_pressure = cpu_detector.current_pressure();
+                        if current_pressure >= 3 {
+                            continue; // Skip this management cycle under high pressure
+                        }
+                        
                         // Advanced adaptive segment management
                         if let Err(e) = self.adaptive_segment_management().await {
                             eprintln!("Segment management error: {}", e);
@@ -1675,7 +1958,7 @@ impl AdaptiveRMI {
     /// Enhanced merge triggering logic
     async fn should_trigger_merge(&self) -> bool {
         let hot_utilization = self.hot_buffer.utilization();
-        let overflow_size = self.overflow_buffer.lock().len();
+        let (overflow_size, _, _rejected_writes, _pressure) = self.overflow_buffer.lock().stats();
         let merge_in_progress = self.merge_scheduler.is_merge_in_progress();
         
         // Don't start new merge if one is already in progress
@@ -1696,7 +1979,7 @@ impl AdaptiveRMI {
         let segments = self.segments.read();
         let hot_buffer_size = self.hot_buffer.size.load(Ordering::Relaxed);
         let hot_buffer_utilization = self.hot_buffer.utilization();
-        let overflow_size = self.overflow_buffer.lock().len();
+        let (overflow_size, _overflow_capacity, _rejected_writes, _pressure) = self.overflow_buffer.lock().stats();
         
         let total_keys: usize = segments.iter().map(|s| s.len()).sum();
         let segment_count = segments.len();
