@@ -1,68 +1,61 @@
 # KyroDB Ops Guide
 
 ## Install
-- Binary: download from GitHub Releases (kyrodb-engine). Place at /usr/local/bin.
-- Docker: docker run -p 3030:3030 kyrodb/kyrodb-engine:latest
-- Systemd: see docs/systemd/kyrodb-engine.service
+- Binary: GitHub Releases (`kyrodb-engine`) → place at /usr/local/bin
+- Docker: `docker run -p 3030:3030 kyrodb/kyrodb-engine:latest`
+- Systemd: see `docs/systemd/kyrodb-engine.service`
 
 ## Run
-- Data dir: /var/lib/kyrodb (set via global --data-dir argument before 'serve' command)
-- Auth: --auth-token TOKEN (read/write access), --admin-token TOKEN (admin access)
-- TLS: --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem (enables HTTPS)
-- Rotation: --wal-segment-bytes, --wal-max-segments
-- Compaction: --compact-interval-secs, --compact-when-wal-bytes, or --wal-max-bytes
+- Data dir: `/var/lib/kyrodb` (set via global `--data-dir` before `serve`)
+- Auth (optional): `--auth-token` (rw), `--admin-token` (admin). Omit for benchmarks.
+- TLS (optional): `--tls-cert`, `--tls-key`
+- Rotation: `--wal-segment-bytes`, `--wal-max-segments`
+- Compaction: `--compact-interval-secs`, `--compact-when-wal-bytes`, or `--wal-max-bytes`
 
 ## Security Configuration
 
 ### TLS/HTTPS Setup
 ```bash
-# Generate self-signed certificate for testing
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
-
-# Run with TLS
 ./kyrodb-engine --tls-cert cert.pem --tls-key key.pem serve 0.0.0.0 3030
 ```
 
-### Authentication & Authorization
-- **Read-Only Access**: No token required (when no auth configured)
-- **Read/Write Access**: Use `--auth-token` for read/write operations
-- **Admin Access**: Use `--admin-token` for privileged operations (snapshot, compaction, etc.)
+### Authentication & Authorization (Optional)
+- Read‑only: no token required (when not configured)
+- Read/Write: `--auth-token` for data operations
+- Admin: `--admin-token` for privileged ops (snapshot, compaction, etc.)
 
 ```bash
-# Example with role-based access
 ./kyrodb-engine serve 0.0.0.0 3030 \
   --auth-token "rw-token-123" \
   --admin-token "admin-token-456"
 ```
 
-### API Permissions by Role
-- **Admin**: All operations (snapshot, compact, RMI rebuild, etc.)
-- **Read/Write**: Data operations (put, append, vector insert, SQL)
-- **Read-Only**: Read operations (lookup, get, offset, subscribe)
-
 ## Backup
-- Snapshot files: snapshot.bin, snapshot.data, manifest.json, index-rmi.bin
+- Snapshot artifacts: `snapshot.bin`, `snapshot.data`, `manifest.json`, `index-rmi.bin`
 - Steps:
-  1) curl -X POST :3030/v1/snapshot
-  2) Stop writes or accept a short RPO
-  3) Copy files atomically (same directory)
-  4) Verify RMI checksum (manifest lists files)
+  1) `POST :3030/v1/snapshot`
+  2) Optionally pause writes for strict RPO=0
+  3) Copy all files atomically in the data dir
+  4) Verify RMI checksum (listed in manifest)
 
 ## Restore
-- Place files into data dir
-- Start server; WAL is reset post-snapshot; manifest is commit point
+- Place snapshot artifacts into the data dir
+- Start server; WAL tail replays; manifest is the commit point
 
-## Metrics
-- Scrape /metrics (Prometheus exposition). Key series:
-  - kyrodb_appends_total
-  - kyrodb_rmi_reads_total, kyrodb_btree_reads_total
-  - kyrodb_compactions_total, kyrodb_snapshot_latency_seconds
+## Metrics & Build Info
+- Prometheus: scrape `/metrics`
+  - `kyrodb_appends_total`
+  - `kyrodb_rmi_reads_total`, `kyrodb_rmi_probe_length_histogram`
+  - `kyrodb_compactions_total`, `kyrodb_snapshot_duration_seconds`
+- Build info: `/build_info` (commit, features, rustc, target)
 
-## Build Info & Provenance
-- Endpoint: GET /build_info
-- Includes: commit hash, branch, build time, Rust version, target triple, enabled features
+## Tuning & Bench Policy
+- RMI: `KYRODB_RMI_TARGET_LEAF`, `KYRODB_RMI_EPS_MULT`
+- Cache: payload cache size (LRU) and memory budget
+- CPU: pinning/governor for stable tails
+- Benchmarks: disable auth/rate limit; enable `bench-no-metrics`; warm via snapshot → RMI → `/v1/warmup`
 
-## Tuning
-- RMI tuning via KYRODB_RMI_TARGET_LEAF, KYRODB_RMI_EPS_MULT
-- Payload cache: default LRU 4096 entries
-- CPU pinning and governor for stable tail latencies
+## API Versioning
+- Stable today: `/v1/*`
+- Planned Phase 1: `/v2/*` (hybrid queries, streaming ingest)

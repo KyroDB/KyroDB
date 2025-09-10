@@ -4,24 +4,24 @@
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
 [![CI](https://github.com/vatskishan03/KyroDB/actions/workflows/ci.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
 
-**Status: Phase 0 Development** - Foundation-first approach to building a production-ready database with learned indexing.
+**Status: Phase 0 (Foundation)** — Production‑hardening of the single‑node engine with learned indexing.
 
-KyroDB is a high-performance, durable key-value database engine featuring Recursive Model Index (RMI) for predictable sub-millisecond lookups.
+KyroDB is a high-performance, durable key-value database engine featuring Recursive Model Index (RMI) for predictable sub-millisecond lookups. It is the foundation of an AI‑native database platform.
 
 ## 🚀 Core Features
 
-- ⚡ **Learned Indexing (RMI)**: 2-stage models with SIMD-accelerated probing for O(1) expected lookup time
+- ⚡ **Learned Indexing (RMI)**: 2‑stage models with SIMD‑accelerated probing for O(1) expected lookup time (feature‑gated via `learned-index`)
 - 🛡️ **ACID Durability**: WAL + snapshots with atomic operations and fast crash recovery  
-- 🔒 **Lock-Free Concurrency**: Eliminates deadlocks while maintaining high throughput
-- 📊 **Enterprise Monitoring**: Prometheus metrics, health checks, structured logging
-- 🌐 **HTTP API**: RESTful endpoints optimized for maximum performance
+- 🔒 **Concurrency Discipline**: Defensive locking; moving to lock‑free/atomic swaps on hot paths
+- 📊 **Observability**: Prometheus metrics, health checks, structured logging (feature‑gated for benches)
+- 🌐 **HTTP API**: Stable `/v1/*` endpoints; planned `/v2/*` hybrid queries (Phase 1)
 
-## 📈 Performance Targets (Phase 0)
+## 📈 Phase 0 Targets
 
-- **P99 Latency**: < 1ms for point lookups
-- **Throughput**: > 100K QPS sustained
-- **Memory Efficiency**: Bounded usage with predictable performance
-- **Zero Deadlocks**: Lock-free architecture eliminates concurrency issues
+- P99 < 1ms for point lookups on 10M keys (warm path)
+- Zero O(n) fallbacks; bounded epsilon search
+- No deadlocks under mixed load (loom + chaos tests)
+- Recovery ≤ 2s for 1GB WAL; bounded memory usage
 
 ---
 
@@ -42,7 +42,7 @@ cargo build -p kyrodb-engine --release
 ./target/release/kyrodb-engine serve 127.0.0.1 3030
 ```
 
-### Basic Operations
+### Basic Operations (v1)
 ```bash
 # Put key-value
 curl -X POST http://localhost:3030/v1/put -H "Content-Type: application/json" \
@@ -58,9 +58,8 @@ curl http://localhost:3030/v1/get_fast/456
 
 ---
 
-## Architecture
+## Architecture Overview
 
-### Core Components
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   HTTP Server   │    │  RMI Learned     │    │   WAL +         │
@@ -72,35 +71,30 @@ curl http://localhost:3030/v1/get_fast/456
 └─────────────────┘    └──────────────────┘    └─────────────────┘
 ```
 
-### Key Technologies
-- **RMI (Recursive Model Index)**: Learned data structures that predict key locations
-- **Lock-Free Concurrency**: ArcSwap and atomic operations eliminate deadlocks
-- **Memory-Mapped I/O**: Zero-copy reads for maximum throughput
-- **SIMD Acceleration**: AVX2/AVX512 vectorized search operations
+Key technologies: RMI (Recursive Model Index), memory‑mapped I/O, SIMD acceleration, atomic index swaps.
 
 ---
 
 ## API Reference
 
-### Core Operations
+### Core Operations (v1)
 ```http
-# Key-value operations
 POST /v1/put {"key": u64, "value": string}
 GET  /v1/lookup?key=123
-POST /v1/put_fast/{key}  # Binary body for max performance
-GET  /v1/get_fast/{key}  # Binary response
+POST /v1/put_fast/{key}
+GET  /v1/get_fast/{key}
 
-# Administrative
-POST /v1/snapshot       # Trigger manual snapshot
-POST /v1/compact        # Trigger compaction
-POST /v1/rmi/build      # Rebuild RMI index
-POST /v1/warmup         # Warm up caches
+POST /v1/snapshot
+POST /v1/compact
+POST /v1/rmi/build
+POST /v1/warmup
 
-# Monitoring  
-GET  /health            # Health check
-GET  /metrics           # Prometheus metrics
-GET  /build_info        # Version and build info
+GET  /health
+GET  /metrics
+GET  /build_info
 ```
+
+Planned (v2, Phase 1): `/v2/search/hybrid`, `/v2/documents/stream`.
 
 ---
 
@@ -108,14 +102,13 @@ GET  /build_info        # Version and build info
 
 ### Production Deployment
 ```bash
-# Optimized for production
 ./kyrodb-engine serve 0.0.0.0 3030 \
   --auto-snapshot-secs 3600 \
   --wal-max-bytes 1073741824 \
   --rmi-rebuild-appends 100000 \
   --enable-rate-limiting
 
-# With environment tuning
+# Env tuning
 RUST_LOG=info \
 KYRODB_WARM_ON_START=1 \
 KYRODB_RL_RPS=50000 \
@@ -124,67 +117,43 @@ KYRODB_RL_RPS=50000 \
 
 ### Monitoring & Metrics
 ```bash
-# Health check
 curl http://localhost:3030/health
-
-# Key metrics to monitor
 curl http://localhost:3030/metrics | grep kyrodb_
-# - kyrodb_rmi_reads_total
-# - kyrodb_rmi_probe_length_histogram  
-# - kyrodb_appends_total
-# - kyrodb_snapshot_duration_seconds
+# kyrodb_appends_total, kyrodb_rmi_reads_total, kyrodb_rmi_probe_length_histogram, ...
 ```
+
+---
+
+## Benchmarks & Feature Gates
+
+- Disable auth/rate limits for perf runs; enable `bench-no-metrics` to avoid metrics overhead
+- Warm path before measuring: snapshot → RMI build → `/v1/warmup`
+- Record p50/p99, probe length, rebuild time, cache hit rate
+
+Features: `learned-index`, `bench-no-metrics`, `failpoints`, SIMD feature flags (`simd-avx2`, `simd-avx512`).
+
+---
+
+## Positioning & Migration
+
+KyroDB targets AI retrieval workloads and can replace multi‑DB stacks there. It complements OLTP/analytics systems like PostgreSQL.
+
+Adoption path: start with an AI collection in KyroDB, dual‑write/batch import, validate, then cut over hot paths. Bridges for Kafka/Parquet planned.
 
 ---
 
 ## Development
 
-### Build & Test
 ```bash
-# Full test suite
 cargo test -p kyrodb-engine
-
-# Benchmarks
 cd bench && cargo run --release
-
-# Fuzzing (requires nightly)
 cargo +nightly fuzz run rmi_probe
-```
-
-### Performance Validation
-```bash
-# End-to-end benchmark
-cd bench
-cargo run --release -- --load-n 1000000 --read-seconds 30
-
-# Check for O(n) fallbacks (should be zero)
-curl http://localhost:3030/metrics | grep kyrodb_btree_reads_total
-```
-
----
-
-## Contributing
-
-We welcome contributions focused on Phase 0 foundation work:
-
-- 🚀 **Performance**: RMI optimizations, SIMD improvements
-- 🔒 **Concurrency**: Lock-free data structures, deadlock elimination  
-- 🧪 **Testing**: Property-based tests, chaos testing, fuzzing
-- 📊 **Benchmarking**: Performance validation, regression detection
-
-```bash
-# Development setup
-git clone https://github.com/vatskishan03/KyroDB.git
-cd KyroDB
-cargo test -p kyrodb-engine
 ```
 
 ---
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Apache 2.0 — see [LICENSE](LICENSE).
 
----
-
-**KyroDB: Foundation-first approach to the world's fastest learned-index database** 🚀
+**KyroDB: Foundation-first AI‑native database** 🚀

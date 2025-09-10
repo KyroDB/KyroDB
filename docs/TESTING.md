@@ -1,25 +1,34 @@
-Testing and reliability
+# Testing and Reliability
 
-- Crash/recovery matrix
-  - Covered by existing tests in `engine/tests/`:
-    - WAL CRC tail corruption, rotation/retention, background compaction
-    - Snapshot atomicity and mmap read
-    - RMI build/rebuild thresholds and epsilon bounds
-    - Subscribe/recovery
-  - CI matrix runs tests across OSes and feature sets:
-    - Default features (learned-index)
-    - No default features
-    - http-test feature
+## Phase Gates (Go/No-Go)
 
-- Fuzzing (cargo-fuzz): WAL and snapshot parsers
-  - Fuzz target: `engine/fuzz/fuzz_targets/fuzz_target_1.rs`
-  - Parsers under test in `engine/src/lib.rs`:
-    - `parse_wal_stream_bytes(&[u8])`
-    - `parse_snapshot_data_index_bytes(&[u8])`
-  - Local run examples:
-    - `cd engine && cargo fuzz run fuzz_target_1` (requires `cargo install cargo-fuzz`)
-  - CI only builds fuzzers; running long fuzz campaigns is left manual to keep CI fast.
+Before advancing phases, the following suites must be green:
+- Property tests (proptest) for RMI correctness and epsilon bounds
+- Chaos tests (failpoints) for crash recovery (WAL, snapshots, atomic swaps)
+- Concurrency tests (loom) for critical paths (group commit, swaps, rotation)
+- Fuzzing (cargo-fuzz) for parsers (WAL, snapshot indexes)
+- Bench regression: p50/p99 latency, probe length histogram, rebuild duration
 
-- Concurrency testing (loom)
-  - Consider using `loom` for small, critical concurrent sections (e.g., WAL rotate + manifest).
-  - Not enabled in CI by default due to runtime cost; track progress in issues.
+## Existing Coverage (engine/tests)
+- WAL CRC tail corruption; rotation/retention; background compaction
+- Snapshot atomicity and mmap read
+- RMI build thresholds, epsilon bounds, probe metrics, rebuild crash/swap
+- Router consistency; recovery; fast lookup chaos; enterprise-safe modes
+
+## CI Matrix
+- OSes: Linux/macOS
+- Features:
+  - Default with `learned-index`
+  - Without learned index
+  - `http-test` integration (server running)
+
+## Fuzzing (cargo-fuzz)
+- Targets: WAL and snapshot parsers
+- Example:
+```bash
+cd engine && cargo fuzz run fuzz_target_1
+```
+
+## Concurrency (loom)
+- Enable for small, critical sections (WAL rotate + manifest, index swap)
+- Loom not on by default in CI due to runtime cost; run in nightly jobs or manually
