@@ -1964,68 +1964,50 @@ impl AdaptiveRMI {
         Ok(segment_updates)
     }
 
-    /// RACE-FREE parallel segment updates using epoch validation to prevent TOCTOU
+    /// RACE-FREE segment updates using single write lock for entire operation
     async fn merge_segment_updates_parallel(
         segments: Arc<RwLock<Vec<AdaptiveSegment>>>,
         segment_id: usize,
         updates: Vec<(u64, u64)>,
     ) -> Result<()> {
-        // 1. Capture segment snapshot with epoch under read lock
-        let (current_data, current_model, current_epoch) = {
-            let segments_guard = segments.read();
-            if segment_id >= segments_guard.len() {
-                return Err(anyhow!("Invalid segment ID: {}", segment_id));
-            }
-            
-            let segment = &segments_guard[segment_id];
-            (
-                segment.data.clone(),
-                segment.local_model.clone(),
-                segment.get_epoch(), // Capture epoch for validation
-            )
-        }; // Read lock released immediately
-
-        // 2. Process updates outside of any locks (safe with snapshot)
-        let (new_data, needs_retrain) = Self::merge_updates_efficiently(current_data, updates).await?;
+        // CRITICAL FIX: Use single write lock for entire operation to eliminate TOCTOU races
+        let mut segments_guard = segments.write();
         
-        // 3. Retrain model if necessary (expensive operation outside locks)
+        // 1. Validate segment exists under write lock (no race possible)
+        if segment_id >= segments_guard.len() {
+            return Err(anyhow!("Invalid segment ID: {} >= {}", segment_id, segments_guard.len()));
+        }
+        
+        // 2. Extract current segment data safely under lock
+        let target_segment = &mut segments_guard[segment_id];
+        let current_data = target_segment.data.clone();
+        let current_model = target_segment.local_model.clone();
+        let current_epoch = target_segment.get_epoch();
+        let update_count = updates.len();
+        
+        // 3. Process updates efficiently (quick in-memory operation)
+        let (new_data, needs_retrain) = Self::merge_updates_efficiently_sync(current_data, updates)?;
+        
+        // 4. Update model if necessary (optimized for speed)
         let new_model = if needs_retrain || Self::should_retrain_model(&new_data, &current_model) {
             LocalLinearModel::new(&new_data)
         } else {
             current_model
         };
-
-        // 4. Atomic update with epoch validation (prevents race conditions)
-        {
-            let mut segments_guard = segments.write();
-            
-            // Validate segment still exists
-            if segment_id >= segments_guard.len() {
-                return Ok(()); // Segment was removed - operation is obsolete
-            }
-            
-            let target_segment = &mut segments_guard[segment_id];
-            
-            // RACE PROTECTION: Check if segment was modified since snapshot
-            if target_segment.get_epoch() != current_epoch {
-                // Segment was modified by another operation - operation is stale
-                // For safety, we skip the update rather than retry to avoid infinite loops
-                println!("⚠️  Skipping stale segment update for segment {} (epoch mismatch)", segment_id);
-                return Ok(());
-            }
-            
-            // Safe to update: create new segment and atomically replace
-            let mut new_segment = AdaptiveSegment::new_with_model(new_data, new_model);
-            // Set epoch to next value to indicate this is a new version
-            new_segment.epoch.store(current_epoch + 1, std::sync::atomic::Ordering::Release);
-            *target_segment = new_segment;
-        }
+        
+        // 5. Atomic in-place update under same write lock (no races possible)
+        target_segment.data = new_data;
+        target_segment.local_model = new_model;
+        target_segment.epoch.store(current_epoch + 1, std::sync::atomic::Ordering::Release);
+        
+        // Update access patterns and statistics
+        target_segment.metrics.access_count.fetch_add(update_count as u64, Ordering::Relaxed);
         
         Ok(())
     }
 
-    /// Efficient update merging with minimal allocations
-    async fn merge_updates_efficiently(
+    /// Efficient update merging with minimal allocations (synchronous version for write lock)
+    fn merge_updates_efficiently_sync(
         mut current_data: Vec<(u64, u64)>,
         updates: Vec<(u64, u64)>,
     ) -> Result<(Vec<(u64, u64)>, bool)> {
@@ -2051,10 +2033,19 @@ impl AdaptiveRMI {
         }
 
         // Determine if retrain is needed based on growth
-        let growth_ratio = current_data.len() as f64 / initial_size as f64;
-        let needs_retrain = significant_changes && (growth_ratio > 1.1 || current_data.len() - initial_size > 100);
+        let growth_ratio = current_data.len() as f64 / initial_size.max(1) as f64;
+        let needs_retrain = significant_changes && (growth_ratio > 1.1 || current_data.len().saturating_sub(initial_size) > 100);
 
         Ok((current_data, needs_retrain))
+    }
+
+    /// Efficient update merging with minimal allocations (async version for compatibility)
+    async fn merge_updates_efficiently(
+        current_data: Vec<(u64, u64)>,
+        updates: Vec<(u64, u64)>,
+    ) -> Result<(Vec<(u64, u64)>, bool)> {
+        // Delegate to synchronous version - this is a quick in-memory operation
+        Self::merge_updates_efficiently_sync(current_data, updates)
     }
 
     /// Determine if model retraining is needed
