@@ -2486,10 +2486,11 @@ impl AdaptiveRMI {
                         println!("🚨 Emergency merge required - overflow buffer {}% full", 
                             (overflow_size * 100) / overflow_cap);
                         
-                        // Yield heavily before emergency operations
-                        for _ in 0..5 {
+                        // Yield heavily before emergency operations with adaptive timing
+                        let yield_count = std::cmp::min(10, (overflow_size * 10) / overflow_cap); // Scale with buffer fullness
+                        for _ in 0..yield_count {
                             tokio::task::yield_now().await;
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await; // Adaptive micro-sleep
                         }
                         
                         // Emergency merge with minimal CPU usage
@@ -2505,24 +2506,28 @@ impl AdaptiveRMI {
                         }
                     }
                     
-                    // In emergency mode, yield CPU extensively and wait longer
-                    for _ in 0..10 {
+                    // In emergency mode, yield CPU extensively with adaptive timing based on pressure level
+                    let emergency_yield_count = std::cmp::min(15, _pressure_level * 3); // Scale with pressure
+                    for _ in 0..emergency_yield_count {
                         tokio::task::yield_now().await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let emergency_sleep_ms = std::cmp::min(2000, 200 * _pressure_level as u64); // Adaptive emergency sleep
+                    tokio::time::sleep(std::time::Duration::from_millis(emergency_sleep_ms.max(500))).await;
                     continue; // Skip normal operations in emergency mode
-                }
-                
-                // Adaptive CPU yielding based on throttling detection
-                if cpu_detector.should_yield_cpu() {
-                    for _ in 0..3 {
-                        tokio::task::yield_now().await;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 
                 // ENHANCED TASK SCHEDULING: Priority-based with throttling awareness
                 let current_pressure = cpu_detector.current_pressure();
+                
+                // Adaptive CPU yielding based on throttling detection and current workload
+                if cpu_detector.should_yield_cpu() {
+                    let yield_intensity = std::cmp::min(5, current_pressure + 1); // Scale with pressure
+                    for _ in 0..yield_intensity {
+                        tokio::task::yield_now().await;
+                    }
+                    let adaptive_yield_sleep = std::time::Duration::from_millis(25 + (current_pressure * 15) as u64);
+                    tokio::time::sleep(adaptive_yield_sleep).await;
+                }
                 
                 // Check for urgent operations first (memory pressure)
                 let urgent_merge_needed = {
@@ -2578,7 +2583,10 @@ impl AdaptiveRMI {
                     };
                     
                     if should_merge {
-                        // Progressive yielding based on CPU pressure
+                        // Get buffer state for adaptive timing
+                        let (overflow_size, overflow_capacity, _rejected, _pressure, _memory) = self.overflow_buffer.lock().stats();
+                        
+                        // Progressive yielding based on CPU pressure with smarter timing
                         match current_pressure {
                             0..=1 => { /* No yielding needed */ }
                             2 => {
@@ -2588,13 +2596,14 @@ impl AdaptiveRMI {
                                 for _ in 0..2 {
                                     tokio::task::yield_now().await;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(15 + (overflow_size * 10 / overflow_capacity.max(1)) as u64)).await; // Adaptive based on buffer pressure
                             }
                             _ => {
                                 for _ in 0..5 {
                                     tokio::task::yield_now().await;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                let adaptive_sleep_ms = 50 + (current_pressure * 25) + (overflow_size * 50 / overflow_capacity.max(1));
+                                tokio::time::sleep(std::time::Duration::from_millis(adaptive_sleep_ms.min(200) as u64)).await; // Cap at 200ms
                             }
                         }
                         
@@ -2676,14 +2685,17 @@ impl AdaptiveRMI {
                     stats_adaptive.optimize_interval(completion_time);
                 }
                 
-                // CRITICAL: Adaptive sleep with pressure-aware yielding
-                let base_sleep = std::time::Duration::from_millis(10);
+                // CRITICAL: Adaptive sleep with pressure-aware yielding and workload consideration
+                let hot_utilization = self.hot_buffer.utilization() as u64;
+                let base_sleep_ms = 5 + (hot_utilization * 10); // More sleep when hot buffer is fuller
+                let base_sleep = std::time::Duration::from_millis(base_sleep_ms.clamp(5, 25));
+                
                 let pressure_sleep = match current_pressure {
                     0 => base_sleep,
                     1 => base_sleep * 2,
-                    2 => base_sleep * 4,
-                    3 => base_sleep * 8,
-                    _ => base_sleep * 16,
+                    2 => base_sleep * 3 + std::time::Duration::from_millis(hot_utilization * 5), // Factor in buffer pressure
+                    3 => base_sleep * 5 + std::time::Duration::from_millis(hot_utilization * 10),
+                    _ => base_sleep * 8 + std::time::Duration::from_millis(hot_utilization * 20),
                 };
                 
                 // Yield CPU before sleeping when under pressure
@@ -2727,10 +2739,18 @@ impl AdaptiveRMI {
                 tokio::task::yield_now().await;
             }
             
+            // Capture updates length before moving it
+            let updates_len = updates.len();
             self.emergency_merge_segment_simple(segment_id, updates).await?;
             
-            // Sleep between segment updates to avoid CPU starvation
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Adaptive sleep between segment updates based on system pressure
+            let emergency_sleep = match updates_len {
+                0..=10 => std::time::Duration::from_millis(10),   // Light load
+                11..=50 => std::time::Duration::from_millis(25),  // Medium load  
+                51..=100 => std::time::Duration::from_millis(50), // Heavy load
+                _ => std::time::Duration::from_millis(100),       // Very heavy load
+            };
+            tokio::time::sleep(emergency_sleep).await;
         }
         
         println!("✅ Emergency merge completed successfully");
