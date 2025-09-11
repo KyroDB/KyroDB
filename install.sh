@@ -171,9 +171,9 @@ build_kyrodb() {
         echo -e "${YELLOW}ℹ️  No advanced SIMD support detected${NC}"
     fi
     
-    # Set optimal build environment
+    # Set conservative build environment that works everywhere
     export CARGO_TARGET_DIR="${build_dir}/target"
-    export RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat"
+    export RUSTFLAGS="-C target-cpu=native"
     
     # Build with optimal features
     local build_features="learned-index"
@@ -182,10 +182,20 @@ build_kyrodb() {
     fi
     
     echo -e "${YELLOW}⚡ Building KyroDB engine with features: ${build_features}${NC}"
-    cargo build -p kyrodb-engine --release --features "$build_features"
+    
+    # Clean build with proper error handling
+    if ! cargo build -p kyrodb-engine --release --features "$build_features"; then
+        echo -e "${RED}❌ Engine build failed. Trying without CPU-specific optimizations...${NC}"
+        export RUSTFLAGS=""  # Clear all flags
+        cargo build -p kyrodb-engine --release --features "learned-index"
+    fi
     
     echo -e "${YELLOW}⚡ Building benchmark tools...${NC}"
-    cargo build -p bench --release
+    if ! cargo build -p bench --release; then
+        echo -e "${RED}❌ Bench build failed. Trying without optimizations...${NC}"
+        export RUSTFLAGS=""
+        cargo build -p bench --release
+    fi
     
     # Install binaries
     echo -e "${YELLOW}📦 Installing binaries...${NC}"
@@ -439,7 +449,17 @@ echo -e "\${YELLOW}# Performance metrics:\${NC}"
 echo "curl http://127.0.0.1:3030/metrics"
 echo ""
 echo -e "\${GREEN}🎯 Performance Testing:\${NC}"
-echo "kyrodb-bench --base http://127.0.0.1:3030 --load-n 100000 --read-seconds 30"
+echo "# Mixed read/write workload"
+echo "kyrodb-bench --base http://127.0.0.1:3030 --workers 32 --duration 30 --key-count 10000"
+echo ""
+echo "# Read-only performance test"
+echo "kyrodb-bench --base http://127.0.0.1:3030 --test-mode read --workers 64 --duration 30"
+echo ""
+echo "# Write-only performance test"  
+echo "kyrodb-bench --base http://127.0.0.1:3030 --test-mode write --workers 32 --duration 30"
+echo ""
+echo "# Enable RMI index for optimal performance"
+echo "kyrodb-bench --base http://127.0.0.1:3030 --enable-rmi --workers 64 --duration 30"
 echo ""
 echo -e "\${GREEN}📋 Useful Commands:\${NC}"
 echo "• View logs: tail -f $LOG_DIR/kyrodb.log"
@@ -511,7 +531,7 @@ display_completion() {
     echo ""
     echo -e "${BOLD}🎯 Performance:${NC}"
     echo -e "   ${YELLOW}kyrodb-tune${NC}        # Apply performance optimizations"
-    echo -e "   ${YELLOW}kyrodb-bench --base http://127.0.0.1:3030 --load-n 100000${NC}"
+    echo -e "   ${YELLOW}kyrodb-bench --base http://127.0.0.1:3030 --workers 32 --duration 30${NC}"
     echo ""
     if check_root; then
         echo -e "${BOLD}🔧 System Service:${NC}"
