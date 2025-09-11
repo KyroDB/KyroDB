@@ -20,7 +20,7 @@
 //! - Memory usage: Bounded and predictable
 //! - No blocking operations: Reads never wait for writes
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::collections::VecDeque;
 use parking_lot::{RwLock, Mutex};
@@ -40,11 +40,17 @@ const OVERFLOW_PRESSURE_CRITICAL: usize = (MAX_OVERFLOW_CAPACITY * 95) / 100; //
 const SYSTEM_MEMORY_LIMIT_MB: usize = 2048; // 2GB soft limit per RMI instance
 const MEMORY_CHECK_INTERVAL_MS: u64 = 1000; // Check memory usage every second
 
-/// Adaptive timing constants for CPU pressure detection
+/// Adaptive timing constants for CPU pressure detection and container throttling protection
 const BASE_MERGE_INTERVAL_MS: u64 = 50;
 const BASE_MANAGEMENT_INTERVAL_SEC: u64 = 5;  
 const BASE_STATS_INTERVAL_SEC: u64 = 30;
 const MAX_INTERVAL_MULTIPLIER: u64 = 8; // Maximum slowdown under high CPU pressure
+
+/// Container throttling emergency thresholds
+const EMERGENCY_MODE_PRESSURE_THRESHOLD: usize = 4; // Critical pressure level
+const EMERGENCY_MODE_CONSECUTIVE_THROTTLES: usize = 10; // Consecutive throttling events
+const EMERGENCY_MODE_YIELD_COUNT: usize = 10; // Heavy yielding in emergency mode
+const PRESSURE_YIELD_MULTIPLIER: usize = 2; // Yield count = pressure level * multiplier
 
 /// Centralized error handler for background operations
 #[derive(Debug)]
@@ -1234,10 +1240,16 @@ impl BoundedOverflowBuffer {
     }
 }
 
-/// CPU pressure detection for adaptive timing in container environments
+/// Enhanced CPU pressure detection for container environments with comprehensive throttling awareness
+#[derive(Debug)]
 struct CPUPressureDetector {
     last_check: std::time::Instant,
-    pressure_level: AtomicUsize, // 0=none, 1=low, 2=medium, 3=high
+    pressure_level: AtomicUsize, // 0=none, 1=low, 2=medium, 3=high, 4=critical
+    throttle_history: Mutex<VecDeque<u64>>, // Track throttling events over time
+    load_history: Mutex<VecDeque<f64>>, // Track load average trend
+    consecutive_throttles: AtomicUsize, // Consecutive throttling detections
+    last_throttle_count: AtomicU64, // Previous throttle count for delta calculation
+    container_detection: AtomicU8, // 0=unknown, 1=container, 2=bare_metal
 }
 
 impl CPUPressureDetector {
@@ -1245,57 +1257,207 @@ impl CPUPressureDetector {
         Self {
             last_check: std::time::Instant::now(),
             pressure_level: AtomicUsize::new(0),
+            throttle_history: Mutex::new(VecDeque::with_capacity(10)),
+            load_history: Mutex::new(VecDeque::with_capacity(5)),
+            consecutive_throttles: AtomicUsize::new(0),
+            last_throttle_count: AtomicU64::new(0),
+            container_detection: AtomicU8::new(0),
         }
     }
 
-    /// Detect CPU pressure using multiple signals
+    /// Enhanced pressure detection with comprehensive container throttling awareness
     fn detect_pressure(&mut self) -> usize {
         let now = std::time::Instant::now();
         
-        // Only check pressure every 5 seconds to avoid overhead
-        if now.duration_since(self.last_check).as_secs() < 5 {
+        // More frequent checks during high pressure to respond quickly
+        let check_interval_secs = match self.pressure_level.load(Ordering::Relaxed) {
+            0..=1 => 5,  // Normal: check every 5 seconds
+            2 => 3,      // Medium pressure: check every 3 seconds  
+            3 => 2,      // High pressure: check every 2 seconds
+            _ => 1,      // Critical pressure: check every second
+        };
+        
+        if now.duration_since(self.last_check).as_secs() < check_interval_secs {
             return self.pressure_level.load(Ordering::Relaxed);
         }
         
         self.last_check = now;
         let mut pressure_signals = 0;
+        let mut max_signal_strength = 0;
 
-        // Signal 1: Check container CPU throttling (if available)
-        if let Ok(throttling) = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.stat") {
-            if let Some(line) = throttling.lines().find(|l| l.starts_with("nr_throttled")) {
-                if let Some(value_str) = line.split_whitespace().nth(1) {
-                    if let Ok(throttled) = value_str.parse::<u64>() {
-                        if throttled > 0 {
-                            pressure_signals += 1; // Container CPU throttling detected
+        // Signal 1: Enhanced container CPU throttling detection
+        pressure_signals += self.detect_container_throttling(&mut max_signal_strength);
+
+        // Signal 2: Enhanced system load analysis with trending
+        pressure_signals += self.detect_load_pressure(&mut max_signal_strength);
+
+        // Signal 3: Enhanced memory pressure with swap detection
+        pressure_signals += self.detect_memory_pressure(&mut max_signal_strength);
+
+        // Signal 4: New - I/O wait and context switching pressure
+        pressure_signals += self.detect_io_pressure(&mut max_signal_strength);
+
+        // Signal 5: New - Container-specific cgroup pressure indicators
+        pressure_signals += self.detect_cgroup_pressure(&mut max_signal_strength);
+
+        // Calculate final pressure level using both signal count and maximum signal strength
+        let raw_pressure = match pressure_signals {
+            0 => 0,      // No pressure
+            1..=2 => 1,  // Low pressure  
+            3..=4 => 2,  // Medium pressure
+            5..=6 => 3,  // High pressure
+            _ => 4,      // Critical pressure
+        };
+
+        // Adjust based on maximum signal strength (individual signals can override)
+        let final_pressure = raw_pressure.max(max_signal_strength);
+
+        // Update consecutive throttling tracking
+        if final_pressure >= 3 {
+            self.consecutive_throttles.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.consecutive_throttles.store(0, Ordering::Relaxed);
+        }
+
+        self.pressure_level.store(final_pressure, Ordering::Relaxed);
+        
+        if final_pressure != raw_pressure {
+            println!("🔧 CPU pressure escalated from {} to {} due to critical signal", raw_pressure, final_pressure);
+        }
+
+        final_pressure
+    }
+
+    /// Detect container CPU throttling with delta tracking
+    fn detect_container_throttling(&self, max_signal_strength: &mut usize) -> usize {
+        let mut signals = 0;
+
+        // Check modern cgroup v2 throttling
+        if let Ok(throttling) = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat") {
+            self.container_detection.store(1, Ordering::Relaxed); // We're in a container
+            
+            for line in throttling.lines() {
+                if line.starts_with("throttled_usec") {
+                    if let Some(value_str) = line.split_whitespace().nth(1) {
+                        if let Ok(throttled_usec) = value_str.parse::<u64>() {
+                            let previous = self.last_throttle_count.load(Ordering::Relaxed);
+                            self.last_throttle_count.store(throttled_usec, Ordering::Relaxed);
+                            
+                            // Check if throttling increased (delta throttling)
+                            if throttled_usec > previous {
+                                let delta = throttled_usec - previous;
+                                if delta > 100_000 { // > 100ms of throttling per check interval
+                                    signals += 3;
+                                    *max_signal_strength = (*max_signal_strength).max(4); // Critical
+                                    println!("🚨 Container CPU throttling detected: +{}μs throttled", delta);
+                                } else if delta > 10_000 { // > 10ms of throttling
+                                    signals += 2;
+                                    *max_signal_strength = (*max_signal_strength).max(3); // High
+                                } else if delta > 0 {
+                                    signals += 1;
+                                    *max_signal_strength = (*max_signal_strength).max(2); // Medium
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also check nr_periods and nr_throttled for additional context
+                else if line.starts_with("nr_throttled") {
+                    if let Some(value_str) = line.split_whitespace().nth(1) {
+                        if let Ok(nr_throttled) = value_str.parse::<u64>() {
+                            if nr_throttled > 0 {
+                                signals += 1;
+                                println!("📊 Container throttle count: {}", nr_throttled);
+                            }
                         }
                     }
                 }
             }
         }
+        // Fallback to cgroup v1
+        else if let Ok(throttling) = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.stat") {
+            self.container_detection.store(1, Ordering::Relaxed);
+            
+            if let Some(line) = throttling.lines().find(|l| l.starts_with("nr_throttled")) {
+                if let Some(value_str) = line.split_whitespace().nth(1) {
+                    if let Ok(throttled) = value_str.parse::<u64>() {
+                        if throttled > 0 {
+                            signals += 1;
+                            println!("📊 Legacy container throttling detected: {}", throttled);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Not in a container - check bare metal indicators
+            self.container_detection.store(2, Ordering::Relaxed);
+        }
 
-        // Signal 2: Check system load (simplified heuristic)
+        signals
+    }
+
+    /// Enhanced load pressure detection with trending analysis
+    fn detect_load_pressure(&self, max_signal_strength: &mut usize) -> usize {
+        let mut signals = 0;
+
         if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
             if let Some(load_str) = loadavg.split_whitespace().next() {
                 if let Ok(load) = load_str.parse::<f64>() {
-                    // Fallback CPU count detection
                     let cpu_count = std::thread::available_parallelism()
                         .map(|p| p.get())
                         .unwrap_or(1) as f64;
                     let load_ratio = load / cpu_count;
                     
-                    if load_ratio > 2.0 {
-                        pressure_signals += 2; // Very high load
-                    } else if load_ratio > 1.5 {
-                        pressure_signals += 1; // High load
+                    // Update load history for trending
+                    {
+                        let mut history = self.load_history.lock();
+                        history.push_back(load_ratio);
+                        if history.len() > 5 {
+                            history.pop_front();
+                        }
+                        
+                        // Check if load is trending upward (early warning)
+                        if history.len() >= 3 {
+                            let recent_avg = history.iter().rev().take(2).sum::<f64>() / 2.0;
+                            let older_avg = history.iter().take(history.len() - 2).sum::<f64>() / (history.len() - 2) as f64;
+                            
+                            if recent_avg > older_avg * 1.5 {
+                                signals += 1; // Load is trending up rapidly
+                                println!("📈 Load trending upward: {:.2} -> {:.2}", older_avg, recent_avg);
+                            }
+                        }
+                    }
+                    
+                    // Absolute load thresholds
+                    if load_ratio > 4.0 {
+                        signals += 3;
+                        *max_signal_strength = (*max_signal_strength).max(4); // Critical
+                        println!("🚨 Critical system load: {:.2}x CPU count", load_ratio);
+                    } else if load_ratio > 2.5 {
+                        signals += 2;
+                        *max_signal_strength = (*max_signal_strength).max(3); // High
+                    } else if load_ratio > 1.8 {
+                        signals += 1;
+                        *max_signal_strength = (*max_signal_strength).max(2); // Medium
+                    } else if load_ratio > 1.2 {
+                        signals += 1;
                     }
                 }
             }
         }
 
-        // Signal 3: Memory pressure indicator
+        signals
+    }
+
+    /// Enhanced memory pressure detection including swap usage
+    fn detect_memory_pressure(&self, max_signal_strength: &mut usize) -> usize {
+        let mut signals = 0;
+
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
             let mut available_kb = 0u64;
             let mut total_kb = 0u64;
+            let mut swap_total_kb = 0u64;
+            let mut swap_free_kb = 0u64;
             
             for line in meminfo.lines() {
                 if line.starts_with("MemAvailable:") {
@@ -1306,45 +1468,160 @@ impl CPUPressureDetector {
                     if let Some(value) = line.split_whitespace().nth(1) {
                         total_kb = value.parse().unwrap_or(0);
                     }
+                } else if line.starts_with("SwapTotal:") {
+                    if let Some(value) = line.split_whitespace().nth(1) {
+                        swap_total_kb = value.parse().unwrap_or(0);
+                    }
+                } else if line.starts_with("SwapFree:") {
+                    if let Some(value) = line.split_whitespace().nth(1) {
+                        swap_free_kb = value.parse().unwrap_or(0);
+                    }
                 }
             }
             
             if total_kb > 0 {
                 let available_ratio = available_kb as f64 / total_kb as f64;
-                if available_ratio < 0.1 {
-                    pressure_signals += 2; // Very low memory
+                
+                if available_ratio < 0.05 {
+                    signals += 3;
+                    *max_signal_strength = (*max_signal_strength).max(4); // Critical
+                    println!("🚨 Critical memory pressure: {:.1}% available", available_ratio * 100.0);
+                } else if available_ratio < 0.1 {
+                    signals += 2;
+                    *max_signal_strength = (*max_signal_strength).max(3); // High
                 } else if available_ratio < 0.2 {
-                    pressure_signals += 1; // Low memory
+                    signals += 1;
+                    *max_signal_strength = (*max_signal_strength).max(2); // Medium
+                }
+                
+                // Check swap usage (indicates memory pressure)
+                if swap_total_kb > 0 {
+                    let swap_used_ratio = (swap_total_kb - swap_free_kb) as f64 / swap_total_kb as f64;
+                    if swap_used_ratio > 0.5 {
+                        signals += 2;
+                        *max_signal_strength = (*max_signal_strength).max(3); // High
+                        println!("🔄 High swap usage: {:.1}%", swap_used_ratio * 100.0);
+                    } else if swap_used_ratio > 0.2 {
+                        signals += 1;
+                    }
                 }
             }
         }
 
-        // Determine pressure level based on accumulated signals
-        let pressure = match pressure_signals {
-            0 => 0,      // No pressure
-            1 => 1,      // Low pressure  
-            2..=3 => 2,  // Medium pressure
-            _ => 3,      // High pressure
-        };
-
-        self.pressure_level.store(pressure, Ordering::Relaxed);
-        pressure
+        signals
     }
 
-    /// Get current pressure level without detection
+    /// Detect I/O wait and context switching pressure
+    fn detect_io_pressure(&self, max_signal_strength: &mut usize) -> usize {
+        let mut signals = 0;
+
+        // Check I/O wait from /proc/stat
+        if let Ok(stat) = std::fs::read_to_string("/proc/stat") {
+            if let Some(cpu_line) = stat.lines().find(|l| l.starts_with("cpu ")) {
+                let fields: Vec<&str> = cpu_line.split_whitespace().collect();
+                if fields.len() >= 6 {
+                    // cpu user nice system idle iowait irq softirq ...
+                    if let (Ok(idle), Ok(iowait)) = (fields[4].parse::<u64>(), fields[5].parse::<u64>()) {
+                        let total_time = idle + iowait;
+                        if total_time > 0 {
+                            let iowait_ratio = iowait as f64 / total_time as f64;
+                            
+                            if iowait_ratio > 0.3 {
+                                signals += 2;
+                                *max_signal_strength = (*max_signal_strength).max(3); // High
+                                println!("💾 High I/O wait: {:.1}%", iowait_ratio * 100.0);
+                            } else if iowait_ratio > 0.15 {
+                                signals += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        signals
+    }
+
+    /// Detect container-specific cgroup pressure indicators
+    fn detect_cgroup_pressure(&self, max_signal_strength: &mut usize) -> usize {
+        let mut signals = 0;
+
+        // Check cgroup v2 pressure stall information
+        if let Ok(pressure) = std::fs::read_to_string("/sys/fs/cgroup/cpu.pressure") {
+            for line in pressure.lines() {
+                if line.starts_with("some avg10=") {
+                    if let Some(avg_str) = line.strip_prefix("some avg10=") {
+                        if let Some(avg_val_str) = avg_str.split_whitespace().next() {
+                            if let Ok(avg_pressure) = avg_val_str.parse::<f64>() {
+                                if avg_pressure > 50.0 {
+                                    signals += 2;
+                                    *max_signal_strength = (*max_signal_strength).max(3); // High
+                                    println!("📊 CPU pressure stall: {:.1}%", avg_pressure);
+                                } else if avg_pressure > 20.0 {
+                                    signals += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        signals
+    }
+
+    /// Get current pressure level without detection (fast path)
     fn current_pressure(&self) -> usize {
         self.pressure_level.load(Ordering::Relaxed)
     }
 
-    /// Calculate interval multiplier based on pressure
+    /// Enhanced interval multiplier with progressive scaling
     fn interval_multiplier(&self, pressure: usize) -> u64 {
-        match pressure {
+        let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
+        
+        let base_multiplier = match pressure {
             0 => 1,  // No pressure - normal intervals
             1 => 2,  // Low pressure - 2x slower
-            2 => 4,  // Medium pressure - 4x slower
-            3 => MAX_INTERVAL_MULTIPLIER, // High pressure - 8x slower
-            _ => MAX_INTERVAL_MULTIPLIER,
-        }
+            2 => 4,  // Medium pressure - 4x slower  
+            3 => 6,  // High pressure - 6x slower
+            4 => 8,  // Critical pressure - 8x slower
+            _ => 8,  // Cap at 8x
+        };
+
+        // Apply consecutive throttling penalty
+        let penalty_multiplier = if consecutive > 10 {
+            2 // Double the interval if we've been throttled many times
+        } else if consecutive > 5 {
+            1.5 as u64 // 50% penalty for persistent throttling
+        } else {
+            1
+        };
+
+        (base_multiplier * penalty_multiplier).min(MAX_INTERVAL_MULTIPLIER)
+    }
+
+    /// Check if we should yield CPU to other processes
+    fn should_yield_cpu(&self) -> bool {
+        let pressure = self.current_pressure();
+        let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
+        
+        // Yield if under high pressure or persistent throttling
+        pressure >= 3 || consecutive > 3
+    }
+
+    /// Get comprehensive pressure statistics for monitoring
+    fn get_pressure_stats(&self) -> (usize, usize, bool, &'static str) {
+        let pressure = self.current_pressure();
+        let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
+        let is_container = self.container_detection.load(Ordering::Relaxed) == 1;
+        
+        let environment = match self.container_detection.load(Ordering::Relaxed) {
+            1 => "container",
+            2 => "bare_metal",
+            _ => "unknown",
+        };
+        
+        (pressure, consecutive, is_container, environment)
     }
 }
 
@@ -2150,7 +2427,7 @@ impl AdaptiveRMI {
     }
     */
 
-    /// Enhanced background maintenance task with advanced adaptive scheduling and robust error handling
+    /// Container-aware background maintenance with robust CPU throttling protection
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut cpu_detector = CPUPressureDetector::new();
@@ -2162,114 +2439,337 @@ impl AdaptiveRMI {
             let mut stats_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC));
             
             let mut last_pressure_check = std::time::Instant::now();
+            let mut emergency_mode = false;
+            let mut last_emergency_check = std::time::Instant::now();
             
-            println!("🚀 Starting enhanced adaptive background maintenance with dynamic interval optimization");
+            println!("🚀 Starting container-aware background maintenance with CPU throttling protection");
             
             loop {
-                // Periodically adjust base intervals based on CPU pressure
+                let loop_start = std::time::Instant::now();
+                
+                // CRITICAL: Check CPU pressure more frequently and adapt immediately
                 let now = std::time::Instant::now();
-                if now.duration_since(last_pressure_check).as_secs() >= 10 {
+                let pressure_check_interval = if emergency_mode { 2 } else { 5 }; // More frequent in emergency
+                
+                if now.duration_since(last_pressure_check).as_secs() >= pressure_check_interval {
                     last_pressure_check = now;
                     let pressure = cpu_detector.detect_pressure();
                     let multiplier = cpu_detector.interval_multiplier(pressure);
+                    let (_pressure_level, consecutive_throttles, _is_container, environment) = cpu_detector.get_pressure_stats();
+                    
+                    // Emergency mode activation - completely change behavior under extreme pressure
+                    let new_emergency_mode = _pressure_level >= 4 || consecutive_throttles > 10;
+                    if new_emergency_mode != emergency_mode {
+                        emergency_mode = new_emergency_mode;
+                        last_emergency_check = now;
+                        
+                        if emergency_mode {
+                            println!("🚨 EMERGENCY MODE ACTIVATED - CPU pressure critical (level {}, {} consecutive throttles)", 
+                                _pressure_level, consecutive_throttles);
+                            println!("🔧 Environment: {}, switching to survival mode operations", environment);
+                        } else {
+                            println!("✅ Emergency mode deactivated - CPU pressure normalized");
+                        }
+                    }
                     
                     if multiplier > 1 {
-                        println!("🔧 CPU pressure detected (level {}), base intervals scaled by {}x", pressure, multiplier);
+                        println!("🔧 CPU pressure detected (level {}, env: {}) - intervals scaled by {}x", 
+                            pressure, environment, multiplier);
                         
-                        // Update base durations for all adaptive intervals
+                        // Dynamic base interval adjustment based on pressure
                         merge_adaptive = AdaptiveInterval::new(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS * multiplier));
                         management_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC * multiplier));
                         stats_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC * multiplier));
                     }
                 }
                 
-                tokio::select! {
-                    _ = tokio::time::sleep(merge_adaptive.current()) => {
-                        let merge_start = std::time::Instant::now();
+                // EMERGENCY MODE: Minimal operations, maximum yielding
+                if emergency_mode {
+                    let _emergency_duration = now.duration_since(last_emergency_check);
+                    
+                    // Only do critical overflow buffer merges in emergency mode
+                    let (overflow_size, overflow_cap, _rejected, _pressure_level, _memory) = self.overflow_buffer.lock().stats();
+                    let overflow_critical = overflow_size >= overflow_cap * 9 / 10; // 90% full
+                    
+                    if overflow_critical {
+                        println!("🚨 Emergency merge required - overflow buffer {}% full", 
+                            (overflow_size * 100) / overflow_cap);
                         
-                        // Check CPU pressure before doing work
-                        let current_pressure = cpu_detector.current_pressure();
-                        
-                        // Skip merge under high CPU pressure unless overflow buffer is critical
-                        if current_pressure >= 3 {
-                            let (overflow_size, overflow_cap, _, _, _) = self.overflow_buffer.lock().stats();
-                            if overflow_size < overflow_cap * 3 / 4 {
-                                continue; // Skip this merge cycle
-                            }
-                        }
-                        
-                        // Enhanced hot buffer merge triggering - check without holding locks
-                        let should_merge = {
-                            let current_size = self.hot_buffer.size.load(std::sync::atomic::Ordering::Relaxed);
-                            current_size > TARGET_SEGMENT_SIZE / 4
-                        };
-                        
-                        if should_merge {
-                            // Yield to foreground operations before heavy merge
+                        // Yield heavily before emergency operations
+                        for _ in 0..5 {
                             tokio::task::yield_now().await;
-                            
-                            match self.merge_hot_buffer().await {
-                                Ok(_) => {
-                                    let completion_time = merge_start.elapsed();
-                                    merge_adaptive.optimize_interval(completion_time);
-                                    error_handler.reset_merge_errors();
-                                }
-                                Err(e) => {
-                                    merge_adaptive.increase_interval();
-                                    let should_continue = error_handler.handle_merge_error(e).await;
-                                    if !should_continue {
-                                        eprintln!("🛑 Too many merge errors, stopping background maintenance");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ = tokio::time::sleep(management_adaptive.current()) => {
-                        let mgmt_start = std::time::Instant::now();
-                        
-                        // Skip heavy management tasks under high CPU pressure
-                        let current_pressure = cpu_detector.current_pressure();
-                        if current_pressure >= 3 {
-                            continue; // Skip this management cycle under high pressure
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                         
-                        // Advanced adaptive segment management with error handling
-                        match self.adaptive_segment_management().await {
+                        // Emergency merge with minimal CPU usage
+                        match self.emergency_minimal_merge().await {
                             Ok(_) => {
-                                let completion_time = mgmt_start.elapsed();
-                                management_adaptive.optimize_interval(completion_time);
-                                error_handler.reset_management_errors();
+                                println!("✅ Emergency merge completed");
+                                error_handler.reset_merge_errors();
                             }
                             Err(e) => {
-                                management_adaptive.increase_interval();
+                                println!("❌ Emergency merge failed: {}", e);
                                 error_handler.handle_management_error(e);
                             }
                         }
                     }
-                    _ = tokio::time::sleep(stats_adaptive.current()) => {
-                        let stats_start = std::time::Instant::now();
+                    
+                    // In emergency mode, yield CPU extensively and wait longer
+                    for _ in 0..10 {
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue; // Skip normal operations in emergency mode
+                }
+                
+                // Adaptive CPU yielding based on throttling detection
+                if cpu_detector.should_yield_cpu() {
+                    for _ in 0..3 {
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                
+                // ENHANCED TASK SCHEDULING: Priority-based with throttling awareness
+                let current_pressure = cpu_detector.current_pressure();
+                
+                // Check for urgent operations first (memory pressure)
+                let urgent_merge_needed = {
+                    let (overflow_size, overflow_cap, _rejected, buffer_pressure, _memory) = self.overflow_buffer.lock().stats();
+                    buffer_pressure >= 3 || overflow_size >= overflow_cap * 3 / 4
+                };
+                
+                // Priority 1: Urgent merges (override all pressure limits)
+                if urgent_merge_needed {
+                    println!("⚡ Urgent merge required due to memory pressure");
+                    
+                    // Brief yielding before urgent work
+                    tokio::task::yield_now().await;
+                    
+                    let merge_start = std::time::Instant::now();
+                    match self.merge_hot_buffer().await {
+                        Ok(_) => {
+                            let completion_time = merge_start.elapsed();
+                            merge_adaptive.optimize_interval(completion_time);
+                            error_handler.reset_merge_errors();
+                            println!("✅ Urgent merge completed in {:?}", completion_time);
+                        }
+                        Err(e) => {
+                            merge_adaptive.increase_interval();
+                            let should_continue = error_handler.handle_merge_error(e).await;
+                            if !should_continue {
+                                eprintln!("🛑 Too many merge errors, stopping background maintenance");
+                                break;
+                            }
+                        }
+                    }
+                    continue; // Skip other operations after urgent merge
+                }
+                
+                // Priority 2: Regular merge operations (with pressure-aware scheduling)
+                if now.duration_since(loop_start) >= merge_adaptive.current() {
+                    // Skip merge under high CPU pressure unless buffer is getting full
+                    if current_pressure >= 3 {
+                        let (overflow_size, overflow_cap, _rejected, _pressure, _memory) = self.overflow_buffer.lock().stats();
+                        let hot_utilization = self.hot_buffer.utilization();
                         
-                        // Periodic performance analytics and health checks
-                        self.log_performance_analytics().await;
-                        
-                        // Log error statistics and interval performance
-                        let (merge_errors, mgmt_errors) = error_handler.stats();
-                        if merge_errors > 0 || mgmt_errors > 0 {
-                            println!("📊 Background error stats: {} merge errors, {} management errors", 
-                                merge_errors, mgmt_errors);
+                        if overflow_size < overflow_cap / 2 && hot_utilization < 0.6 {
+                            println!("⏸️  Skipping merge due to CPU pressure (level {})", current_pressure);
+                            tokio::time::sleep(merge_adaptive.current() / 2).await; // Wait half interval
+                            continue;
+                        }
+                    }
+                    
+                    // Enhanced hot buffer merge triggering
+                    let should_merge = {
+                        let current_size = self.hot_buffer.size.load(std::sync::atomic::Ordering::Relaxed);
+                        current_size > TARGET_SEGMENT_SIZE / 4
+                    };
+                    
+                    if should_merge {
+                        // Progressive yielding based on CPU pressure
+                        match current_pressure {
+                            0..=1 => { /* No yielding needed */ }
+                            2 => {
+                                tokio::task::yield_now().await;
+                            }
+                            3 => {
+                                for _ in 0..2 {
+                                    tokio::task::yield_now().await;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            _ => {
+                                for _ in 0..5 {
+                                    tokio::task::yield_now().await;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
                         }
                         
-                        // Log current adaptive intervals
-                        println!("⏱️  Current adaptive intervals - merge: {:?}, mgmt: {:?}, stats: {:?}",
-                            merge_adaptive.current(), management_adaptive.current(), stats_adaptive.current());
-                        
-                        let completion_time = stats_start.elapsed();
-                        stats_adaptive.optimize_interval(completion_time);
+                        let merge_start = std::time::Instant::now();
+                        match self.merge_hot_buffer().await {
+                            Ok(_) => {
+                                let completion_time = merge_start.elapsed();
+                                merge_adaptive.optimize_interval(completion_time);
+                                error_handler.reset_merge_errors();
+                            }
+                            Err(e) => {
+                                merge_adaptive.increase_interval();
+                                let should_continue = error_handler.handle_merge_error(e).await;
+                                if !should_continue {
+                                    eprintln!("🛑 Too many merge errors, stopping background maintenance");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
+                
+                // Priority 3: Management operations (lowest priority, most pressure-sensitive)
+                if now.duration_since(loop_start) >= management_adaptive.current() {
+                    // Skip heavy management tasks under even medium CPU pressure
+                    if current_pressure >= 2 {
+                        println!("⏸️  Skipping management tasks due to CPU pressure (level {})", current_pressure);
+                        tokio::time::sleep(management_adaptive.current() / 3).await; // Wait third of interval
+                        continue;
+                    }
+                    
+                    // Extensive yielding before management operations
+                    for _ in 0..5 {
+                        tokio::task::yield_now().await;
+                    }
+                    
+                    let mgmt_start = std::time::Instant::now();
+                    match self.adaptive_segment_management().await {
+                        Ok(_) => {
+                            let completion_time = mgmt_start.elapsed();
+                            management_adaptive.optimize_interval(completion_time);
+                            error_handler.reset_management_errors();
+                        }
+                        Err(e) => {
+                            management_adaptive.increase_interval();
+                            error_handler.handle_management_error(e);
+                        }
+                    }
+                }
+                
+                // Priority 4: Statistics and monitoring (very low priority)
+                if now.duration_since(loop_start) >= stats_adaptive.current() {
+                    // Skip stats under any significant CPU pressure
+                    if current_pressure >= 2 {
+                        tokio::time::sleep(stats_adaptive.current() / 4).await; // Wait quarter interval
+                        continue;
+                    }
+                    
+                    let stats_start = std::time::Instant::now();
+                    
+                    // Lightweight analytics only
+                    self.log_performance_analytics().await;
+                    
+                    // Enhanced logging with pressure information
+                    let (merge_errors, mgmt_errors) = error_handler.stats();
+                    let (_pressure_level, consecutive_throttles, _is_container, environment) = cpu_detector.get_pressure_stats();
+                    
+                    if merge_errors > 0 || mgmt_errors > 0 || _pressure_level > 0 {
+                        println!("📊 Status - Errors: {}M/{}G, Pressure: L{} ({} throttles), Env: {}", 
+                            merge_errors, mgmt_errors, _pressure_level, consecutive_throttles, environment);
+                    }
+                    
+                    if _pressure_level == 0 {
+                        println!("⏱️  Intervals - merge: {:?}, mgmt: {:?}, stats: {:?}",
+                            merge_adaptive.current(), management_adaptive.current(), stats_adaptive.current());
+                    }
+                    
+                    let completion_time = stats_start.elapsed();
+                    stats_adaptive.optimize_interval(completion_time);
+                }
+                
+                // CRITICAL: Adaptive sleep with pressure-aware yielding
+                let base_sleep = std::time::Duration::from_millis(10);
+                let pressure_sleep = match current_pressure {
+                    0 => base_sleep,
+                    1 => base_sleep * 2,
+                    2 => base_sleep * 4,
+                    3 => base_sleep * 8,
+                    _ => base_sleep * 16,
+                };
+                
+                // Yield CPU before sleeping when under pressure
+                if current_pressure >= 2 {
+                    for _ in 0..(current_pressure * 2) {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                
+                tokio::time::sleep(pressure_sleep).await;
             }
         })
+    }
+    
+    /// Emergency minimal merge operation for critical memory pressure scenarios
+    async fn emergency_minimal_merge(&self) -> Result<()> {
+        println!("🚨 Performing emergency minimal merge to prevent OOM");
+        
+        // Only drain overflow buffer, keep hot buffer for performance
+        let overflow_data = {
+            let mut overflow = self.overflow_buffer.lock();
+            if overflow.data.is_empty() {
+                return Ok(()); // Nothing to merge
+            }
+            overflow.drain_all()
+        };
+        
+        if overflow_data.is_empty() {
+            return Ok(());
+        }
+        
+        println!("🔧 Emergency merging {} overflow entries", overflow_data.len());
+        
+        // Simplified merge - just add to segments without complex optimization
+        let updates_by_segment = self.group_updates_by_segment(overflow_data).await?;
+        
+        // Process in small batches with heavy yielding
+        for (segment_id, updates) in updates_by_segment {
+            // Yield extensively during emergency operations
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            
+            self.emergency_merge_segment_simple(segment_id, updates).await?;
+            
+            // Sleep between segment updates to avoid CPU starvation
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        
+        println!("✅ Emergency merge completed successfully");
+        Ok(())
+    }
+    
+    /// Simplified segment merge for emergency scenarios
+    async fn emergency_merge_segment_simple(&self, segment_id: usize, updates: Vec<(u64, u64)>) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        
+        // Simplified update without complex model retraining
+        // Process updates in small batches to avoid holding locks for too long
+        for chunk in updates.chunks(10) {
+            {
+                let mut segments = self.segments.write();
+                
+                if segment_id < segments.len() {
+                    for (key, value) in chunk {
+                        segments[segment_id].insert(*key, *value)?;
+                    }
+                }
+            } // Release lock before yielding
+            
+            // Yield every chunk during emergency
+            tokio::task::yield_now().await;
+        }
+        
+        Ok(())
     }
 
     /// Performance analytics and monitoring
