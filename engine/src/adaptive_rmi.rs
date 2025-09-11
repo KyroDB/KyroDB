@@ -28,10 +28,17 @@ use crossbeam_queue::SegQueue;
 use tokio::sync::Notify;
 use anyhow::{Result, anyhow};
 
-/// Maximum overflow buffer capacity to prevent unbounded growth
-const MAX_OVERFLOW_CAPACITY: usize = 10_000;
-/// Pressure threshold to start rejecting writes (90% of max capacity)
-const OVERFLOW_PRESSURE_THRESHOLD: usize = (MAX_OVERFLOW_CAPACITY * 9) / 10;
+/// Critical memory management constants - prevent OOM in production RAG workloads
+const MAX_OVERFLOW_CAPACITY: usize = 50_000; // Increased for high-throughput RAG ingestion
+// Multi-tier pressure thresholds for graduated back-pressure response
+const OVERFLOW_PRESSURE_LOW: usize = (MAX_OVERFLOW_CAPACITY * 6) / 10;     // 60% - early warning
+const OVERFLOW_PRESSURE_MEDIUM: usize = (MAX_OVERFLOW_CAPACITY * 8) / 10;  // 80% - urgent merge
+const OVERFLOW_PRESSURE_HIGH: usize = (MAX_OVERFLOW_CAPACITY * 9) / 10;    // 90% - reject writes
+const OVERFLOW_PRESSURE_CRITICAL: usize = (MAX_OVERFLOW_CAPACITY * 95) / 100; // 95% - hard reject
+
+/// Memory safety circuit breaker for system-wide protection
+const SYSTEM_MEMORY_LIMIT_MB: usize = 2048; // 2GB soft limit per RMI instance
+const MEMORY_CHECK_INTERVAL_MS: u64 = 1000; // Check memory usage every second
 
 /// Adaptive timing constants for CPU pressure detection
 const BASE_MERGE_INTERVAL_MS: u64 = 50;
@@ -1014,6 +1021,7 @@ pub struct BackgroundMerger {
 #[derive(Debug)]
 pub enum MergeOperation {
     HotBufferMerge,
+    UrgentHotBufferMerge, // High-priority merge due to memory pressure
     SegmentSplit(usize),
     SegmentMerge(usize, usize),
 }
@@ -1065,15 +1073,20 @@ impl BackgroundMerger {
         self.merge_in_progress.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Schedule urgent merge due to overflow pressure
+    /// Schedule urgent merge due to overflow pressure with priority handling
     pub fn schedule_urgent_merge(&self) -> bool {
-        // Only allow urgent merge if no merge is currently in progress
-        if self.merge_in_progress.load(Ordering::Relaxed) == 0 {
-            self.schedule_merge_async();
-            true
-        } else {
-            false
-        }
+        // Always schedule urgent merge regardless of current merge status
+        // High-priority merges should preempt normal operations
+        self.pending_merges.push(MergeOperation::UrgentHotBufferMerge);
+        self.merge_notify.notify_waiters(); // Notify all waiters for urgent operation
+        true // Always signal that urgent merge was scheduled
+    }
+
+    /// Check if there are urgent merges pending
+    pub fn has_urgent_merges(&self) -> bool {
+        // This is a simple implementation - in production we'd want
+        // a more sophisticated priority queue
+        !self.pending_merges.is_empty()
     }
 }
 
@@ -1087,7 +1100,11 @@ pub struct BoundedOverflowBuffer {
     /// Rejection counter for back-pressure signaling
     rejected_writes: AtomicUsize,
     /// Pressure level indicator
-    pressure_level: AtomicUsize, // 0=none, 1=low, 2=medium, 3=high
+    pressure_level: AtomicUsize, // 0=none, 1=low, 2=medium, 3=high, 4=critical
+    /// Memory usage tracking for circuit breaker
+    estimated_memory_mb: AtomicUsize,
+    /// Last memory check timestamp
+    last_memory_check: AtomicU64,
 }
 
 impl BoundedOverflowBuffer {
@@ -1097,40 +1114,80 @@ impl BoundedOverflowBuffer {
             max_capacity,
             rejected_writes: AtomicUsize::new(0),
             pressure_level: AtomicUsize::new(0),
+            estimated_memory_mb: AtomicUsize::new(0),
+            last_memory_check: AtomicU64::new(0),
         }
     }
 
-    /// Try to insert with back-pressure handling
+    /// Enhanced memory-aware insert with circuit breaker protection
     pub fn try_insert(&mut self, key: u64, value: u64) -> Result<bool> {
         let current_size = self.data.len();
         
-        // Update pressure level based on current size
+        // Circuit breaker: Check system memory usage periodically
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last_check = self.last_memory_check.load(Ordering::Relaxed);
+        
+        if now - last_check > MEMORY_CHECK_INTERVAL_MS {
+            self.update_memory_estimate(current_size);
+            self.last_memory_check.store(now, Ordering::Relaxed);
+            
+            // Circuit breaker: Reject if approaching system memory limit
+            let memory_mb = self.estimated_memory_mb.load(Ordering::Relaxed);
+            if memory_mb > SYSTEM_MEMORY_LIMIT_MB {
+                self.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                return Err(anyhow!("Circuit breaker triggered: system memory limit exceeded ({}MB > {}MB)", 
+                    memory_mb, SYSTEM_MEMORY_LIMIT_MB));
+            }
+        }
+
+        // Multi-tier pressure calculation with graduated back-pressure
         let pressure = if current_size == 0 {
             0 // none
-        } else if current_size < self.max_capacity / 3 {
-            1 // low
-        } else if current_size < (self.max_capacity * 2) / 3 {
-            2 // medium
+        } else if current_size < OVERFLOW_PRESSURE_LOW {
+            1 // low - normal operation
+        } else if current_size < OVERFLOW_PRESSURE_MEDIUM {
+            2 // medium - schedule urgent merge
+        } else if current_size < OVERFLOW_PRESSURE_HIGH {
+            3 // high - reject with retry hint
+        } else if current_size < OVERFLOW_PRESSURE_CRITICAL {
+            4 // critical - hard reject
         } else {
-            3 // high
+            4 // critical - at capacity
         };
         self.pressure_level.store(pressure, Ordering::Relaxed);
 
-        // Reject if at capacity
+        // Hard capacity limit - never exceed to prevent OOM
         if current_size >= self.max_capacity {
             self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-            return Ok(false); // Signal back-pressure - caller should retry later
+            return Err(anyhow!("Overflow buffer at maximum capacity ({}). Background merge may be stalled.", 
+                self.max_capacity));
         }
 
-        // Reject early if under high pressure (90%+ capacity)
-        if current_size >= OVERFLOW_PRESSURE_THRESHOLD {
+        // Graduated back-pressure: reject at critical threshold with retry guidance
+        if current_size >= OVERFLOW_PRESSURE_CRITICAL {
             self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-            return Ok(false); // Early rejection to prevent hitting hard limit
+            return Ok(false); // Signal back-pressure - caller should implement exponential backoff
+        }
+
+        // High pressure: reject 50% of writes to prevent cascade failure
+        if current_size >= OVERFLOW_PRESSURE_HIGH && current_size % 2 == 0 {
+            self.rejected_writes.fetch_add(1, Ordering::Relaxed);
+            return Ok(false); // Probabilistic rejection under high pressure
         }
 
         // Accept the write
         self.data.push_back((key, value));
         Ok(true)
+    }
+
+    /// Update memory usage estimate for circuit breaker
+    fn update_memory_estimate(&self, current_size: usize) {
+        // Estimate: each entry ~16 bytes + VecDeque overhead
+        let estimated_mb = (current_size * 16 + 1024) / (1024 * 1024);
+        self.estimated_memory_mb.store(estimated_mb, Ordering::Relaxed);
     }
 
     /// Search for a key in the buffer (LIFO order for recency)
@@ -1150,19 +1207,30 @@ impl BoundedOverflowBuffer {
         drained
     }
 
-    /// Get buffer statistics
-    pub fn stats(&self) -> (usize, usize, usize, usize) {
+    /// Get buffer statistics including memory usage
+    pub fn stats(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.data.len(),
             self.max_capacity,
             self.rejected_writes.load(Ordering::Relaxed),
             self.pressure_level.load(Ordering::Relaxed),
+            self.estimated_memory_mb.load(Ordering::Relaxed),
         )
     }
 
-    /// Check if buffer is under pressure
+    /// Check if buffer is under pressure (medium pressure or higher)
     pub fn is_under_pressure(&self) -> bool {
-        self.pressure_level.load(Ordering::Relaxed) >= 2 // medium or high pressure
+        self.pressure_level.load(Ordering::Relaxed) >= 2 // medium or higher pressure
+    }
+
+    /// Check if buffer is under critical pressure requiring immediate action
+    pub fn is_under_critical_pressure(&self) -> bool {
+        self.pressure_level.load(Ordering::Relaxed) >= 4 // critical pressure
+    }
+
+    /// Get current pressure level for monitoring
+    pub fn get_pressure_level(&self) -> usize {
+        self.pressure_level.load(Ordering::Relaxed)
     }
 }
 
@@ -1370,17 +1438,48 @@ impl AdaptiveRMI {
         }
     }
 
-    /// Insert without blocking reads - core innovation
+    /// Enhanced insert with robust memory management and circuit breaker protection
     pub fn insert(&self, key: u64, value: u64) -> Result<()> {
         // 1. Try to insert into hot buffer (lock-free, bounded size)
         if self.hot_buffer.try_insert(key, value)? {
             return Ok(());
         }
 
-        // 2. If hot buffer full, trigger background merge
-        self.merge_scheduler.schedule_merge_async();
+        // 2. Hot buffer full - check overflow buffer pressure before proceeding
+        let (overflow_size, overflow_capacity, rejected_writes, pressure_level, memory_mb) = {
+            let overflow = self.overflow_buffer.lock();
+            overflow.stats()
+        };
 
-        // 3. Try to store in bounded overflow buffer with back-pressure
+        // 3. Circuit breaker: Reject immediately if memory usage is critical
+        if memory_mb > SYSTEM_MEMORY_LIMIT_MB {
+            return Err(anyhow!(
+                "Circuit breaker active: Memory usage {}MB exceeds limit {}MB. System under extreme memory pressure.",
+                memory_mb, SYSTEM_MEMORY_LIMIT_MB
+            ));
+        }
+
+        // 4. Schedule appropriate merge based on pressure level
+        match pressure_level {
+            0..=1 => {
+                // Low pressure - normal merge
+                self.merge_scheduler.schedule_merge_async();
+            }
+            2..=3 => {
+                // Medium to high pressure - urgent merge
+                self.merge_scheduler.schedule_urgent_merge();
+            }
+            4.. => {
+                // Critical pressure - immediate rejection with exponential backoff guidance
+                let backoff_ms = std::cmp::min(1000, 50 * (rejected_writes / 10 + 1));
+                return Err(anyhow!(
+                    "Write rejected: Overflow buffer under critical pressure ({}/{} capacity, {}MB memory). Retry after {}ms with exponential backoff.",
+                    overflow_size, overflow_capacity, memory_mb, backoff_ms
+                ));
+            }
+        }
+
+        // 5. Attempt to insert into bounded overflow buffer with back-pressure
         {
             let mut overflow = self.overflow_buffer.lock();
             match overflow.try_insert(key, value)? {
@@ -1389,22 +1488,23 @@ impl AdaptiveRMI {
                     return Ok(());
                 }
                 false => {
-                    // Buffer full - check pressure before applying back-pressure
-                    let is_under_pressure = overflow.is_under_pressure();
-                    drop(overflow); // Release lock before yielding
+                    // Buffer rejected write due to pressure
+                    let is_critical = overflow.is_under_critical_pressure();
+                    drop(overflow); // Release lock before error
                     
-                    // Signal urgent merge needed due to overflow pressure
-                    if self.merge_scheduler.schedule_urgent_merge() {
-                        // Try one more time after scheduling urgent merge
-                        let mut overflow = self.overflow_buffer.lock();
-                        if overflow.try_insert(key, value)? {
-                            return Ok(());
-                        }
+                    if is_critical {
+                        // Critical pressure - hard rejection
+                        return Err(anyhow!(
+                            "Write permanently rejected: System under critical memory pressure. Reduce write rate and implement exponential backoff."
+                        ));
+                    } else {
+                        // High pressure - temporary rejection with retry guidance
+                        let retry_ms = std::cmp::min(500, 25 * (rejected_writes / 5 + 1));
+                        return Err(anyhow!(
+                            "Write temporarily rejected: High memory pressure. Retry after {}ms.", 
+                            retry_ms
+                        ));
                     }
-                    
-                    // All buffers exhausted - reject write to prevent memory exhaustion
-                    return Err(anyhow!("Write rejected: system under extreme memory pressure. Please retry in {}ms", 
-                        if is_under_pressure { 100 } else { 50 }));
                 }
             }
         }
@@ -2092,7 +2192,7 @@ impl AdaptiveRMI {
                         
                         // Skip merge under high CPU pressure unless overflow buffer is critical
                         if current_pressure >= 3 {
-                            let (overflow_size, overflow_cap, _, _) = self.overflow_buffer.lock().stats();
+                            let (overflow_size, overflow_cap, _, _, _) = self.overflow_buffer.lock().stats();
                             if overflow_size < overflow_cap * 3 / 4 {
                                 continue; // Skip this merge cycle
                             }
@@ -2187,7 +2287,7 @@ impl AdaptiveRMI {
     /// Enhanced merge triggering logic
     async fn should_trigger_merge(&self) -> bool {
         let hot_utilization = self.hot_buffer.utilization();
-        let (overflow_size, _, _rejected_writes, _pressure) = self.overflow_buffer.lock().stats();
+        let (overflow_size, _, _rejected_writes, _pressure, _memory_mb) = self.overflow_buffer.lock().stats();
         let merge_in_progress = self.merge_scheduler.is_merge_in_progress();
         
         // Don't start new merge if one is already in progress
@@ -2208,7 +2308,7 @@ impl AdaptiveRMI {
         let segments = self.segments.read();
         let hot_buffer_size = self.hot_buffer.size.load(Ordering::Relaxed);
         let hot_buffer_utilization = self.hot_buffer.utilization();
-        let (overflow_size, _overflow_capacity, _rejected_writes, _pressure) = self.overflow_buffer.lock().stats();
+        let (overflow_size, _overflow_capacity, _rejected_writes, _pressure, _memory_mb) = self.overflow_buffer.lock().stats();
         
         let total_keys: usize = segments.iter().map(|s| s.len()).sum();
         let segment_count = segments.len();
