@@ -59,25 +59,56 @@ install_dependencies() {
         # Ubuntu/Debian
         if check_root; then
             apt-get update
-            apt-get install -y curl wget build-essential pkg-config libssl-dev
+            apt-get install -y curl wget build-essential pkg-config libssl-dev git
         else
-            echo -e "${YELLOW}ℹ️  Skipping system packages (requires root). Ensure you have: curl, wget, build-essential, pkg-config, libssl-dev${NC}"
+            echo -e "${YELLOW}ℹ️  Skipping system packages (requires root). Ensure you have: curl, wget, build-essential, pkg-config, libssl-dev, git${NC}"
         fi
     elif command -v yum >/dev/null 2>&1; then
         # RHEL/CentOS
         if check_root; then
             yum update -y
             yum groupinstall -y "Development Tools"
-            yum install -y curl wget openssl-devel pkg-config
+            yum install -y curl wget openssl-devel pkg-config git
         else
             echo -e "${YELLOW}ℹ️  Skipping system packages (requires root). Ensure you have development tools installed${NC}"
         fi
     elif command -v brew >/dev/null 2>&1; then
-        # macOS
-        brew install curl wget pkg-config openssl
+        # macOS - NEVER run brew as root
+        if check_root; then
+            echo -e "${RED}⚠️  Homebrew detected but running as root${NC}"
+            echo -e "${YELLOW}ℹ️  Homebrew cannot run as root for security reasons${NC}"
+            echo -e "${YELLOW}ℹ️  Please ensure these packages are installed:${NC}"
+            echo -e "     • curl (usually pre-installed)"
+            echo -e "     • wget: brew install wget"
+            echo -e "     • pkg-config: brew install pkg-config" 
+            echo -e "     • openssl: brew install openssl"
+            echo -e "     • git (usually pre-installed)"
+            echo -e "${YELLOW}ℹ️  Or run this script without sudo for automatic installation${NC}"
+        else
+            # Safe to run brew as non-root user
+            echo -e "${GREEN}🍺 Installing dependencies via Homebrew...${NC}"
+            brew install curl wget pkg-config openssl git || {
+                echo -e "${YELLOW}⚠️  Some packages may already be installed${NC}"
+            }
+        fi
     else
-        echo -e "${YELLOW}⚠️  Unknown package manager. Please ensure curl, wget, and build tools are installed${NC}"
+        echo -e "${YELLOW}⚠️  Unknown package manager. Please ensure curl, wget, git and build tools are installed${NC}"
     fi
+    
+    # Verify critical dependencies are available
+    echo -e "${YELLOW}🔍 Verifying dependencies...${NC}"
+    local missing_deps=()
+    
+    command -v curl >/dev/null 2>&1 || missing_deps+=("curl")
+    command -v git >/dev/null 2>&1 || missing_deps+=("git")
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        echo -e "${RED}❌ Missing critical dependencies: ${missing_deps[*]}${NC}"
+        echo -e "${YELLOW}ℹ️  Please install missing dependencies and re-run${NC}"
+        exit 1
+    fi
+    
+    echo -e "${GREEN}✅ Dependencies verified${NC}"
 }
 
 # Function: Install or update Rust
@@ -551,14 +582,30 @@ display_completion() {
 main() {
     echo -e "${YELLOW}🔍 Checking system requirements...${NC}"
     
-    # Minimum system checks
-    if [[ $(uname -m) != "x86_64" && $(uname -m) != "aarch64" ]]; then
-        echo -e "${RED}❌ Unsupported architecture: $(uname -m)${NC}"
-        exit 1
-    fi
+    # Architecture compatibility check - support all major platforms
+    local arch=$(uname -m)
+    case "$arch" in
+        x86_64)
+            echo -e "${GREEN}✅ x86_64 architecture detected${NC}"
+            ;;
+        aarch64|arm64)
+            echo -e "${GREEN}✅ ARM64 architecture detected - excellent for KyroDB performance!${NC}"
+            if [[ "$arch" == "arm64" ]]; then
+                echo -e "${GREEN}🍎 Apple Silicon detected - unified memory optimizations enabled${NC}"
+            fi
+            ;;
+        *)
+            echo -e "${RED}❌ Unsupported architecture: $arch${NC}"
+            echo -e "${YELLOW}ℹ️  KyroDB supports: x86_64, aarch64 (ARM64), arm64 (Apple Silicon)${NC}"
+            exit 1
+            ;;
+    esac
     
+    # Memory check
     if [[ $MEMORY_GB -lt 2 ]]; then
         echo -e "${YELLOW}⚠️  Low memory detected (${MEMORY_GB}GB). 4GB+ recommended for optimal performance${NC}"
+    elif [[ $MEMORY_GB -ge 8 ]]; then
+        echo -e "${GREEN}✅ Adequate memory detected (${MEMORY_GB}GB) - perfect for high-performance workloads${NC}"
     fi
     
     # Execute installation steps
