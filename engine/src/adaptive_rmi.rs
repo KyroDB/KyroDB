@@ -376,12 +376,17 @@ impl LocalLinearModel {
             max_error = max_error.max(error);
         }
 
+        // Ensure minimum error bound of 1 to handle floating-point precision and guarantee non-empty search windows
+        let min_error_bound = 1u32;
+        let calculated_error = max_error.min(MAX_SEARCH_WINDOW as u32 / 2);
+        let final_error_bound = calculated_error.max(min_error_bound);
+
         Self {
             slope,
             intercept,
             key_min,
             key_max,
-            error_bound: max_error.min(MAX_SEARCH_WINDOW as u32 / 2),
+            error_bound: final_error_bound,
         }
     }
 
@@ -874,6 +879,11 @@ impl GlobalRoutingModel {
     /// Validate that router is still consistent with expected generation
     pub fn validate_generation(&self, expected_generation: u64) -> bool {
         self.generation.load(Ordering::Acquire) == expected_generation
+    }
+
+    /// Increment router generation for structural changes (CRITICAL for race-free updates)
+    pub fn increment_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Add a split point to the routing model (atomic operation)
@@ -1415,32 +1425,47 @@ impl AdaptiveRMI {
             }
         }
 
-        // 3. Route to appropriate segment with consistency validation
-        let (segment_id, router_generation) = {
-            let router = self.global_router.read();
-            let segment_id = router.predict_segment(key);
-            let generation = router.get_generation();
-            (segment_id, generation)
-        };
+        // 3. Atomic read of router and segments with generation validation
+        loop {
+            let router_generation = {
+                let router = self.global_router.read();
+                router.get_generation()
+            };
 
-        let segments = self.segments.read();
-        if segment_id >= segments.len() {
-            return None;
-        }
+            let segments = self.segments.read();
+            
+            // Validate router hasn't changed since we captured generation
+            let (segment_id, final_generation) = {
+                let router = self.global_router.read();
+                let current_generation = router.get_generation();
+                if current_generation != router_generation {
+                    // Router changed, retry
+                    drop(segments);
+                    drop(router);
+                    continue;
+                }
+                let segment_id = router.predict_segment(key);
+                (segment_id, current_generation)
+            };
 
-        // 4. Validate router is still consistent before search
-        {
-            let router = self.global_router.read();
-            if !router.validate_generation(router_generation) {
-                // Router was updated during our lookup - retry with fresh routing
-                drop(segments);
-                drop(router);
-                return self.lookup_with_retry(key, 1);
+            if segment_id >= segments.len() {
+                return None;
             }
-        }
 
-        // 5. Search in the predicted segment
-        segments[segment_id].bounded_search(key)
+            // Final validation that router is still consistent
+            {
+                let router = self.global_router.read();
+                if !router.validate_generation(final_generation) {
+                    // Router was updated - retry
+                    drop(segments);
+                    drop(router);
+                    continue;
+                }
+            }
+
+            // Now safe to search with consistent router-segment state
+            return segments[segment_id].bounded_search(key);
+        }
     }
 
     /// Retry lookup with fresh routing (prevents infinite retries)
@@ -1450,30 +1475,8 @@ impl AdaptiveRMI {
             return self.fallback_linear_search(key);
         }
 
-        // Retry with fresh routing
-        let (segment_id, router_generation) = {
-            let router = self.global_router.read();
-            let segment_id = router.predict_segment(key);
-            let generation = router.get_generation();
-            (segment_id, generation)
-        };
-
-        let segments = self.segments.read();
-        if segment_id >= segments.len() {
-            return None;
-        }
-
-        // Validate consistency again
-        {
-            let router = self.global_router.read();
-            if !router.validate_generation(router_generation) {
-                drop(segments);
-                drop(router);
-                return self.lookup_with_retry(key, retry_count + 1);
-            }
-        }
-
-        segments[segment_id].bounded_search(key)
+        // Use the same atomic lookup logic as main lookup
+        self.lookup(key)
     }
 
     /// Fallback linear search when router consistency cannot be maintained
@@ -1525,9 +1528,17 @@ impl AdaptiveRMI {
                 let initial_segment = AdaptiveSegment::new(all_writes.clone());
                 segments_guard.push(initial_segment);
                 
-                // Update router boundaries consistently with segments
-                let boundaries = vec![all_writes[0].0]; // First key as boundary
+                // Set up router for single segment (key range covers all keys)
+                // With one segment, router should route all keys to segment 0
+                let first_key = all_writes[0].0;
+                let last_key = all_writes[all_writes.len() - 1].0;
+                
+                // For single segment, use empty boundaries so predict_segment always returns 0
+                let boundaries = vec![];
                 router_guard.update_boundaries(boundaries);
+                
+                println!("✅ Created initial segment with {} keys (range: {} to {})", 
+                    all_writes.len(), first_key, last_key);
                 
                 Ok(())
             }).await?;
@@ -1627,9 +1638,10 @@ impl AdaptiveRMI {
             }
             
             // Safe to update: create new segment and atomically replace
-            let new_segment = AdaptiveSegment::new_with_model(new_data, new_model);
+            let mut new_segment = AdaptiveSegment::new_with_model(new_data, new_model);
+            // Set epoch to next value to indicate this is a new version
+            new_segment.epoch.store(current_epoch + 1, std::sync::atomic::Ordering::Release);
             *target_segment = new_segment;
-            target_segment.increment_epoch(); // Mark modification
         }
         
         Ok(())
@@ -1799,7 +1811,7 @@ impl AdaptiveRMI {
         })
     }
 
-    /// Execute split operation under lock
+    /// Execute split operation under lock with proper generation tracking
     fn execute_split_operation_under_lock(
         &self,
         segments: &mut Vec<AdaptiveSegment>,
@@ -1810,7 +1822,7 @@ impl AdaptiveRMI {
             return Ok(()); // Segment was already removed
         }
         
-        // Create two new segments
+        // Create two new segments with fresh epochs
         let left_segment = AdaptiveSegment::new(split_op.left_data);
         let right_segment = AdaptiveSegment::new(split_op.right_data);
         
@@ -1818,17 +1830,24 @@ impl AdaptiveRMI {
         segments[split_op.segment_id] = left_segment;
         segments.insert(split_op.segment_id + 1, right_segment);
         
+        // CRITICAL: Update router generation before modifying router structure
+        router.increment_generation();
+        
         // Update router with new split point
         if let Some((split_key, _)) = segments[split_op.segment_id + 1].data.first() {
             router.add_split_point(*split_key, split_op.segment_id);
         }
         
-        println!("✅ Split segment {} at position {}", split_op.segment_id, split_op.split_point);
+        // Update router generation again after structural changes
+        router.increment_generation();
+        
+        println!("✅ Split segment {} at position {} (generation: {})", 
+                split_op.segment_id, split_op.split_point, router.get_generation());
         
         Ok(())
     }
 
-    /// Execute merge operation under lock
+    /// Execute merge operation under lock with proper generation tracking
     fn execute_merge_operation_under_lock(
         &self,
         segments: &mut Vec<AdaptiveSegment>,
@@ -1840,7 +1859,10 @@ impl AdaptiveRMI {
             return Ok(()); // One of the segments was already removed
         }
         
-        // Create merged segment
+        // CRITICAL: Update router generation before structural changes
+        router.increment_generation();
+        
+        // Create merged segment with fresh epoch
         let merged_segment = AdaptiveSegment::new(merge_op.merged_data);
         
         // Replace the segment we're keeping with merged data
@@ -1855,11 +1877,15 @@ impl AdaptiveRMI {
             router.remove_split_point(merge_op.keep_id);
         }
         
+        // Update router generation after structural changes
+        router.increment_generation();
+        
         println!(
-            "✅ Merged segments {} and {} (combined_access: {})", 
+            "✅ Merged segments {} and {} (combined_access: {}, generation: {})", 
             merge_op.segment_id_1, 
             merge_op.segment_id_2, 
-            merge_op.combined_access
+            merge_op.combined_access,
+            router.get_generation()
         );
         
         Ok(())
