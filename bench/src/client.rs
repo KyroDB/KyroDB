@@ -11,10 +11,23 @@ impl BenchClient {
         match protocol {
             "http" => {
                 let http = reqwest::Client::builder()
-                    .timeout(Duration::from_secs(10))
-                    .pool_max_idle_per_host(100)  // Connection pooling
-                    .tcp_keepalive(Duration::from_secs(30))
-                    .tcp_nodelay(true)
+                    // ✅ CRITICAL FIX: Aggressive connection pooling for maximum throughput
+                    .pool_max_idle_per_host(2000)  // Increased from 1000 
+                    .pool_idle_timeout(Duration::from_secs(600))  // Keep connections alive longer
+                    .connect_timeout(Duration::from_millis(200))  // Faster connection timeout
+                    .timeout(Duration::from_millis(2000))  // Slightly increased total timeout
+                    // ✅ CRITICAL FIX: HTTP/2 optimization for multiplexing
+                    .http2_prior_knowledge()  // Force HTTP/2 for better multiplexing
+                    .http2_keep_alive_interval(Duration::from_secs(5))  // Frequent keepalive
+                    .http2_keep_alive_timeout(Duration::from_secs(10))
+                    .http2_keep_alive_while_idle(true)
+                    .http2_max_frame_size(Some(1048576))  // 1MB frame size for large payloads
+                    // ✅ CRITICAL FIX: TCP optimization
+                    .tcp_keepalive(Duration::from_secs(600))
+                    .tcp_nodelay(true)  // Disable Nagle's algorithm for low latency
+                    // ✅ CRITICAL FIX: TLS optimization (if using HTTPS)
+                    .danger_accept_invalid_certs(true)  // Skip cert validation for benchmarks
+                    .use_rustls_tls()  // Use faster Rust TLS implementation
                     .build()?;
                 Ok(BenchClient { http })
             }
@@ -35,20 +48,18 @@ impl BenchClient {
             hasher.finish()
         });
         
-        let url = format!("{}/v1/put", base_url);
-        let body = serde_json::json!({
-            "key": key_num,
-            "value": value
-        });
+        // Use high-performance binary endpoint instead of JSON
+        let url = format!("{}/v1/put_fast/{}", base_url, key_num);
         
         let response = self.http.post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body)
+            .header("Content-Type", "application/octet-stream")
+            .body(value.into_bytes())
             .send()
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP PUT request failed: {}", e))?;
 
         if !response.status().is_success() {
-            anyhow::bail!("PUT failed with status: {}", response.status());
+            anyhow::bail!("PUT failed with status: {} for key: {}", response.status(), key_num);
         }
 
         Ok(())
@@ -65,20 +76,17 @@ impl BenchClient {
             hasher.finish()
         });
         
-        let url = format!("{}/v1/lookup?key={}", base_url, key_num);
-        let response = self.http.get(&url).send().await?;
+        // Use high-performance binary endpoint for reads too
+        let url = format!("{}/v1/get_fast/{}", base_url, key_num);
+        let response = self.http.get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP GET request failed: {}", e))?;
 
         match response.status().as_u16() {
-            200 => {
-                let result: serde_json::Value = response.json().await?;
-                if let Some(value) = result.get("value").and_then(|v| v.as_str()) {
-                    Ok(Some(value.to_string()))
-                } else {
-                    Ok(None)
-                }
-            },
+            200 => Ok(Some(response.text().await?)),
             404 => Ok(None),
-            _ => anyhow::bail!("GET failed with status: {}", response.status()),
+            _ => anyhow::bail!("GET failed with status: {} for key: {}", response.status(), key_num),
         }
     }
 

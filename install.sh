@@ -179,34 +179,40 @@ build_kyrodb() {
     
     local build_dir
     if [[ -d "$(pwd)/Cargo.toml" ]] && grep -q "kyrodb" "$(pwd)/Cargo.toml"; then
-        # We're already in KyroDB directory
         build_dir="$(pwd)"
         echo -e "${GREEN}✅ Using current directory: ${build_dir}${NC}"
     else
-        # Clone repository
         build_dir="/tmp/kyrodb-build-$$"
         echo -e "${YELLOW}📥 Cloning KyroDB repository...${NC}"
         git clone https://github.com/vatskishan03/KyroDB.git "$build_dir"
         cd "$build_dir"
     fi
     
-    # Detect optimal build features based on CPU
+    # M4-specific optimizations
+    local arch=$(uname -m)
     local cpu_features=""
-    if grep -q "avx512" /proc/cpuinfo 2>/dev/null; then
+    
+    if [[ "$arch" == "arm64" ]]; then
+        echo -e "${GREEN}🚀 Apple Silicon M4 detected - enabling ARM64 NEON optimizations${NC}"
+        cpu_features="simd-neon"
+        export RUSTFLAGS="-C target-cpu=native -C opt-level=3"
+        echo -e "${GREEN}🎯 M4 unified memory architecture optimizations enabled${NC}"
+    elif grep -q "avx512" /proc/cpuinfo 2>/dev/null; then
         cpu_features="simd-avx512"
         echo -e "${GREEN}🚀 AVX512 detected - enabling advanced SIMD optimizations${NC}"
+        export RUSTFLAGS="-C target-cpu=native"
     elif grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
         cpu_features="simd-avx2"
         echo -e "${GREEN}🚀 AVX2 detected - enabling SIMD optimizations${NC}"
+        export RUSTFLAGS="-C target-cpu=native"
     else
         echo -e "${YELLOW}ℹ️  No advanced SIMD support detected${NC}"
+        export RUSTFLAGS="-C target-cpu=native"
     fi
     
-    # Set conservative build environment that works everywhere
     export CARGO_TARGET_DIR="${build_dir}/target"
-    export RUSTFLAGS="-C target-cpu=native"
     
-    # Build with optimal features
+    # Build with optimal features for Phase 0 performance targets
     local build_features="learned-index"
     if [[ -n "$cpu_features" ]]; then
         build_features="${build_features},${cpu_features}"
@@ -217,7 +223,7 @@ build_kyrodb() {
     # Clean build with proper error handling
     if ! cargo build -p kyrodb-engine --release --features "$build_features"; then
         echo -e "${RED}❌ Engine build failed. Trying without CPU-specific optimizations...${NC}"
-        export RUSTFLAGS=""  # Clear all flags
+        export RUSTFLAGS=""
         cargo build -p kyrodb-engine --release --features "learned-index"
     fi
     
@@ -242,7 +248,7 @@ build_kyrodb() {
         rm -rf "$build_dir"
     fi
     
-    echo -e "${GREEN}✅ KyroDB built and installed successfully${NC}"
+    echo -e "${GREEN}✅ KyroDB built and installed successfully for M4${NC}"
 }
 
 # Function: Generate optimal configuration
@@ -596,7 +602,7 @@ main() {
             ;;
         *)
             echo -e "${RED}❌ Unsupported architecture: $arch${NC}"
-            echo -e "${YELLOW}ℹ️  KyroDB supports: x86_64, aarch64 (ARM64), arm64 (Apple Silicon)${NC}"
+            echo -e "${YELLOW}ℹ️  KyroDB supports: x86_64, aarch64, arm64 (Apple Silicon)${NC}"
             exit 1
             ;;
     esac

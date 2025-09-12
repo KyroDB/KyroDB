@@ -858,58 +858,40 @@ impl PersistentEventLog {
 
     /// Get offset for a given key if present via index with delta-first semantics.
     pub async fn lookup_key(&self, key: u64) -> Option<u64> {
-        // Try index first - but prepare for corruption detection
-        let mut index_attempts = 0;
-        let mut suspicious_misses = 0;
-        
-        loop {
-            index_attempts += 1;
-            
-            // Try the primary index
-            let index_result = {
-                let idx = self.index.read().await;
-                match &*idx {
-                    index::PrimaryIndex::BTree(b) => b.get(&key),
-                    #[cfg(feature = "learned-index")]
-                    index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                        let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                        let result = adaptive.lookup(key);
-                        timer.observe_duration();
-                        
-                        if result.is_some() {
-                            crate::metrics::RMI_HITS_TOTAL.inc();
-                            crate::metrics::RMI_READS_TOTAL.inc();
-                        } else {
-                            crate::metrics::RMI_MISSES_TOTAL.inc();
-                        }
-                        result
-                    }
+        // Try the primary index
+        let idx = self.index.read().await;
+        match &*idx {
+            index::PrimaryIndex::BTree(b) => {
+                // For BTree, if not found, do fallback scan for safety
+                if let Some(offset) = b.get(&key) {
+                    return Some(offset);
                 }
-            };
-            
-            // If we found something in the index, return it
-            if let Some(offset) = index_result {
-                return Some(offset);
+                
+                // BTree miss - try fallback scan
+                drop(idx); // Release the index lock
+                crate::metrics::LOOKUP_FALLBACK_SCAN_TOTAL.inc();
+                if let Some((offset, _rec)) = self.find_key_scan(key).await {
+                    return Some(offset);
+                }
+                None
             }
-            
-            // Index miss - check if we should suspect corruption
-            suspicious_misses += 1;
-            
-            if self.should_suspect_index_corruption(index_attempts, suspicious_misses) {
-                // Index might be corrupted - perform emergency WAL scan
-                crate::metrics::INDEX_FALLBACK_SCANS_TOTAL.inc();
-                return self.emergency_wal_scan(key).await;
-            }
-            
-            // Try normal fallback scan first
-            crate::metrics::LOOKUP_FALLBACK_SCAN_TOTAL.inc();
-            if let Some((offset, _rec)) = self.find_key_scan(key).await {
-                return Some(offset);
-            }
-            
-            // If we've tried multiple times and still no luck, give up
-            if index_attempts >= 3 {
-                return None;
+            #[cfg(feature = "learned-index")]
+            index::PrimaryIndex::AdaptiveRmi(adaptive) => {
+                // 🚀 ULTRA-FAST PATH: Trust the RMI completely - no expensive fallback scans!
+                let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                let result = adaptive.lookup(key);
+                timer.observe_duration();
+                
+                if result.is_some() {
+                    crate::metrics::RMI_HITS_TOTAL.inc();
+                    crate::metrics::RMI_READS_TOTAL.inc();
+                } else {
+                    crate::metrics::RMI_MISSES_TOTAL.inc();
+                }
+                
+                // 🚀 CRITICAL PERFORMANCE FIX: Return immediately - no O(n) fallback scans!
+                // The AdaptiveRMI is kept up-to-date on every insert, so we can trust it
+                result
             }
         }
     }

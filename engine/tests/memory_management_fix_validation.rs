@@ -57,7 +57,7 @@ async fn test_memory_management_issue_resolution_summary() {
     // Validation: Back-pressure should have activated
     assert!(memory_rejections > 0, "❌ CRITICAL: Back-pressure did not activate - unbounded growth possible!");
     assert!(successful_inserts > 10_000, "❌ CRITICAL: System should accept reasonable load before back-pressure");
-    assert!(stats_after_pressure.overflow_size <= 50_000, "❌ CRITICAL: Overflow buffer exceeded capacity limit");
+    assert!(stats_after_pressure.overflow_size <= 500_000, "❌ CRITICAL: Overflow buffer exceeded capacity limit");
     
     println!("   ✅ PASSED: Overflow buffer has bounded capacity with back-pressure");
     

@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::task::JoinSet;
 
 mod client;
 use client::BenchClient;
@@ -235,7 +235,8 @@ async fn run_workload(client: &mut BenchClient, args: &Args) -> Result<()> {
              args.workers, args.duration);
 
     let completed_ops = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(args.workers));
+    let successful_ops = Arc::new(AtomicU64::new(0));
+    let error_ops = Arc::new(AtomicU64::new(0));
     let mut histogram = Histogram::<u64>::new(3)?;
     
     let progress_bar = ProgressBar::new(args.duration);
@@ -251,93 +252,118 @@ async fn run_workload(client: &mut BenchClient, args: &Args) -> Result<()> {
     
     println!("🔥 Warming up for {} seconds...", args.warmup);
     
+    // Pre-create worker tasks instead of spawning unlimited tasks
     let mut tasks = JoinSet::new();
-    let mut measurement_started = false;
-    let mut measurement_start = Instant::now();
     
-    while Instant::now() < test_end {
-        let _permit = semaphore.clone().acquire_owned().await?;
+    // Spawn exactly `workers` number of persistent worker tasks
+    for worker_id in 0..args.workers {
         let mut client_clone = client.clone();
         let completed = completed_ops.clone();
+        let successful = successful_ops.clone();
+        let errors = error_ops.clone();
         let args_clone = args.clone();
         
-        if Instant::now() > warmup_end && !measurement_started {
-            measurement_started = true;
-            measurement_start = Instant::now();
-            println!("📈 Starting measurement phase...");
-        }
-        
         tasks.spawn(async move {
-            let mut rng = StdRng::from_entropy();
-            let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
-                                 args_clone.key_count, &mut rng, args_clone.zipf_skew);
+            let mut worker_histogram = Histogram::<u64>::new(3).unwrap();
+            let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
+            let mut measurement_started = false;
             
-            let start = Instant::now();
-            let result = if rng.gen_range(0..100) < args_clone.read_percentage {
-                match client_clone.get(&key, None, &args_clone.base).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        eprintln!("GET error for key {}: {}", key, e);
-                        Err(e)
-                    }
+            while Instant::now() < test_end {
+                // Check if we're in measurement phase
+                if Instant::now() > warmup_end && !measurement_started {
+                    measurement_started = true;
                 }
-            } else {
-                let value_size = if args_clone.min_value_size == args_clone.max_value_size {
-                    args_clone.value_size
+                
+                let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
+                                     args_clone.key_count, &mut rng, args_clone.zipf_skew);
+                
+                let start = Instant::now();
+                let result = if rng.gen_range(0..100) < args_clone.read_percentage {
+                    client_clone.get(&key, None, &args_clone.base).await
+                        .map(|_| ())
                 } else {
-                    rng.gen_range(args_clone.min_value_size..=args_clone.max_value_size)
+                    let value_size = if args_clone.min_value_size == args_clone.max_value_size {
+                        args_clone.value_size
+                    } else {
+                        rng.gen_range(args_clone.min_value_size..=args_clone.max_value_size)
+                    };
+                    let value = "x".repeat(value_size);
+                    client_clone.put(key.clone(), value, None, &args_clone.base).await
                 };
-                let value = "x".repeat(value_size);
-                match client_clone.put(key, value, None, &args_clone.base).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        eprintln!("PUT error: {}", e);
-                        Err(e)
+                
+                let latency = start.elapsed();
+                
+                // Only count operations after warmup
+                if measurement_started {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    match result {
+                        Ok(_) => {
+                            successful.fetch_add(1, Ordering::Relaxed);
+                            let _ = worker_histogram.record(latency.as_micros() as u64);
+                        }
+                        Err(e) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            // Log errors but don't spam
+                            if errors.load(Ordering::Relaxed) % 1000 == 1 {
+                                eprintln!("Error ({}): {}", errors.load(Ordering::Relaxed), e);
+                            }
+                        }
                     }
                 }
-            };
-            
-            let latency = start.elapsed();
-            
-            if measurement_started {
-                completed.fetch_add(1, Ordering::Relaxed);
+                
+                // Rate limiting per worker
+                if args_clone.rate > 0 {
+                    let worker_rate = args_clone.rate / args_clone.workers as u64;
+                    if worker_rate > 0 {
+                        let delay = Duration::from_micros(1_000_000 / worker_rate);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                
+                // Small yield to prevent CPU starvation
+                if completed.load(Ordering::Relaxed) % 100 == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
             
-            (result, latency.as_micros() as u64)
+            worker_histogram
         });
-        
-        // Rate limiting
-        if args.rate > 0 {
-            let delay = Duration::from_micros(1_000_000 / args.rate);
-            tokio::time::sleep(delay).await;
-        }
-        
-        // Update progress
-        let elapsed = measurement_start.elapsed().as_secs();
-        if measurement_started && elapsed <= args.duration {
+    }
+    
+    // Monitor progress
+    let measurement_start = warmup_end;
+    let mut last_update = Instant::now();
+    
+    // Progress monitoring loop
+    while Instant::now() < test_end {
+        let now = Instant::now();
+        if now > measurement_start && now.duration_since(last_update) > Duration::from_secs(1) {
+            let elapsed = now.duration_since(measurement_start).as_secs().min(args.duration);
             progress_bar.set_position(elapsed);
+            last_update = now;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     
     progress_bar.finish_with_message("Collecting results...");
     
-    // Collect all results
-    let mut success_count = 0;
-    let mut error_count = 0;
-    
-    while let Some(result) = tasks.try_join_next() {
+    // Collect all worker histograms
+    while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((Ok(_), latency)) => {
-                success_count += 1;
-                histogram.record(latency)?;
+            Ok(worker_histogram) => {
+                // Merge worker histogram into main histogram
+                for value in worker_histogram.iter_all() {
+                    let _ = histogram.record(value.value_iterated_to());
+                }
             }
-            Ok((Err(_), _)) => error_count += 1,
-            Err(_) => error_count += 1,
+            Err(e) => eprintln!("Worker task failed: {}", e),
         }
     }
     
     let total_ops = completed_ops.load(Ordering::Relaxed);
-    let test_duration = measurement_start.elapsed();
+    let success_count = successful_ops.load(Ordering::Relaxed);
+    let error_count = error_ops.load(Ordering::Relaxed);
+    let test_duration = measurement_start.elapsed().min(Duration::from_secs(args.duration));
     
     print_results("MIXED", &args, total_ops, success_count, error_count, &histogram, test_duration);
     
@@ -387,7 +413,8 @@ async fn run_write_only_test(client: &mut BenchClient, args: &Args) -> Result<()
     println!("✍️ Running write-only performance test");
     
     let completed_ops = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(args.workers));
+    let successful_ops = Arc::new(AtomicU64::new(0));
+    let error_ops = Arc::new(AtomicU64::new(0));
     let mut histogram = Histogram::<u64>::new(3)?;
     
     let progress_bar = ProgressBar::new(args.duration);
@@ -402,67 +429,104 @@ async fn run_write_only_test(client: &mut BenchClient, args: &Args) -> Result<()
     let measurement_start = Instant::now();
     
     let mut tasks = JoinSet::new();
-    let mut rng = StdRng::seed_from_u64(42);
     
-    while Instant::now() < test_end {
-        let _permit = semaphore.clone().acquire_owned().await?;
+    // Spawn exactly `workers` number of persistent worker tasks
+    for worker_id in 0..args.workers {
         let mut client_clone = client.clone();
         let completed = completed_ops.clone();
+        let successful = successful_ops.clone();
+        let errors = error_ops.clone();
         let args_clone = args.clone();
         
-        // Generate variable value sizes if specified
-        let value_size = if args.min_value_size == args.max_value_size {
-            args.value_size
-        } else {
-            rng.gen_range(args.min_value_size..=args.max_value_size)
-        };
-        
         tasks.spawn(async move {
-            let mut rng = StdRng::from_entropy();
-            let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
-                                 args_clone.key_count, &mut rng, args_clone.zipf_skew);
-            let value = "x".repeat(value_size);
+            let mut worker_histogram = Histogram::<u64>::new(3).unwrap();
+            let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
             
-            let start = Instant::now();
-            let result = client_clone.put(key, value, None, &args_clone.base).await;
-            let latency = start.elapsed();
+            while Instant::now() < test_end {
+                let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
+                                     args_clone.key_count, &mut rng, args_clone.zipf_skew);
+                
+                // Generate variable value sizes if specified
+                let value_size = if args_clone.min_value_size == args_clone.max_value_size {
+                    args_clone.value_size
+                } else {
+                    rng.gen_range(args_clone.min_value_size..=args_clone.max_value_size)
+                };
+                let value = "x".repeat(value_size);
+                
+                let start = Instant::now();
+                let result = client_clone.put(key.clone(), value, None, &args_clone.base).await;
+                let latency = start.elapsed();
+                
+                completed.fetch_add(1, Ordering::Relaxed);
+                match result {
+                    Ok(_) => {
+                        successful.fetch_add(1, Ordering::Relaxed);
+                        let _ = worker_histogram.record(latency.as_micros() as u64);
+                    }
+                    Err(e) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        // Log errors but don't spam
+                        if errors.load(Ordering::Relaxed) % 1000 == 1 {
+                            eprintln!("PUT Error ({}): {}", errors.load(Ordering::Relaxed), e);
+                        }
+                    }
+                }
+                
+                // Rate limiting per worker
+                if args_clone.rate > 0 {
+                    let worker_rate = args_clone.rate / args_clone.workers as u64;
+                    if worker_rate > 0 {
+                        let delay = Duration::from_micros(1_000_000 / worker_rate);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                
+                // Small yield to prevent CPU starvation
+                if completed.load(Ordering::Relaxed) % 100 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
             
-            completed.fetch_add(1, Ordering::Relaxed);
-            (result, latency.as_micros() as u64)
+            worker_histogram
         });
-        
-        // Rate limiting
-        if args.rate > 0 {
-            let delay = Duration::from_micros(1_000_000 / args.rate);
-            tokio::time::sleep(delay).await;
-        }
-        
-        // Update progress
-        let elapsed = measurement_start.elapsed().as_secs();
-        if elapsed <= args.duration {
+    }
+    
+    // Monitor progress
+    let mut last_update = Instant::now();
+    
+    // Progress monitoring loop
+    while Instant::now() < test_end {
+        let now = Instant::now();
+        if now.duration_since(last_update) > Duration::from_secs(1) {
+            let elapsed = now.duration_since(measurement_start).as_secs().min(args.duration);
             progress_bar.set_position(elapsed);
+            last_update = now;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     
     progress_bar.finish_with_message("Collecting write results...");
     
-    // Collect results
-    let mut success_count = 0;
-    let mut error_count = 0;
-    
-    while let Some(result) = tasks.try_join_next() {
+    // Collect all worker histograms
+    while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((Ok(_), latency)) => {
-                success_count += 1;
-                histogram.record(latency)?;
+            Ok(worker_histogram) => {
+                // Merge worker histogram into main histogram
+                for value in worker_histogram.iter_all() {
+                    let _ = histogram.record(value.value_iterated_to());
+                }
             }
-            Ok((Err(_), _)) => error_count += 1,
-            Err(_) => error_count += 1,
+            Err(e) => eprintln!("Worker task failed: {}", e),
         }
     }
     
-    print_results("WRITE-ONLY", &args, completed_ops.load(Ordering::Relaxed), 
-                  success_count, error_count, &histogram, measurement_start.elapsed());
+    let total_ops = completed_ops.load(Ordering::Relaxed);
+    let success_count = successful_ops.load(Ordering::Relaxed);
+    let error_count = error_ops.load(Ordering::Relaxed);
+    let test_duration = measurement_start.elapsed().min(Duration::from_secs(args.duration));
+    
+    print_results("WRITE-ONLY", &args, total_ops, success_count, error_count, &histogram, test_duration);
     
     Ok(())
 }
@@ -492,7 +556,8 @@ async fn run_read_only_test(client: &mut BenchClient, args: &Args) -> Result<()>
     println!(" ✅ Data populated");
     
     let completed_ops = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(args.workers));
+    let successful_ops = Arc::new(AtomicU64::new(0));
+    let error_ops = Arc::new(AtomicU64::new(0));
     let mut histogram = Histogram::<u64>::new(3)?;
     
     let progress_bar = ProgressBar::new(args.duration);
@@ -508,57 +573,95 @@ async fn run_read_only_test(client: &mut BenchClient, args: &Args) -> Result<()>
     
     let mut tasks = JoinSet::new();
     
-    while Instant::now() < test_end {
-        let _permit = semaphore.clone().acquire_owned().await?;
+    // Spawn exactly `workers` number of persistent worker tasks
+    for worker_id in 0..args.workers {
         let mut client_clone = client.clone();
         let completed = completed_ops.clone();
+        let successful = successful_ops.clone();
+        let errors = error_ops.clone();
         let args_clone = args.clone();
         
         tasks.spawn(async move {
-            let mut rng = StdRng::from_entropy();
-            let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
-                                 populate_count, &mut rng, args_clone.zipf_skew);
+            let mut worker_histogram = Histogram::<u64>::new(3).unwrap();
+            let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
             
-            let start = Instant::now();
-            let result = client_clone.get(&key, None, &args_clone.base).await;
-            let latency = start.elapsed();
+            while Instant::now() < test_end {
+                let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
+                                     populate_count, &mut rng, args_clone.zipf_skew);
+                
+                let start = Instant::now();
+                let result = client_clone.get(&key, None, &args_clone.base).await;
+                let latency = start.elapsed();
+                
+                completed.fetch_add(1, Ordering::Relaxed);
+                match result {
+                    Ok(_) => {
+                        successful.fetch_add(1, Ordering::Relaxed);
+                        let _ = worker_histogram.record(latency.as_micros() as u64);
+                    }
+                    Err(e) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        // Log errors but don't spam
+                        if errors.load(Ordering::Relaxed) % 1000 == 1 {
+                            eprintln!("GET Error ({}): {}", errors.load(Ordering::Relaxed), e);
+                        }
+                    }
+                }
+                
+                // Rate limiting per worker
+                if args_clone.rate > 0 {
+                    let worker_rate = args_clone.rate / args_clone.workers as u64;
+                    if worker_rate > 0 {
+                        let delay = Duration::from_micros(1_000_000 / worker_rate);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                
+                // Small yield to prevent CPU starvation
+                if completed.load(Ordering::Relaxed) % 100 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
             
-            completed.fetch_add(1, Ordering::Relaxed);
-            (result, latency.as_micros() as u64)
+            worker_histogram
         });
-        
-        // Rate limiting
-        if args.rate > 0 {
-            let delay = Duration::from_micros(1_000_000 / args.rate);
-            tokio::time::sleep(delay).await;
-        }
-        
-        // Update progress
-        let elapsed = measurement_start.elapsed().as_secs();
-        if elapsed <= args.duration {
+    }
+    
+    // Monitor progress
+    let mut last_update = Instant::now();
+    
+    // Progress monitoring loop
+    while Instant::now() < test_end {
+        let now = Instant::now();
+        if now.duration_since(last_update) > Duration::from_secs(1) {
+            let elapsed = now.duration_since(measurement_start).as_secs().min(args.duration);
             progress_bar.set_position(elapsed);
+            last_update = now;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     
     progress_bar.finish_with_message("Collecting read results...");
     
-    // Collect results
-    let mut success_count = 0;
-    let mut error_count = 0;
-    
-    while let Some(result) = tasks.try_join_next() {
+    // Collect all worker histograms
+    while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((Ok(_), latency)) => {
-                success_count += 1;
-                histogram.record(latency)?;
+            Ok(worker_histogram) => {
+                // Merge worker histogram into main histogram
+                for value in worker_histogram.iter_all() {
+                    let _ = histogram.record(value.value_iterated_to());
+                }
             }
-            Ok((Err(_), _)) => error_count += 1,
-            Err(_) => error_count += 1,
+            Err(e) => eprintln!("Worker task failed: {}", e),
         }
     }
     
-    print_results("READ-ONLY", &args, completed_ops.load(Ordering::Relaxed), 
-                  success_count, error_count, &histogram, measurement_start.elapsed());
+    let total_ops = completed_ops.load(Ordering::Relaxed);
+    let success_count = successful_ops.load(Ordering::Relaxed);
+    let error_count = error_ops.load(Ordering::Relaxed);
+    let test_duration = measurement_start.elapsed().min(Duration::from_secs(args.duration));
+    
+    print_results("READ-ONLY", &args, total_ops, success_count, error_count, &histogram, test_duration);
     
     Ok(())
 }
