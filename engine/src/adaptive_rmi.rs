@@ -1849,7 +1849,8 @@ impl AdaptiveRMI {
         }
     }
 
-    /// 🚀 ULTRA-FAST lookup with single-lock optimization for maximum throughput
+    /// � RACE-FREE lookup with generation-based consistency protection
+    /// Eliminates TOCTOU vulnerabilities between router prediction and segment access
     pub fn lookup(&self, key: u64) -> Option<u64> {
         // 1. Check hot buffer first (most recent data) - completely lock-free
         if let Some(value) = self.hot_buffer.get(key) {
@@ -1866,24 +1867,25 @@ impl AdaptiveRMI {
             return Some(value);
         }
 
-        // 3. 🚀 CRITICAL PERFORMANCE FIX: Single lock strategy for maximum throughput
-        // The previous dual-lock approach was causing massive contention
+        // 3. � RACE-FREE ATOMIC COORDINATION: Prevent TOCTOU between router and segments
+        // Always acquire locks in order: 1) segments, 2) router to prevent deadlocks
+        let segments_guard = self.segments.read();
+        let router_guard = self.global_router.read();
         
-        // Fast router prediction (lock-free when stable)
-        let segment_id = {
-            let router = self.global_router.read();
-            router.predict_segment(key)
-        }; // Router lock dropped immediately
+        // 4. Atomic router prediction with segments already locked
+        let segment_id = router_guard.predict_segment(key);
         
-        // Single segment lookup with bounds check
-        let segments = self.segments.read();
-        if segment_id < segments.len() {
-            segments[segment_id].bounded_search_fast(key)
+        // 5. Safe segment access - both router and segments are consistent
+        if segment_id < segments_guard.len() {
+            // Use fast bounded search since we have exclusive consistency
+            segments_guard[segment_id].bounded_search_fast(key)
         } else {
-            // No fallback - just return None if router is inconsistent
-            // This eliminates the 404s by failing fast instead of doing expensive linear search
-            None
+            // Router-segment inconsistency detected - use safe fallback
+            // This should be extremely rare with proper atomic updates
+            drop(router_guard); // Release router lock for fallback search
+            self.fallback_linear_search_with_segments_lock(segments_guard, key)
         }
+        // Both locks automatically released here
     }
 
     /// DEPRECATED: This method had race conditions - lookup() now handles retries internally
@@ -1898,7 +1900,12 @@ impl AdaptiveRMI {
     fn fallback_linear_search_safe(&self, key: u64) -> Option<u64> {
         // ✅ SINGLE LOCK: Acquire segments lock once and hold throughout search
         let segments_guard = self.segments.read();
-        
+        self.fallback_linear_search_with_segments_lock(segments_guard, key)
+    }
+
+    /// 🔒 OPTIMIZED fallback search with pre-acquired segments lock
+    /// Used when we already hold the segments lock to avoid double-locking
+    fn fallback_linear_search_with_segments_lock(&self, segments_guard: parking_lot::RwLockReadGuard<Vec<AdaptiveSegment>>, key: u64) -> Option<u64> {
         // ✅ SAFE ITERATION: No router dependencies, pure linear search
         for segment in segments_guard.iter() {
             // ✅ BOUNDED SEARCH: Each segment provides its own bounds checking
