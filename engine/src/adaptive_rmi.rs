@@ -37,22 +37,22 @@ const OVERFLOW_PRESSURE_HIGH: usize = (MAX_OVERFLOW_CAPACITY * 9) / 10;    // 90
 const OVERFLOW_PRESSURE_CRITICAL: usize = (MAX_OVERFLOW_CAPACITY * 95) / 100; // 95% - hard reject
 
 /// Memory safety circuit breaker for system-wide protection
-const SYSTEM_MEMORY_LIMIT_MB: usize = 2048; // 2GB soft limit per RMI instance
+const SYSTEM_MEMORY_LIMIT_MB: usize = if cfg!(test) { 10 } else { 2048 }; // Test: 10MB, Production: 2GB
 const MEMORY_CHECK_INTERVAL_MS: u64 = 1000; // Check memory usage every second
 
 /// Adaptive timing constants for CPU pressure detection and container throttling protection
 const BASE_MERGE_INTERVAL_MS: u64 = 50;
 const BASE_MANAGEMENT_INTERVAL_SEC: u64 = 5;  
 const BASE_STATS_INTERVAL_SEC: u64 = 30;
-const MAX_INTERVAL_MULTIPLIER: u64 = 8; // Maximum slowdown under high CPU pressure
+const MAX_INTERVAL_MULTIPLIER: u64 = 8;
 
-/// Container throttling emergency thresholds
-const EMERGENCY_MODE_PRESSURE_THRESHOLD: usize = 4; // Critical pressure level
-const EMERGENCY_MODE_CONSECUTIVE_THROTTLES: usize = 10; // Consecutive throttling events
-const EMERGENCY_MODE_YIELD_COUNT: usize = 10; // Heavy yielding in emergency mode
-const PRESSURE_YIELD_MULTIPLIER: usize = 2; // Yield count = pressure level * multiplier
+// Container throttling emergency thresholds
+const EMERGENCY_MODE_PRESSURE_THRESHOLD: usize = 4;
+const EMERGENCY_MODE_CONSECUTIVE_THROTTLES: usize = 10;
+const EMERGENCY_MODE_YIELD_COUNT: usize = 10;
+const PRESSURE_YIELD_MULTIPLIER: usize = 2;
 
-/// Centralized error handler for background operations
+// Centralized error handler for background operations
 #[derive(Debug)]
 struct BackgroundErrorHandler {
     merge_errors: AtomicUsize,
@@ -60,7 +60,7 @@ struct BackgroundErrorHandler {
     last_error_time: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
-/// Enhanced adaptive interval controller for background tasks
+// Enhanced adaptive interval controller for background tasks
 #[derive(Debug)]
 struct AdaptiveInterval {
     base_duration: std::time::Duration,
@@ -74,8 +74,8 @@ struct AdaptiveInterval {
 
 impl AdaptiveInterval {
     fn new(base_duration: std::time::Duration) -> Self {
-        let min_duration = base_duration / 4;  // 4x faster minimum
-        let max_duration = base_duration * 8;  // 8x slower maximum
+        let min_duration = base_duration / 4;
+        let max_duration = base_duration * 8;
         
         Self {
             base_duration,
@@ -88,11 +88,9 @@ impl AdaptiveInterval {
         }
     }
     
-    /// Increase interval due to errors (exponential backoff)
     fn increase_interval(&mut self) {
         self.consecutive_errors += 1;
         
-        // Exponential backoff with jitter
         let multiplier = 2_u32.pow(std::cmp::min(self.consecutive_errors, 3) as u32);
         let new_duration = self.base_duration * multiplier;
         
@@ -161,11 +159,9 @@ impl BackgroundErrorHandler {
         }
     }
 
-    /// Handle background merge errors with exponential backoff
     async fn handle_merge_error(&self, error: anyhow::Error) -> bool {
         let error_count = self.merge_errors.fetch_add(1, Ordering::Relaxed) + 1;
         
-        // Update last error time
         {
             let mut last_time = self.last_error_time.lock().unwrap();
             *last_time = Some(std::time::Instant::now());
@@ -173,29 +169,24 @@ impl BackgroundErrorHandler {
         
         eprintln!("❌ Background merge error #{}: {}", error_count, error);
         
-        // Exponential backoff: 1s, 2s, 4s, 8s, max 60s
         if error_count > 1 {
             let backoff_secs = std::cmp::min(2_u64.pow((error_count - 1) as u32), 60);
             println!("🔄 Backing off merge operations for {} seconds", backoff_secs);
             tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
         }
         
-        // Stop retrying after 10 consecutive errors
         error_count < 10
     }
 
-    /// Handle management operation errors
     fn handle_management_error(&self, error: anyhow::Error) {
         let error_count = self.management_errors.fetch_add(1, Ordering::Relaxed) + 1;
         eprintln!("❌ Background management error #{}: {}", error_count, error);
         
-        // Reset error count after successful operations
         if error_count > 5 {
             println!("⚠️  Too many management errors, may need manual intervention");
         }
     }
 
-    /// Reset error counts on successful operations
     fn reset_merge_errors(&self) {
         self.merge_errors.store(0, Ordering::Relaxed);
     }
@@ -204,7 +195,6 @@ impl BackgroundErrorHandler {
         self.management_errors.store(0, Ordering::Relaxed);
     }
 
-    /// Get error statistics
     fn stats(&self) -> (usize, usize) {
         (
             self.merge_errors.load(Ordering::Relaxed),
@@ -219,25 +209,13 @@ const MAX_SEARCH_WINDOW: usize = 64;
 /// Default hot buffer capacity - tunable via environment
 const DEFAULT_HOT_BUFFER_SIZE: usize = 4096;
 
-/// Minimum segment size before considering merge
 const MIN_SEGMENT_SIZE: usize = 100;
-
-/// Maximum segment size before forcing split
 const MAX_SEGMENT_SIZE: usize = 8192;
-
-/// Target segment size for optimal performance
 const TARGET_SEGMENT_SIZE: usize = 1024;
-
-/// Background merge trigger threshold
 const MERGE_TRIGGER_RATIO: f32 = 0.75;
-
-/// Maximum error rate before triggering segment split
 const MAX_ERROR_RATE: f64 = 0.15;
-
-/// Target access frequency for performance triggers
 const TARGET_ACCESS_FREQUENCY: u64 = 1000;
 
-/// Performance statistics for bounded search monitoring
 #[derive(Debug, Clone)]
 pub struct SearchStats {
     pub total_lookups: u64,
@@ -249,7 +227,6 @@ pub struct SearchStats {
     pub bounded_guarantee: bool,
 }
 
-/// Validation of bounded search performance guarantees
 #[derive(Debug, Clone)]
 pub struct BoundedSearchValidation {
     pub max_search_window: usize,
@@ -260,7 +237,6 @@ pub struct BoundedSearchValidation {
     pub performance_class: String,
 }
 
-/// Performance statistics for monitoring
 #[derive(Debug, Clone)]
 pub struct AdaptiveRMIStats {
     pub segment_count: usize,
@@ -284,7 +260,6 @@ pub struct BoundedSearchAnalytics {
     pub per_segment_stats: Vec<SearchStats>,
 }
 
-/// System-wide validation of bounded search guarantees
 #[derive(Debug, Clone)]
 pub struct BoundedSearchSystemValidation {
     pub system_meets_guarantees: bool,
@@ -295,7 +270,6 @@ pub struct BoundedSearchSystemValidation {
     pub recommendation: String,
 }
 
-/// Operation data for segment splits
 #[derive(Debug)]
 struct SegmentSplitOperation {
     segment_id: usize,
@@ -304,7 +278,6 @@ struct SegmentSplitOperation {
     right_data: Vec<(u64, u64)>,
 }
 
-/// Operation data for segment merges
 #[derive(Debug)]
 struct SegmentMergeOperation {
     segment_id_1: usize,
@@ -315,19 +288,16 @@ struct SegmentMergeOperation {
     combined_access: u64,
 }
 
-/// Linear model for key-to-position prediction within a segment
 #[derive(Debug, Clone)]
 pub struct LocalLinearModel {
     slope: f64,
     intercept: f64,
     key_min: u64,
     key_max: u64,
-    /// Maximum prediction error observed during training
     error_bound: u32,
 }
 
 impl LocalLinearModel {
-    /// Create a new linear model from sorted key-offset pairs
     pub fn new(data: &[(u64, u64)]) -> Self {
         if data.is_empty() {
             return Self {
@@ -403,32 +373,26 @@ impl LocalLinearModel {
         }
     }
 
-    /// Predict position for a given key
     #[inline]
     pub fn predict(&self, key: u64) -> usize {
         let predicted = self.slope * (key as f64) + self.intercept;
         predicted.round().max(0.0) as usize
     }
 
-    /// Get maximum prediction error bound
     #[inline]
     pub fn error_bound(&self) -> u32 {
         self.error_bound
     }
 
-    /// Check if key is within the model's trained range
     #[inline]
     pub fn contains_key(&self, key: u64) -> bool {
         key >= self.key_min && key <= self.key_max
     }
 }
 
-/// Performance metrics for adaptive segment management
 #[derive(Debug, Default)]
 pub struct SegmentMetrics {
-    /// Total number of lookups in this segment
     access_count: AtomicU64,
-    /// Last access timestamp (for LRU tracking)
     last_access: AtomicU64,
     /// Number of times this segment was split
     split_count: AtomicU64,
@@ -555,7 +519,7 @@ impl AdaptiveSegment {
         }
     }
 
-    /// 🚀 ULTRA-FAST bounded search - O(1) average case, dramatically improved performance
+    /// 
     pub fn bounded_search_fast(&self, key: u64) -> Option<u64> {
         if self.data.is_empty() {
             return None;
@@ -1000,7 +964,7 @@ impl BoundedHotBuffer {
         }
     }
 
-    /// 🔒 ATOMIC insert with hard capacity enforcement and race-free guarantees
+    /// 
     /// Try to insert into hot buffer - returns true if successful
     pub fn try_insert(&self, key: u64, value: u64) -> Result<bool> {
         // 🚀 DELEGATE to atomic implementation for guaranteed consistency
@@ -1020,22 +984,19 @@ impl BoundedHotBuffer {
         None
     }
 
-    /// 🔒 TRULY ATOMIC drain with guaranteed consistency and no data loss
+    /// 
     /// Fixes race condition where size and buffer could be inconsistent
     pub fn drain_atomic(&self) -> Vec<(u64, u64)> {
         let mut buffer = self.buffer.lock();
         
-        // 🛡️ ATOMIC SNAPSHOT: Capture state atomically before any modifications
+        // 🛡️ atomic SNAPSHOT: Capture state atomically before any modifications
         let drained_count = buffer.len();
         let buffer_capacity = buffer.capacity();
         
-        // 🔒 ATOMIC DRAIN: All state changes in single critical section
         let drained_data: Vec<_> = buffer.drain(..).collect();
         
-        // 🧮 ATOMIC SIZE UPDATE: Ensure size matches drained count exactly
         self.size.store(0, Ordering::Release); // Use Release ordering for consistency
         
-        // 📊 MEMORY RECLAMATION METRICS
         let freed_bytes = Self::calculate_hot_buffer_memory(&drained_data, buffer_capacity);
         
         println!("🔒 Hot buffer atomic drain: {} entries, ~{}KB freed, capacity: {}",
@@ -1044,7 +1005,7 @@ impl BoundedHotBuffer {
         drained_data
     }
 
-    /// 📊 Calculate accurate memory usage for hot buffer
+    /// 
     fn calculate_hot_buffer_memory(_data: &[(u64, u64)], capacity: usize) -> usize {
         let tuple_size = std::mem::size_of::<(u64, u64)>();
         let vec_overhead = std::mem::size_of::<Vec<(u64, u64)>>();
@@ -1055,7 +1016,7 @@ impl BoundedHotBuffer {
         capacity * tuple_size + vec_overhead + mutex_overhead + atomic_overhead
     }
 
-    /// 🛡️ ATOMIC insert with hard capacity enforcement
+    /// 🛡️ atomic insert with hard capacity enforcement
     /// Prevents unbounded growth with absolute guarantees
     pub fn try_insert_atomic(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
         let mut buffer = self.buffer.lock();
@@ -1065,11 +1026,9 @@ impl BoundedHotBuffer {
             return Ok(false); // Hard reject, no unbounded growth possible
         }
         
-        // 🔒 ATOMIC INSERT: Buffer and size updated atomically
         buffer.push_back((key, value));
         let new_size = buffer.len();
         
-        // 🧮 ATOMIC SIZE UPDATE with memory ordering
         self.size.store(new_size, Ordering::Release);
         
         // 🛡️ DOUBLE-CHECK: Verify atomic consistency (safety assertion)
@@ -1201,7 +1160,7 @@ impl BoundedOverflowBuffer {
         }
     }
 
-    /// 🛡️ ATOMIC insert with hard memory enforcement and accurate tracking
+    /// 🛡️ atomic insert with hard memory enforcement and accurate tracking
     pub fn try_insert(&mut self, key: u64, value: u64) -> Result<bool> {
         let current_size = self.data.len();
         
@@ -1211,7 +1170,6 @@ impl BoundedOverflowBuffer {
             // Continue with insertion if enforcement succeeded in making space
         }
         
-        // 📊 ACCURATE MEMORY TRACKING: Update with current state after enforcement
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1274,36 +1232,30 @@ impl BoundedOverflowBuffer {
             }
         }
 
-        // ✅ ACCEPT THE WRITE with atomic state tracking
         self.data.push_back((key, value));
         
-        // 📊 IMMEDIATE MEMORY UPDATE for real-time accuracy
         self.update_accurate_memory_estimate(self.data.len());
         
         Ok(true)
     }
 
-    /// 📊 ACCURATE memory usage estimation replacing the flawed 16-byte approximation
+    /// 
     /// Provides precise memory tracking including all container overheads
     fn update_accurate_memory_estimate(&self, current_size: usize) {
         // 🎯 PRECISE CALCULATION: Account for all memory components
         let tuple_size = std::mem::size_of::<(u64, u64)>(); // Exactly 16 bytes per tuple
         let capacity = self.data.capacity(); // Actual allocated capacity
         
-        // 🔍 DETAILED MEMORY BREAKDOWN:
         let tuple_data_bytes = capacity * tuple_size;
         let vecdeque_overhead = std::mem::size_of::<VecDeque<(u64, u64)>>();
         let allocator_overhead = capacity * tuple_size / 32; // ~3% allocator overhead
         let struct_overhead = std::mem::size_of::<BoundedOverflowBuffer>();
         
-        // 🧮 TOTAL ACCURATE MEMORY USAGE
         let total_bytes = tuple_data_bytes + vecdeque_overhead + allocator_overhead + struct_overhead;
         let accurate_mb = (total_bytes + 1024 * 1024 - 1) / (1024 * 1024); // Round up
         
-        // 🔒 ATOMIC UPDATE with memory ordering for consistency
         self.estimated_memory_mb.store(accurate_mb, Ordering::Release);
         
-        // 📊 MEMORY EFFICIENCY METRICS for monitoring
         let utilization = (current_size * 100) / capacity.max(1);
         let wasted_mb = ((capacity - current_size) * tuple_size) / (1024 * 1024);
         
@@ -1323,19 +1275,16 @@ impl BoundedOverflowBuffer {
         None
     }
 
-    /// 🔒 ATOMIC drain all data with guaranteed consistency and memory reclamation
+    /// 
     /// Fixes critical race condition where partial drains could lose data
     pub fn drain_all_atomic(&mut self) -> Vec<(u64, u64)> {
-        // 🛡️ ATOMIC OPERATION: All state changes happen atomically
+        // 🛡️ atomic OPERATION: All state changes happen atomically
         let drained_count = self.data.len();
         
-        // 🧮 ACCURATE MEMORY RECLAMATION: Calculate memory before draining
         let freed_bytes = Self::calculate_actual_memory_usage(&self.data);
         
-        // 🔒 ATOMIC DRAIN: Convert VecDeque to Vec
         let drained_data: Vec<_> = self.data.drain(..).collect();
         
-        // 🔒 ATOMIC STATE RESET: Update all counters atomically 
         self.pressure_level.store(0, Ordering::Release);
         self.rejected_writes.store(0, Ordering::Release);
         self.estimated_memory_mb.store(0, Ordering::Release);
@@ -1346,14 +1295,13 @@ impl BoundedOverflowBuffer {
         drained_data
     }
 
-    /// 📊 ACCURATE memory calculation replacing the flawed 16-byte estimation
+    /// 
     fn calculate_actual_memory_usage(data: &VecDeque<(u64, u64)>) -> usize {
         // 🎯 ACCURATE CALCULATION: Real VecDeque memory usage
         let tuple_size = std::mem::size_of::<(u64, u64)>(); // Exactly 16 bytes
         let capacity_bytes = data.capacity() * tuple_size;
         let vecdeque_overhead = std::mem::size_of::<VecDeque<(u64, u64)>>();
         
-        // 🔍 DETAILED BREAKDOWN: Include all memory components
         capacity_bytes + vecdeque_overhead
     }
 
@@ -1393,7 +1341,6 @@ impl BoundedOverflowBuffer {
             }
         }
         
-        // ✅ Update accurate memory estimate
         self.estimated_memory_mb.store(actual_memory_mb, Ordering::Release);
         
         Ok(())
@@ -1811,7 +1758,7 @@ impl CPUPressureDetector {
     }
 }
 
-/// ✅ RACE-FREE lookup result enum for atomic operations
+/// 
 #[derive(Debug)]
 enum LookupResult {
     Found(Option<u64>),
@@ -1908,71 +1855,80 @@ impl AdaptiveRMI {
         }
     }
 
-    /// ✅ NON-BLOCKING insert with minimal lock time and memory pressure protection
+    /// 
     pub fn insert(&self, key: u64, value: u64) -> Result<()> {
         // 1. Try to insert into hot buffer (lock-free, bounded size)
         if self.hot_buffer.try_insert(key, value)? {
             return Ok(());
         }
 
-        // 2. ✅ MINIMAL LOCK TIME: Get overflow buffer stats quickly
-        let (overflow_size, overflow_capacity, rejected_writes, pressure_level, memory_mb) = {
+        // 2. ✅ minimal lock time: Get overflow buffer stats quickly
+        let (overflow_size, overflow_capacity, rejected_writes, pressure_level, overflow_memory_mb) = {
             let overflow = self.overflow_buffer.lock();
             overflow.stats()
-        }; // ✅ Lock dropped immediately after stats
+        }; // 
 
-        // 3. Circuit breaker: Reject immediately if memory usage is critical
-        if memory_mb > SYSTEM_MEMORY_LIMIT_MB {
+        let hot_memory_kb = {
+            let hot_size = self.hot_buffer.size.load(Ordering::Relaxed);
+            (hot_size * std::mem::size_of::<(u64, u64)>()) / 1024
+        };
+        
+        let segments_memory_kb = {
+            let segments = self.segments.read();
+            let total_segment_memory: usize = segments.iter()
+                .map(|seg| seg.data.len() * std::mem::size_of::<(u64, u64)>())
+                .sum();
+            total_segment_memory / 1024
+        };
+        
+        let total_memory_mb = (overflow_memory_mb * 1024 + hot_memory_kb + segments_memory_kb) / 1024;
+
+        if cfg!(test) && (overflow_memory_mb > 0 || hot_memory_kb > 0 || segments_memory_kb > 0) {
+            println!("🧮 Memory usage: total={}MB (overflow={}MB, hot={}KB, segments={}KB), limit={}MB", 
+                total_memory_mb, overflow_memory_mb, hot_memory_kb, segments_memory_kb, SYSTEM_MEMORY_LIMIT_MB);
+        }
+
+        if total_memory_mb > SYSTEM_MEMORY_LIMIT_MB {
             return Err(anyhow!(
-                "Circuit breaker active: Memory usage {}MB exceeds limit {}MB. System under extreme memory pressure.",
-                memory_mb, SYSTEM_MEMORY_LIMIT_MB
+                "Circuit breaker active: Total memory usage {}MB exceeds limit {}MB (overflow: {}MB, hot: {}KB, segments: {}KB). System under extreme memory pressure.",
+                total_memory_mb, SYSTEM_MEMORY_LIMIT_MB, overflow_memory_mb, hot_memory_kb, segments_memory_kb
             ));
         }
 
-        // 4. Schedule appropriate merge based on pressure level (no locks needed)
         match pressure_level {
             0..=1 => {
-                // Low pressure - normal merge
                 self.merge_scheduler.schedule_merge_async();
             }
             2..=3 => {
-                // Medium to high pressure - urgent merge
                 self.merge_scheduler.schedule_urgent_merge();
             }
             4.. => {
-                // Critical pressure - immediate rejection with exponential backoff guidance
                 let backoff_ms = std::cmp::min(1000, 50 * (rejected_writes / 10 + 1));
                 return Err(anyhow!(
-                    "Write rejected: Overflow buffer under critical pressure ({}/{} capacity, {}MB memory). Retry after {}ms with exponential backoff.",
-                    overflow_size, overflow_capacity, memory_mb, backoff_ms
+                    "Write rejected: Overflow buffer under critical pressure ({}/{} capacity, {}MB total memory). Retry after {}ms with exponential backoff.",
+                    overflow_size, overflow_capacity, total_memory_mb, backoff_ms
                 ));
             }
         }
 
-        // 5. ✅ NON-BLOCKING insert attempt with minimal lock time
+        // 6. ✅ non-blocking insert attempt with minimal lock time
         let insert_result = {
             let mut overflow = self.overflow_buffer.lock();
-            // ✅ FAST OPERATION: Single atomic insert operation
             let result = overflow.try_insert(key, value);
             let is_critical = overflow.is_under_critical_pressure();
             (result, is_critical)
-        }; // ✅ Lock dropped immediately after insert
+        }; // 
 
-        // 6. ✅ LOCK-FREE result processing
         match insert_result {
             (Ok(true), _) => {
-                // Successfully buffered
                 Ok(())
             }
             (Ok(false), is_critical) => {
-                // Buffer rejected write due to pressure
                 if is_critical {
-                    // Critical pressure - hard rejection
                     Err(anyhow!(
                         "Write permanently rejected: System under critical memory pressure. Reduce write rate and implement exponential backoff."
                     ))
                 } else {
-                    // High pressure - temporary rejection with retry guidance
                     let retry_ms = std::cmp::min(500, 25 * (rejected_writes / 5 + 1));
                     Err(anyhow!(
                         "Write temporarily rejected: High memory pressure. Retry after {}ms.", 
@@ -1987,7 +1943,7 @@ impl AdaptiveRMI {
         }
     }
 
-    /// � RACE-FREE lookup with generation-based consistency protection
+    /// � race-free lookup with generation-based consistency protection
     /// Eliminates TOCTOU vulnerabilities between router prediction and segment access
     pub fn lookup(&self, key: u64) -> Option<u64> {
         // 1. Check hot buffer first (most recent data) - completely lock-free
@@ -2005,7 +1961,7 @@ impl AdaptiveRMI {
             return Some(value);
         }
 
-        // 3. � RACE-FREE ATOMIC COORDINATION: Prevent TOCTOU between router and segments
+        // 3. � race-free atomic COORDINATION: Prevent TOCTOU between router and segments
         // Always acquire locks in order: 1) segments, 2) router to prevent deadlocks
         let segments_guard = self.segments.read();
         let router_guard = self.global_router.read();
@@ -2026,52 +1982,48 @@ impl AdaptiveRMI {
         // Both locks automatically released here
     }
 
-    /// DEPRECATED: This method had race conditions - lookup() now handles retries internally
+    /// DEPRECATED
     /// All retry logic is now integrated into the main lookup() method for atomicity
     fn lookup_with_retry(&self, key: u64, retry_count: usize) -> Option<u64> {
-        // ✅ SAFE DELEGATION: Main lookup method now handles all retry logic safely
         let _ = retry_count; // Suppress unused parameter warning
         self.lookup(key)
     }
 
-    /// ✅ COMPLETELY SAFE fallback linear search (race-free)
+    /// 
     fn fallback_linear_search_safe(&self, key: u64) -> Option<u64> {
-        // ✅ SINGLE LOCK: Acquire segments lock once and hold throughout search
         let segments_guard = self.segments.read();
         self.fallback_linear_search_with_segments_lock(segments_guard, key)
     }
 
-    /// 🔒 OPTIMIZED fallback search with pre-acquired segments lock
+    /// 
     /// Used when we already hold the segments lock to avoid double-locking
     fn fallback_linear_search_with_segments_lock(&self, segments_guard: parking_lot::RwLockReadGuard<Vec<AdaptiveSegment>>, key: u64) -> Option<u64> {
-        // ✅ SAFE ITERATION: No router dependencies, pure linear search
         for segment in segments_guard.iter() {
-            // ✅ BOUNDED SEARCH: Each segment provides its own bounds checking
             if let Some(value) = segment.bounded_search(key) {
                 return Some(value);
             }
         }
         
-        // ✅ DEFINITIVE RESULT: Key not found in any segment
         None
     }
 
-    /// DEPRECATED: Old fallback method - use fallback_linear_search_safe instead
+    /// DEPRECATED
     fn fallback_linear_search(&self, key: u64) -> Option<u64> {
         // Delegate to the new safe implementation
         self.fallback_linear_search_safe(key)
     }
 
-    /// ✅ NON-BLOCKING background merge operation with minimal lock time
+    /// 
+    /// Lock order protocol: 1) segments, 2) router, 3) overflow
     pub async fn merge_hot_buffer(&self) -> Result<()> {
         self.merge_scheduler.start_merge();
         
-        // 1. ✅ ATOMIC DRAIN: Guaranteed consistency with no data loss risk
+        // 1. ✅ atomic DRAIN: Guaranteed consistency with no data loss risk
         let hot_data = self.hot_buffer.drain_atomic();
         let overflow_data = {
             let mut overflow = self.overflow_buffer.lock();
             overflow.drain_all_atomic()
-        }; // ✅ Lock dropped immediately after atomic drain
+        }; // 
 
         // 2. Combine and sort all pending writes (lock-free operation)
         let mut all_writes = hot_data;
@@ -2084,79 +2036,52 @@ impl AdaptiveRMI {
         
         all_writes.sort_by_key(|(k, _)| *k);
 
-        // 3. Check if we need to create initial segments (RACE-FREE coordinated update)
-        let segments_empty = {
-            let segments = self.segments.read();
-            segments.is_empty()
-        }; // segments guard dropped here
-        
-        if segments_empty {
-            // RACE-FREE: Coordinate segment and router updates atomically
-            self.update_segments_and_router_atomically(|segments_guard, router_guard| {
+        // 3. ✅ DEADLOCK-FREE: Use consistent lock ordering for all updates
+        self.atomic_update_with_consistent_locking(|segments, router| {
+            if segments.is_empty() {
                 // Create initial segment
-                let initial_segment = AdaptiveSegment::new(all_writes.clone());
-                segments_guard.push(initial_segment);
-                
-                // Set up router for single segment (key range covers all keys)
-                // With one segment, router should route all keys to segment 0
                 let first_key = all_writes[0].0;
                 let last_key = all_writes[all_writes.len() - 1].0;
                 
-                // For single segment, use empty boundaries so predict_segment always returns 0
-                let boundaries = vec![];
-                router_guard.update_boundaries(boundaries);
+                let initial_segment = AdaptiveSegment::new(all_writes.clone());
+                segments.push(initial_segment);
+                
+                // Update router for single segment (empty boundaries route all to segment 0)
+                router.update_boundaries(vec![]);
                 
                 println!("✅ Created initial segment with {} keys (range: {} to {})", 
-                    all_writes.len(), first_key, last_key);
-                
-                Ok(())
-            }).await?;
-            
-            self.merge_scheduler.complete_merge();
-            return Ok(());
-        }
+                         all_writes.len(), first_key, last_key);
+                return Ok(());
+            }
 
-        // 4. Group writes by target segments for parallel processing
-        let segment_updates = self.group_updates_by_segment(all_writes).await?;
+            // Group updates by segment using current router state
+            let mut segment_updates = std::collections::HashMap::new();
+            for (key, value) in all_writes {
+                let segment_id = router.predict_segment(key);
+                segment_updates.entry(segment_id).or_insert_with(Vec::new).push((key, value));
+            }
 
-        // 5. Update segments in parallel (no global locks)
-        let update_tasks: Vec<_> = segment_updates.into_iter()
-            .map(|(segment_id, updates)| {
-                let segments = self.segments.clone();
-                tokio::spawn(async move {
-                    Self::merge_segment_updates_parallel(segments, segment_id, updates).await
-                })
-            })
-            .collect();
+            // Apply updates to segments atomically
+            for (segment_id, updates) in segment_updates {
+                if segment_id < segments.len() {
+                    let target_segment = &mut segments[segment_id];
+                    for (key, value) in updates {
+                        target_segment.insert(key, value)?;
+                    }
+                }
+            }
 
-        // 6. Wait for all parallel updates to complete
-        for task in update_tasks {
-            task.await??;
-        }
-
-        // 7. Check for segment adaptation needs after merge
-        self.check_segment_adaptation_after_merge().await?;
+            Ok(())
+        }).await?;
 
         self.merge_scheduler.complete_merge();
         Ok(())
     }
 
-    /// Group updates by target segments efficiently
-    async fn group_updates_by_segment(&self, all_writes: Vec<(u64, u64)>) -> Result<std::collections::HashMap<usize, Vec<(u64, u64)>>> {
-        let mut segment_updates: std::collections::HashMap<usize, Vec<(u64, u64)>> = 
-            std::collections::HashMap::new();
-
-        let router = self.global_router.read();
-        for (key, value) in all_writes {
-            let segment_id = router.predict_segment(key);
-            segment_updates.entry(segment_id).or_default().push((key, value));
-        }
-        drop(router);
-
-        Ok(segment_updates)
-    }
-
-    /// RACE-FREE segment updates using single write lock for entire operation
+    /// DEPRECATED
+    /// This method had potential deadlock risks with separate lock acquisition
+    /// Updates are now grouped inline within atomic_update_with_consistent_locking
+    /// race-free segment updates using single write lock for entire operation
     async fn merge_segment_updates_parallel(
         segments: Arc<RwLock<Vec<AdaptiveSegment>>>,
         segment_id: usize,
@@ -2502,15 +2427,27 @@ impl AdaptiveRMI {
     where
         F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
     {
-        // Acquire write lock for atomic operation
+        // Delegate to the new deadlock-free implementation
+        self.atomic_update_with_consistent_locking(segment_update_fn).await
+    }
+
+    /// 
+    /// Lock order protocol: Always acquire locks in order: 1) segments, 2) router, 3) overflow
+    async fn atomic_update_with_consistent_locking<F>(&self, update_fn: F) -> Result<()>
+    where
+        F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
+    {
         let mut segments_guard = self.segments.write();
         let mut router_guard = self.global_router.write();
         
-        // Apply segment updates
-        segment_update_fn(&mut segments_guard, &mut router_guard)?;
+        // Apply updates atomically
+        update_fn(&mut segments_guard, &mut router_guard)?;
         
         // Update router boundaries to maintain consistency
         self.update_router_boundaries_under_lock(&segments_guard, &mut router_guard)?;
+        
+        // Increment generation after any structural changes
+        router_guard.increment_generation();
         
         Ok(())
     }
@@ -2534,7 +2471,7 @@ impl AdaptiveRMI {
         cold_small_trigger || very_small_trigger
     }
 
-    /// DEPRECATED: Old split method with race conditions - use execute_split_under_lock instead
+    /// DEPRECATED
     /// This method is kept for reference but should not be used in production
     async fn split_segment_advanced(&self, _segment_id: usize) -> Result<()> {
         // RACE CONDITION: This method has TOCTOU races between reading segments
@@ -2558,12 +2495,12 @@ impl AdaptiveRMI {
         mid.clamp(min_segment, max_segment)
     }
 
-    /// DEPRECATED: Old merge partner finder with race conditions
+    /// DEPRECATED
     async fn find_merge_partner(&self, _segment_id: usize, _candidates: &[usize]) -> Result<Option<usize>> {
         // RACE CONDITION: This method has TOCTOU races
         Err(anyhow::anyhow!("find_merge_partner is deprecated due to race conditions"))
     }
-    /// DEPRECATED: Old merge processing methods with race conditions - use execute_merge_under_lock instead
+    /// DEPRECATED
     /// These methods are kept for reference but should not be used in production
     /*
     async fn process_segment_merges(&self, merge_candidates: Vec<usize>) -> Result<()> {
@@ -2600,7 +2537,7 @@ impl AdaptiveRMI {
         access_score + size_score + size_penalty
     }
 
-    /// DEPRECATED: Old merge method with race conditions - use execute_merge_under_lock instead
+    /// DEPRECATED
     /// This method is kept for reference but should not be used in production
     /*
     async fn merge_segments_advanced(&self, segment_id_1: usize, segment_id_2: usize) -> Result<()> {
@@ -2611,13 +2548,12 @@ impl AdaptiveRMI {
     */
 
     /// Container-aware background maintenance with robust CPU throttling protection
-    /// ✅ INFINITE LOOP PREVENTION: Multiple circuit breakers and bounded operations
+    /// 
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut cpu_detector = CPUPressureDetector::new();
             let error_handler = BackgroundErrorHandler::new();
             
-            // ✅ INFINITE LOOP PREVENTION: Global circuit breaker
             let mut loop_iteration_count = 0u64;
             let mut last_circuit_breaker_check = std::time::Instant::now();
             const MAX_ITERATIONS_PER_MINUTE: u64 = 12000; // 200 Hz max reasonable rate
@@ -2637,7 +2573,6 @@ impl AdaptiveRMI {
                 loop_iteration_count += 1;
                 let loop_start = std::time::Instant::now();
                 
-                // ✅ INFINITE LOOP CIRCUIT BREAKER: Prevent runaway loops
                 if loop_iteration_count % 1000 == 0 { // Check every 1000 iterations
                     let now = std::time::Instant::now();
                     let elapsed_since_check = now.duration_since(last_circuit_breaker_check);
@@ -2693,7 +2628,6 @@ impl AdaptiveRMI {
                     }
                 }
                 
-                // ✅ FIXED EMERGENCY MODE: Minimal operations, HTTP-server friendly
                 if emergency_mode {
                     let _emergency_duration = now.duration_since(last_emergency_check);
                     
@@ -2705,7 +2639,6 @@ impl AdaptiveRMI {
                         println!("🚨 Emergency merge required - overflow buffer {}% full", 
                             (overflow_size * 100) / overflow_cap);
                         
-                        // ✅ CRITICAL FIX: Minimal yielding to avoid HTTP server starvation
                         tokio::task::yield_now().await; // Single yield only
                         
                         // Emergency merge with minimal CPU usage
@@ -2721,7 +2654,6 @@ impl AdaptiveRMI {
                         }
                     }
                     
-                    // ✅ CRITICAL FIX: HTTP-server friendly emergency sleep (was 2000ms!)
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Fixed 100ms max
                     continue; // Skip normal operations in emergency mode
                 }
@@ -2729,11 +2661,8 @@ impl AdaptiveRMI {
                 // ENHANCED TASK SCHEDULING: Priority-based with throttling awareness
                 let current_pressure = cpu_detector.current_pressure();
                 
-                // ✅ FIXED: HTTP-server friendly CPU yielding (was 5+ yields!)
                 if cpu_detector.should_yield_cpu() {
-                    // ✅ CRITICAL FIX: Single yield only to avoid HTTP server starvation
                     tokio::task::yield_now().await;
-                    // ✅ CRITICAL FIX: Maximum 10ms sleep to maintain HTTP responsiveness
                     tokio::time::sleep(std::time::Duration::from_millis(
                         std::cmp::min(10, 2 + current_pressure as u64)
                     )).await;
@@ -2796,7 +2725,6 @@ impl AdaptiveRMI {
                         // Get buffer state for adaptive timing
                         let (overflow_size, overflow_capacity, _rejected, _pressure, _memory) = self.overflow_buffer.lock().stats();
                         
-                        // ✅ FIXED: HTTP-server friendly progressive yielding
                         match current_pressure {
                             0..=4 => { /* No yielding needed - HTTP-optimized */ }
                             5..=6 => {
@@ -2804,14 +2732,12 @@ impl AdaptiveRMI {
                             }
                             7..=8 => {
                                 tokio::task::yield_now().await; // Single yield only
-                                // ✅ CRITICAL FIX: Maximum 5ms sleep to preserve HTTP responsiveness  
                                 tokio::time::sleep(std::time::Duration::from_millis(
                                     std::cmp::min(5, 1 + (overflow_size * 1 / overflow_capacity.max(1)) as u64)
                                 )).await; 
                             }
                             _ => {
                                 tokio::task::yield_now().await; // Single yield only
-                                // ✅ CRITICAL FIX: Maximum 10ms sleep cap for HTTP server responsiveness
                                 let adaptive_sleep_ms = std::cmp::min(10, 2 + (overflow_size * 2 / overflow_capacity.max(1)));
                                 tokio::time::sleep(std::time::Duration::from_millis(adaptive_sleep_ms as u64)).await;
                             }
@@ -2845,7 +2771,6 @@ impl AdaptiveRMI {
                         continue;
                     }
                     
-                    // ✅ FIXED: Single yield for management operations (was 5 yields!)
                     tokio::task::yield_now().await; // Single yield only
                     
                     let mgmt_start = std::time::Instant::now();
@@ -2906,7 +2831,6 @@ impl AdaptiveRMI {
                     _ => base_sleep * 8 + std::time::Duration::from_millis(hot_utilization * 20),
                 };
                 
-                // ✅ CRITICAL FIX: NO CPU yielding in main loop - HTTP server priority
                 // The excessive yielding was completely starving the HTTP server
                 // Background tasks should never monopolize CPU from HTTP requests
                 
@@ -2919,7 +2843,6 @@ impl AdaptiveRMI {
     async fn emergency_minimal_merge(&self) -> Result<()> {
         println!("🚨 Performing emergency minimal merge to prevent OOM");
         
-        // ✅ ATOMIC DRAIN: Use atomic drain for guaranteed consistency
         let overflow_data = {
             let mut overflow = self.overflow_buffer.lock();
             if overflow.data.is_empty() {
@@ -2936,89 +2859,49 @@ impl AdaptiveRMI {
         
         println!("🔧 Emergency merging {} overflow entries", overflow_data.len());
         
-        // ✅ INFINITE LOOP PREVENTION: Bound emergency operations
         if overflow_data.len() > 100_000 {
             eprintln!("🚨 EMERGENCY ABORT: Too many overflow entries ({}), potential infinite loop", overflow_data.len());
             return Err(anyhow::anyhow!("Emergency merge aborted: overflow data too large ({})", overflow_data.len()));
         }
         
-        // Simplified merge - just add to segments without complex optimization
-        let updates_by_segment = self.group_updates_by_segment(overflow_data).await?;
-        
-        // ✅ INFINITE LOOP PREVENTION: Bound segment processing
-        let segment_count = updates_by_segment.len();
-        if segment_count > 1000 {
-            eprintln!("🚨 EMERGENCY ABORT: Too many segments ({}), potential infinite loop", segment_count);
-            return Err(anyhow::anyhow!("Emergency merge aborted: too many segments ({})", segment_count));
-        }
-        
-        // Process in small batches with HTTP-server friendly yielding
-        for (segment_id, updates) in updates_by_segment {
-            // ✅ CRITICAL FIX: Single yield only - prevent HTTP server starvation
-            tokio::task::yield_now().await; // Single yield only
-            
-            // Capture updates length before moving it
-            let updates_len = updates.len();
-            self.emergency_merge_segment_simple(segment_id, updates).await?;
-            
-            // Adaptive sleep between segment updates based on system pressure
-            let emergency_sleep = match updates_len {
-                0..=10 => std::time::Duration::from_millis(10),   // Light load
-                11..=50 => std::time::Duration::from_millis(25),  // Medium load  
-                51..=100 => std::time::Duration::from_millis(50), // Heavy load
-                _ => std::time::Duration::from_millis(100),       // Very heavy load
-            };
-            tokio::time::sleep(emergency_sleep).await;
-        }
+        self.atomic_update_with_consistent_locking(|segments, router| {
+            // Group updates by segment using current router state
+            let mut segment_updates = std::collections::HashMap::new();
+            for (key, value) in overflow_data {
+                let segment_id = router.predict_segment(key);
+                segment_updates.entry(segment_id).or_insert_with(Vec::new).push((key, value));
+            }
+
+            let segment_count = segment_updates.len();
+            if segment_count > 1000 {
+                eprintln!("🚨 EMERGENCY ABORT: Too many segments ({}), potential infinite loop", segment_count);
+                return Err(anyhow::anyhow!("Emergency merge aborted: too many segments ({})", segment_count));
+            }
+
+            // Apply updates to segments atomically (all under same lock)
+            for (segment_id, updates) in segment_updates {
+                if segment_id < segments.len() && !updates.is_empty() {
+                    if updates.len() > 10_000 {
+                        eprintln!("🚨 EMERGENCY SEGMENT ABORT: Too many updates ({}), potential infinite loop", updates.len());
+                        return Err(anyhow::anyhow!("Emergency segment merge aborted: too many updates ({})", updates.len()));
+                    }
+                    
+                    let target_segment = &mut segments[segment_id];
+                    for (key, value) in updates {
+                        target_segment.insert(key, value)?;
+                    }
+                }
+            }
+
+            Ok(())
+        }).await?;
         
         println!("✅ Emergency merge completed successfully");
         Ok(())
     }
-    
-    /// Simplified segment merge for emergency scenarios
-    /// ✅ INFINITE LOOP PREVENTION: Bounded operations and error handling
-    async fn emergency_merge_segment_simple(&self, segment_id: usize, updates: Vec<(u64, u64)>) -> Result<()> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-        
-        // ✅ INFINITE LOOP PREVENTION: Bound update size
-        if updates.len() > 10_000 {
-            eprintln!("🚨 EMERGENCY SEGMENT ABORT: Too many updates ({}), potential infinite loop", updates.len());
-            return Err(anyhow::anyhow!("Emergency segment merge aborted: too many updates ({})", updates.len()));
-        }
-        
-        // Simplified update without complex model retraining
-        // Process updates in small batches to avoid holding locks for too long
-        let total_chunks = updates.chunks(10).len();
-        let mut processed_chunks = 0;
-        
-        for chunk in updates.chunks(10) {
-            processed_chunks += 1;
-            
-            // ✅ INFINITE LOOP PREVENTION: Sanity check for chunk processing
-            if processed_chunks > total_chunks * 2 {
-                eprintln!("🚨 EMERGENCY ABORT: Chunk processing exceeded bounds ({} > {})", processed_chunks, total_chunks * 2);
-                return Err(anyhow::anyhow!("Emergency merge aborted: chunk processing loop error"));
-            }
-            
-            {
-                let mut segments = self.segments.write();
-                
-                if segment_id < segments.len() {
-                    for (key, value) in chunk {
-                        segments[segment_id].insert(*key, *value)?;
-                    }
-                }
-            } // Release lock before yielding
-            
-            // Yield every chunk during emergency
-            tokio::task::yield_now().await;
-        }
-        
-        Ok(())
-    }
 
+    /// DEPRECATED
+    /// Emergency merges now use atomic_update_with_consistent_locking to prevent deadlocks
     /// Performance analytics and monitoring
     async fn log_performance_analytics(&self) {
         let segments = self.segments.read();
@@ -3030,7 +2913,7 @@ impl AdaptiveRMI {
             num_segments, total_keys
         );
     }
-                                    // DEPRECATED: merge_segments_advanced has race conditions
+                                    // DEPRECATED
     /// Enhanced merge triggering logic
     async fn should_trigger_merge(&self) -> bool {
         let hot_utilization = self.hot_buffer.utilization();
