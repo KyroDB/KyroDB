@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
                                 }
                             }
                             
-                            let size = log_for_size.wal_size_bytes();
+                            let size = log_for_size.wal_size_bytes().await;
                             if size >= maxb {
                                 println!(
                                     "📦 Size-based compaction: wal={} bytes >= {}",
@@ -283,9 +283,13 @@ async fn main() -> Result<()> {
                         }
                         
                         // Check if compaction should run based on conditions
-                        if compact_when_wal_bytes == 0
-                            || log_for_compact.wal_size_bytes() >= compact_when_wal_bytes
-                        {
+                        let should_compact = if compact_when_wal_bytes == 0 {
+                            true
+                        } else {
+                            log_for_compact.wal_size_bytes().await >= compact_when_wal_bytes
+                        };
+                        
+                        if should_compact {
                             // Yield to other tasks before heavy operation
                             tokio::task::yield_now().await;
                             

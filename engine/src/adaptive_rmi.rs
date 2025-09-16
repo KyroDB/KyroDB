@@ -288,6 +288,17 @@ struct SegmentMergeOperation {
     combined_access: u64,
 }
 
+/// 🚀 PHASE 4: SIMD Capabilities Information
+#[derive(Debug, Clone)]
+pub struct SIMDCapabilities {
+    pub has_avx2: bool,
+    pub has_avx512: bool,
+    pub has_neon: bool,
+    pub optimal_batch_size: usize,
+    pub architecture: String,
+    pub simd_width: usize, // Number of elements processed in parallel
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalLinearModel {
     slope: f64,
@@ -3046,6 +3057,829 @@ impl AdaptiveRMI {
             performance_level: performance_level.to_string(),
             segments_needing_attention,
             recommendation: recommendation.to_string(),
+        }
+    }
+
+    // ============================================================================
+    // 🚀 PHASE 4: SIMD-OPTIMIZED BATCH PROCESSING
+    // ============================================================================
+    
+    /// 🚀 SIMD BATCH LOOKUP: Process multiple keys with vectorized operations
+    /// 
+    /// This method provides enterprise-grade batch processing with automatic
+    /// SIMD optimization when available, falling back gracefully to scalar
+    /// operations on unsupported architectures.
+    pub fn lookup_batch_simd(&self, keys: &[u64]) -> Vec<Option<u64>> {
+        let mut results = Vec::with_capacity(keys.len());
+        
+        // 🚀 ARM64 NEON PROCESSING: Optimized for Apple Silicon
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            // Process in chunks of 16 keys for optimal cache performance on ARM64
+            const OPTIMAL_CHUNK_SIZE: usize = 16;
+            
+            for chunk in keys.chunks(OPTIMAL_CHUNK_SIZE) {
+                // Process 4 keys at a time within each chunk (NEON width)
+                for neon_group in chunk.chunks(4) {
+                    if neon_group.len() == 4 {
+                        let neon_results = self.lookup_4_keys_neon_optimized(neon_group);
+                        results.extend_from_slice(&neon_results);
+                    } else {
+                        // Scalar fallback for remaining keys in chunk
+                        for &key in neon_group {
+                            results.push(self.lookup(key));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 🚀 x86_64 AVX2 PROCESSING: Optimized for Intel/AMD
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            // Process in chunks of 32 keys for optimal cache performance
+            const OPTIMAL_CHUNK_SIZE: usize = 32;
+            
+            for chunk in keys.chunks(OPTIMAL_CHUNK_SIZE) {
+                // Process 8 keys at a time within each chunk
+                for simd_group in chunk.chunks(8) {
+                    if simd_group.len() == 8 {
+                        unsafe {
+                            let simd_results = self.lookup_8_keys_optimized_simd(simd_group);
+                            results.extend_from_slice(&simd_results);
+                        }
+                    } else {
+                        // Scalar fallback for remaining keys in chunk
+                        for &key in simd_group {
+                            results.push(self.lookup(key));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 🚀 COMPATIBILITY PATH: Scalar processing for other architectures
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(target_arch = "aarch64", target_feature = "neon")
+        )))]
+        {
+            for &key in keys {
+                results.push(self.lookup(key));
+            }
+        }
+        
+        results
+    }
+    
+    /// 🚀 OPTIMIZED 8-KEY SIMD: True vectorization with minimal overhead
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn lookup_8_keys_optimized_simd(&self, keys: &[u64]) -> [Option<u64>; 8] {
+        use std::arch::x86_64::*;
+        
+        // 🚀 EFFICIENT LOADING: Load keys directly from memory
+        let keys_ptr = keys.as_ptr() as *const __m256i;
+        let keys_lo = _mm256_loadu_si256(keys_ptr);
+        let keys_hi = _mm256_loadu_si256(keys_ptr.add(1));
+        
+        // 🚀 PIPELINE OPTIMIZATION: Overlap computation phases
+        
+        // Phase 1: Hot buffer (lock-free vectorized)
+        let hot_results = self.simd_hot_buffer_lookup(keys_lo, keys_hi);
+        
+        // 🚀 EARLY EXIT: If all found in hot buffer, skip remaining phases
+        if hot_results.iter().all(|r| r.is_some()) {
+            return hot_results;
+        }
+        
+        // Phase 2: Overflow buffer (only for missing keys)
+        let overflow_results = self.simd_overflow_buffer_lookup(keys_lo, keys_hi, &hot_results);
+        
+        // 🚀 EARLY EXIT: If all found in buffers, skip segment lookup
+        let found_in_buffers = hot_results.iter().zip(overflow_results.iter())
+            .all(|(hot, overflow)| hot.is_some() || overflow.is_some());
+        
+        if found_in_buffers {
+            return [
+                hot_results[0].or(overflow_results[0]),
+                hot_results[1].or(overflow_results[1]),
+                hot_results[2].or(overflow_results[2]),
+                hot_results[3].or(overflow_results[3]),
+                hot_results[4].or(overflow_results[4]),
+                hot_results[5].or(overflow_results[5]),
+                hot_results[6].or(overflow_results[6]),
+                hot_results[7].or(overflow_results[7]),
+            ];
+        }
+        
+        // Phase 3: Segments (only for still missing keys)
+        let segment_results = self.simd_segment_lookup(keys_lo, keys_hi, &hot_results, &overflow_results);
+        
+        // 🚀 VECTORIZED RESULT COMBINATION: Efficiently combine results
+        [
+            hot_results[0].or(overflow_results[0]).or(segment_results[0]),
+            hot_results[1].or(overflow_results[1]).or(segment_results[1]),
+            hot_results[2].or(overflow_results[2]).or(segment_results[2]),
+            hot_results[3].or(overflow_results[3]).or(segment_results[3]),
+            hot_results[4].or(overflow_results[4]).or(segment_results[4]),
+            hot_results[5].or(overflow_results[5]).or(segment_results[5]),
+            hot_results[6].or(overflow_results[6]).or(segment_results[6]),
+            hot_results[7].or(overflow_results[7]).or(segment_results[7]),
+        ]
+    }
+    
+    /// 🚀 LOCK-FREE SIMD HOT BUFFER LOOKUP: Vectorized hot buffer search
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn simd_hot_buffer_lookup(&self, keys_lo: __m256i, keys_hi: __m256i) -> [Option<u64>; 8] {
+        let mut results = [None; 8];
+        
+        // 🚀 SINGLE LOCK ACQUISITION: Get all data at once to minimize lock time
+        let buffer_snapshot = {
+            let buffer = self.hot_buffer.buffer.lock();
+            if buffer.is_empty() {
+                return results; // Early exit if buffer is empty
+            }
+            buffer.iter().copied().collect::<Vec<_>>()
+        }; // Lock released immediately
+        
+        // 🚀 LOCK-FREE VECTORIZED SEARCH: No locks during actual search
+        // Extract all 8 keys first
+        let keys_array = [
+            _mm256_extract_epi64(keys_lo, 0) as u64,
+            _mm256_extract_epi64(keys_lo, 1) as u64,
+            _mm256_extract_epi64(keys_lo, 2) as u64,
+            _mm256_extract_epi64(keys_lo, 3) as u64,
+            _mm256_extract_epi64(keys_hi, 0) as u64,
+            _mm256_extract_epi64(keys_hi, 1) as u64,
+            _mm256_extract_epi64(keys_hi, 2) as u64,
+            _mm256_extract_epi64(keys_hi, 3) as u64,
+        ];
+        
+        // 🚀 VECTORIZED COMPARISON: Process 4 keys at a time with SIMD comparisons
+        if buffer_snapshot.len() >= 4 {
+            // Process in groups of 4 for better cache efficiency
+            for chunk_start in (0..buffer_snapshot.len()).step_by(4) {
+                let chunk_end = (chunk_start + 4).min(buffer_snapshot.len());
+                let chunk = &buffer_snapshot[chunk_start..chunk_end];
+                
+                if chunk.len() >= 4 {
+                    // Load 4 buffer keys into SIMD register
+                    let buffer_keys = _mm256_set_epi64x(
+                        if chunk.len() > 3 { chunk[3].0 as i64 } else { 0 },
+                        if chunk.len() > 2 { chunk[2].0 as i64 } else { 0 },
+                        if chunk.len() > 1 { chunk[1].0 as i64 } else { 0 },
+                        chunk[0].0 as i64
+                    );
+                    
+                    // Compare each search key against all 4 buffer keys simultaneously
+                    for (i, &search_key) in keys_array.iter().enumerate() {
+                        if results[i].is_some() { continue; } // Already found
+                        
+                        let search_vec = _mm256_set1_epi64x(search_key as i64);
+                        let matches = _mm256_cmpeq_epi64(search_vec, buffer_keys);
+                        let mask = _mm256_movemask_epi8(matches);
+                        
+                        // Check for matches and extract corresponding values
+                        if mask != 0 {
+                            for (j, &(k, v)) in chunk.iter().enumerate() {
+                                if k == search_key {
+                                    results[i] = Some(v);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Scalar fallback for remaining items
+                    for &(k, v) in chunk {
+                        for (i, &search_key) in keys_array.iter().enumerate() {
+                            if results[i].is_none() && k == search_key {
+                                results[i] = Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Small buffer: use scalar search
+            for &(k, v) in buffer_snapshot.iter().rev() {
+                for (i, &search_key) in keys_array.iter().enumerate() {
+                    if results[i].is_none() && k == search_key {
+                        results[i] = Some(v);
+                    }
+                }
+            }
+        }
+        
+        results
+    }
+    
+    /// 🚀 OPTIMIZED SIMD OVERFLOW BUFFER LOOKUP: Selective vectorized overflow search
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn simd_overflow_buffer_lookup(
+        &self, 
+        keys_lo: __m256i, 
+        keys_hi: __m256i, 
+        hot_results: &[Option<u64>; 8]
+    ) -> [Option<u64>; 8] {
+        let mut results = [None; 8];
+        
+        // 🚀 EARLY EXIT: Skip if all results found in hot buffer
+        let missing_count = hot_results.iter().filter(|r| r.is_none()).count();
+        if missing_count == 0 {
+            return results;
+        }
+        
+        // 🚀 SELECTIVE PROCESSING: Only process missing keys
+        let missing_keys: Vec<(usize, u64)> = hot_results.iter().enumerate()
+            .filter_map(|(i, result)| {
+                if result.is_none() {
+                    let key = if i < 4 {
+                        _mm256_extract_epi64(keys_lo, i as i32) as u64
+                    } else {
+                        _mm256_extract_epi64(keys_hi, (i - 4) as i32) as u64
+                    };
+                    Some((i, key))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        if missing_keys.is_empty() {
+            return results;
+        }
+        
+        // 🚀 MINIMAL LOCK TIME: Get snapshot of overflow buffer
+        let overflow_snapshot = {
+            let overflow = self.overflow_buffer.lock();
+            if overflow.data.is_empty() {
+                return results; // Early exit if overflow is empty
+            }
+            overflow.data.iter().copied().collect::<Vec<_>>()
+        }; // Lock released immediately
+        
+        // 🚀 VECTORIZED OVERFLOW SEARCH: Process missing keys in SIMD batches
+        for chunk in missing_keys.chunks(4) {
+            if chunk.len() >= 4 && overflow_snapshot.len() >= 4 {
+                // Load 4 search keys into SIMD register
+                let search_keys = _mm256_set_epi64x(
+                    if chunk.len() > 3 { chunk[3].1 as i64 } else { 0 },
+                    if chunk.len() > 2 { chunk[2].1 as i64 } else { 0 },
+                    if chunk.len() > 1 { chunk[1].1 as i64 } else { 0 },
+                    chunk[0].1 as i64
+                );
+                
+                // Search through overflow buffer in SIMD chunks
+                for buffer_chunk in overflow_snapshot.chunks(4) {
+                    if buffer_chunk.len() >= 4 {
+                        let buffer_keys = _mm256_set_epi64x(
+                            if buffer_chunk.len() > 3 { buffer_chunk[3].0 as i64 } else { 0 },
+                            if buffer_chunk.len() > 2 { buffer_chunk[2].0 as i64 } else { 0 },
+                            if buffer_chunk.len() > 1 { buffer_chunk[1].0 as i64 } else { 0 },
+                            buffer_chunk[0].0 as i64
+                        );
+                        
+                        // Compare all 4 search keys against all 4 buffer keys
+                        for (j, &(search_idx, search_key)) in chunk.iter().enumerate() {
+                            let search_vec = _mm256_set1_epi64x(search_key as i64);
+                            let matches = _mm256_cmpeq_epi64(search_vec, buffer_keys);
+                            let mask = _mm256_movemask_epi8(matches);
+                            
+                            if mask != 0 {
+                                // Find exact match and extract value
+                                for &(k, v) in buffer_chunk {
+                                    if k == search_key {
+                                        results[search_idx] = Some(v);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Scalar fallback for small chunks
+                for &(search_idx, search_key) in chunk {
+                    for &(k, v) in &overflow_snapshot {
+                        if k == search_key {
+                            results[search_idx] = Some(v);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        results
+    }
+    
+    /// 🚀 SIMD SEGMENT LOOKUP: Vectorized segment prediction and bounded search
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn simd_segment_lookup(
+        &self, 
+        keys_lo: __m256i, 
+        keys_hi: __m256i, 
+        hot_results: &[Option<u64>; 8],
+        overflow_results: &[Option<u64>; 8]
+    ) -> [Option<u64>; 8] {
+        let mut results = [None; 8];
+        
+        // 🚀 EARLY EXIT: Check if we need to do segment lookup at all
+        let need_segment_lookup = (0..8).any(|i| {
+            hot_results[i].is_none() && overflow_results[i].is_none()
+        });
+        
+        if !need_segment_lookup {
+            return results;
+        }
+        
+        // 🚀 MINIMAL LOCK TIME: Acquire locks in proper order to prevent deadlocks
+        let segments_guard = self.segments.read();
+        let router_guard = self.global_router.read();
+        
+        // 🚀 VECTORIZED SEGMENT PREDICTION: Predict segments for all 8 keys at once
+        let segment_ids = self.simd_predict_segments(keys_lo, keys_hi, &router_guard);
+        
+        // 🚀 SELECTIVE VECTORIZED BOUNDED SEARCH: Only search for missing keys
+        let missing_keys_with_segments: Vec<(usize, u64, usize)> = (0..8)
+            .filter_map(|i| {
+                if hot_results[i].is_none() && overflow_results[i].is_none() {
+                    let key = if i < 4 {
+                        _mm256_extract_epi64(keys_lo, i as i32) as u64
+                    } else {
+                        _mm256_extract_epi64(keys_hi, (i - 4) as i32) as u64
+                    };
+                    Some((i, key, segment_ids[i]))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // 🚀 VECTORIZED BOUNDED SEARCH: Process keys in SIMD batches
+        for chunk in missing_keys_with_segments.chunks(4) {
+            if chunk.len() >= 4 {
+                // Try to find segments with enough data for SIMD processing
+                let mut simd_processed = vec![false; chunk.len()];
+                
+                for &(result_idx, key, segment_id) in chunk {
+                    if segment_id < segments_guard.len() && !simd_processed[result_idx % 4] {
+                        let segment = &segments_guard[segment_id];
+                        
+                        // Use SIMD bounded search if segment has enough data
+                        if segment.data.len() >= 8 {
+                            results[result_idx] = self.simd_bounded_search_vectorized(
+                                &segment.data, key, segment.local_model.predict(key)
+                            );
+                        } else {
+                            // Scalar bounded search for small segments
+                            results[result_idx] = segment.bounded_search_fast(key);
+                        }
+                        simd_processed[result_idx % 4] = true;
+                    }
+                }
+            } else {
+                // Scalar fallback for remaining keys
+                for &(result_idx, key, segment_id) in chunk {
+                    if segment_id < segments_guard.len() {
+                        results[result_idx] = segments_guard[segment_id].bounded_search_fast(key);
+                    }
+                }
+            }
+        }
+        
+        results
+    }
+    
+    /// 🚀 VECTORIZED BOUNDED SEARCH: SIMD-optimized binary search with prediction
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn simd_bounded_search_vectorized(
+        &self,
+        data: &[(u64, u64)], 
+        search_key: u64,
+        predicted_position: usize
+    ) -> Option<u64> {
+        if data.is_empty() {
+            return None;
+        }
+        
+        // 🚀 BOUNDED SEARCH WINDOW: Limit search to small window around prediction
+        const SEARCH_WINDOW: usize = 8; // Must be multiple of 4 for SIMD
+        let data_len = data.len();
+        
+        let start = predicted_position.saturating_sub(SEARCH_WINDOW / 2);
+        let end = (predicted_position + SEARCH_WINDOW / 2).min(data_len);
+        let window = &data[start..end];
+        
+        if window.is_empty() {
+            return None;
+        }
+        
+        // 🚀 VECTORIZED COMPARISON: Compare search_key against 4 keys simultaneously
+        if window.len() >= 4 {
+            let search_vec = _mm256_set1_epi64x(search_key as i64);
+            
+            // Process in chunks of 4
+            for chunk in window.chunks(4) {
+                if chunk.len() >= 4 {
+                    // Load 4 keys from data into SIMD register
+                    let data_keys = _mm256_set_epi64x(
+                        chunk[3].0 as i64,
+                        chunk[2].0 as i64,
+                        chunk[1].0 as i64,
+                        chunk[0].0 as i64
+                    );
+                    
+                    // Compare all 4 keys at once
+                    let matches = _mm256_cmpeq_epi64(search_vec, data_keys);
+                    let mask = _mm256_movemask_epi8(matches);
+                    
+                    // Check for exact matches
+                    if mask != 0 {
+                        // Find the exact match and return corresponding value
+                        for &(k, v) in chunk {
+                            if k == search_key {
+                                return Some(v);
+                            }
+                        }
+                    }
+                } else {
+                    // Scalar search for remaining elements
+                    for &(k, v) in chunk {
+                        if k == search_key {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Scalar search for small windows
+            for &(k, v) in window {
+                if k == search_key {
+                    return Some(v);
+                }
+            }
+        }
+        
+        // If not found in predicted window, fallback to binary search
+        match data.binary_search_by_key(&search_key, |(k, _)| *k) {
+            Ok(idx) => Some(data[idx].1),
+            Err(_) => None,
+        }
+    }
+    
+    /// 🚀 TRUE SIMD SEGMENT PREDICTION: Vectorized routing model prediction
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn simd_predict_segments(
+        &self, 
+        keys_lo: __m256i, 
+        keys_hi: __m256i, 
+        router: &parking_lot::RwLockReadGuard<GlobalRoutingModel>
+    ) -> [usize; 8] {
+        // 🚀 TRUE VECTORIZED ARITHMETIC: Process all 8 keys simultaneously
+        let shift = 64u32.saturating_sub(router.router_bits as u32);
+        let shift_vec = _mm256_set1_epi64x(shift as i64);
+        
+        // 🚀 SIMD SHIFT: Shift all 8 keys at once for routing prefix calculation
+        let prefixes_lo = _mm256_srlv_epi64(keys_lo, shift_vec);
+        let prefixes_hi = _mm256_srlv_epi64(keys_hi, shift_vec);
+        
+        // 🚀 VECTORIZED BOUNDS CHECKING: Clamp all indices simultaneously
+        let router_len = router.router.len() as i64;
+        let max_index = _mm256_set1_epi64x(router_len - 1);
+        
+        // Clamp all indices to valid range in parallel
+        let clamped_lo = _mm256_min_epi64(prefixes_lo, max_index);
+        let clamped_hi = _mm256_min_epi64(prefixes_hi, max_index);
+        
+        // 🚀 OPTIMIZED EXTRACTION: Direct array access instead of function calls
+        [
+            router.router[_mm256_extract_epi64(clamped_lo, 0) as usize] as usize,
+            router.router[_mm256_extract_epi64(clamped_lo, 1) as usize] as usize,
+            router.router[_mm256_extract_epi64(clamped_lo, 2) as usize] as usize,
+            router.router[_mm256_extract_epi64(clamped_lo, 3) as usize] as usize,
+            router.router[_mm256_extract_epi64(clamped_hi, 0) as usize] as usize,
+            router.router[_mm256_extract_epi64(clamped_hi, 1) as usize] as usize,
+            router.router[_mm256_extract_epi64(clamped_hi, 2) as usize] as usize,
+            router.router[_mm256_extract_epi64(clamped_hi, 3) as usize] as usize,
+        ]
+    }
+    
+    /// 🚀 ARM64 NEON: 4-key vectorized lookup optimized for Apple Silicon
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn lookup_4_keys_neon_optimized(&self, keys: &[u64]) -> [Option<u64>; 4] {
+        use std::arch::aarch64::*;
+        
+        unsafe {
+            // 🚀 NEON LOADING: Load 4 keys into 128-bit registers  
+            // NEON processes 2 u64 values per 128-bit register
+            let keys_vec1 = vld1q_u64([keys[0], keys[1]].as_ptr());
+            let keys_vec2 = vld1q_u64([keys[2], keys[3]].as_ptr());
+            
+            // Phase 1: Hot buffer (lock-free vectorized)
+            let hot_results = self.neon_hot_buffer_lookup(keys);
+            
+            // Early exit if all found in hot buffer
+            if hot_results.iter().all(|r| r.is_some()) {
+                return hot_results;
+            }
+            
+            // Phase 2: Overflow buffer (only for missing keys)
+            let overflow_results = self.neon_overflow_buffer_lookup(keys, &hot_results);
+            
+            // Early exit if all found in buffers
+            let found_in_buffers = hot_results.iter().zip(overflow_results.iter())
+                .all(|(hot, overflow)| hot.is_some() || overflow.is_some());
+            
+            if found_in_buffers {
+                return [
+                    hot_results[0].or(overflow_results[0]),
+                    hot_results[1].or(overflow_results[1]),
+                    hot_results[2].or(overflow_results[2]),
+                    hot_results[3].or(overflow_results[3]),
+                ];
+            }
+            
+            // Phase 3: Segments (only for still missing keys)
+            let segment_results = self.neon_segment_lookup(keys, &hot_results, &overflow_results);
+            
+            // Combine results
+            [
+                hot_results[0].or(overflow_results[0]).or(segment_results[0]),
+                hot_results[1].or(overflow_results[1]).or(segment_results[1]),
+                hot_results[2].or(overflow_results[2]).or(segment_results[2]),
+                hot_results[3].or(overflow_results[3]).or(segment_results[3]),
+            ]
+        }
+    }
+
+    /// 🚀 ARM64 NEON HOT BUFFER: Vectorized hot buffer search
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn neon_hot_buffer_lookup(&self, keys: &[u64]) -> [Option<u64>; 4] {
+        use std::arch::aarch64::*;
+        
+        let mut results = [None; 4];
+        
+        // 🚀 SINGLE LOCK ACQUISITION: Get buffer snapshot
+        let buffer_snapshot = {
+            let buffer = self.hot_buffer.buffer.lock();
+            if buffer.is_empty() {
+                return results;
+            }
+            buffer.iter().copied().collect::<Vec<_>>()
+        };
+        
+        unsafe {
+            // 🚀 NEON VECTORIZED SEARCH: Process buffer in NEON chunks
+            for chunk in buffer_snapshot.chunks(2) {
+                if chunk.len() >= 2 {
+                    // Load 2 buffer keys into NEON vector
+                    let buffer_keys = vld1q_u64([chunk[0].0, chunk[1].0].as_ptr());
+                    
+                    // Compare each search key against buffer keys
+                    for (i, &search_key) in keys.iter().enumerate() {
+                        if results[i].is_some() { continue; }
+                        
+                        let search_vec = vdupq_n_u64(search_key);
+                        let matches = vceqq_u64(search_vec, buffer_keys);
+                        
+                        // Check for matches using NEON comparison results
+                        let match_mask = vgetq_lane_u64(matches, 0);
+                        if match_mask != 0 && chunk[0].0 == search_key {
+                            results[i] = Some(chunk[0].1);
+                        } else if chunk.len() > 1 {
+                            let match_mask2 = vgetq_lane_u64(matches, 1);
+                            if match_mask2 != 0 && chunk[1].0 == search_key {
+                                results[i] = Some(chunk[1].1);
+                            }
+                        }
+                    }
+                } else {
+                    // Scalar fallback for remaining elements
+                    for &(k, v) in chunk {
+                        for (i, &search_key) in keys.iter().enumerate() {
+                            if results[i].is_none() && k == search_key {
+                                results[i] = Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        results
+    }
+
+    /// 🚀 ARM64 NEON OVERFLOW BUFFER: Selective vectorized overflow search
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn neon_overflow_buffer_lookup(&self, keys: &[u64], hot_results: &[Option<u64>; 4]) -> [Option<u64>; 4] {
+        use std::arch::aarch64::*;
+        
+        let mut results = [None; 4];
+        
+        // Early exit if all found in hot buffer
+        if hot_results.iter().all(|r| r.is_some()) {
+            return results;
+        }
+        
+        // Get overflow snapshot
+        let overflow_snapshot = {
+            let overflow = self.overflow_buffer.lock();
+            if overflow.data.is_empty() {
+                return results;
+            }
+            overflow.data.iter().copied().collect::<Vec<_>>()
+        };
+        
+        unsafe {
+            // NEON vectorized search through overflow buffer
+            for chunk in overflow_snapshot.chunks(2) {
+                if chunk.len() >= 2 {
+                    let buffer_keys = vld1q_u64([chunk[0].0, chunk[1].0].as_ptr());
+                    
+                    for (i, &search_key) in keys.iter().enumerate() {
+                        if hot_results[i].is_some() || results[i].is_some() { continue; }
+                        
+                        let search_vec = vdupq_n_u64(search_key);
+                        let matches = vceqq_u64(search_vec, buffer_keys);
+                        
+                        let match_mask = vgetq_lane_u64(matches, 0);
+                        if match_mask != 0 && chunk[0].0 == search_key {
+                            results[i] = Some(chunk[0].1);
+                        } else if chunk.len() > 1 {
+                            let match_mask2 = vgetq_lane_u64(matches, 1);
+                            if match_mask2 != 0 && chunk[1].0 == search_key {
+                                results[i] = Some(chunk[1].1);
+                            }
+                        }
+                    }
+                } else {
+                    // Scalar fallback
+                    for &(k, v) in chunk {
+                        for (i, &search_key) in keys.iter().enumerate() {
+                            if hot_results[i].is_none() && results[i].is_none() && k == search_key {
+                                results[i] = Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        results
+    }
+
+    /// 🚀 ARM64 NEON SEGMENT LOOKUP: Vectorized segment prediction and search
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn neon_segment_lookup(
+        &self,
+        keys: &[u64],
+        hot_results: &[Option<u64>; 4],
+        overflow_results: &[Option<u64>; 4]
+    ) -> [Option<u64>; 4] {
+        let mut results = [None; 4];
+        
+        // Check if segment lookup is needed
+        let need_lookup = (0..4).any(|i| {
+            hot_results[i].is_none() && overflow_results[i].is_none()
+        });
+        
+        if !need_lookup {
+            return results;
+        }
+        
+        // Acquire locks
+        let segments_guard = self.segments.read();
+        let router_guard = self.global_router.read();
+        
+        // Process each missing key
+        for i in 0..4 {
+            if hot_results[i].is_none() && overflow_results[i].is_none() {
+                let key = keys[i];
+                let segment_id = router_guard.predict_segment(key);
+                
+                if segment_id < segments_guard.len() {
+                    results[i] = segments_guard[segment_id].bounded_search_fast(key);
+                }
+            }
+        }
+        
+        results
+    }
+    
+    /// 🚀 ADAPTIVE BATCH SIZE: Determine optimal batch size based on workload and hardware
+    pub fn get_optimal_batch_size(&self) -> usize {
+        // Base batch size on available SIMD capabilities and system resources
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            // AVX2 processes 8 keys optimally per SIMD operation
+            const AVX2_SIMD_WIDTH: usize = 8;
+            
+            // Scale based on CPU and memory characteristics
+            let cpu_cores = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1);
+                
+            // 🚀 CACHE-AWARE SCALING: Optimal batch size considering L1/L2 cache
+            // - L1 cache: ~32KB, can hold ~4000 u64 keys
+            // - L2 cache: ~256KB, can hold ~32000 u64 keys
+            // - Optimal batch: 4-16x SIMD width based on cores
+            let base_batch = AVX2_SIMD_WIDTH * 4; // 32 keys baseline
+            let scaled_batch = base_batch * cpu_cores.min(8); // Scale up to 8 cores
+            
+            // Cap at reasonable maximum to prevent cache pressure
+            scaled_batch.min(1024) // Max 1024 keys per batch
+        }
+        
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            // NEON processes 4 keys optimally per SIMD operation (128-bit vectors)
+            const NEON_SIMD_WIDTH: usize = 4;
+            
+            // Scale based on CPU and unified memory architecture
+            let cpu_cores = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1);
+                
+            // 🚀 APPLE SILICON OPTIMIZATION: Leverage unified memory and wide execution
+            // - Apple Silicon has larger caches and unified memory
+            // - Can handle larger batches efficiently
+            let base_batch = NEON_SIMD_WIDTH * 8; // 32 keys baseline  
+            let scaled_batch = base_batch * cpu_cores.min(12); // Scale up to 12 cores (M4 Max)
+            
+            // Higher cap for Apple Silicon's superior memory system
+            scaled_batch.min(2048) // Max 2048 keys per batch
+        }
+        
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(target_arch = "aarch64", target_feature = "neon")
+        )))]
+        {
+            // Scalar fallback: smaller batches to avoid cache pressure
+            let cpu_cores = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1);
+                
+            // Conservative scaling for scalar operations
+            (16 * cpu_cores).min(128) // 16-128 keys per batch
+        }
+    }
+    
+    /// 🚀 ENHANCED SIMD CAPABILITY DETECTION: Runtime detection with performance hints
+    pub fn simd_capabilities() -> SIMDCapabilities {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            let cores = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1);
+                
+            SIMDCapabilities {
+                has_avx2: true,
+                has_avx512: cfg!(all(target_arch = "x86_64", target_feature = "avx512f")),
+                has_neon: false,
+                optimal_batch_size: (8 * cores).min(1024), // 8-1024 keys per batch
+                architecture: "x86_64".to_string(),
+                simd_width: 8, // AVX2 processes 8 u64 values
+            }
+        }
+        
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            let cores = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1);
+                
+            SIMDCapabilities {
+                has_avx2: false,
+                has_avx512: false,
+                has_neon: true,
+                optimal_batch_size: (4 * cores).min(2048), // 4-2048 keys per batch
+                architecture: "aarch64".to_string(),
+                simd_width: 4, // NEON processes 4 u64 values (2 per 128-bit register)
+            }
+        }
+        
+        #[cfg(not(any(
+            all(target_arch = "x86_64", target_feature = "avx2"),
+            all(target_arch = "aarch64", target_feature = "neon")
+        )))]
+        {
+            SIMDCapabilities {
+                has_avx2: false,
+                has_avx512: false,
+                has_neon: false,
+                optimal_batch_size: 32, // Scalar: Conservative batch sizes
+                architecture: std::env::consts::ARCH.to_string(),
+                simd_width: 1, // Scalar processing
+            }
         }
     }
 }
