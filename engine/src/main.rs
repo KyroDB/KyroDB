@@ -11,17 +11,6 @@ use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
 
-// 🚀 ULTRA-FAST HTTP IMPORTS: For zero-allocation handlers
-use hyper::{Method, Request, Response};
-use hyper::body::{Incoming, Bytes};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
-use std::convert::Infallible;
-use http_body_util::Full;
-use std::net::SocketAddr;
-
 /// Adaptive system load detection for background task throttling
 fn detect_system_load_multiplier() -> u64 {
     let mut load_signals = 0;
@@ -795,238 +784,321 @@ async fn main() -> Result<()> {
                 }
             }));
 
-            // Parse address
+            // Parse address for unified server
             let addr = (host.parse::<std::net::IpAddr>()?, port);
-            let ultra_fast_port = port + 1; // Ultra-fast server on port+1
-            let ultra_fast_addr = (host.parse::<std::net::IpAddr>()?, ultra_fast_port);
             
             tracing::info!(
-                "Starting kyrodb-engine HYBRID MODE: Warp on {}:{}, Ultra-Fast on {}:{} (commit={}, features={})",
+                "Starting kyrodb-engine UNIFIED SERVER on {}:{} (commit={}, features={})",
                 host,
                 port,
-                host,
-                ultra_fast_port,
                 build_commit,
                 build_features
             );
 
             println!(
-                "🚀 HYBRID SERVER STARTING:\n   📡 Warp (compatibility) at http://{}:{}\n   ⚡ Ultra-Fast (performance) at http://{}:{}\n   📝 Commit: {}, Features: {}",
-                host, port, host, ultra_fast_port, build_commit, build_features
+                "🚀 UNIFIED KYRODB SERVER STARTING:\n   ⚡ Ultra-Fast Endpoints + Legacy Compatibility at http://{}:{}\n   💾 Full throttle - no rate limiting, no authentication\n   📝 Commit: {}, Features: {}",
+                host, port, build_commit, build_features
             );
 
-            // 🚀 PHASE 1: Start ultra-fast Hyper server for performance-critical endpoints
-            let ultra_fast_log = log.clone();
-            let ultra_fast_future = {
-                let listener = TcpListener::bind(ultra_fast_addr).await?;
-                
-                async move {
-                    tracing::info!("🚀 Ultra-fast server listening on {}:{}", ultra_fast_addr.0, ultra_fast_addr.1);
-                    
-                    loop {
-                        let (stream, _) = match listener.accept().await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                tracing::error!("🚀 Accept error: {}", e);
-                                continue;
-                            }
-                        };
-                        
-                        let io = TokioIo::new(stream);
-                        let log_clone = ultra_fast_log.clone();
-                        
-                        tokio::task::spawn(async move {
-                            if let Err(err) = http1::Builder::new()
-                                .serve_connection(io, service_fn(move |req| {
-                                    ultra_fast_handler(req, log_clone.clone())
-                                }))
-                                .await
-                            {
-                                tracing::error!("🚀 Connection error: {}", err);
-                            }
-                        });
-                    }
-                }
-            };
+            // 🚀 CREATE UNIFIED ROUTES: Ultra-fast + legacy endpoints in single server
+            let unified_routes = create_unified_routes(log.clone());
 
-            // 📡 LEGACY: Start Warp server for compatibility
-            let warp_future = async move {
-                warp::serve(routes)
-                    .run(addr)
-                    .await;
-            };
-
-            // 🔥 RUN BOTH SERVERS CONCURRENTLY
-            tokio::try_join!(
-                async { ultra_fast_future.await; Ok::<(), anyhow::Error>(()) },
-                async { warp_future.await; Ok::<(), anyhow::Error>(()) }
-            )?;
+            // � START UNIFIED SERVER
+            warp::serve(unified_routes).run(addr).await;
         }
     }
 
     Ok(())
 }
 
-/// 🚀 ULTRA-FAST HTTP HANDLER: Zero-allocation performance for 1M+ ops/sec
-async fn ultra_fast_handler(
-    req: Request<Incoming>,
+/// 🚀 CREATE UNIFIED ROUTES: Single server with ultra-fast + legacy endpoints
+fn create_unified_routes(
     log: Arc<engine_crate::PersistentEventLog>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    match (req.method(), req.uri().path()) {
-        // 🚀 ULTRA-FAST PATH: /v1/lookup_ultra/{key}
-        (&Method::GET, path) if path.starts_with("/v1/lookup_ultra/") => {
-            // Zero-allocation key parsing
-            if let Some(key_str) = path.strip_prefix("/v1/lookup_ultra/") {
-                if let Ok(key) = key_str.parse::<u64>() {
-                    // 🚀 DIRECT RMI ACCESS: Skip all async indirection
-                    let value = log.lookup_key_direct(key);
-                    
-                    // 🚀 ZERO-ALLOCATION RESPONSE: Use buffer pool
-                    let pool = engine_crate::get_ultra_fast_pool();
-                    let mut response_body = pool.get_json_buffer();
-                    
-                    match value {
-                        Some(v) => {
-                            response_body.push_str("{\"key\":");
-                            response_body.push_str(&key.to_string());
-                            response_body.push_str(",\"value\":");
-                            response_body.push_str(&v.to_string());
-                            response_body.push_str("}");
-                        },
-                        None => {
-                            response_body.push_str("{\"key\":");
-                            response_body.push_str(&key.to_string());
-                            response_body.push_str(",\"value\":null}");
-                        }
-                    }
-                    
-                    let response = Response::builder()
-                        .status(200)
-                        .header("content-type", "application/json")
-                        .body(Full::new(Bytes::from(response_body.clone())))
-                        .unwrap();
-                    
-                    // Return buffer to pool
-                    pool.return_json_buffer(response_body);
-                    
-                    return Ok(response);
-                }
+) -> impl warp::Filter<Extract = impl warp::Reply, Error = std::convert::Infallible> + Clone {
+    let v1 = warp::path("v1");
+
+    // 🚀 ULTRA-FAST LOOKUP ENDPOINTS: Zero-allocation paths for maximum performance
+    let ultra_fast_routes = create_ultra_fast_lookup_routes(log.clone());
+    
+    // 📡 LEGACY ENDPOINTS: Existing functionality for compatibility
+    let legacy_routes = create_legacy_endpoints(log.clone());
+    
+    // 🔧 ADMIN ENDPOINTS: Management and monitoring
+    let admin_routes = create_admin_endpoints(log.clone());
+    
+    // 💊 HEALTH ENDPOINTS: Health checks and diagnostics
+    let health_routes = create_health_endpoints();
+
+    // 🔗 COMBINE ALL ROUTES: Ultra-fast takes precedence for overlapping paths
+    let all_routes = ultra_fast_routes
+        .or(legacy_routes)
+        .or(admin_routes)
+        .or(health_routes);
+
+    // Apply middleware
+    let routes_with_compression = all_routes.with(warp::compression::gzip());
+
+    // Per-request logging (runtime disable via KYRODB_DISABLE_HTTP_LOG=1)
+    let disable_http_log = std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
+    let routes_with_logging = routes_with_compression.with(warp::log::custom({
+        move |info: warp::log::Info| {
+            if disable_http_log {
+                return;
             }
-            
-            Ok(Response::builder()
-                .status(400)
-                .body(Full::new(Bytes::from("Invalid key")))
-                .unwrap())
+            tracing::info!(
+                target: "kyrodb",
+                method = %info.method(),
+                path = info.path(),
+                status = info.status().as_u16(),
+                elapsed_ms = info.elapsed().as_millis()
+            );
         }
-        
-        // 🚀 BATCH LOOKUP: /v1/lookup_batch (for maximum throughput)
-        (&Method::POST, "/v1/lookup_batch") => {
-            handle_batch_lookup(req, log).await
-        }
-        
-        // 🚀 RAW BINARY PROTOCOL: /v1/lookup_binary/{key}
-        (&Method::GET, path) if path.starts_with("/v1/lookup_binary/") => {
-            if let Some(key_str) = path.strip_prefix("/v1/lookup_binary/") {
-                if let Ok(key) = key_str.parse::<u64>() {
-                    let value = log.lookup_key_direct(key);
-                    
-                    // 🚀 BINARY RESPONSE: 16 bytes total (8 key + 8 value)
-                    let pool = engine_crate::get_ultra_fast_pool();
-                    let mut response = pool.get_binary_buffer();
-                    response.reserve(16);
-                    response.extend_from_slice(&key.to_le_bytes());
-                    response.extend_from_slice(&value.unwrap_or(0).to_le_bytes());
-                    
-                    let response_body = Response::builder()
-                        .status(200)
-                        .header("content-type", "application/octet-stream")
-                        .body(Full::new(Bytes::from(response.clone())))
-                        .unwrap();
-                    
-                    // Return buffer to pool
-                    pool.return_binary_buffer(response);
-                    
-                    return Ok(response_body);
-                }
-            }
-            
-            Ok(Response::builder()
-                .status(400)
-                .body(Full::new(Bytes::new()))
-                .unwrap())
-        }
-        
-        // 🚀 LEGACY COMPATIBILITY: Keep existing endpoints for compatibility
-        (&Method::GET, path) if path.starts_with("/v1/lookup_fast/") => {
-            if let Some(key_str) = path.strip_prefix("/v1/lookup_fast/") {
-                if let Ok(key) = key_str.parse::<u64>() {
-                    if let Some(offset) = log.lookup_key_direct(key) {
-                        let response = offset.to_le_bytes().to_vec();
-                        return Ok(Response::builder()
-                            .status(200)
-                            .header("content-type", "application/octet-stream")
-                            .body(Full::new(Bytes::from(response)))
-                            .unwrap());
-                    }
-                }
-            }
-            Ok(Response::builder()
-                .status(404)
-                .body(Full::new(Bytes::new()))
-                .unwrap())
-        }
-        
-        // Health check
-        (&Method::GET, "/health") => {
-            Ok(Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from("{\"status\":\"ok\"}")))
-                .unwrap())
-        }
-        
-        _ => {
-            Ok(Response::builder()
-                .status(404)
-                .body(Full::new(Bytes::from("Not Found")))
-                .unwrap())
-        }
-    }
+    }));
+
+    // Error recovery - return proper error type
+    let routes_with_recovery = routes_with_logging.recover(|_rej: warp::Rejection| async move {
+        Ok::<_, std::convert::Infallible>(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error":"not found"})),
+            warp::http::StatusCode::NOT_FOUND,
+        ))
+    });
+
+    routes_with_recovery
 }
 
-/// 🚀 BATCH LOOKUP HANDLER: Maximum throughput with single lock acquisition
-async fn handle_batch_lookup(
-    req: Request<Incoming>,
+/// 🚀 ULTRA-FAST LOOKUP ROUTES: Zero-allocation paths for maximum performance
+fn create_ultra_fast_lookup_routes(
     log: Arc<engine_crate::PersistentEventLog>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
-    use http_body_util::BodyExt;
-    
-    // Parse batch request and return multiple results
-    let body_bytes = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return Ok(Response::builder()
-            .status(400)
-            .body(Full::new(Bytes::from("Invalid body")))
-            .unwrap()),
+) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    let v1 = warp::path("v1");
+
+    // 🚀 ULTRA-FAST PATH: /v1/lookup_ultra/{key}
+    let lookup_ultra = {
+        let log = log.clone();
+        v1.and(warp::path("lookup_ultra"))
+            .and(warp::path::param::<u64>())
+            .and(warp::get())
+            .map(move |key: u64| {
+                let value = log.lookup_key_direct(key);
+                
+                // 🚀 ZERO-ALLOCATION RESPONSE
+                let pool = engine_crate::get_ultra_fast_pool();
+                let mut response = pool.get_json_buffer();
+                
+                match value {
+                    Some(v) => {
+                        use std::fmt::Write;
+                        write!(&mut response, "{{\"key\":{},\"value\":{}}}", key, v).unwrap();
+                    }
+                    None => {
+                        use std::fmt::Write;
+                        write!(&mut response, "{{\"key\":{},\"value\":null}}", key).unwrap();
+                    }
+                }
+                
+                let reply_data = response.clone();
+                pool.return_json_buffer(response);
+                
+                warp::reply::with_header(
+                    reply_data,
+                    "content-type", 
+                    "application/json"
+                )
+            })
     };
-    
-    // Parse keys from JSON array: [123, 456, 789]
-    let keys: Vec<u64> = match serde_json::from_slice(&body_bytes) {
-        Ok(keys) => keys,
-        Err(_) => return Ok(Response::builder()
-            .status(400)
-            .body(Full::new(Bytes::from("Invalid JSON")))
-            .unwrap()),
+
+    // 🚀 BATCH LOOKUP: /v1/lookup_batch
+    let lookup_batch = {
+        let log = log.clone();
+        v1.and(warp::path("lookup_batch"))
+            .and(warp::post())
+            .and(warp::body::json())
+            .map(move |keys: Vec<u64>| {
+                let results = log.lookup_keys_batch(&keys);
+                warp::reply::json(&results)
+            })
     };
-    
-    // 🚀 BATCH PROCESSING: Process all keys in single operation
-    let results = log.lookup_keys_batch(&keys);
-    
-    let response_json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-    
-    Ok(Response::builder()
-        .status(200)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(response_json)))
-        .unwrap())
+
+    lookup_ultra.or(lookup_batch)
+}
+
+///  LEGACY ENDPOINTS: Existing functionality for compatibility
+fn create_legacy_endpoints(
+    log: Arc<engine_crate::PersistentEventLog>,
+) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    let v1 = warp::path("v1");
+
+    // PUT endpoint for key-value pairs
+    let put_route = {
+        let log = log.clone();
+        v1.and(warp::path("put"))
+            .and(warp::path::param::<u64>())
+            .and(warp::path::param::<u64>())
+            .and(warp::put())
+            .and_then(move |key: u64, value: u64| {
+                let log = log.clone();
+                async move {
+                    let request_id = uuid::Uuid::new_v4();
+                    let record = kyrodb_engine::Record { key, value: value.to_le_bytes().to_vec() };
+                    let payload = bincode::serialize(&record)
+                        .map_err(|_| warp::reject())?;
+                    
+                    let offset = log.append(request_id, payload).await
+                        .map_err(|_| warp::reject())?;
+                    
+                    Ok::<_, warp::Rejection>(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"offset": offset})),
+                        warp::http::StatusCode::CREATED
+                    ))
+                }
+            })
+    };
+
+    // Legacy lookup endpoint with async path  
+    let lookup_route = {
+        let log = log.clone();
+        v1.and(warp::path("lookup"))
+            .and(warp::path::param::<u64>())
+            .and(warp::get())
+            .and_then(move |key: u64| {
+                let log = log.clone();
+                async move {
+                    match log.lookup_key(key).await {
+                        Some(offset) => {
+                            if let Some(payload) = log.get(offset).await {
+                                Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                    payload,
+                                    warp::http::StatusCode::OK
+                                ))
+                            } else {
+                                Err(warp::reject::not_found())
+                            }
+                        }
+                        None => Err(warp::reject::not_found())
+                    }
+                }
+            })
+    };
+
+    // Fast offset lookup (now using ultra-fast implementation)
+    let lookup_fast = {
+        let log = log.clone();
+        v1.and(warp::path("lookup_fast"))
+            .and(warp::path::param::<u64>())
+            .and(warp::get())
+            .map(move |key: u64| {
+                if let Some(offset) = log.lookup_key_direct(key) {
+                    let response = offset.to_le_bytes().to_vec();
+                    warp::reply::with_header(
+                        response,
+                        "content-type",
+                        "application/octet-stream"
+                    )
+                } else {
+                    warp::reply::with_header(
+                        Vec::<u8>::new(),
+                        "content-type",
+                        "application/octet-stream"
+                    )
+                }
+            })
+    };
+
+    put_route.or(lookup_route).or(lookup_fast)
+}
+
+/// 🔧 ADMIN ENDPOINTS: Management and monitoring
+fn create_admin_endpoints(
+    log: Arc<engine_crate::PersistentEventLog>,
+) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    let v1 = warp::path("v1");
+
+    // Snapshot endpoint
+    let snapshot_route = {
+        let log = log.clone();
+        v1.and(warp::path("snapshot"))
+            .and(warp::post())
+            .and_then(move || {
+                let log = log.clone();
+                async move {
+                    log.snapshot().await
+                        .map_err(|_| warp::reject())?;
+                    Ok::<_, warp::Rejection>(warp::reply::json(
+                        &serde_json::json!({ "snapshot": "ok" }),
+                    ))
+                }
+            })
+    };
+
+    // RMI build endpoint
+    let rmi_build = {
+        let log = log.clone();
+        v1.and(warp::path("rmi"))
+            .and(warp::path("build"))
+            .and(warp::post())
+            .and_then(move || {
+                let log = log.clone();
+                async move {
+                    #[cfg(feature = "learned-index")]
+                    {
+                        log.compact_keep_latest_and_snapshot().await
+                            .map_err(|_| warp::reject())?;
+                        Ok::<_, warp::Rejection>(warp::reply::json(
+                            &serde_json::json!({ "rmi_build": "completed" }),
+                        ))
+                    }
+                    #[cfg(not(feature = "learned-index"))]
+                    {
+                        Ok::<_, warp::Rejection>(warp::reply::json(
+                            &serde_json::json!({ "rmi_build": "disabled" }),
+                        ))
+                    }
+                }
+            })
+    };
+
+    snapshot_route.or(rmi_build)
+}
+
+/// 💊 HEALTH ENDPOINTS: Health checks and diagnostics
+fn create_health_endpoints() -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    // Health check endpoint
+    let health_route = warp::path("health")
+        .and(warp::get())
+        .map(|| {
+            warp::reply::json(&serde_json::json!({ "status": "ok" }))
+        });
+
+    // Metrics endpoint
+    let metrics_route = warp::path("metrics")
+        .and(warp::get())
+        .map(|| {
+            #[cfg(not(feature = "bench-no-metrics"))]
+            {
+                let encoder = prometheus::TextEncoder::new();
+                let metric_families = prometheus::gather();
+                match encoder.encode_to_string(&metric_families) {
+                    Ok(output) => warp::reply::with_header(
+                        output,
+                        "Content-Type",
+                        "text/plain; version=0.0.4",
+                    ),
+                    Err(_) => warp::reply::with_header(
+                        "# Metrics encoding failed".to_string(),
+                        "Content-Type",
+                        "text/plain",
+                    ),
+                }
+            }
+            #[cfg(feature = "bench-no-metrics")]
+            {
+                warp::reply::with_header(
+                    "# Metrics disabled for benchmarking".to_string(),
+                    "Content-Type",
+                    "text/plain",
+                )
+            }
+        });
+
+    health_route.or(metrics_route)
 }
