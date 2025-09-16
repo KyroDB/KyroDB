@@ -879,7 +879,7 @@ fn create_ultra_fast_lookup_routes(
             .and(warp::path::param::<u64>())
             .and(warp::get())
             .map(move |key: u64| {
-                let value = log.lookup_key_direct(key);
+                let value = log.lookup_key_ultra_fast(key);
                 
                 // 🚀 ZERO-ALLOCATION RESPONSE
                 let pool = engine_crate::get_ultra_fast_pool();
@@ -914,7 +914,7 @@ fn create_ultra_fast_lookup_routes(
             .and(warp::post())
             .and(warp::body::json())
             .map(move |keys: Vec<u64>| {
-                let results = log.lookup_keys_batch(&keys);
+                let results = log.lookup_keys_ultra_batch(&keys);
                 warp::reply::json(&results)
             })
     };
@@ -987,7 +987,7 @@ fn create_legacy_endpoints(
             .and(warp::path::param::<u64>())
             .and(warp::get())
             .map(move |key: u64| {
-                if let Some(offset) = log.lookup_key_direct(key) {
+                if let Some(offset) = log.lookup_key_ultra_fast(key) {
                     let response = offset.to_le_bytes().to_vec();
                     warp::reply::with_header(
                         response,
