@@ -896,6 +896,74 @@ impl PersistentEventLog {
         }
     }
 
+    /// 🚀 DIRECT RMI ACCESS: Zero-overhead lookup for ultra-fast HTTP path
+    pub fn lookup_key_direct(&self, key: u64) -> Option<u64> {
+        // 🚀 NON-BLOCKING TRY_READ: Use try_read to avoid async overhead
+        match self.index.try_read() {
+            Ok(idx) => match &*idx {
+                index::PrimaryIndex::AdaptiveRmi(adaptive) => {
+                    // 🚀 DIRECT CALL: No async overhead, pure synchronous lookup
+                    let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                    let result = adaptive.lookup(key);
+                    timer.observe_duration();
+                    
+                    if result.is_some() {
+                        crate::metrics::RMI_HITS_TOTAL.inc();
+                        crate::metrics::RMI_READS_TOTAL.inc();
+                    } else {
+                        crate::metrics::RMI_MISSES_TOTAL.inc();
+                    }
+                    
+                    result
+                }
+                index::PrimaryIndex::BTree(btree) => {
+                    btree.get(&key)
+                }
+            },
+            Err(_) => None, // Lock contention - return None for ultra-fast path
+        }
+    }
+    
+    /// 🚀 BATCH LOOKUP: Process multiple keys efficiently with single lock acquisition
+    pub fn lookup_keys_batch(&self, keys: &[u64]) -> Vec<(u64, Option<u64>)> {
+        let mut results = Vec::with_capacity(keys.len());
+        
+        // Single lock acquisition for entire batch
+        match self.index.try_read() {
+            Ok(idx) => match &*idx {
+                index::PrimaryIndex::AdaptiveRmi(adaptive) => {
+                    let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+                    for &key in keys {
+                        let value = adaptive.lookup(key);
+                        results.push((key, value));
+                        
+                        if value.is_some() {
+                            crate::metrics::RMI_HITS_TOTAL.inc();
+                        } else {
+                            crate::metrics::RMI_MISSES_TOTAL.inc();
+                        }
+                    }
+                    crate::metrics::RMI_READS_TOTAL.inc_by(keys.len() as f64);
+                    timer.observe_duration();
+                }
+                index::PrimaryIndex::BTree(btree) => {
+                    for &key in keys {
+                        let value = btree.get(&key);
+                        results.push((key, value));
+                    }
+                }
+            },
+            Err(_) => {
+                // Lock contention - return empty results for ultra-fast path
+                for &key in keys {
+                    results.push((key, None));
+                }
+            }
+        }
+        
+        results
+    }
+
     /// Determine if we should suspect index corruption based on lookup patterns
     fn should_suspect_index_corruption(&self, attempts: u32, misses: u32) -> bool {
         // Simple heuristic: if we've had multiple attempts with misses, suspect corruption
@@ -1721,4 +1789,92 @@ impl PersistentEventLog {
         // Implementation would track pending fsync operations
         // For now, we'll implement the immediate version
     }
+}
+
+/// 🚀 ULTRA-FAST BUFFER POOL: Zero-allocation responses for maximum performance
+pub struct UltraFastBufferPool {
+    /// Pre-allocated response buffers
+    json_buffers: crossbeam_queue::SegQueue<String>,
+    binary_buffers: crossbeam_queue::SegQueue<Vec<u8>>,
+    /// Statistics
+    allocations: AtomicUsize,
+    reuses: AtomicUsize,
+}
+
+impl UltraFastBufferPool {
+    pub fn new() -> Self {
+        let pool = Self {
+            json_buffers: crossbeam_queue::SegQueue::new(),
+            binary_buffers: crossbeam_queue::SegQueue::new(),
+            allocations: AtomicUsize::new(0),
+            reuses: AtomicUsize::new(0),
+        };
+        
+        // Pre-allocate buffers for zero-allocation responses
+        for _ in 0..1000 {
+            pool.json_buffers.push(String::with_capacity(256));
+            pool.binary_buffers.push(Vec::with_capacity(64));
+        }
+        
+        pool
+    }
+    
+    /// 🚀 GET BUFFER: Zero allocation in common case
+    pub fn get_json_buffer(&self) -> String {
+        match self.json_buffers.pop() {
+            Some(mut buf) => {
+                buf.clear();
+                self.reuses.fetch_add(1, Ordering::Relaxed);
+                buf
+            }
+            None => {
+                self.allocations.fetch_add(1, Ordering::Relaxed);
+                String::with_capacity(256)
+            }
+        }
+    }
+    
+    /// 🚀 RETURN BUFFER: Reuse for next request
+    pub fn return_json_buffer(&self, buf: String) {
+        if buf.capacity() <= 1024 { // Don't keep huge buffers
+            self.json_buffers.push(buf);
+        }
+    }
+    
+    /// 🚀 GET BINARY BUFFER: Zero allocation for binary responses
+    pub fn get_binary_buffer(&self) -> Vec<u8> {
+        match self.binary_buffers.pop() {
+            Some(mut buf) => {
+                buf.clear();
+                self.reuses.fetch_add(1, Ordering::Relaxed);
+                buf
+            }
+            None => {
+                self.allocations.fetch_add(1, Ordering::Relaxed);
+                Vec::with_capacity(64)
+            }
+        }
+    }
+    
+    /// 🚀 RETURN BINARY BUFFER: Reuse for next request
+    pub fn return_binary_buffer(&self, buf: Vec<u8>) {
+        if buf.capacity() <= 512 { // Don't keep huge buffers
+            self.binary_buffers.push(buf);
+        }
+    }
+    
+    /// Get pool statistics
+    pub fn stats(&self) -> (usize, usize) {
+        (
+            self.allocations.load(Ordering::Relaxed),
+            self.reuses.load(Ordering::Relaxed),
+        )
+    }
+}
+
+use std::sync::OnceLock;
+static ULTRA_FAST_POOL: OnceLock<UltraFastBufferPool> = OnceLock::new();
+
+pub fn get_ultra_fast_pool() -> &'static UltraFastBufferPool {
+    ULTRA_FAST_POOL.get_or_init(|| UltraFastBufferPool::new())
 }
