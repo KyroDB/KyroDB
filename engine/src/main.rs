@@ -918,8 +918,15 @@ fn create_ultra_fast_lookup_routes(
             .and(warp::post())
             .and(warp::body::json())
             .map(move |keys: Vec<u64>| {
-                let results = log.lookup_keys_ultra_batch(&keys);
-                warp::reply::json(&results)
+                let raw_results = log.lookup_keys_ultra_batch(&keys);
+                // Convert to format expected by ultra-fast client: [{"value": "123"}, {"value": null}, ...]
+                let json_results: Vec<serde_json::Value> = raw_results.into_iter().map(|(key, maybe_value)| {
+                    match maybe_value {
+                        Some(value) => serde_json::json!({"key": key, "value": value.to_string()}),
+                        None => serde_json::json!({"key": key, "value": null}),
+                    }
+                }).collect();
+                warp::reply::json(&json_results)
             })
     };
 
