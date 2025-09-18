@@ -790,24 +790,39 @@ async fn main() -> Result<()> {
 
             // Parse address for unified server
             let addr = (host.parse::<std::net::IpAddr>()?, port);
+            let binary_port = port + 1; // Binary protocol on adjacent port
             
             tracing::info!(
-                "Starting kyrodb-engine UNIFIED SERVER on {}:{} (commit={}, features={})",
+                "Starting kyrodb-engine DUAL-PROTOCOL SERVERS: HTTP on {}:{}, Binary TCP on {}:{} (commit={}, features={})",
                 host,
                 port,
+                host,
+                binary_port,
                 build_commit,
                 build_features
             );
 
             println!(
-                "🚀 UNIFIED KYRODB SERVER STARTING:\n   ⚡ Ultra-Fast Endpoints + Legacy Compatibility at http://{}:{}\n   💾 Full throttle - no rate limiting, no authentication\n   📝 Commit: {}, Features: {}",
-                host, port, build_commit, build_features
+                "🚀 DUAL-PROTOCOL KYRODB SERVERS STARTING:\n   🌐 HTTP API (Ultra-Fast + Legacy) at http://{}:{}\n   ⚡ Binary TCP Protocol at tcp://{}:{}\n   💾 Full throttle - no rate limiting, no authentication\n   📝 Commit: {}, Features: {}",
+                host, port, host, binary_port, build_commit, build_features
             );
 
-            // 🚀 CREATE UNIFIED ROUTES: Ultra-fast + legacy endpoints in single server
+            // 🚀 CREATE UNIFIED HTTP ROUTES: Ultra-fast + legacy endpoints
             let unified_routes = create_unified_routes(log.clone());
 
-            // � START UNIFIED SERVER
+            // 📡 START BINARY TCP SERVER (concurrent with HTTP)
+            let binary_log = log.clone();
+            let binary_addr = format!("{}:{}", host, binary_port);
+            tokio::spawn(async move {
+                if let Err(e) = engine_crate::binary_protocol::binary_protocol_server(
+                    binary_log,
+                    binary_addr
+                ).await {
+                    eprintln!("❌ Binary TCP server error: {}", e);
+                }
+            });
+
+            // 📡 START HTTP SERVER (primary server)
             warp::serve(unified_routes).run(addr).await;
         }
     }

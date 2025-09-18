@@ -6,6 +6,9 @@
 //! - Enterprise-grade durability with group commit
 //! - Memory management with allocation tracking and limits
 
+// Binary protocol module for maximum performance
+pub mod binary_protocol;
+
 use anyhow::{Context, Result};
 use bincode::Options;
 use chrono::Utc;
