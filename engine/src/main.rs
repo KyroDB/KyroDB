@@ -814,7 +814,7 @@ async fn main() -> Result<()> {
             let binary_log = log.clone();
             let binary_addr = format!("{}:{}", host, binary_port);
             tokio::spawn(async move {
-                if let Err(e) = engine_crate::binary_protocol::binary_protocol_server(
+                if let Err(e) = kyrodb_engine::binary_protocol::binary_protocol_server(
                     binary_log,
                     binary_addr
                 ).await {
