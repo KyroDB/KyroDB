@@ -396,3 +396,254 @@ pub static GROUP_COMMIT_BATCHES_TOTAL: Lazy<Counter> = Lazy::new(|| {
     )
     .expect("register kyrodb_group_commit_batches_total")
 });
+
+// === BINARY PROTOCOL PERFORMANCE METRICS ===
+
+// Binary Protocol Connection Metrics
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_CONNECTIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_binary_connections_total", 
+        "Total binary protocol connections established"
+    )
+    .expect("register kyrodb_binary_connections_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_ACTIVE_CONNECTIONS: Lazy<prometheus::Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_binary_active_connections",
+        "Current number of active binary protocol connections"
+    )
+    .expect("register kyrodb_binary_active_connections")
+});
+
+// Binary Protocol Command Metrics
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_COMMANDS_TOTAL: Lazy<prometheus::CounterVec> = Lazy::new(|| {
+    prometheus::register_counter_vec!(
+        "kyrodb_binary_commands_total",
+        "Binary protocol commands processed by type",
+        &["command"]
+    )
+    .expect("register kyrodb_binary_commands_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_COMMAND_LATENCY_SECONDS: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "kyrodb_binary_command_latency_seconds",
+        "Binary protocol command processing latency by type"
+    )
+    .buckets(prometheus::exponential_buckets(0.000001, 2.0, 20).unwrap()); // Microsecond precision
+    
+    prometheus::register_histogram_vec!(opts, &["command"])
+        .expect("register kyrodb_binary_command_latency_seconds")
+});
+
+// Binary Protocol Batch Processing Metrics
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_BATCH_SIZE: Lazy<Histogram> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "kyrodb_binary_batch_size",
+        "Binary protocol batch operation sizes"
+    )
+    .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0]);
+    
+    prometheus::register_histogram!(opts)
+        .expect("register kyrodb_binary_batch_size")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "kyrodb_binary_batch_lookup_latency_seconds",
+        "Binary protocol batch lookup processing latency"
+    )
+    .buckets(prometheus::exponential_buckets(0.000001, 2.0, 20).unwrap()); // Microsecond precision
+    
+    prometheus::register_histogram!(opts)
+        .expect("register kyrodb_binary_batch_lookup_latency_seconds")
+});
+
+// Binary Protocol Frame Processing Metrics
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_FRAMES_PROCESSED_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_binary_frames_processed_total",
+        "Total binary protocol frames processed successfully"
+    )
+    .expect("register kyrodb_binary_frames_processed_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_FRAMES_INVALID_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_binary_frames_invalid_total",
+        "Total invalid binary protocol frames received"
+    )
+    .expect("register kyrodb_binary_frames_invalid_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_FRAME_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "kyrodb_binary_frame_size_bytes",
+        "Binary protocol frame sizes in bytes"
+    )
+    .buckets(prometheus::exponential_buckets(64.0, 2.0, 20).unwrap()); // 64B to 32MB
+    
+    prometheus::register_histogram!(opts)
+        .expect("register kyrodb_binary_frame_size_bytes")
+});
+
+// Binary Protocol Error Metrics
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_PROTOCOL_ERRORS_TOTAL: Lazy<prometheus::CounterVec> = Lazy::new(|| {
+    prometheus::register_counter_vec!(
+        "kyrodb_binary_protocol_errors_total",
+        "Binary protocol errors by type",
+        &["error_type"]
+    )
+    .expect("register kyrodb_binary_protocol_errors_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_CRC_ERRORS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_binary_crc_errors_total",
+        "Total binary protocol CRC validation errors"
+    )
+    .expect("register kyrodb_binary_crc_errors_total")
+});
+
+// Binary Protocol Throughput Metrics
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_BYTES_RECEIVED_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_binary_bytes_received_total",
+        "Total bytes received via binary protocol"
+    )
+    .expect("register kyrodb_binary_bytes_received_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_BYTES_SENT_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_binary_bytes_sent_total",
+        "Total bytes sent via binary protocol"
+    )
+    .expect("register kyrodb_binary_bytes_sent_total")
+});
+
+// Binary Protocol SIMD Optimization Metrics (Phase 4)
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_SIMD_BATCHES_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_binary_simd_batches_total",
+        "Total SIMD-optimized batch operations processed"
+    )
+    .expect("register kyrodb_binary_simd_batches_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static BINARY_SIMD_SPEEDUP_RATIO: Lazy<Histogram> = Lazy::new(|| {
+    let opts = prometheus::HistogramOpts::new(
+        "kyrodb_binary_simd_speedup_ratio",
+        "SIMD vs scalar performance speedup ratio"
+    )
+    .buckets(vec![1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]);
+    
+    prometheus::register_histogram!(opts)
+        .expect("register kyrodb_binary_simd_speedup_ratio")
+});
+
+// === BINARY PROTOCOL METRIC HELPER FUNCTIONS ===
+
+/// Register binary protocol metrics with the global Prometheus registry
+#[cfg(not(feature = "bench-no-metrics"))]
+pub fn register_binary_metrics() {
+    // Metrics are registered lazily via Lazy::new(), so just force evaluation
+    Lazy::force(&BINARY_CONNECTIONS_TOTAL);
+    Lazy::force(&BINARY_ACTIVE_CONNECTIONS);
+    Lazy::force(&BINARY_COMMANDS_TOTAL);
+    Lazy::force(&BINARY_COMMAND_LATENCY_SECONDS);
+    Lazy::force(&BINARY_BATCH_SIZE);
+    Lazy::force(&BINARY_BATCH_LOOKUP_LATENCY_SECONDS);
+    Lazy::force(&BINARY_FRAMES_PROCESSED_TOTAL);
+    Lazy::force(&BINARY_FRAMES_INVALID_TOTAL);
+    Lazy::force(&BINARY_FRAME_SIZE_BYTES);
+    Lazy::force(&BINARY_PROTOCOL_ERRORS_TOTAL);
+    Lazy::force(&BINARY_CRC_ERRORS_TOTAL);
+    Lazy::force(&BINARY_BYTES_RECEIVED_TOTAL);
+    Lazy::force(&BINARY_BYTES_SENT_TOTAL);
+    Lazy::force(&BINARY_SIMD_BATCHES_TOTAL);
+    Lazy::force(&BINARY_SIMD_SPEEDUP_RATIO);
+}
+
+/// Increment binary protocol command counter for specific command type
+#[cfg(not(feature = "bench-no-metrics"))]
+pub fn inc_binary_command(command: &str) {
+    BINARY_COMMANDS_TOTAL.with_label_values(&[command]).inc();
+}
+
+/// Record binary protocol command latency
+#[cfg(not(feature = "bench-no-metrics"))]
+pub fn observe_binary_command_latency(command: &str, duration_seconds: f64) {
+    BINARY_COMMAND_LATENCY_SECONDS
+        .with_label_values(&[command])
+        .observe(duration_seconds);
+}
+
+/// Record binary protocol error by type
+#[cfg(not(feature = "bench-no-metrics"))]
+pub fn inc_binary_protocol_error(error_type: &str) {
+    BINARY_PROTOCOL_ERRORS_TOTAL
+        .with_label_values(&[error_type])
+        .inc();
+}
+
+// === STUB IMPLEMENTATIONS FOR bench-no-metrics FEATURE ===
+
+#[cfg(feature = "bench-no-metrics")]
+pub fn register_binary_metrics() {
+    // No-op for benchmarking
+}
+
+#[cfg(feature = "bench-no-metrics")]
+pub fn inc_binary_command(_command: &str) {
+    // No-op for benchmarking
+}
+
+#[cfg(feature = "bench-no-metrics")]
+pub fn observe_binary_command_latency(_command: &str, _duration_seconds: f64) {
+    // No-op for benchmarking
+}
+
+#[cfg(feature = "bench-no-metrics")]
+pub fn inc_binary_protocol_error(_error_type: &str) {
+    // No-op for benchmarking
+}
+
+// Export binary protocol metrics to shim module for bench-no-metrics
+#[cfg(feature = "bench-no-metrics")]
+mod binary_protocol_shim {
+    use super::shim::*;
+    use once_cell::sync::Lazy;
+    
+    pub static BINARY_CONNECTIONS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BINARY_ACTIVE_CONNECTIONS: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static BINARY_FRAMES_PROCESSED_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BINARY_FRAMES_INVALID_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BINARY_CRC_ERRORS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BINARY_BYTES_RECEIVED_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BINARY_BYTES_SENT_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BINARY_SIMD_BATCHES_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static BINARY_BATCH_SIZE: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static BINARY_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static BINARY_FRAME_SIZE_BYTES: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static BINARY_SIMD_SPEEDUP_RATIO: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+}
+
+#[cfg(feature = "bench-no-metrics")]
+pub use binary_protocol_shim::*;

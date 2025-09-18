@@ -90,12 +90,13 @@ impl bb8::ManageConnection for TcpConnectionManager {
 impl UltraFastBenchClient {
     /// Create new ultra-fast benchmark client with connection pooling
     pub async fn new(base_url: &str) -> Result<Self> {
-        // Parse URL to get host:port
+        // Parse HTTP URL to derive binary protocol address
         let url = Url::parse(base_url)?;
         let host = url.host_str().unwrap_or("127.0.0.1");
-        let port = url.port().unwrap_or(3030);
+        let http_port = url.port().unwrap_or(3030);
+        let binary_port = http_port + 1; // Convention: HTTP + 1
         
-        // Create connection pool with aggressive settings for maximum performance
+        // Create connection pool for binary protocol with maximum performance
         let pool = Pool::builder()
             .max_size(200)  // 200 pre-established connections
             .min_idle(Some(50))  // Keep minimum 50 connections warm
@@ -103,7 +104,7 @@ impl UltraFastBenchClient {
             .idle_timeout(Some(std::time::Duration::from_secs(300)))  // 5min idle timeout
             .max_lifetime(Some(std::time::Duration::from_secs(1800)))  // 30min max lifetime
             .test_on_check_out(false)  // Skip validation for speed
-            .build(TcpConnectionManager::new(format!("{}:{}", host, port)))
+            .build(TcpConnectionManager::new(format!("{}:{}", host, binary_port)))
             .await?;
         
         // Create fallback HTTP client with optimizations
@@ -122,7 +123,7 @@ impl UltraFastBenchClient {
         
         Ok(Self {
             connection_pool: Arc::new(pool),
-            use_binary_protocol: false, // TODO: Enable after binary server is implemented
+            use_binary_protocol: true, // ✅ ENABLE by default for maximum performance
             batch_size: 1000,
             base_url: base_url.to_string(),
             http_client,
@@ -460,6 +461,52 @@ impl UltraFastBenchClient {
     /// Set optimal batch size
     pub fn set_batch_size(&mut self, size: usize) {
         self.batch_size = size.clamp(1, 10000);
+    }
+    
+    /// Check if binary protocol is enabled
+    pub fn is_binary_protocol_enabled(&self) -> bool {
+        self.use_binary_protocol
+    }
+    
+    /// Get optimal batch size for the current configuration
+    pub fn get_optimal_batch_size(&self) -> usize {
+        // For binary protocol, we can handle larger batches efficiently
+        if self.use_binary_protocol {
+            self.batch_size.max(1000) // At least 1K for binary protocol
+        } else {
+            self.batch_size.min(100) // Smaller batches for HTTP
+        }
+    }
+    
+    /// Get SIMD capabilities string if available
+    pub fn get_simd_capabilities(&self) -> Option<String> {
+        if self.use_binary_protocol {
+            // Check for various SIMD instruction sets
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    Some("AVX2".to_string())
+                } else if std::arch::is_x86_feature_detected!("sse4.1") {
+                    Some("SSE4.1".to_string())
+                } else {
+                    Some("Scalar".to_string())
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    Some("NEON".to_string())
+                } else {
+                    Some("Scalar".to_string())
+                }
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                Some("Scalar".to_string())
+            }
+        } else {
+            None
+        }
     }
 }
 

@@ -101,6 +101,14 @@ enum Commands {
         host: String,
         port: u16,
 
+        /// Enable binary protocol server (default: enabled for maximum performance)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        enable_binary: bool,
+        
+        /// Binary protocol port offset from HTTP port (default: +1)
+        #[arg(long, default_value = "1")]
+        binary_port_offset: u16,
+
         /// Automatically trigger snapshot every N seconds
         #[arg(long)]
         auto_snapshot_secs: Option<u64>,
@@ -167,6 +175,8 @@ async fn main() -> Result<()> {
         Commands::Serve {
             host,
             port,
+            enable_binary,
+            binary_port_offset,
             auto_snapshot_secs,
             snapshot_every_n_appends,
             wal_max_bytes,
@@ -790,7 +800,7 @@ async fn main() -> Result<()> {
 
             // Parse address for unified server
             let addr = (host.parse::<std::net::IpAddr>()?, port);
-            let binary_port = port + 1; // Binary protocol on adjacent port
+            let binary_port = port + binary_port_offset; // Configurable port offset
             
             tracing::info!(
                 "Starting kyrodb-engine DUAL-PROTOCOL SERVERS: HTTP on {}:{}, Binary TCP on {}:{} (commit={}, features={})",
@@ -802,25 +812,34 @@ async fn main() -> Result<()> {
                 build_features
             );
 
-            println!(
-                "🚀 DUAL-PROTOCOL KYRODB SERVERS STARTING:\n   🌐 HTTP API (Ultra-Fast + Legacy) at http://{}:{}\n   ⚡ Binary TCP Protocol at tcp://{}:{}\n   💾 Full throttle - no rate limiting, no authentication\n   📝 Commit: {}, Features: {}",
-                host, port, host, binary_port, build_commit, build_features
-            );
+            if enable_binary {
+                println!(
+                    "🚀 DUAL-PROTOCOL KYRODB SERVERS STARTING:\n   🌐 HTTP API (Ultra-Fast + Legacy) at http://{}:{}\n   ⚡ Binary TCP Protocol at tcp://{}:{}\n   💾 Full throttle - no rate limiting, no authentication\n   📝 Commit: {}, Features: {}",
+                    host, port, host, binary_port, build_commit, build_features
+                );
+            } else {
+                println!(
+                    "🚀 HTTP-ONLY KYRODB SERVER STARTING:\n   🌐 HTTP API (Ultra-Fast + Legacy) at http://{}:{}\n   💾 Full throttle - no rate limiting, no authentication\n   📝 Commit: {}, Features: {}",
+                    host, port, build_commit, build_features
+                );
+            }
 
             // 🚀 CREATE UNIFIED HTTP ROUTES: Ultra-fast + legacy endpoints
             let unified_routes = create_unified_routes(log.clone());
 
-            // 📡 START BINARY TCP SERVER (concurrent with HTTP)
-            let binary_log = log.clone();
-            let binary_addr = format!("{}:{}", host, binary_port);
-            tokio::spawn(async move {
-                if let Err(e) = kyrodb_engine::binary_protocol::binary_protocol_server(
-                    binary_log,
-                    binary_addr
-                ).await {
-                    eprintln!("❌ Binary TCP server error: {}", e);
-                }
-            });
+            // 📡 START BINARY TCP SERVER (concurrent with HTTP) - OPTIONAL
+            if enable_binary {
+                let binary_log = log.clone();
+                let binary_addr = format!("{}:{}", host, binary_port);
+                tokio::spawn(async move {
+                    if let Err(e) = kyrodb_engine::binary_protocol::binary_protocol_server(
+                        binary_log,
+                        binary_addr
+                    ).await {
+                        eprintln!("❌ Binary TCP server error: {}", e);
+                    }
+                });
+            }
 
             // 📡 START HTTP SERVER (primary server)
             warp::serve(unified_routes).run(addr).await;

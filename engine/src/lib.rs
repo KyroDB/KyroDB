@@ -8,6 +8,7 @@
 
 // Binary protocol module for maximum performance
 pub mod binary_protocol;
+pub use binary_protocol::{binary_protocol_server, MAGIC, CMD_BATCH_LOOKUP, CMD_PUT, CMD_BATCH_PUT, CMD_PING};
 
 use anyhow::{Context, Result};
 use bincode::Options;
