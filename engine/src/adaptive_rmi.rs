@@ -1787,13 +1787,14 @@ impl CPUPressureDetector {
         (base_multiplier * penalty_multiplier).min(MAX_INTERVAL_MULTIPLIER)
     }
 
-    /// Check if we should yield CPU to other processes
+    /// Check if we should yield CPU to other processes (HTTP-optimized thresholds)
     fn should_yield_cpu(&self) -> bool {
         let pressure = self.current_pressure();
         let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
         
-        // Yield if under high pressure or persistent throttling
-        pressure >= 3 || consecutive > 3
+        // CRITICAL FIX: Much higher thresholds to preserve HTTP performance
+        // Only yield under extreme pressure to avoid starving HTTP server
+        pressure >= 7 || consecutive > 10
     }
 
     /// Get comprehensive pressure statistics for monitoring
@@ -2655,7 +2656,7 @@ impl AdaptiveRMI {
                         println!("🚨 Emergency merge required - overflow buffer {}% full", 
                             (overflow_size * 100) / overflow_cap);
                         
-                        tokio::task::yield_now().await; // Single yield only
+                        // CRITICAL FIX: No yielding during emergency operations - immediate execution needed
                         
                         // Emergency merge with minimal CPU usage
                         match self.emergency_minimal_merge().await {
@@ -2674,14 +2675,17 @@ impl AdaptiveRMI {
                     continue; // Skip normal operations in emergency mode
                 }
                 
-                // ENHANCED TASK SCHEDULING: Priority-based with throttling awareness
+                // ENHANCED TASK SCHEDULING: Priority-based with minimal yielding for HTTP performance
                 let current_pressure = cpu_detector.current_pressure();
                 
-                if cpu_detector.should_yield_cpu() {
+                // CRITICAL FIX: Only yield under extreme pressure to preserve HTTP performance
+                if cpu_detector.should_yield_cpu() && current_pressure >= 7 {
+                    // Single yield only, no excessive sleeping that starves HTTP
                     tokio::task::yield_now().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        std::cmp::min(10, 2 + current_pressure as u64)
-                    )).await;
+                    // Very brief sleep only under extreme pressure
+                    if current_pressure >= 9 {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
                 }
                 
                 // Check for urgent operations first (memory pressure)
@@ -2694,9 +2698,7 @@ impl AdaptiveRMI {
                 if urgent_merge_needed {
                     println!("⚡ Urgent merge required due to memory pressure");
                     
-                    // Brief yielding before urgent work
-                    tokio::task::yield_now().await;
-                    
+                    // CRITICAL FIX: No yielding before urgent operations - they need immediate execution
                     let merge_start = std::time::Instant::now();
                     match self.merge_hot_buffer().await {
                         Ok(_) => {
@@ -2741,21 +2743,17 @@ impl AdaptiveRMI {
                         // Get buffer state for adaptive timing
                         let (overflow_size, overflow_capacity, _rejected, _pressure, _memory) = self.overflow_buffer.lock().stats();
                         
+                        // CRITICAL FIX: Dramatically reduce yielding to preserve HTTP performance
                         match current_pressure {
-                            0..=4 => { /* No yielding needed - HTTP-optimized */ }
-                            5..=6 => {
-                                tokio::task::yield_now().await; // Single yield only
-                            }
+                            0..=6 => { /* No yielding needed - HTTP-optimized for low-medium pressure */ }
                             7..=8 => {
-                                tokio::task::yield_now().await; // Single yield only
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    std::cmp::min(5, 1 + (overflow_size * 1 / overflow_capacity.max(1)) as u64)
-                                )).await; 
+                                // Only yield under high pressure and only once
+                                tokio::task::yield_now().await; 
                             }
                             _ => {
-                                tokio::task::yield_now().await; // Single yield only
-                                let adaptive_sleep_ms = std::cmp::min(10, 2 + (overflow_size * 2 / overflow_capacity.max(1)));
-                                tokio::time::sleep(std::time::Duration::from_millis(adaptive_sleep_ms as u64)).await;
+                                // Extreme pressure: single yield + minimal sleep
+                                tokio::task::yield_now().await; 
+                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                             }
                         }
                         
@@ -2787,7 +2785,7 @@ impl AdaptiveRMI {
                         continue;
                     }
                     
-                    tokio::task::yield_now().await; // Single yield only
+                    // CRITICAL FIX: No yielding before maintenance operations - let them run efficiently
                     
                     let mgmt_start = std::time::Instant::now();
                     match self.adaptive_segment_management().await {
@@ -2834,21 +2832,21 @@ impl AdaptiveRMI {
                     stats_adaptive.optimize_interval(completion_time);
                 }
                 
-                // CRITICAL: Adaptive sleep with pressure-aware yielding and workload consideration
+                // CRITICAL: HTTP-optimized sleep with minimal pressure sensitivity
                 let hot_utilization = self.hot_buffer.utilization() as u64;
-                let base_sleep_ms = 5 + (hot_utilization * 10); // More sleep when hot buffer is fuller
-                let base_sleep = std::time::Duration::from_millis(base_sleep_ms.clamp(5, 25));
+                let base_sleep_ms = 2 + (hot_utilization * 3); // Reduced base sleep for HTTP responsiveness
+                let base_sleep = std::time::Duration::from_millis(base_sleep_ms.clamp(2, 10)); // Much shorter max sleep
                 
                 let pressure_sleep = match current_pressure {
-                    0 => base_sleep,
-                    1 => base_sleep * 2,
-                    2 => base_sleep * 3 + std::time::Duration::from_millis(hot_utilization * 5), // Factor in buffer pressure
-                    3 => base_sleep * 5 + std::time::Duration::from_millis(hot_utilization * 10),
-                    _ => base_sleep * 8 + std::time::Duration::from_millis(hot_utilization * 20),
+                    0..=2 => base_sleep,                                                              // Normal operation
+                    3..=4 => base_sleep * 2,                                                         // Light pressure
+                    5..=6 => base_sleep * 3,                                                         // Medium pressure  
+                    7..=8 => base_sleep * 4 + std::time::Duration::from_millis(hot_utilization * 2), // High pressure
+                    _ => base_sleep * 6 + std::time::Duration::from_millis(hot_utilization * 3),     // Extreme pressure
                 };
                 
-                // The excessive yielding was completely starving the HTTP server
-                // Background tasks should never monopolize CPU from HTTP requests
+                // PERFORMANCE FIX: Background tasks yield minimally to preserve HTTP throughput
+                // HTTP server gets priority over background maintenance operations
                 
                 tokio::time::sleep(pressure_sleep).await;
             }
