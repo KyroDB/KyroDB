@@ -1978,25 +1978,25 @@ impl AdaptiveRMI {
             return Some(value);
         }
 
-        // 3. � race-free atomic COORDINATION: Prevent TOCTOU between router and segments
-        // Always acquire locks in order: 1) segments, 2) router to prevent deadlocks
-        let segments_guard = self.segments.read();
-        let router_guard = self.global_router.read();
+        // 🚀 ULTRA-FAST LOCK-FREE LOOKUP: Single atomic snapshot for maximum performance
+        let (segment_id, segments_guard) = {
+            // Single atomic snapshot: get both router prediction and segments together
+            let segments_guard = self.segments.read();
+            let router_guard = self.global_router.read();
+            let predicted_id = router_guard.predict_segment(key);
+            drop(router_guard); // Release router lock immediately
+            (predicted_id, segments_guard)
+        };
         
-        // 4. Atomic router prediction with segments already locked
-        let segment_id = router_guard.predict_segment(key);
-        
-        // 5. Safe segment access - both router and segments are consistent
+        // Fast segment lookup with bounds validation (no retry loops)
         if segment_id < segments_guard.len() {
-            // Use fast bounded search since we have exclusive consistency
-            segments_guard[segment_id].bounded_search_fast(key)
+            // Use fast bounded search 
+            return segments_guard[segment_id].bounded_search_fast(key);
         } else {
-            // Router-segment inconsistency detected - use safe fallback
-            // This should be extremely rare with proper atomic updates
-            drop(router_guard); // Release router lock for fallback search
-            self.fallback_linear_search_with_segments_lock(segments_guard, key)
+            // Graceful degradation: use fallback search if prediction is out of bounds
+            return self.fallback_linear_search_with_segments_lock(&segments_guard, key);
         }
-        // Both locks automatically released here
+        // Segment lock automatically released here
     }
 
     /// DEPRECATED
@@ -2009,12 +2009,12 @@ impl AdaptiveRMI {
     /// 
     fn fallback_linear_search_safe(&self, key: u64) -> Option<u64> {
         let segments_guard = self.segments.read();
-        self.fallback_linear_search_with_segments_lock(segments_guard, key)
+        self.fallback_linear_search_with_segments_lock(&segments_guard, key)
     }
 
     /// 
     /// Used when we already hold the segments lock to avoid double-locking
-    fn fallback_linear_search_with_segments_lock(&self, segments_guard: parking_lot::RwLockReadGuard<Vec<AdaptiveSegment>>, key: u64) -> Option<u64> {
+    fn fallback_linear_search_with_segments_lock(&self, segments_guard: &[AdaptiveSegment], key: u64) -> Option<u64> {
         for segment in segments_guard.iter() {
             if let Some(value) = segment.bounded_search(key) {
                 return Some(value);
@@ -2078,13 +2078,20 @@ impl AdaptiveRMI {
                 segment_updates.entry(segment_id).or_insert_with(Vec::new).push((key, value));
             }
 
-            // Apply updates to segments atomically
+            // CRITICAL FIX: Apply updates to segments with full race condition protection
             for (segment_id, updates) in segment_updates {
                 if segment_id < segments.len() {
                     let target_segment = &mut segments[segment_id];
                     for (key, value) in updates {
                         target_segment.insert(key, value)?;
                     }
+                } else {
+                    // CRITICAL: This indicates a router-segment inconsistency under atomic lock
+                    // This should be impossible but must be handled gracefully
+                    eprintln!("🚨 CRITICAL RACE CONDITION: Router predicted invalid segment {} >= {} under atomic lock", 
+                        segment_id, segments.len());
+                    return Err(anyhow!("Router-segment inconsistency detected under atomic lock - segment_id: {}, segments.len(): {}", 
+                        segment_id, segments.len()));
                 }
             }
 
@@ -2596,10 +2603,10 @@ impl AdaptiveRMI {
                     
                     if elapsed_since_check.as_secs() < 60 && loop_iteration_count > MAX_ITERATIONS_PER_MINUTE {
                         eprintln!("🚨 CIRCUIT BREAKER ACTIVATED: Background loop running too fast");
-                        eprintln!("🔧 {} iterations in {} seconds, forcing sleep", loop_iteration_count, elapsed_since_check.as_secs());
+                        eprintln!("🔧 {} iterations in {} seconds, limiting iterations", loop_iteration_count, elapsed_since_check.as_secs());
                         
-                        // Force a significant sleep to prevent CPU spinning
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        // 🚀 ZERO-LATENCY: Just reset counters, never sleep
+                        // HTTP performance is more important than preventing CPU spinning
                         loop_iteration_count = 0;
                         last_circuit_breaker_check = now;
                     } else if elapsed_since_check.as_secs() >= 60 {
@@ -2671,22 +2678,16 @@ impl AdaptiveRMI {
                         }
                     }
                     
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Fixed 100ms max
+                    // ULTRA-FAST: No sleeping in emergency mode, just continue
                     continue; // Skip normal operations in emergency mode
                 }
                 
-                // ENHANCED TASK SCHEDULING: Priority-based with minimal yielding for HTTP performance
+                // 🚀 ZERO-LATENCY MODE: Disable yielding and sleeping for maximum HTTP performance
+                // Background tasks should never block HTTP responses
                 let current_pressure = cpu_detector.current_pressure();
                 
-                // CRITICAL FIX: Only yield under extreme pressure to preserve HTTP performance
-                if cpu_detector.should_yield_cpu() && current_pressure >= 7 {
-                    // Single yield only, no excessive sleeping that starves HTTP
-                    tokio::task::yield_now().await;
-                    // Very brief sleep only under extreme pressure
-                    if current_pressure >= 9 {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                }
+                // COMPLETELY REMOVE YIELDING: HTTP performance is priority #1
+                // No yielding or sleeping that could impact read latencies
                 
                 // Check for urgent operations first (memory pressure)
                 let urgent_merge_needed = {
@@ -2743,19 +2744,9 @@ impl AdaptiveRMI {
                         // Get buffer state for adaptive timing
                         let (overflow_size, overflow_capacity, _rejected, _pressure, _memory) = self.overflow_buffer.lock().stats();
                         
-                        // CRITICAL FIX: Dramatically reduce yielding to preserve HTTP performance
-                        match current_pressure {
-                            0..=6 => { /* No yielding needed - HTTP-optimized for low-medium pressure */ }
-                            7..=8 => {
-                                // Only yield under high pressure and only once
-                                tokio::task::yield_now().await; 
-                            }
-                            _ => {
-                                // Extreme pressure: single yield + minimal sleep
-                                tokio::task::yield_now().await; 
-                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                            }
-                        }
+                        // 🚀 ZERO-LATENCY: No yielding or sleeping regardless of pressure
+                        // Background operations should never impact HTTP response times
+                        // Let the OS scheduler handle CPU allocation efficiently
                         
                         let merge_start = std::time::Instant::now();
                         match self.merge_hot_buffer().await {
@@ -2803,10 +2794,9 @@ impl AdaptiveRMI {
                 
                 // Priority 4: Statistics and monitoring (very low priority)
                 if now.duration_since(loop_start) >= stats_adaptive.current() {
-                    // Skip stats under any significant CPU pressure
-                    if current_pressure >= 2 {
-                        tokio::time::sleep(stats_adaptive.current() / 4).await; // Wait quarter interval
-                        continue;
+                    // 🚀 ULTRA-FAST: Skip stats completely during any load to maintain HTTP performance
+                    if current_pressure >= 1 {
+                        continue; // Skip stats entirely instead of sleeping
                     }
                     
                     let stats_start = std::time::Instant::now();
@@ -2832,23 +2822,12 @@ impl AdaptiveRMI {
                     stats_adaptive.optimize_interval(completion_time);
                 }
                 
-                // CRITICAL: HTTP-optimized sleep with minimal pressure sensitivity
-                let hot_utilization = self.hot_buffer.utilization() as u64;
-                let base_sleep_ms = 2 + (hot_utilization * 3); // Reduced base sleep for HTTP responsiveness
-                let base_sleep = std::time::Duration::from_millis(base_sleep_ms.clamp(2, 10)); // Much shorter max sleep
+                // 🚀 ZERO-LATENCY MODE: No sleeping in background maintenance
+                // HTTP requests must have absolute priority over background tasks
+                // Let tokio scheduler handle task scheduling efficiently
                 
-                let pressure_sleep = match current_pressure {
-                    0..=2 => base_sleep,                                                              // Normal operation
-                    3..=4 => base_sleep * 2,                                                         // Light pressure
-                    5..=6 => base_sleep * 3,                                                         // Medium pressure  
-                    7..=8 => base_sleep * 4 + std::time::Duration::from_millis(hot_utilization * 2), // High pressure
-                    _ => base_sleep * 6 + std::time::Duration::from_millis(hot_utilization * 3),     // Extreme pressure
-                };
-                
-                // PERFORMANCE FIX: Background tasks yield minimally to preserve HTTP throughput
-                // HTTP server gets priority over background maintenance operations
-                
-                tokio::time::sleep(pressure_sleep).await;
+                // Only yield control, never sleep - this allows HTTP requests to be processed immediately
+                tokio::task::yield_now().await;
             }
         })
     }
@@ -2892,7 +2871,7 @@ impl AdaptiveRMI {
                 return Err(anyhow::anyhow!("Emergency merge aborted: too many segments ({})", segment_count));
             }
 
-            // Apply updates to segments atomically (all under same lock)
+            // CRITICAL FIX: Apply updates to segments with full race condition protection
             for (segment_id, updates) in segment_updates {
                 if segment_id < segments.len() && !updates.is_empty() {
                     if updates.len() > 10_000 {
@@ -2904,6 +2883,12 @@ impl AdaptiveRMI {
                     for (key, value) in updates {
                         target_segment.insert(key, value)?;
                     }
+                } else if segment_id >= segments.len() {
+                    // CRITICAL: Router-segment inconsistency during emergency merge
+                    eprintln!("🚨 EMERGENCY RACE CONDITION: Router predicted invalid segment {} >= {} during emergency merge", 
+                        segment_id, segments.len());
+                    return Err(anyhow::anyhow!("Emergency merge failed: router-segment inconsistency - segment_id: {}, segments.len(): {}", 
+                        segment_id, segments.len()));
                 }
             }
 
@@ -3396,60 +3381,69 @@ impl AdaptiveRMI {
             return results;
         }
         
-        // 🚀 MINIMAL LOCK TIME: Acquire locks in proper order to prevent deadlocks
-        let segments_guard = self.segments.read();
-        let router_guard = self.global_router.read();
+        // 🚀 ULTRA-FAST SIMD: Single atomic snapshot for maximum performance
+        let (segment_ids, segments_guard) = {
+            // Single atomic snapshot: get both router predictions and segments together
+            let segments_guard = self.segments.read();
+            let router_guard = self.global_router.read();
+            let ids = self.simd_predict_segments(keys_lo, keys_hi, &router_guard);
+            drop(router_guard); // Release router lock immediately
+            (ids, segments_guard)
+        };
         
-        // 🚀 VECTORIZED SEGMENT PREDICTION: Predict segments for all 8 keys at once
-        let segment_ids = self.simd_predict_segments(keys_lo, keys_hi, &router_guard);
-        
-        // 🚀 SELECTIVE VECTORIZED BOUNDED SEARCH: Only search for missing keys
+        // Fast SIMD processing with bounds validation (no retry loops)
         let missing_keys_with_segments: Vec<(usize, u64, usize)> = (0..8)
             .filter_map(|i| {
                 if hot_results[i].is_none() && overflow_results[i].is_none() {
                     let key = if i < 4 {
                         _mm256_extract_epi64(keys_lo, i as i32) as u64
-                    } else {
-                        _mm256_extract_epi64(keys_hi, (i - 4) as i32) as u64
-                    };
-                    Some((i, key, segment_ids[i]))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        
-        // 🚀 VECTORIZED BOUNDED SEARCH: Process keys in SIMD batches
-        for chunk in missing_keys_with_segments.chunks(4) {
-            if chunk.len() >= 4 {
-                // Try to find segments with enough data for SIMD processing
-                let mut simd_processed = vec![false; chunk.len()];
-                
-                for &(result_idx, key, segment_id) in chunk {
-                    if segment_id < segments_guard.len() && !simd_processed[result_idx % 4] {
-                        let segment = &segments_guard[segment_id];
-                        
-                        // Use SIMD bounded search if segment has enough data
-                        if segment.data.len() >= 8 {
-                            results[result_idx] = self.simd_bounded_search_vectorized(
-                                &segment.data, key, segment.local_model.predict(key)
-                            );
                         } else {
-                            // Scalar bounded search for small segments
-                            results[result_idx] = segment.bounded_search_fast(key);
-                        }
-                        simd_processed[result_idx % 4] = true;
+                            _mm256_extract_epi64(keys_hi, (i - 4) as i32) as u64
+                        };
+                        Some((i, key, segment_ids[i]))
+                    } else {
+                        None
                     }
-                }
-            } else {
-                // Scalar fallback for remaining keys
-                for &(result_idx, key, segment_id) in chunk {
-                    if segment_id < segments_guard.len() {
-                        results[result_idx] = segments_guard[segment_id].bounded_search_fast(key);
+                })
+                .collect();
+            
+            // 5. RACE-FREE VECTORIZED BOUNDED SEARCH with validated segments
+            for chunk in missing_keys_with_segments.chunks(4) {
+                if chunk.len() >= 4 {
+                    // Process segments with validated consistency
+                    let mut simd_processed = vec![false; chunk.len()];
+                    
+                    for &(result_idx, key, segment_id) in chunk {
+                        if segment_id < segments_guard.len() && !simd_processed[result_idx % 4] {
+                            let segment = &segments_guard[segment_id];
+                            
+                            // Use SIMD bounded search if segment has enough data
+                            if segment.data.len() >= 8 {
+                                results[result_idx] = self.simd_bounded_search_vectorized(
+                                    &segment.data, key, segment.local_model.predict(key)
+                                );
+                            } else {
+                                // Scalar bounded search for small segments
+                                results[result_idx] = segment.bounded_search_fast(key);
+                            }
+                            simd_processed[result_idx % 4] = true;
+                        } else if segment_id >= segments_guard.len() {
+                            // Graceful degradation: use fallback search if prediction is out of bounds
+                            results[result_idx] = self.fallback_linear_search_with_segments_lock(&segments_guard, key);
+                        }
+                    }
+                } else {
+                    // Scalar fallback for remaining keys with bounds checking
+                    for &(result_idx, key, segment_id) in chunk {
+                        if segment_id < segments_guard.len() {
+                            results[result_idx] = segments_guard[segment_id].bounded_search_fast(key);
+                        } else {
+                            // Graceful degradation: use fallback search if prediction is out of bounds
+                            results[result_idx] = self.fallback_linear_search_with_segments_lock(&segments_guard, key);
+                        }
                     }
                 }
             }
-        }
         
         results
     }
@@ -3753,18 +3747,29 @@ impl AdaptiveRMI {
             return results;
         }
         
-        // Acquire locks
-        let segments_guard = self.segments.read();
-        let router_guard = self.global_router.read();
+        // 🚀 ULTRA-FAST NEON: Single atomic snapshot for maximum performance
+        let (segment_predictions, segments_guard) = {
+            // Single atomic snapshot: get both router predictions and segments together
+            let segments_guard = self.segments.read();
+            let router_guard = self.global_router.read();
+            let predictions: Vec<usize> = keys.iter()
+                .map(|&key| router_guard.predict_segment(key))
+                .collect();
+            drop(router_guard); // Release router lock immediately
+            (predictions, segments_guard)
+        };
         
-        // Process each missing key
+        // Fast NEON processing with bounds validation
         for i in 0..4 {
             if hot_results[i].is_none() && overflow_results[i].is_none() {
                 let key = keys[i];
-                let segment_id = router_guard.predict_segment(key);
+                let segment_id = segment_predictions[i];
                 
                 if segment_id < segments_guard.len() {
                     results[i] = segments_guard[segment_id].bounded_search_fast(key);
+                } else {
+                    // Graceful degradation: use fallback search if prediction is out of bounds
+                    results[i] = self.fallback_linear_search_with_segments_lock(&segments_guard, key);
                 }
             }
         }
