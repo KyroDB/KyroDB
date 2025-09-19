@@ -95,7 +95,7 @@ impl AdaptiveInterval {
         let new_duration = self.base_duration * multiplier;
         
         self.current_duration = std::cmp::min(new_duration, self.max_duration);
-        println!("📈 Increased background interval to {:?} due to {} consecutive errors", 
+        println!("Increased background interval to {:?} due to {} consecutive errors", 
                 self.current_duration, self.consecutive_errors);
     }
     
@@ -132,7 +132,7 @@ impl AdaptiveInterval {
             };
             
             if new_duration != self.current_duration {
-                println!("⚡ Optimized background interval: {:?} -> {:?} (avg completion: {:?})", 
+                println!("Optimized background interval: {:?} -> {:?} (avg completion: {:?})", 
                         self.current_duration, new_duration, avg_completion);
                 self.current_duration = new_duration;
             }
@@ -167,7 +167,7 @@ impl BackgroundErrorHandler {
             *last_time = Some(std::time::Instant::now());
         }
         
-        eprintln!("❌ Background merge error #{}: {}", error_count, error);
+        eprintln!("Background merge error #{}: {}", error_count, error);
         
         if error_count > 1 {
             let backoff_secs = std::cmp::min(2_u64.pow((error_count - 1) as u32), 60);
@@ -180,10 +180,10 @@ impl BackgroundErrorHandler {
 
     fn handle_management_error(&self, error: anyhow::Error) {
         let error_count = self.management_errors.fetch_add(1, Ordering::Relaxed) + 1;
-        eprintln!("❌ Background management error #{}: {}", error_count, error);
+        eprintln!("Background management error #{}: {}", error_count, error);
         
         if error_count > 5 {
-            println!("⚠️  Too many management errors, may need manual intervention");
+            println!("Too many management errors, may need manual intervention");
         }
     }
 
@@ -1023,7 +1023,7 @@ impl BoundedHotBuffer {
         let mutex_overhead = std::mem::size_of::<parking_lot::Mutex<Vec<(u64, u64)>>>();
         let atomic_overhead = std::mem::size_of::<AtomicUsize>();
         
-        // 🎯 ACCURATE TOTAL: Include all allocations and overheads
+        // Accurate total: include all allocations and overheads
         capacity * tuple_size + vec_overhead + mutex_overhead + atomic_overhead
     }
 
@@ -1032,7 +1032,7 @@ impl BoundedHotBuffer {
     pub fn try_insert_atomic(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
         let mut buffer = self.buffer.lock();
         
-        // 🚨 HARD CAPACITY CHECK: Absolute limit enforcement
+        // Hard capacity check: absolute limit enforcement
         if buffer.len() >= self.capacity {
             return Ok(false); // Hard reject, no unbounded growth possible
         }
@@ -1085,7 +1085,7 @@ impl BoundedHotBuffer {
             return Ok(false);
         }
         
-        // ✅ ATOMIC INSERT: Both buffer and size updated under same lock
+        // Atomic insert: both buffer and size updated under same lock
         buffer.push_back((key, value));
         let new_len = buffer.len();
         self.size.store(new_len, Ordering::Release);
@@ -1215,7 +1215,7 @@ impl BoundedOverflowBuffer {
         
         // 🛡️ HARD ENFORCEMENT: Apply absolute limits before any processing
         if let Err(enforcement_msg) = self.enforce_hard_memory_limits() {
-            eprintln!("🚨 Memory enforcement triggered: {}", enforcement_msg);
+            eprintln!("Memory enforcement triggered: {}", enforcement_msg);
             // Continue with insertion if enforcement succeeded in making space
         }
         
@@ -1230,7 +1230,7 @@ impl BoundedOverflowBuffer {
             self.update_accurate_memory_estimate(current_size);
             self.last_memory_check.store(now, Ordering::Relaxed);
             
-            // 🚨 HARD CIRCUIT BREAKER: Absolute memory protection
+            // Hard circuit breaker: absolute memory protection
             let memory_mb = self.estimated_memory_mb.load(Ordering::Relaxed);
             if memory_mb > SYSTEM_MEMORY_LIMIT_MB {
                 self.rejected_writes.fetch_add(1, Ordering::Relaxed);
@@ -1239,7 +1239,7 @@ impl BoundedOverflowBuffer {
             }
         }
 
-        // 🎯 ENHANCED PRESSURE CALCULATION with atomic memory tracking
+        // Enhanced pressure calculation with atomic memory tracking
         let current_len = self.data.len(); // Re-check after potential enforcement
         let pressure = if current_len == 0 {
             0 // none
@@ -1353,7 +1353,7 @@ impl BoundedOverflowBuffer {
 
     /// 
     fn calculate_actual_memory_usage(data: &VecDeque<(u64, u64)>) -> usize {
-        // 🎯 ACCURATE CALCULATION: Real VecDeque memory usage
+        // Accurate calculation: real VecDeque memory usage
         let tuple_size = std::mem::size_of::<(u64, u64)>(); // Exactly 16 bytes
         let capacity_bytes = data.capacity() * tuple_size;
         let vecdeque_overhead = std::mem::size_of::<VecDeque<(u64, u64)>>();
@@ -1368,7 +1368,7 @@ impl BoundedOverflowBuffer {
         let actual_memory_bytes = Self::calculate_actual_memory_usage(&self.data);
         let actual_memory_mb = actual_memory_bytes / (1024 * 1024);
         
-        // 🚨 HARD LIMIT 1: Absolute count limit (prevent integer overflow)
+        // Hard limit 1: absolute count limit (prevent integer overflow)
         if current_size > MAX_OVERFLOW_CAPACITY {
             // 🛑 EMERGENCY TRUNCATION: Remove oldest entries to enforce hard limit
             let excess = current_size - MAX_OVERFLOW_CAPACITY;
@@ -1380,7 +1380,7 @@ impl BoundedOverflowBuffer {
                 excess, current_size, MAX_OVERFLOW_CAPACITY));
         }
         
-        // 🚨 HARD LIMIT 2: Absolute memory limit (prevent OOM)
+        // Hard limit 2: absolute memory limit (prevent OOM)
         if actual_memory_mb > SYSTEM_MEMORY_LIMIT_MB {
             // 🛑 EMERGENCY TRUNCATION: Remove entries until under memory limit
             let target_size = (SYSTEM_MEMORY_LIMIT_MB * 1024 * 1024) / std::mem::size_of::<(u64, u64)>();
@@ -1511,7 +1511,7 @@ impl CPUPressureDetector {
         self.pressure_level.store(final_pressure, Ordering::Relaxed);
         
         if final_pressure != raw_pressure {
-            println!("🔧 CPU pressure escalated from {} to {} due to critical signal", raw_pressure, final_pressure);
+            println!("CPU pressure escalated from {} to {} due to critical signal", raw_pressure, final_pressure);
         }
 
         final_pressure
@@ -1538,7 +1538,7 @@ impl CPUPressureDetector {
                                 if delta > 100_000 { // > 100ms of throttling per check interval
                                     signals += 3;
                                     *max_signal_strength = (*max_signal_strength).max(4); // Critical
-                                    println!("🚨 Container CPU throttling detected: +{}μs throttled", delta);
+                                    println!("Container CPU throttling detected: +{}μs throttled", delta);
                                 } else if delta > 10_000 { // > 10ms of throttling
                                     signals += 2;
                                     *max_signal_strength = (*max_signal_strength).max(3); // High
@@ -1556,7 +1556,7 @@ impl CPUPressureDetector {
                         if let Ok(nr_throttled) = value_str.parse::<u64>() {
                             if nr_throttled > 0 {
                                 signals += 1;
-                                println!("📊 Container throttle count: {}", nr_throttled);
+                                println!("Container throttle count: {}", nr_throttled);
                             }
                         }
                     }
@@ -1572,7 +1572,7 @@ impl CPUPressureDetector {
                     if let Ok(throttled) = value_str.parse::<u64>() {
                         if throttled > 0 {
                             signals += 1;
-                            println!("📊 Legacy container throttling detected: {}", throttled);
+                            println!("Legacy container throttling detected: {}", throttled);
                         }
                     }
                 }
@@ -1612,7 +1612,7 @@ impl CPUPressureDetector {
                             
                             if recent_avg > older_avg * 1.5 {
                                 signals += 1; // Load is trending up rapidly
-                                println!("📈 Load trending upward: {:.2} -> {:.2}", older_avg, recent_avg);
+                                println!("Load trending upward: {:.2} -> {:.2}", older_avg, recent_avg);
                             }
                         }
                     }

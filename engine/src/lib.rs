@@ -32,7 +32,7 @@ pub mod index;
 pub use index::{BTreeIndex, Index, PrimaryIndex};
 pub mod metrics;
 
-// Phase 0 foundation modules
+// Foundation modules
 #[cfg(feature = "learned-index")]
 
 #[cfg(feature = "learned-index")]
@@ -83,7 +83,6 @@ impl BufferPool {
     }
 
     // TODO: Implement buffer return for memory pool optimization
-    // fn return_buffer(&self, buf: BytesMut) - currently unused
 
     #[allow(dead_code)]
     fn metrics(&self) -> (usize, usize) {
@@ -561,16 +560,7 @@ impl PersistentEventLog {
             max_off.saturating_add(1)
         };
 
-        // Remove unconditional RMI load by file existence; we'll defer to manifest below
-        // #[cfg(feature = "learned-index")]
-        // {
-        //     let rmi_path = data_dir.join("index-rmi.bin");
-        //     if rmi_path.exists() {
-        //         if let Some(rmi) = crate::index::RmiIndex::load_from_file(&rmi_path) {
-        //             idx = index::PrimaryIndex::Rmi(rmi);
-        //         }
-        //     }
-        // }
+        // RMI loading is handled by the adaptive RMI system
 
         // 6) Read manifest (best-effort) to seed next_offset and paths, and (if enabled) commit RMI selection
         let manifest_path = data_dir.join("manifest.json");
@@ -582,11 +572,7 @@ impl PersistentEventLog {
                             next = n;
                         }
                     }
-                    #[cfg(feature = "learned-index")]
-                    {
-                        // Note: Legacy RMI loading removed - only AdaptiveRMI is supported
-                        // AdaptiveRMI builds incrementally and doesn't need file loading
-                    }
+                    // AdaptiveRMI builds incrementally and doesn't need file loading
                 }
             }
         }
@@ -605,7 +591,7 @@ impl PersistentEventLog {
             data_dir: data_dir.clone(),
             tx,
             index: Arc::new(RwLock::new(idx)),
-            // TODO: migrate to ArcSwap<index::PrimaryIndex>
+            // TODO: migrate to ArcSwap for better concurrency
             next_offset: Arc::new(RwLock::new(next)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
             wal_segment_bytes: Arc::new(RwLock::new(None)),
@@ -883,7 +869,7 @@ impl PersistentEventLog {
             }
             #[cfg(feature = "learned-index")]
             index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                // 🚀 ULTRA-FAST PATH: Trust the RMI completely - no expensive fallback scans!
+                // Ultra-fast path: trust the RMI completely - no expensive fallback scans
                 let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
                 let result = adaptive.lookup(key);
                 timer.observe_duration();
@@ -895,20 +881,20 @@ impl PersistentEventLog {
                     crate::metrics::RMI_MISSES_TOTAL.inc();
                 }
                 
-                // 🚀 CRITICAL PERFORMANCE FIX: Return immediately - no O(n) fallback scans!
+                // Return immediately - no O(n) fallback scans
                 // The AdaptiveRMI is kept up-to-date on every insert, so we can trust it
                 result
             }
         }
     }
 
-    /// 🚀 DIRECT RMI ACCESS: Zero-overhead lookup for ultra-fast HTTP path
+    /// Direct RMI access for zero-overhead lookup
     pub fn lookup_key_direct(&self, key: u64) -> Option<u64> {
-        // 🚀 NON-BLOCKING TRY_READ: Use try_read to avoid async overhead
+        // Non-blocking try_read to avoid async overhead
         match self.index.try_read() {
             Ok(idx) => match &*idx {
                 index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                    // 🚀 DIRECT CALL: No async overhead, pure synchronous lookup
+                    // Direct call: no async overhead, pure synchronous lookup
                     let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
                     let result = adaptive.lookup(key);
                     timer.observe_duration();
@@ -930,7 +916,7 @@ impl PersistentEventLog {
         }
     }
     
-    /// 🚀 BATCH LOOKUP: Process multiple keys efficiently with single lock acquisition
+    /// Batch lookup: process multiple keys efficiently with single lock acquisition
     pub fn lookup_keys_batch(&self, keys: &[u64]) -> Vec<(u64, Option<u64>)> {
         let mut results = Vec::with_capacity(keys.len());
         
@@ -970,18 +956,18 @@ impl PersistentEventLog {
         results
     }
     
-    /// 🚀 ULTRA-FAST LOCK-FREE LOOKUP: Zero-overhead with minimal metrics
+    /// Ultra-fast lock-free lookup with minimal metrics
     /// This is the absolute fastest path - use for high-frequency operations
     pub fn lookup_key_ultra_fast(&self, key: u64) -> Option<u64> {
-        // 🚀 COMPLETELY LOCK-FREE: No contention possible
+        // Completely lock-free: no contention possible
         match self.index.try_read() {
             Ok(idx) => match &*idx {
                 #[cfg(feature = "learned-index")]
                 index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                    // 🚀 DIRECT CALL: Pure synchronous lookup with minimal overhead
+                    // Direct call: pure synchronous lookup with minimal overhead
                     let result = adaptive.lookup(key);
                     
-                    // 🚀 MINIMAL METRICS: Only increment counters, no timers for maximum speed
+                    // Minimal metrics: only increment counters, no timers for maximum speed
                     #[cfg(not(feature = "bench-no-metrics"))]
                     {
                         if result.is_some() {
@@ -1002,7 +988,7 @@ impl PersistentEventLog {
         }
     }
     
-    /// 🚀 ULTRA-FAST BATCH LOOKUP: Optimized for high-throughput scenarios with SIMD
+    /// Ultra-fast batch lookup optimized for high-throughput scenarios with SIMD
     pub fn lookup_keys_ultra_batch(&self, keys: &[u64]) -> Vec<(u64, Option<u64>)> {
         let mut results = Vec::with_capacity(keys.len());
         
@@ -1011,7 +997,7 @@ impl PersistentEventLog {
             Ok(idx) => match &*idx {
                 #[cfg(feature = "learned-index")]
                 index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                    // 🚀 PHASE 4: Use SIMD batch processing when available
+                    // Use SIMD batch processing when available
                     let simd_results = adaptive.lookup_batch_simd(keys);
                     
                     // Convert to expected format
@@ -1020,7 +1006,7 @@ impl PersistentEventLog {
                         results.push((key, value));
                     }
                     
-                    // 🚀 MINIMAL METRICS: Batch increment for efficiency
+                    // Minimal metrics: batch increment for efficiency
                     #[cfg(not(feature = "bench-no-metrics"))]
                     {
                         let hits = results.iter().filter(|(_, v)| v.is_some()).count();
@@ -1047,7 +1033,7 @@ impl PersistentEventLog {
         results
     }
     
-    /// 🚀 LOCK-FREE INDEX ACCESS: For specialized high-performance scenarios
+    /// Lock-free index access for specialized high-performance scenarios
     /// Returns the current index snapshot without any locking overhead
     pub fn get_index_snapshot(&self) -> Option<std::sync::Arc<index::PrimaryIndex>> {
         // Future optimization: Could use ArcSwap here for truly atomic reads
@@ -1068,7 +1054,7 @@ impl PersistentEventLog {
         }).flatten()
     }
     
-    /// 🚀 PHASE 4: SIMD-OPTIMIZED BATCH LOOKUP
+    /// SIMD-optimized batch lookup
     /// 
     /// Enterprise-grade batch processing with automatic SIMD optimization.
     /// Processes multiple keys simultaneously using vectorized operations when available.
@@ -1084,7 +1070,7 @@ impl PersistentEventLog {
     /// let results = db.lookup_keys_simd_batch(&keys);
     /// ```
     pub fn lookup_keys_simd_batch(&self, keys: &[u64]) -> Vec<(u64, Option<u64>)> {
-        // 🚀 ADAPTIVE BATCH SIZE: Use optimal batch size for the architecture
+        // Adaptive batch size: use optimal batch size for the architecture
         let optimal_batch_size = match self.index.try_read() {
             Ok(idx) => match &*idx {
                 #[cfg(feature = "learned-index")]
@@ -1107,7 +1093,7 @@ impl PersistentEventLog {
         results
     }
     
-    /// 🚀 SIMD CAPABILITY QUERY: Get SIMD capabilities of the current system
+    /// Get SIMD capabilities of the current system
     pub fn get_simd_capabilities(&self) -> Option<crate::adaptive_rmi::SIMDCapabilities> {
         match self.index.try_read() {
             Ok(idx) => match &*idx {
@@ -1311,9 +1297,6 @@ impl PersistentEventLog {
             #[cfg(feature = "failpoints")]
             fail::fail_point!("wal_after_retention_before_manifest", |_| {});
             // TODO: Implement manifest write if needed for WAL rotation
-            // if let Err(e) = self.write_manifest().await {
-            //     eprintln!("⚠️ manifest write after rotation failed: {}", e);
-            // }
         }
     }
 
@@ -1691,7 +1674,7 @@ impl PersistentEventLog {
     }
 }
 
-/// 🚀 BUFFER SIZE CATEGORIES: Optimized allocation strategies
+/// Buffer size categories for optimized allocation strategies
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferSize {
     Small,   // 256B JSON, 64B binary - 80% of requests
@@ -1699,7 +1682,7 @@ pub enum BufferSize {
     Large,   // 4KB JSON, 2KB binary - 2% of requests
 }
 
-/// 🚀 POOL STATISTICS: Comprehensive performance metrics
+/// Pool statistics for comprehensive performance metrics
 #[derive(Debug, Clone)]
 pub struct PoolStats {
     pub allocations: u64,
@@ -1711,7 +1694,7 @@ pub struct PoolStats {
     pub current_memory_usage: usize,
 }
 
-/// 🚀 POOL HEALTH: Performance quality indicators  
+/// Pool health performance quality indicators  
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolHealth {
     Excellent, // >95% cache hit rate
@@ -1720,9 +1703,9 @@ pub enum PoolHealth {
     Poor,      // <80% cache hit rate
 }
 
-/// 🚀 ULTRA-FAST BUFFER POOL: Zero-allocation responses for maximum performance
+/// Ultra-fast buffer pool for zero-allocation responses
 /// 
-/// Phase 3 Implementation: Advanced memory pool with multiple buffer sizes,
+/// Advanced memory pool with multiple buffer sizes,
 /// pressure-based adaptation, and enterprise-grade statistics tracking.
 pub struct UltraFastBufferPool {
     /// Pre-allocated JSON response buffers (small, medium, large)
@@ -1766,7 +1749,7 @@ impl UltraFastBufferPool {
             current_memory_usage: AtomicUsize::new(0),
         };
         
-        // 🚀 ENTERPRISE PRE-ALLOCATION: Multiple buffer sizes for zero-allocation responses
+        // Enterprise pre-allocation: multiple buffer sizes for zero-allocation responses
         // Small buffers: 80% of requests (optimized for lookup responses)
         for _ in 0..800 {
             pool.json_buffers_small.push(String::with_capacity(256));
@@ -1794,12 +1777,12 @@ impl UltraFastBufferPool {
         pool
     }
     
-    /// 🚀 SMART BUFFER SELECTION: Get optimally-sized JSON buffer
+    /// Smart buffer selection: get optimally-sized JSON buffer
     pub fn get_json_buffer(&self) -> String {
         self.get_json_buffer_sized(BufferSize::Small)
     }
     
-    /// 🚀 SIZE-AWARE JSON BUFFER: Get buffer based on expected size
+    /// Size-aware JSON buffer: get buffer based on expected size
     pub fn get_json_buffer_sized(&self, size: BufferSize) -> String {
         let (queue, capacity) = match size {
             BufferSize::Small => (&self.json_buffers_small, 256),
@@ -1822,12 +1805,12 @@ impl UltraFastBufferPool {
         }
     }
     
-    /// 🚀 ENTERPRISE BUFFER RETURN: Intelligent reuse with memory pressure handling
+    /// Enterprise buffer return: intelligent reuse with memory pressure handling
     pub fn return_json_buffer(&self, buf: String) {
         self.return_json_buffer_sized(buf, BufferSize::Small)
     }
     
-    /// 🚀 SMART BUFFER RETURN: Return to appropriate size pool
+    /// Smart buffer return: return to appropriate size pool
     pub fn return_json_buffer_sized(&self, buf: String, _expected_size: BufferSize) {
         // Determine actual buffer size category based on capacity
         let (queue, max_capacity) = if buf.capacity() <= 512 {
@@ -1850,12 +1833,12 @@ impl UltraFastBufferPool {
         }
     }
     
-    /// 🚀 SMART BINARY BUFFER: Zero allocation for binary responses
+    /// Smart binary buffer: zero allocation for binary responses
     pub fn get_binary_buffer(&self) -> Vec<u8> {
         self.get_binary_buffer_sized(BufferSize::Small)
     }
     
-    /// 🚀 SIZE-AWARE BINARY BUFFER: Get buffer based on expected size
+    /// Size-aware binary buffer: get buffer based on expected size
     pub fn get_binary_buffer_sized(&self, size: BufferSize) -> Vec<u8> {
         let (queue, capacity) = match size {
             BufferSize::Small => (&self.binary_buffers_small, 64),
@@ -1878,12 +1861,12 @@ impl UltraFastBufferPool {
         }
     }
     
-    /// 🚀 INTELLIGENT BINARY RETURN: Return to appropriate size pool
+    /// Intelligent binary return: return to appropriate size pool
     pub fn return_binary_buffer(&self, buf: Vec<u8>) {
         self.return_binary_buffer_sized(buf, BufferSize::Small)
     }
     
-    /// 🚀 SMART BINARY RETURN: Return to appropriate size pool
+    /// Smart binary return: return to appropriate size pool
     pub fn return_binary_buffer_sized(&self, buf: Vec<u8>, _expected_size: BufferSize) {
         // Determine actual buffer size category based on capacity
         let (queue, max_capacity) = if buf.capacity() <= 128 {
@@ -1906,7 +1889,7 @@ impl UltraFastBufferPool {
         }
     }
     
-    /// 🚀 MEMORY PRESSURE DETECTION: Prevent unlimited memory growth
+    /// Memory pressure detection: prevent unlimited memory growth
     fn should_accept_buffer(&self) -> bool {
         // Simple heuristic: check current queue lengths vs limits
         let current_usage = self.current_memory_usage.load(Ordering::Relaxed);
@@ -1915,7 +1898,7 @@ impl UltraFastBufferPool {
         current_usage < max_usage
     }
     
-    /// 🚀 ENTERPRISE STATISTICS: Comprehensive pool performance metrics
+    /// Enterprise statistics: comprehensive pool performance metrics
     pub fn stats(&self) -> PoolStats {
         PoolStats {
             allocations: self.allocations.load(Ordering::Relaxed),
@@ -1932,7 +1915,7 @@ impl UltraFastBufferPool {
         }
     }
     
-    /// 🚀 POOL HEALTH CHECK: Monitor pool performance
+    /// Pool health check: monitor pool performance
     pub fn health_check(&self) -> PoolHealth {
         let stats = self.stats();
     

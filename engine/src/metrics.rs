@@ -121,7 +121,7 @@ pub static SSE_LAGGED_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_sse_lagged_total")
 });
 
-// New: WAL CRC errors
+// WAL CRC errors
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static WAL_CRC_ERRORS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
@@ -131,7 +131,7 @@ pub static WAL_CRC_ERRORS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_wal_crc_errors_total")
 });
 
-// New: Compactions
+// Compactions
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static COMPACTIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
@@ -151,7 +151,7 @@ pub static COMPACTION_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_compaction_duration_seconds")
 });
 
-// New: RMI hits/misses (only incremented when learned-index feature is active)
+// RMI hits/misses (only incremented when learned-index feature is active)
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_HITS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
@@ -170,7 +170,7 @@ pub static RMI_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_rmi_misses_total")
 });
 
-// New: RMI lookup latency histogram
+// RMI lookup latency histogram
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
@@ -183,7 +183,7 @@ pub static RMI_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_rmi_lookup_latency_seconds")
 });
 
-// New: RMI lookup latency during rebuild (segmented)
+// RMI lookup latency during rebuild (segmented)
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
@@ -197,7 +197,7 @@ pub static RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS: Lazy<Histogram> = Lazy::ne
         .expect("register kyrodb_rmi_lookup_latency_during_rebuild_seconds")
 });
 
-// New: epsilon distribution (recorded as histogram in units of keys)
+// Epsilon distribution (recorded as histogram in units of keys)
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_EPSILON_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
@@ -208,7 +208,7 @@ pub static RMI_EPSILON_HISTOGRAM: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_rmi_epsilon")
 });
 
-// New: RMI gauges
+// RMI gauges
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_INDEX_LEAVES: Lazy<Gauge> = Lazy::new(|| {
     prometheus::register_gauge!(
@@ -233,7 +233,7 @@ pub static RMI_EPSILON_MAX: Lazy<Gauge> = Lazy::new(|| {
         .expect("register kyrodb_rmi_epsilon_max")
 });
 
-// New: RMI rebuild metrics
+// RMI rebuild metrics
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_REBUILDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
@@ -253,7 +253,7 @@ pub static RMI_REBUILD_DURATION_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     prometheus::register_histogram!(opts).expect("register kyrodb_rmi_rebuild_duration_seconds")
 });
 
-// New: RMI probe length histogram and mispredict counter
+// RMI probe length histogram and mispredict counter
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_PROBE_LEN: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
@@ -291,7 +291,7 @@ pub static WAL_BLOCK_CACHE_MISSES_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_wal_block_cache_misses_total")
 });
 
-// New: read counters by index type
+// Read counters by index type
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_READS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
@@ -337,7 +337,7 @@ pub static RMI_REBUILD_IN_PROGRESS: Lazy<Gauge> = Lazy::new(|| {
     .expect("register kyrodb_rmi_rebuild_in_progress")
 });
 
-// New: RMI rebuild stalls
+// RMI rebuild stalls
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_REBUILD_STALLS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
@@ -397,7 +397,7 @@ pub static GROUP_COMMIT_BATCHES_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_group_commit_batches_total")
 });
 
-// === BINARY PROTOCOL PERFORMANCE METRICS ===
+// Binary Protocol Performance Metrics
 
 // Binary Protocol Connection Metrics
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -558,7 +558,7 @@ pub static BINARY_SIMD_SPEEDUP_RATIO: Lazy<Histogram> = Lazy::new(|| {
         .expect("register kyrodb_binary_simd_speedup_ratio")
 });
 
-// 🚀 ENHANCED RMI PERFORMANCE METRICS
+// Enhanced RMI performance metrics
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new(
@@ -628,7 +628,7 @@ pub static RMI_ADAPTIVE_OPTIMIZATIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("register kyrodb_rmi_adaptive_optimizations_total")
 });
 
-// === BINARY PROTOCOL METRIC HELPER FUNCTIONS ===
+// Binary Protocol Metric Helper Functions
 
 /// Register binary protocol metrics with the global Prometheus registry
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -673,7 +673,7 @@ pub fn inc_binary_protocol_error(error_type: &str) {
         .inc();
 }
 
-// === STUB IMPLEMENTATIONS FOR bench-no-metrics FEATURE ===
+// Stub implementations for bench-no-metrics feature
 
 #[cfg(feature = "bench-no-metrics")]
 pub fn register_binary_metrics() {
@@ -714,7 +714,7 @@ mod binary_protocol_shim {
     pub static BINARY_FRAME_SIZE_BYTES: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static BINARY_SIMD_SPEEDUP_RATIO: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     
-    // 🚀 ENHANCED RMI PERFORMANCE METRICS
+    // Enhanced RMI performance metrics
     pub static RMI_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_SINGLE_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_SIMD_BATCH_SIZE: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);

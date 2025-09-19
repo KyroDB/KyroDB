@@ -1,11 +1,11 @@
-//! 🚀 RMI OPTIMIZATION CONFIGURATION
+//! RMI Optimization Configuration
 //! 
 //! Configuration options for tuning RMI performance parameters
 
 use serde::{Deserialize, Serialize};
 use std::env;
 
-/// 🚀 RMI OPTIMIZATION CONFIGURATION
+/// RMI Optimization Configuration
 /// 
 /// Comprehensive configuration for tuning RMI performance
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,8 +68,7 @@ impl Default for RmiOptimizationConfig {
 }
 
 impl RmiOptimizationConfig {
-    /// 🚀 CREATE CONFIG FROM ENVIRONMENT
-    /// Load configuration from environment variables with sensible defaults
+    /// Create configuration from environment variables with sensible defaults
     pub fn from_env() -> Self {
         let mut config = Self::default();
         
@@ -169,8 +168,7 @@ impl RmiOptimizationConfig {
         config
     }
     
-    /// 🚀 VALIDATE CONFIGURATION
-    /// Ensure configuration parameters are within valid ranges
+    /// Validate configuration parameters are within valid ranges
     pub fn validate(&self) -> Result<(), String> {
         if self.simd_batch_size < 8 || self.simd_batch_size > 64 {
             return Err("SIMD batch size must be between 8 and 64".to_string());
@@ -215,8 +213,7 @@ impl RmiOptimizationConfig {
         Ok(())
     }
     
-    /// 🚀 GET OPTIMIZED BATCH SIZE
-    /// Calculate optimal batch size based on current configuration
+    /// Get optimized batch size based on current configuration
     pub fn get_optimized_batch_size(&self, current_throughput: u64) -> usize {
         if !self.enable_adaptive_batching {
             return self.simd_batch_size;
@@ -235,8 +232,7 @@ impl RmiOptimizationConfig {
         }
     }
     
-    /// 🚀 GET OPTIMIZED PREFETCH DISTANCE
-    /// Calculate optimal prefetch distance based on access patterns
+    /// Get optimized prefetch distance based on access patterns
     pub fn get_optimized_prefetch_distance(&self, cache_hit_rate: f64) -> usize {
         if !self.enable_prefetching {
             return 0;
@@ -251,8 +247,7 @@ impl RmiOptimizationConfig {
         }
     }
     
-    /// 🚀 GET OPTIMIZED EPSILON BOUND
-    /// Calculate optimal epsilon bound based on segment characteristics
+    /// Get optimized epsilon bound based on segment characteristics
     pub fn get_optimized_epsilon_bound(&self, segment_size: usize) -> usize {
         if segment_size < 100 {
             // Small segments - use smaller epsilon
@@ -266,7 +261,6 @@ impl RmiOptimizationConfig {
         }
     }
     
-    /// 🚀 GET PERFORMANCE TARGETS
     /// Get performance targets for optimization
     pub fn get_performance_targets(&self) -> PerformanceTargets {
         PerformanceTargets {
@@ -278,8 +272,6 @@ impl RmiOptimizationConfig {
     }
 }
 
-/// 🚀 PERFORMANCE TARGETS
-/// 
 /// Performance targets for optimization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceTargets {
@@ -289,13 +281,10 @@ pub struct PerformanceTargets {
     pub target_memory_usage_mb: usize,
 }
 
-/// 🚀 CONFIGURATION VALIDATOR
-/// 
-/// Validates configuration parameters
+/// Configuration validator for validating configuration parameters
 pub struct ConfigValidator;
 
 impl ConfigValidator {
-    /// 🚀 VALIDATE ALL CONFIGURATIONS
     /// Validate all configuration parameters
     pub fn validate_all(config: &RmiOptimizationConfig) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -325,11 +314,8 @@ impl ConfigValidator {
     }
 }
 
-/// 🚀 CONFIGURATION HELPER FUNCTIONS
-/// 
-/// Helper functions for working with configuration
+/// Configuration helper functions
 
-/// 🚀 LOAD CONFIGURATION FROM FILE
 /// Load configuration from a JSON file
 pub fn load_config_from_file(path: &str) -> Result<RmiOptimizationConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
@@ -338,7 +324,6 @@ pub fn load_config_from_file(path: &str) -> Result<RmiOptimizationConfig, Box<dy
     Ok(config)
 }
 
-/// 🚀 SAVE CONFIGURATION TO FILE
 /// Save configuration to a JSON file
 pub fn save_config_to_file(config: &RmiOptimizationConfig, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let content = serde_json::to_string_pretty(config)?;
@@ -346,19 +331,17 @@ pub fn save_config_to_file(config: &RmiOptimizationConfig, path: &str) -> Result
     Ok(())
 }
 
-/// 🚀 GET DEFAULT CONFIGURATION PATH
 /// Get the default configuration file path
 pub fn get_default_config_path() -> String {
     "kyrodb_rmi_config.json".to_string()
 }
 
-/// 🚀 CREATE DEFAULT CONFIGURATION FILE
 /// Create a default configuration file
 pub fn create_default_config_file(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let default_path = get_default_config_path();
     let config_path = path.unwrap_or(&default_path);
     let config = RmiOptimizationConfig::default();
     save_config_to_file(&config, config_path)?;
-    println!("🚀 Created default RMI configuration file: {}", config_path);
+    println!("Created default RMI configuration file: {}", config_path);
     Ok(())
 }

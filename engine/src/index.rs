@@ -127,10 +127,8 @@ impl PrimaryIndex {
                     std::sync::atomic::Ordering::SeqCst, 
                     std::sync::atomic::Ordering::SeqCst
                 ).is_ok() {
-                    println!("🚀 Starting single adaptive RMI background maintenance task");
                     Some(ar.clone().start_background_maintenance())
                 } else {
-                    println!("⚠️  Background maintenance already running, skipping duplicate start");
                     None
                 }
             }

@@ -1,4 +1,4 @@
-//! Phase 0: Memory Management & Resource Tracking
+//! Memory Management & Resource Tracking
 //! 
 //! This module implements comprehensive memory management for KyroDB
 //! with allocation tracking, bounded resource usage, and cache eviction.
@@ -55,7 +55,6 @@ struct CachedSnapshot {
     data: Vec<u8>, // Serialized index data
     size: usize,
     last_access: Instant,
-    // generation removed - it was never accessed after being set
 }
 
 /// Buffer pool for reusing memory allocations with proper LRU eviction
@@ -144,7 +143,7 @@ impl MemoryManager {
             return MemoryResult::Success(Vec::new());
         }
         
-        // ENHANCEMENT: Always check pool first, regardless of pressure level
+        // Always check pool first, regardless of pressure level
         if let Ok(buffer) = self.try_from_pool_enhanced(size) {
             self.track_allocation(size);
             return MemoryResult::Success(buffer);
@@ -154,7 +153,7 @@ impl MemoryManager {
         let current_pressure = self.memory_pressure();
         
         if current_pressure == MemoryPressure::High {
-            // ENHANCEMENT: Implement forced eviction under critical pressure
+            // Implement forced eviction under critical pressure
             if let Ok(_) = self.force_eviction(size) {
                 // Try pool again after forced eviction
                 if let Ok(buffer) = self.try_from_pool_enhanced(size) {

@@ -30,13 +30,13 @@ pub const CMD_PUT: u8 = 0x03;
 pub const CMD_BATCH_PUT: u8 = 0x04;
 pub const CMD_PING: u8 = 0xFF;
 
-/// 🚀 BINARY PROTOCOL TCP SERVER: Maximum performance entry point
+/// Binary protocol TCP server entry point
 pub async fn binary_protocol_server(
     log: Arc<PersistentEventLog>, 
     bind_addr: String
 ) -> Result<()> {
     let listener = TcpListener::bind(&bind_addr).await?;
-    tracing::info!("⚡ Binary protocol server listening on {}", bind_addr);
+    tracing::info!("Binary protocol server listening on {}", bind_addr);
     
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -45,7 +45,7 @@ pub async fn binary_protocol_server(
         // Spawn connection handler
         tokio::spawn(async move {
             if let Err(e) = handle_binary_connection(stream, log_clone).await {
-                eprintln!("📡 Connection {} error: {}", peer_addr, e);
+                eprintln!("Connection {} error: {}", peer_addr, e);
             }
         });
     }
@@ -56,7 +56,7 @@ async fn handle_binary_connection(
     stream: TcpStream,
     log: Arc<PersistentEventLog>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("📡 Binary protocol client connected: {}", stream.peer_addr()?);
+    println!("Binary protocol client connected: {}", stream.peer_addr()?);
     
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -70,12 +70,12 @@ async fn handle_binary_connection(
                 match response {
                     Ok(response_data) => {
                         if let Err(e) = write_response(&mut writer, response_data).await {
-                            eprintln!("📡 Write error: {}", e);
+                            eprintln!("Write error: {}", e);
                             break;
                         }
                     }
                     Err(e) => {
-                        eprintln!("📡 Frame processing error: {}", e);
+                        eprintln!("Frame processing error: {}", e);
                         // Send error response
                         let mut error_response = BytesMut::with_capacity(8);
                         error_response.put_u32_le(MAGIC);
@@ -86,17 +86,17 @@ async fn handle_binary_connection(
                 }
             }
             Err(e) => {
-                eprintln!("📡 Frame read error: {}", e);
+                eprintln!("Frame read error: {}", e);
                 break;
             }
         }
     }
     
-    println!("📡 Binary protocol client disconnected");
+    println!("Binary protocol client disconnected");
     Ok(())
 }
 
-/// 🚀 FRAME READER: Efficient frame boundary detection
+/// Frame reader for efficient frame boundary detection
 async fn read_frame(
     reader: &mut BufReader<OwnedReadHalf>, 
     buffer: &mut BytesMut
@@ -136,7 +136,7 @@ async fn read_frame(
     Ok(buffer.split())
 }
 
-/// 🚀 FRAME PROCESSOR: High-performance command dispatch
+/// Frame processor for high-performance command dispatch
 async fn process_frame(
     mut frame: BytesMut, 
     log: &Arc<PersistentEventLog>
@@ -163,7 +163,7 @@ async fn process_frame(
     }
 }
 
-/// 🚀 ENHANCED BATCH LOOKUP: Ultra-optimized SIMD batch processing
+/// Enhanced batch lookup with SIMD optimization
 async fn process_batch_lookup(
     mut payload: BytesMut, 
     log: &Arc<PersistentEventLog>
@@ -174,7 +174,7 @@ async fn process_batch_lookup(
         return Err(anyhow::anyhow!("Batch too large: {} keys", num_keys));
     }
     
-    // 🚀 ZERO-COPY KEY EXTRACTION with SIMD optimization
+    // Zero-copy key extraction with SIMD optimization
     let mut keys = Vec::with_capacity(num_keys);
     for _ in 0..num_keys {
         if payload.len() < 8 {
@@ -183,25 +183,21 @@ async fn process_batch_lookup(
         keys.push(payload.get_u64_le());
     }
     
-    // 🚀 ULTRA-FAST SIMD BATCH LOOKUP: Use enhanced RMI optimizations
+    // Ultra-fast SIMD batch lookup using enhanced RMI optimizations
     let start_time = std::time::Instant::now();
     let results = log.lookup_keys_ultra_batch(&keys);
     let _lookup_duration = start_time.elapsed();
     
-    // 🚀 PERFORMANCE METRICS: Record lookup performance
-    // TODO: Implement performance metrics recording
-    // if let Some(metrics) = log.get_performance_metrics() {
-    //     metrics.record_batch_lookup_performance(num_keys, lookup_duration);
-    // }
+    // Performance metrics recording (TODO: implement)
     
-    // 🚀 EFFICIENT RESPONSE ENCODING with zero-copy optimization
+    // Efficient response encoding with zero-copy optimization
     let mut response = BytesMut::with_capacity(8 + results.len() * 17);
     
     // Response header: [MAGIC: u32][NUM_RESULTS: u32]
     response.put_u32_le(MAGIC);
     response.put_u32_le(results.len() as u32);
     
-    // 🚀 VECTORIZED RESPONSE ENCODING: Process results in chunks
+    // Vectorized response encoding: process results in chunks
     for chunk in results.chunks(16) {
         for (key, value_opt) in chunk {
             response.put_u64_le(*key);
@@ -221,25 +217,21 @@ async fn process_batch_lookup(
     Ok(response)
 }
 
-/// 🚀 ENHANCED SINGLE LOOKUP: Ultra-fast single key lookup with RMI optimizations
+/// Enhanced single lookup with RMI optimizations
 async fn process_single_lookup(
     mut payload: BytesMut, 
     log: &Arc<PersistentEventLog>
 ) -> Result<BytesMut> {
     let key = payload.get_u64_le();
     
-    // 🚀 ULTRA-FAST SINGLE LOOKUP: Use cache-optimized RMI lookup
+    // Ultra-fast single lookup using cache-optimized RMI lookup
     let start_time = std::time::Instant::now();
     let result = log.lookup_key_ultra_fast(key);
     let _lookup_duration = start_time.elapsed();
     
-    // 🚀 PERFORMANCE METRICS: Record single lookup performance
-    // TODO: Implement performance metrics recording
-    // if let Some(metrics) = log.get_performance_metrics() {
-    //     metrics.record_single_lookup_performance(lookup_duration);
-    // }
+    // Performance metrics recording (TODO: implement)
     
-    // 🚀 EFFICIENT RESPONSE ENCODING
+    // Efficient response encoding
     let mut response = BytesMut::with_capacity(17);
     response.put_u32_le(MAGIC);
     response.put_u64_le(key);
@@ -258,7 +250,7 @@ async fn process_single_lookup(
     Ok(response)
 }
 
-/// 🚀 ENHANCED SINGLE PUT: Maximum write performance with RMI optimizations
+/// Enhanced single put with RMI optimizations
 async fn process_put(
     mut payload: BytesMut, 
     log: &Arc<PersistentEventLog>
@@ -272,16 +264,12 @@ async fn process_put(
     
     let value = payload.split_to(value_len).to_vec();
     
-    // 🚀 DIRECT ENGINE CALL: Bypass HTTP overhead with RMI optimization
+    // Direct engine call bypassing HTTP overhead with RMI optimization
     let start_time = std::time::Instant::now();
     let offset = log.append_kv(Uuid::new_v4(), key, value).await?;
     let _write_duration = start_time.elapsed();
     
-    // 🚀 PERFORMANCE METRICS: Record write performance
-    // TODO: Implement performance metrics recording
-    // if let Some(metrics) = log.get_performance_metrics() {
-    //     metrics.record_write_performance(write_duration);
-    // }
+    // Performance metrics recording (TODO: implement)
     
     // Response: [MAGIC: u32][offset: u64]
     let mut response = BytesMut::with_capacity(12);
@@ -291,7 +279,7 @@ async fn process_put(
     Ok(response)
 }
 
-/// 🚀 BATCH PUT: Maximum insert throughput
+/// Batch put for maximum insert throughput
 async fn process_batch_put(
     mut payload: BytesMut, 
     log: &Arc<PersistentEventLog>
@@ -302,7 +290,7 @@ async fn process_batch_put(
         return Err(anyhow::anyhow!("Batch too large: {} items", num_items));
     }
     
-    // 🚀 BULK EXTRACTION: Process all items efficiently
+    // Bulk extraction: process all items efficiently
     let mut items = Vec::with_capacity(num_items);
     
     for _ in 0..num_items {
@@ -321,7 +309,7 @@ async fn process_batch_put(
         items.push((key, value));
     }
     
-    // 🚀 BATCH ENGINE CALLS: Use group commit optimization
+    // Batch engine calls using group commit optimization
     let mut offsets = Vec::with_capacity(items.len());
     for (key, value) in items {
         let offset = log.append_kv(Uuid::new_v4(), key, value).await?;
@@ -340,7 +328,7 @@ async fn process_batch_put(
     Ok(response)
 }
 
-/// 🚀 PING HANDLER: Keepalive support
+/// Ping handler for keepalive support
 async fn process_ping() -> Result<BytesMut> {
     let mut response = BytesMut::with_capacity(8);
     response.put_u32_le(MAGIC);
@@ -348,7 +336,7 @@ async fn process_ping() -> Result<BytesMut> {
     Ok(response)
 }
 
-/// 🚀 RESPONSE WRITER: Efficient response transmission
+/// Response writer for efficient response transmission
 async fn write_response(
     writer: &mut BufWriter<OwnedWriteHalf>, 
     response: BytesMut
