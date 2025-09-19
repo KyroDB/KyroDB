@@ -965,13 +965,31 @@ fn create_ultra_fast_lookup_routes(
             })
     };
 
-    // 🚀 BATCH LOOKUP: /v1/lookup_batch
+    // 🚀 BATCH LOOKUP: /v1/lookup_batch - Support both array and object formats
     let lookup_batch = {
         let log = log.clone();
         v1.and(warp::path("lookup_batch"))
             .and(warp::post())
             .and(warp::body::json())
-            .map(move |keys: Vec<u64>| {
+            .map(move |body: serde_json::Value| {
+                // Support both formats: [1,2,3] and {"keys": [1,2,3]}
+                let keys: Vec<u64> = if body.is_array() {
+                    // Direct array format: [1,2,3]
+                    body.as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .filter_map(|v| v.as_u64())
+                        .collect()
+                } else if let Some(keys_array) = body.get("keys").and_then(|k| k.as_array()) {
+                    // Object format: {"keys": [1,2,3]}
+                    keys_array
+                        .iter()
+                        .filter_map(|v| v.as_u64())
+                        .collect()
+                } else {
+                    vec![]
+                };
+                
                 let raw_results = log.lookup_keys_ultra_batch(&keys);
                 // Convert to format expected by ultra-fast client: [{"value": "123"}, {"value": null}, ...]
                 let json_results: Vec<serde_json::Value> = raw_results.into_iter().map(|(key, maybe_value)| {
@@ -1207,7 +1225,27 @@ fn create_admin_endpoints(
             })
     };
 
-    snapshot_route.or(rmi_build)
+    // Compaction endpoint (admin operation)
+    let compact_route = {
+        let log = log.clone();
+        v1.and(warp::path("compact"))
+            .and(warp::post())
+            .and_then(move || {
+                let log = log.clone();
+                async move {
+                    match log.compact_keep_latest_and_snapshot_stats().await {
+                        Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::json(
+                            &serde_json::json!({ "compact": "ok", "stats": stats }),
+                        )),
+                        Err(e) => Ok::<_, warp::Rejection>(warp::reply::json(
+                            &serde_json::json!({ "error": e.to_string() }),
+                        )),
+                    }
+                }
+            })
+    };
+
+    snapshot_route.or(rmi_build).or(compact_route)
 }
 
 /// 💊 HEALTH ENDPOINTS: Health checks and diagnostics
