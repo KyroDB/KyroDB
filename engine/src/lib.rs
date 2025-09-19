@@ -1935,7 +1935,7 @@ impl UltraFastBufferPool {
     /// 🚀 POOL HEALTH CHECK: Monitor pool performance
     pub fn health_check(&self) -> PoolHealth {
         let stats = self.stats();
-        
+    
         let health = if stats.cache_hit_rate > 95.0 {
             PoolHealth::Excellent
         } else if stats.cache_hit_rate > 90.0 {

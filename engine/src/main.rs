@@ -11,6 +11,26 @@ use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
 
+/// Custom API error types for HTTP endpoints
+#[derive(Debug)]
+enum ApiError {
+    BadRequest(String),
+    NotFound(String),
+    InternalError(String),
+}
+
+impl warp::reject::Reject for ApiError {}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::BadRequest(msg) => write!(f, "Bad Request: {}", msg),
+            ApiError::NotFound(msg) => write!(f, "Not Found: {}", msg),
+            ApiError::InternalError(msg) => write!(f, "Internal Error: {}", msg),
+        }
+    }
+}
+
 /// Adaptive system load detection for background task throttling
 fn detect_system_load_multiplier() -> u64 {
     let mut load_signals = 0;
@@ -973,63 +993,148 @@ fn create_legacy_endpoints(
 ) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     let v1 = warp::path("v1");
 
-    // PUT endpoint for key-value pairs
+    // PUT endpoint supporting multiple formats:
+    // POST /v1/put {"key": 123, "value": "data"} (JSON body)
+    // PUT /v1/put/123/456 (path parameters for numeric values)
     let put_route = {
-        let log = log.clone();
-        v1.and(warp::path("put"))
-            .and(warp::path::param::<u64>())
-            .and(warp::path::param::<u64>())
-            .and(warp::put())
-            .and_then(move |key: u64, value: u64| {
-                let log = log.clone();
-                async move {
-                    let request_id = uuid::Uuid::new_v4();
-                    let record = kyrodb_engine::Record { key, value: value.to_le_bytes().to_vec() };
-                    let payload = bincode::serialize(&record)
-                        .map_err(|_| warp::reject())?;
-                    
-                    let offset = log.append(request_id, payload).await
-                        .map_err(|_| warp::reject())?;
-                    
-                    Ok::<_, warp::Rejection>(warp::reply::with_status(
-                        warp::reply::json(&serde_json::json!({"offset": offset})),
-                        warp::http::StatusCode::CREATED
-                    ))
-                }
-            })
-    };
-
-    // Legacy lookup endpoint with async path  
-    let lookup_route = {
-        let log = log.clone();
-        v1.and(warp::path("lookup"))
-            .and(warp::path::param::<u64>())
-            .and(warp::get())
-            .and_then(move |key: u64| {
-                let log = log.clone();
-                async move {
-                    match log.lookup_key(key).await {
-                        Some(offset) => {
-                            if let Some(payload) = log.get(offset).await {
-                                Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    payload,
-                                    warp::http::StatusCode::OK
-                                ))
-                            } else {
-                                Err(warp::reject::not_found())
-                            }
-                        }
-                        None => Err(warp::reject::not_found())
+        // JSON body version: POST /v1/put with JSON {"key": u64, "value": string}
+        let put_json = {
+            let log = log.clone();
+            v1.and(warp::path("put"))
+                .and(warp::path::end())
+                .and(warp::post())
+                .and(warp::body::json())
+                .and_then(move |body: serde_json::Value| {
+                    let log = log.clone();
+                    async move {
+                        let key = body.get("key")
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| warp::reject::custom(ApiError::BadRequest("Missing or invalid 'key' field".to_string())))?;
+                        
+                        let value_data = if let Some(value_str) = body.get("value").and_then(|v| v.as_str()) {
+                            value_str.as_bytes().to_vec()
+                        } else if let Some(value_num) = body.get("value").and_then(|v| v.as_u64()) {
+                            value_num.to_le_bytes().to_vec()
+                        } else {
+                            return Err(warp::reject::custom(ApiError::BadRequest("Missing or invalid 'value' field".to_string())));
+                        };
+                        
+                        let request_id = uuid::Uuid::new_v4();
+                        let record = kyrodb_engine::Record { key, value: value_data };
+                        let payload = bincode::serialize(&record)
+                            .map_err(|_| warp::reject::custom(ApiError::InternalError("Serialization failed".to_string())))?;
+                        
+                        let offset = log.append(request_id, payload).await
+                            .map_err(|_| warp::reject::custom(ApiError::InternalError("Append failed".to_string())))?;
+                        
+                        Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"offset": offset, "key": key})),
+                            warp::http::StatusCode::CREATED
+                        ))
                     }
-                }
-            })
+                })
+        };
+            
+        // Path parameter version: PUT /v1/put/123/456 (numeric key/value)
+        let put_path = {
+            let log = log.clone();
+            v1.and(warp::path("put"))
+                .and(warp::path::param::<u64>())
+                .and(warp::path::param::<u64>())
+                .and(warp::path::end())
+                .and(warp::put())
+                .and_then(move |key: u64, value: u64| {
+                    let log = log.clone();
+                    async move {
+                        let request_id = uuid::Uuid::new_v4();
+                        let record = kyrodb_engine::Record { key, value: value.to_le_bytes().to_vec() };
+                        let payload = bincode::serialize(&record)
+                            .map_err(|_| warp::reject::custom(ApiError::InternalError("Serialization failed".to_string())))?;
+                        
+                        let offset = log.append(request_id, payload).await
+                            .map_err(|_| warp::reject::custom(ApiError::InternalError("Append failed".to_string())))?;
+                        
+                        Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&serde_json::json!({"offset": offset, "key": key, "value": value})),
+                            warp::http::StatusCode::CREATED
+                        ))
+                    }
+                })
+        };
+        
+        put_json.or(put_path)
+    };    // Legacy lookup endpoint supporting both patterns:
+    // GET /v1/lookup?key=123 (query parameter)  
+    // GET /v1/lookup/123 (path parameter)
+    let lookup_route = {
+        // Query parameter version: /v1/lookup?key=123
+        let lookup_query = {
+            let log = log.clone();
+            v1.and(warp::path("lookup"))
+                .and(warp::path::end())
+                .and(warp::query::<std::collections::HashMap<String, String>>())
+                .and(warp::get())
+                .and_then(move |params: std::collections::HashMap<String, String>| {
+                    let log = log.clone();
+                    async move {
+                        let key_str = params.get("key")
+                            .ok_or_else(|| warp::reject::custom(ApiError::BadRequest("Missing 'key' parameter".to_string())))?;
+                        let key: u64 = key_str.parse()
+                            .map_err(|_| warp::reject::custom(ApiError::BadRequest("Invalid key format".to_string())))?;
+                            
+                        match log.lookup_key(key).await {
+                            Some(offset) => {
+                                if let Some(payload) = log.get(offset).await {
+                                    Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                        payload,
+                                        warp::http::StatusCode::OK
+                                    ))
+                                } else {
+                                    Err(warp::reject::not_found())
+                                }
+                            }
+                            None => Err(warp::reject::not_found())
+                        }
+                    }
+                })
+        };
+            
+        // Path parameter version: /v1/lookup/123
+        let lookup_path = {
+            let log = log.clone();
+            v1.and(warp::path("lookup"))
+                .and(warp::path::param::<u64>())
+                .and(warp::path::end())
+                .and(warp::get())
+                .and_then(move |key: u64| {
+                    let log = log.clone();
+                    async move {
+                        match log.lookup_key(key).await {
+                            Some(offset) => {
+                                if let Some(payload) = log.get(offset).await {
+                                    Ok::<_, warp::Rejection>(warp::reply::with_status(
+                                        payload,
+                                        warp::http::StatusCode::OK
+                                    ))
+                                } else {
+                                    Err(warp::reject::not_found())
+                                }
+                            }
+                            None => Err(warp::reject::not_found())
+                        }
+                    }
+                })
+        };
+        
+        lookup_query.or(lookup_path)
     };
 
-    // Fast offset lookup (now using ultra-fast implementation)
+    // Fast offset lookup: GET /v1/lookup_fast/123 (ultra-fast implementation)
     let lookup_fast = {
         let log = log.clone();
         v1.and(warp::path("lookup_fast"))
             .and(warp::path::param::<u64>())
+            .and(warp::path::end())
             .and(warp::get())
             .map(move |key: u64| {
                 if let Some(offset) = log.lookup_key_ultra_fast(key) {
@@ -1107,14 +1212,16 @@ fn create_admin_endpoints(
 
 /// 💊 HEALTH ENDPOINTS: Health checks and diagnostics
 fn create_health_endpoints() -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    // Health check endpoint
-    let health_route = warp::path("health")
+    let v1 = warp::path("v1");
+    
+    // Health check endpoint: GET /v1/health
+    let health_route = v1.and(warp::path("health"))
         .and(warp::get())
         .map(|| {
             warp::reply::json(&serde_json::json!({ "status": "ok" }))
         });
 
-    // Metrics endpoint
+    // Metrics endpoint: GET /metrics (no v1 prefix for Prometheus compatibility)
     let metrics_route = warp::path("metrics")
         .and(warp::get())
         .map(|| {
