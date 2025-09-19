@@ -111,6 +111,58 @@ impl BenchClient {
         }
     }
 
+    pub async fn batch_lookup(&mut self, keys: &[u64], base_url: &str) -> Result<Vec<(u64, Option<u64>)>> {
+        let url = format!("{}/v1/lookup_batch", base_url);
+        
+        // Send keys as numbers, not strings
+        let response = self.http
+            .post(&url)
+            .json(keys)
+            .send()
+            .await?;
+            
+        if response.status().is_success() {
+            // Server returns [{"key": 123, "value": "456"}] format
+            let is_gzipped = response.headers().get("content-encoding").and_then(|h| h.to_str().ok()) == Some("gzip");
+            let response_bytes = response.bytes().await?;
+            let response_text = if is_gzipped {
+                // Decompress gzipped response
+                use flate2::read::GzDecoder;
+                use std::io::Read;
+                let mut decoder = GzDecoder::new(&response_bytes[..]);
+                let mut decompressed = String::new();
+                decoder.read_to_string(&mut decompressed)?;
+                decompressed
+            } else {
+                String::from_utf8(response_bytes.to_vec())?
+            };
+            let json_results: Vec<serde_json::Value> = serde_json::from_str(&response_text)?;
+            let mut results = Vec::new();
+            
+            for item in json_results {
+                if let Some(key) = item.get("key").and_then(|k| k.as_u64()) {
+                    let value_opt = if let Some(value) = item.get("value") {
+                        if value.is_null() {
+                            None
+                        } else if let Some(v) = value.as_str().and_then(|s| s.parse::<u64>().ok()) {
+                            Some(v)
+                        } else if let Some(v) = value.as_u64() {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    results.push((key, value_opt));
+                }
+            }
+            Ok(results)
+        } else {
+            anyhow::bail!("Batch lookup failed: {}", response.status());
+        }
+    }
+
     pub async fn batch_put(&mut self, items: &[(String, String)], _token: Option<&str>, base_url: &str) -> Result<()> {
         // KyroDB doesn't have batch endpoints, so fall back to individual PUTs
         for (key, value) in items {

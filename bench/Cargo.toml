@@ -30,6 +30,7 @@ bb8 = "0.8"  # Async connection pool
 url = "2.5"  # URL parsing for connection pool
 bytes = "1.5"  # Efficient byte handling
 async-trait = "0.1"  # Async traits for connection manager
+flate2 = "1.0"  # Gzip decompression
 
 [build-dependencies]
 # No build dependencies needed for HTTP-only benchmarking

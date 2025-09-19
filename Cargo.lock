@@ -229,6 +229,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
+ "flate2",
  "futures",
  "hdrhistogram",
  "indicatif",

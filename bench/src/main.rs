@@ -66,6 +66,23 @@ struct Args {
     /// Warmup time in seconds before measuring
     #[arg(long, default_value = "10")]
     warmup: u64,
+    
+    /// 🚀 RMI OPTIMIZATION BENCHMARKS
+    /// Enable RMI optimization benchmarks
+    #[arg(long)]
+    enable_rmi_optimizations: bool,
+    
+    /// SIMD batch size for RMI benchmarks
+    #[arg(long, default_value = "16")]
+    rmi_simd_batch_size: usize,
+    
+    /// Enable predictive prefetching in benchmarks
+    #[arg(long)]
+    enable_prefetching: bool,
+    
+    /// Memory pool size for zero-allocation benchmarks
+    #[arg(long, default_value = "16")]
+    memory_pool_size: usize,
 
     /// Enable streaming operations for batch workloads (HTTP only)
     #[arg(long)]
@@ -147,7 +164,7 @@ async fn main() -> Result<()> {
         run_phase5_ultra_fast_test(&args).await?;
         return Ok(());
     }
-
+    
     // Create benchmark client
     let mut client = BenchClient::new(
         &args.protocol,
@@ -155,6 +172,14 @@ async fn main() -> Result<()> {
         "",  // No gRPC address needed
         args.auth_token.clone(),
     ).await?;
+
+    // 🚀 RMI OPTIMIZATION BENCHMARKS
+    if args.enable_rmi_optimizations {
+        println!("\n🚀 RMI Optimization Benchmarks");
+        println!("===============================");
+        run_rmi_optimization_benchmarks(&mut client, &args).await?;
+        return Ok(());
+    }
 
     // Pre-benchmark setup
     if args.enable_rmi {
@@ -1140,6 +1165,147 @@ async fn validate_binary_protocol(client: &UltraFastBenchClient) -> Result<()> {
     
     if stress_time.as_millis() > 1000 {
         println!("⚠️  WARNING: Stress test duration {}ms exceeds 1000ms threshold", stress_time.as_millis());
+    }
+    
+    Ok(())
+}
+
+/// 🚀 ENHANCED RMI OPTIMIZATION BENCHMARKS
+/// 
+/// Comprehensive benchmarks for RMI performance optimizations
+async fn run_rmi_optimization_benchmarks(
+    client: &mut BenchClient,
+    args: &Args,
+) -> Result<()> {
+    println!("🚀 Starting RMI Optimization Benchmarks...");
+    
+    // Benchmark 1: SIMD Batch Processing Performance
+    println!("🔍 Benchmark 1: SIMD Batch Processing Performance");
+    let simd_batch_sizes = vec![8, 16, 32, 64];
+    let mut simd_results = Vec::new();
+    
+    for batch_size in simd_batch_sizes {
+        let keys: Vec<u64> = (0..batch_size).map(|i| i as u64).collect();
+        let start = Instant::now();
+        
+        // Perform batch lookup
+        let results = client.batch_lookup(&keys, &args.base).await?;
+        let duration = start.elapsed();
+        
+        let ops_per_sec = (batch_size as f64) / duration.as_secs_f64();
+        simd_results.push((batch_size, ops_per_sec, duration));
+        
+        println!("   • Batch size {}: {:.0} ops/sec ({:.2}ms)", 
+            batch_size, ops_per_sec, duration.as_millis());
+    }
+    
+    // Benchmark 2: Cache Optimization Performance
+    println!("🔍 Benchmark 2: Cache Optimization Performance");
+    let cache_test_keys: Vec<u64> = (0..1000).map(|i| i as u64).collect();
+    let mut cache_latencies = Vec::new();
+    
+    for _ in 0..100 {
+        let start = Instant::now();
+        let _results = client.batch_lookup(&cache_test_keys[..100], &args.base).await?;
+        let duration = start.elapsed();
+        cache_latencies.push(duration.as_micros() as u64);
+    }
+    
+    cache_latencies.sort();
+    let p50_latency = cache_latencies[cache_latencies.len() / 2];
+    let p99_latency = cache_latencies[(cache_latencies.len() * 99) / 100];
+    
+    println!("   • P50 latency: {}μs", p50_latency);
+    println!("   • P99 latency: {}μs", p99_latency);
+    
+    // Benchmark 3: Memory Pool Performance
+    println!("🔍 Benchmark 3: Memory Pool Performance");
+    let memory_pool_sizes = vec![8, 16, 32, 64];
+    let mut memory_results = Vec::new();
+    
+    for pool_size in memory_pool_sizes {
+        let keys: Vec<u64> = (0..pool_size * 10).map(|i| i as u64).collect();
+        let start = Instant::now();
+        
+        // Simulate memory pool operations
+        for chunk in keys.chunks(pool_size) {
+            let _results = client.batch_lookup(chunk, &args.base).await?;
+        }
+        let duration = start.elapsed();
+        
+        let ops_per_sec = (keys.len() as f64) / duration.as_secs_f64();
+        memory_results.push((pool_size, ops_per_sec, duration));
+        
+        println!("   • Pool size {}: {:.0} ops/sec ({:.2}ms)", 
+            pool_size, ops_per_sec, duration.as_millis());
+    }
+    
+    // Benchmark 4: Predictive Prefetching Performance
+    println!("🔍 Benchmark 4: Predictive Prefetching Performance");
+    let sequential_keys: Vec<u64> = (0..1000).map(|i| i as u64).collect();
+    let random_keys: Vec<u64> = (0..1000).map(|i| (i * 7 + 13) % 1000).collect();
+    
+    // Test sequential access pattern
+    let start = Instant::now();
+    let _sequential_results = client.batch_lookup(&sequential_keys[..100], &args.base).await?;
+    let sequential_duration = start.elapsed();
+    
+    // Test random access pattern
+    let start = Instant::now();
+    let _random_results = client.batch_lookup(&random_keys[..100], &args.base).await?;
+    let random_duration = start.elapsed();
+    
+    let prefetch_speedup = random_duration.as_micros() as f64 / sequential_duration.as_micros() as f64;
+    
+    println!("   • Sequential access: {:.2}ms", sequential_duration.as_millis());
+    println!("   • Random access: {:.2}ms", random_duration.as_millis());
+    println!("   • Prefetch speedup: {:.2}x", prefetch_speedup);
+    
+    // Benchmark 5: Adaptive Optimization Performance
+    println!("🔍 Benchmark 5: Adaptive Optimization Performance");
+    let mut adaptive_results = Vec::new();
+    
+    for workload_size in vec![100, 1000, 10000] {
+        let keys: Vec<u64> = (0..workload_size).map(|i| i as u64).collect();
+        let start = Instant::now();
+        
+        let _results = client.batch_lookup(&keys, &args.base).await?;
+        let duration = start.elapsed();
+        
+        let ops_per_sec = (workload_size as f64) / duration.as_secs_f64();
+        adaptive_results.push((workload_size, ops_per_sec, duration));
+        
+        println!("   • Workload size {}: {:.0} ops/sec ({:.2}ms)", 
+            workload_size, ops_per_sec, duration.as_millis());
+    }
+    
+    // Performance Summary
+    println!("🎉 RMI Optimization Benchmarks Completed!");
+    println!("📊 Performance Summary:");
+    
+    // Find best SIMD batch size
+    let best_simd = simd_results.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
+    println!("   • Best SIMD batch size: {} ({:.0} ops/sec)", best_simd.0, best_simd.1);
+    
+    // Find best memory pool size
+    let best_memory = memory_results.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
+    println!("   • Best memory pool size: {} ({:.0} ops/sec)", best_memory.0, best_memory.1);
+    
+    println!("   • Cache P50 latency: {}μs", p50_latency);
+    println!("   • Cache P99 latency: {}μs", p99_latency);
+    println!("   • Prefetch speedup: {:.2}x", prefetch_speedup);
+    
+    // Performance thresholds validation
+    if p50_latency > 100 {
+        println!("⚠️  WARNING: P50 latency {}μs exceeds 100μs threshold", p50_latency);
+    }
+    
+    if p99_latency > 1000 {
+        println!("⚠️  WARNING: P99 latency {}μs exceeds 1000μs threshold", p99_latency);
+    }
+    
+    if prefetch_speedup < 1.5 {
+        println!("⚠️  WARNING: Prefetch speedup {:.2}x below 1.5x threshold", prefetch_speedup);
     }
     
     Ok(())

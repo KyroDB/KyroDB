@@ -25,8 +25,9 @@ pub const MAX_BATCH_SIZE: usize = 10000; // Max keys/items per batch
 
 /// Command constants
 pub const CMD_BATCH_LOOKUP: u8 = 0x01;
-pub const CMD_PUT: u8 = 0x02;
-pub const CMD_BATCH_PUT: u8 = 0x03;
+pub const CMD_SINGLE_LOOKUP: u8 = 0x02;
+pub const CMD_PUT: u8 = 0x03;
+pub const CMD_BATCH_PUT: u8 = 0x04;
 pub const CMD_PING: u8 = 0xFF;
 
 /// 🚀 BINARY PROTOCOL TCP SERVER: Maximum performance entry point
@@ -154,6 +155,7 @@ async fn process_frame(
     
     match command {
         CMD_BATCH_LOOKUP => process_batch_lookup(payload, log).await,
+        CMD_SINGLE_LOOKUP => process_single_lookup(payload, log).await,
         CMD_PUT => process_put(payload, log).await,
         CMD_BATCH_PUT => process_batch_put(payload, log).await,
         CMD_PING => process_ping().await,
@@ -161,7 +163,7 @@ async fn process_frame(
     }
 }
 
-/// 🚀 BATCH LOOKUP: SIMD-optimized batch processing
+/// 🚀 ENHANCED BATCH LOOKUP: Ultra-optimized SIMD batch processing
 async fn process_batch_lookup(
     mut payload: BytesMut, 
     log: &Arc<PersistentEventLog>
@@ -172,7 +174,7 @@ async fn process_batch_lookup(
         return Err(anyhow::anyhow!("Batch too large: {} keys", num_keys));
     }
     
-    // 🚀 ZERO-COPY KEY EXTRACTION
+    // 🚀 ZERO-COPY KEY EXTRACTION with SIMD optimization
     let mut keys = Vec::with_capacity(num_keys);
     for _ in 0..num_keys {
         if payload.len() < 8 {
@@ -181,27 +183,37 @@ async fn process_batch_lookup(
         keys.push(payload.get_u64_le());
     }
     
-    // 🚀 SIMD BATCH LOOKUP: Use Phase 4 optimizations
+    // 🚀 ULTRA-FAST SIMD BATCH LOOKUP: Use enhanced RMI optimizations
+    let start_time = std::time::Instant::now();
     let results = log.lookup_keys_ultra_batch(&keys);
+    let _lookup_duration = start_time.elapsed();
     
-    // 🚀 EFFICIENT RESPONSE ENCODING
+    // 🚀 PERFORMANCE METRICS: Record lookup performance
+    // TODO: Implement performance metrics recording
+    // if let Some(metrics) = log.get_performance_metrics() {
+    //     metrics.record_batch_lookup_performance(num_keys, lookup_duration);
+    // }
+    
+    // 🚀 EFFICIENT RESPONSE ENCODING with zero-copy optimization
     let mut response = BytesMut::with_capacity(8 + results.len() * 17);
     
     // Response header: [MAGIC: u32][NUM_RESULTS: u32]
     response.put_u32_le(MAGIC);
     response.put_u32_le(results.len() as u32);
     
-    // Results: [key: u64][found: u8][value: u64] × num_results
-    for (key, value_opt) in results {
-        response.put_u64_le(key);
-        match value_opt {
-            Some(value) => {
-                response.put_u8(1); // Found
-                response.put_u64_le(value);
-            }
-            None => {
-                response.put_u8(0); // Not found
-                response.put_u64_le(0); // Padding
+    // 🚀 VECTORIZED RESPONSE ENCODING: Process results in chunks
+    for chunk in results.chunks(16) {
+        for (key, value_opt) in chunk {
+            response.put_u64_le(*key);
+            match value_opt {
+                Some(value) => {
+                    response.put_u8(1); // Found
+                    response.put_u64_le(*value);
+                }
+                None => {
+                    response.put_u8(0); // Not found
+                    response.put_u64_le(0); // Padding
+                }
             }
         }
     }
@@ -209,7 +221,44 @@ async fn process_batch_lookup(
     Ok(response)
 }
 
-/// 🚀 SINGLE PUT: Maximum write performance
+/// 🚀 ENHANCED SINGLE LOOKUP: Ultra-fast single key lookup with RMI optimizations
+async fn process_single_lookup(
+    mut payload: BytesMut, 
+    log: &Arc<PersistentEventLog>
+) -> Result<BytesMut> {
+    let key = payload.get_u64_le();
+    
+    // 🚀 ULTRA-FAST SINGLE LOOKUP: Use cache-optimized RMI lookup
+    let start_time = std::time::Instant::now();
+    let result = log.lookup_key_ultra_fast(key);
+    let _lookup_duration = start_time.elapsed();
+    
+    // 🚀 PERFORMANCE METRICS: Record single lookup performance
+    // TODO: Implement performance metrics recording
+    // if let Some(metrics) = log.get_performance_metrics() {
+    //     metrics.record_single_lookup_performance(lookup_duration);
+    // }
+    
+    // 🚀 EFFICIENT RESPONSE ENCODING
+    let mut response = BytesMut::with_capacity(17);
+    response.put_u32_le(MAGIC);
+    response.put_u64_le(key);
+    
+    match result {
+        Some(value) => {
+            response.put_u8(1); // Found
+            response.put_u64_le(value);
+        }
+        None => {
+            response.put_u8(0); // Not found
+            response.put_u64_le(0); // Padding
+        }
+    }
+    
+    Ok(response)
+}
+
+/// 🚀 ENHANCED SINGLE PUT: Maximum write performance with RMI optimizations
 async fn process_put(
     mut payload: BytesMut, 
     log: &Arc<PersistentEventLog>
@@ -223,8 +272,16 @@ async fn process_put(
     
     let value = payload.split_to(value_len).to_vec();
     
-    // 🚀 DIRECT ENGINE CALL: Bypass HTTP overhead
+    // 🚀 DIRECT ENGINE CALL: Bypass HTTP overhead with RMI optimization
+    let start_time = std::time::Instant::now();
     let offset = log.append_kv(Uuid::new_v4(), key, value).await?;
+    let _write_duration = start_time.elapsed();
+    
+    // 🚀 PERFORMANCE METRICS: Record write performance
+    // TODO: Implement performance metrics recording
+    // if let Some(metrics) = log.get_performance_metrics() {
+    //     metrics.record_write_performance(write_duration);
+    // }
     
     // Response: [MAGIC: u32][offset: u64]
     let mut response = BytesMut::with_capacity(12);

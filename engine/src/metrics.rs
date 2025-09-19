@@ -558,6 +558,76 @@ pub static BINARY_SIMD_SPEEDUP_RATIO: Lazy<Histogram> = Lazy::new(|| {
         .expect("register kyrodb_binary_simd_speedup_ratio")
 });
 
+// 🚀 ENHANCED RMI PERFORMANCE METRICS
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_rmi_batch_lookup_latency_seconds",
+        "RMI batch lookup latency in seconds",
+    )
+    .buckets(vec![
+        0.000_001, 0.000_005, 0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001, 0.005, 0.01,
+    ]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_rmi_batch_lookup_latency_seconds")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_SINGLE_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new(
+        "kyrodb_rmi_single_lookup_latency_seconds",
+        "RMI single lookup latency in seconds",
+    )
+    .buckets(vec![
+        0.000_000_1, 0.000_000_5, 0.000_001, 0.000_005, 0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001,
+    ]);
+    prometheus::register_histogram!(opts).expect("register kyrodb_rmi_single_lookup_latency_seconds")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_SIMD_BATCH_SIZE: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_simd_batch_size",
+        "Current SIMD batch size for RMI operations"
+    )
+    .expect("register kyrodb_rmi_simd_batch_size")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_CACHE_HIT_RATE: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_cache_hit_rate",
+        "RMI cache hit rate percentage"
+    )
+    .expect("register kyrodb_rmi_cache_hit_rate")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_PREFETCH_EFFECTIVENESS: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_prefetch_effectiveness",
+        "RMI prefetch effectiveness percentage"
+    )
+    .expect("register kyrodb_rmi_prefetch_effectiveness")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_MEMORY_POOL_USAGE: Lazy<Gauge> = Lazy::new(|| {
+    prometheus::register_gauge!(
+        "kyrodb_rmi_memory_pool_usage",
+        "RMI memory pool usage percentage"
+    )
+    .expect("register kyrodb_rmi_memory_pool_usage")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_ADAPTIVE_OPTIMIZATIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_rmi_adaptive_optimizations_total",
+        "Total number of adaptive optimizations applied"
+    )
+    .expect("register kyrodb_rmi_adaptive_optimizations_total")
+});
+
 // === BINARY PROTOCOL METRIC HELPER FUNCTIONS ===
 
 /// Register binary protocol metrics with the global Prometheus registry
@@ -643,6 +713,15 @@ mod binary_protocol_shim {
     pub static BINARY_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static BINARY_FRAME_SIZE_BYTES: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static BINARY_SIMD_SPEEDUP_RATIO: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    
+    // 🚀 ENHANCED RMI PERFORMANCE METRICS
+    pub static RMI_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static RMI_SINGLE_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static RMI_SIMD_BATCH_SIZE: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static RMI_CACHE_HIT_RATE: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static RMI_PREFETCH_EFFECTIVENESS: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static RMI_MEMORY_POOL_USAGE: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
+    pub static RMI_ADAPTIVE_OPTIMIZATIONS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
 }
 
 #[cfg(feature = "bench-no-metrics")]

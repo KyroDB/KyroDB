@@ -39,6 +39,8 @@ pub mod metrics;
 pub mod memory;
 #[cfg(feature = "learned-index")]
 pub mod adaptive_rmi;
+#[cfg(feature = "learned-index")]
+pub mod rmi_config;
 
 // Export main types for public API
 pub use PersistentEventLog as KyroDb;  // Alias for backward compatibility with tests
