@@ -439,385 +439,6 @@ async fn main() -> Result<()> {
             println!("📍 Data directory: {}", cli.data_dir);
             println!("💾 Full throttle - no rate limiting, no authentication");
 
-            // Core HTTP API endpoints
-            let v1 = warp::path("v1");
-
-            // Health check endpoint
-            let health_route = warp::path("health")
-                .and(warp::get())
-                .map(|| warp::reply::json(&serde_json::json!({ "status": "ok" })));
-
-            // Build info endpoint
-            let build_info_route = warp::path("build_info").and(warp::get()).map({
-                let commit = build_commit;
-                let features = build_features;
-                let branch = option_env!("GIT_BRANCH").unwrap_or("unknown");
-                let build_time = option_env!("BUILD_TIME").unwrap_or("unknown");
-                let rust_version = option_env!("RUST_VERSION").unwrap_or("unknown");
-                let target_triple = option_env!("TARGET_TRIPLE").unwrap_or("unknown");
-                move || {
-                    warp::reply::json(&serde_json::json!({
-                        "commit": commit,
-                        "branch": branch,
-                        "build_time": build_time,
-                        "rust_version": rust_version,
-                        "target_triple": target_triple,
-                        "features": features,
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "name": env!("CARGO_PKG_NAME"),
-                    }))
-                }
-            });
-
-            // Offset endpoint
-            let offset_log = log.clone();
-            let offset_route = v1
-                .and(warp::path("offset"))
-                .and(warp::get())
-                .and_then(move || {
-                    let log = offset_log.clone();
-                    async move {
-                        let off = log.get_offset().await;
-                        Ok::<_, warp::Rejection>(warp::reply::json(
-                            &serde_json::json!({ "offset": off }),
-                        ))
-                    }
-                });
-
-            // KV PUT: POST /v1/put { key: u64, value: string }
-            let put_log = log.clone();
-            let put_route = v1
-                .and(warp::path("put"))
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = put_log.clone();
-                    async move {
-                        let key = body["key"].as_u64().unwrap_or(0);
-                        let value = body["value"].as_str().unwrap_or("").as_bytes().to_vec();
-                        match log.append_kv(Uuid::new_v4(), key, value).await {
-                            Ok(off) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "offset": off })),
-                                StatusCode::OK,
-                            )),
-                            Err(e) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "error": e.to_string() })),
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )),
-                        }
-                    }
-                });
-
-            // Binary PUT: POST /v1/put_fast/{key} with raw bytes body - maximum performance
-            let put_fast_log = log.clone();
-            let put_fast_route = v1
-                .and(warp::path!("put_fast" / u64))
-                .and(warp::post())
-                .and(warp::body::bytes())
-                .and_then(move |key: u64, body: bytes::Bytes| {
-                    let log = put_fast_log.clone();
-                    async move {
-                        match log.append_kv(Uuid::new_v4(), key, body.to_vec()).await {
-                            Ok(off) => {
-                                let response = off.to_le_bytes().to_vec();
-                                Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::with_header(
-                                        response,
-                                        "Content-Type", "application/octet-stream"
-                                    ),
-                                    StatusCode::OK,
-                                ))
-                            },
-                            Err(_) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
-                                warp::reply::with_header(
-                                    "error".as_bytes().to_vec(),
-                                    "Content-Type", "application/octet-stream"
-                                ),
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            )),
-                        }
-                    }
-                });
-
-            // Simple lookup by key: GET /v1/lookup?key=123
-            let lookup_log = log.clone();
-            let lookup_route = v1
-                .and(warp::path("lookup"))
-                .and(warp::get())
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and_then(move |q: std::collections::HashMap<String, String>| {
-                    let log = lookup_log.clone();
-                    async move {
-                        if let Some(k) = q.get("key").and_then(|s| s.parse::<u64>().ok()) {
-                            if let Some(offset) = log.lookup_key(k).await {
-                                if let Some(bytes) = log.get(offset).await {
-                                    if let Ok(rec) =
-                                        bincode::deserialize::<kyrodb_engine::Record>(&bytes)
-                                    {
-                                        return Ok::<_, warp::Rejection>(warp::reply::json(
-                                            &serde_json::json!({
-                                                "key": rec.key,
-                                                "value": String::from_utf8_lossy(&rec.value)
-                                            }),
-                                        ));
-                                    }
-                                }
-                            } else if let Some((_, rec)) = log.find_key_scan(k).await {
-                                return Ok::<_, warp::Rejection>(warp::reply::json(
-                                    &serde_json::json!({
-                                        "key": rec.key,
-                                        "value": String::from_utf8_lossy(&rec.value)
-                                    }),
-                                ));
-                            }
-                        }
-                        let not_found = serde_json::json!({"error":"not found"});
-                        Ok::<_, warp::Rejection>(warp::reply::json(&not_found))
-                    }
-                });
-
-            // Fast lookup endpoints for maximum performance
-            let lookup_fast_log = log.clone();
-            let lookup_fast = v1
-                .and(warp::path!("lookup_fast" / u64))
-                .and(warp::get())
-                .and_then(move |k: u64| {
-                    let log = lookup_fast_log.clone();
-                    async move {
-                        if let Some(off) = log.lookup_key(k).await {
-                            let body = off.to_le_bytes().to_vec();
-                            let resp = warp::http::Response::builder()
-                                .status(StatusCode::OK)
-                                .header("Content-Type", "application/octet-stream")
-                                .body(body)
-                                .map_err(|_| warp::reject::reject())?;
-                            return Ok::<_, warp::Rejection>(resp);
-                        }
-                        let resp = warp::http::Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Vec::new())
-                            .map_err(|_| warp::reject::reject())?;
-                        Ok::<_, warp::Rejection>(resp)
-                    }
-                });
-
-            let get_fast_log = log.clone();
-            let get_fast = v1
-                .and(warp::path!("get_fast" / u64))
-                .and(warp::get())
-                .and_then(move |k: u64| {
-                    let log = get_fast_log.clone();
-                    async move {
-                        if let Some(off) = log.lookup_key(k).await {
-                            if let Some(bytes) = log.get(off).await {
-                                if let Ok(rec) =
-                                    bincode::deserialize::<kyrodb_engine::Record>(&bytes)
-                                {
-                                    let resp = warp::http::Response::builder()
-                                        .status(StatusCode::OK)
-                                        .header("Content-Type", "application/octet-stream")
-                                        .body(rec.value)
-                                        .map_err(|_| warp::reject::reject())?;
-                                    return Ok::<_, warp::Rejection>(resp);
-                                }
-                            }
-                        }
-                        let resp = warp::http::Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Vec::new())
-                            .map_err(|_| warp::reject::reject())?;
-                        Ok::<_ ,warp::Rejection>(resp)
-                    }
-                });
-
-            // Snapshot endpoint
-            let snapshot_log = log.clone();
-            let snapshot_route =
-                v1.and(warp::path("snapshot"))
-                    .and(warp::post())
-                    .and_then(move || {
-                        let log = snapshot_log.clone();
-                        async move {
-                            if let Err(e) = log.snapshot().await {
-                                eprintln!("❌ Snapshot failed: {}", e);
-                                return Ok::<_ ,warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::json(
-                                        &serde_json::json!({ "error": e.to_string() }),
-                                    ),
-                                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                ));
-                            }
-                            Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&serde_json::json!({ "snapshot": "ok" })),
-                                StatusCode::OK,
-                            ))
-                        }
-                    });
-
-            // Compaction endpoint
-            let compact_log = log.clone();
-            let compact_route =
-                v1.and(warp::path("compact"))
-                    .and(warp::post())
-                    .and_then(move || {
-                        let log = compact_log.clone();
-                        async move {
-                            match log.compact_keep_latest_and_snapshot_stats().await {
-                                Ok(stats) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::json(
-                                        &serde_json::json!({ "compact": "ok", "stats": stats }),
-                                    ),
-                                    StatusCode::OK,
-                                )),
-                                Err(e) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
-                                    warp::reply::json(
-                                        &serde_json::json!({ "error": e.to_string() }),
-                                    ),
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                )),
-                            }
-                        }
-                    });
-
-            // RMI build endpoint (feature-gated)
-            #[cfg(feature = "learned-index")]
-            let rmi_build = {
-                let data_dir = cli.data_dir.clone();
-                let build_log = log.clone();
-                v1.and(warp::path!("rmi" / "build"))
-                    .and(warp::post())
-                    .and_then(move || {
-                        let log = build_log.clone();
-                        let _data_dir = data_dir.clone();
-                        async move {
-                            let pairs = log.collect_key_offset_pairs().await;
-                            let timer =
-                                engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
-                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
-                            engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                            
-                            // Build new AdaptiveRMI from current data
-                            let new_index = engine_crate::index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
-                            
-                            // Swap to the new index
-                            log.swap_primary_index(new_index).await;
-                            
-                            let ok = true; // AdaptiveRMI build always succeeds
-                            
-                            timer.observe_duration();
-                            engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
-                            Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({
-                                "ok": ok,
-                                "count": pairs.len()
-                            })))
-                        }
-                    })
-            };
-
-            #[cfg(not(feature = "learned-index"))]
-            let rmi_build = {
-                v1.and(warp::path!("rmi" / "build"))
-                    .and(warp::post())
-                    .map(|| {
-                        warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({
-                                "error": "learned-index feature not enabled"
-                            })),
-                            StatusCode::NOT_IMPLEMENTED,
-                        )
-                    })
-            };
-
-            // Cache warmup endpoint
-            let warmup_log = log.clone();
-            let warmup = v1
-                .and(warp::path("warmup"))
-                .and(warp::post())
-                .and_then(move || {
-                    let log = warmup_log.clone();
-                    async move {
-                        log.warmup().await;
-                        Ok::<_, warp::Rejection>(warp::reply::json(
-                            &serde_json::json!({ "warmup": "ok" }),
-                        ))
-                    }
-                });
-
-            // Metrics endpoint
-            let metrics_route = warp::path("metrics")
-                .and(warp::get())
-                .map(|| {
-                    #[cfg(not(feature = "bench-no-metrics"))]
-                    {
-                        let encoder = prometheus::TextEncoder::new();
-                        let metric_families = prometheus::gather();
-                        match encoder.encode_to_string(&metric_families) {
-                            Ok(output) => warp::reply::with_header(
-                                output,
-                                "Content-Type",
-                                "text/plain; version=0.0.4",
-                            ),
-                            Err(_) => warp::reply::with_header(
-                                "# Metrics encoding failed".to_string(),
-                                "Content-Type",
-                                "text/plain",
-                            ),
-                        }
-                    }
-                    #[cfg(feature = "bench-no-metrics")]
-                    {
-                        warp::reply::with_header(
-                            "# Metrics disabled for benchmarking".to_string(),
-                            "Content-Type",
-                            "text/plain",
-                        )
-                    }
-                });
-
-            // Clean routes without rate limiting
-            let routes = put_route
-                .or(put_fast_route)
-                .or(lookup_route)
-                .or(lookup_fast)
-                .or(get_fast)
-                .or(snapshot_route)
-                .or(compact_route)
-                .or(rmi_build)
-                .or(warmup)
-                .or(health_route)
-                .or(build_info_route)
-                .or(metrics_route)
-                .or(offset_route);
-
-            // Simple error recovery
-            let routes = routes.recover(|_rej: warp::Rejection| async move {
-                Ok::<_, std::convert::Infallible>(warp::reply::with_status(
-                    warp::reply::json(&serde_json::json!({"error":"not found"})),
-                    warp::http::StatusCode::NOT_FOUND,
-                ))
-            });
-
-            // Apply compression middleware
-            let routes = routes.with(warp::compression::gzip());
-
-            // Per-request logging (runtime disable via KYRODB_DISABLE_HTTP_LOG=1)
-            let disable_http_log =
-                std::env::var("KYRODB_DISABLE_HTTP_LOG").ok().as_deref() == Some("1");
-            let routes = routes.with(warp::log::custom({
-                move |info: warp::log::Info| {
-                    if disable_http_log {
-                        return;
-                    }
-                    tracing::info!(
-                        target: "kyrodb",
-                        method = %info.method(),
-                        path = info.path(),
-                        status = info.status().as_u16(),
-                        elapsed_ms = info.elapsed().as_millis()
-                    );
-                }
-            }));
-
             // Parse address for unified server
             let addr = (host.parse::<std::net::IpAddr>()?, port);
             let binary_port = port + binary_port_offset; // Configurable port offset
@@ -873,10 +494,11 @@ async fn main() -> Result<()> {
 fn create_unified_routes(
     log: Arc<engine_crate::PersistentEventLog>,
 ) -> impl warp::Filter<Extract = impl warp::Reply, Error = std::convert::Infallible> + Clone {
-    let v1 = warp::path("v1");
+    // 🚀 ULTRA-FAST WRITE ENDPOINTS: High-performance write paths
+    let ultra_fast_write_routes = create_ultra_fast_write_routes(log.clone());
 
     // 🚀 ULTRA-FAST LOOKUP ENDPOINTS: Zero-allocation paths for maximum performance
-    let ultra_fast_routes = create_ultra_fast_lookup_routes(log.clone());
+    let ultra_fast_lookup_routes = create_ultra_fast_lookup_routes(log.clone());
     
     // 📡 LEGACY ENDPOINTS: Existing functionality for compatibility
     let legacy_routes = create_legacy_endpoints(log.clone());
@@ -888,7 +510,8 @@ fn create_unified_routes(
     let health_routes = create_health_endpoints();
 
     // 🔗 COMBINE ALL ROUTES: Ultra-fast takes precedence for overlapping paths
-    let all_routes = ultra_fast_routes
+    let all_routes = ultra_fast_write_routes
+        .or(ultra_fast_lookup_routes)
         .or(legacy_routes)
         .or(admin_routes)
         .or(health_routes);
@@ -924,11 +547,81 @@ fn create_unified_routes(
     routes_with_recovery
 }
 
+/// 🚀 ULTRA-FAST WRITE ROUTES: High-performance write paths
+fn create_ultra_fast_write_routes(
+    log: Arc<engine_crate::PersistentEventLog>,
+) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    let v1 = warp::path("v1");
+
+    // Binary PUT: POST /v1/put_fast/{key} with raw bytes body - maximum performance
+    let put_fast_route = v1
+        .and(warp::path!("put_fast" / u64))
+        .and(warp::post())
+        .and(warp::body::bytes())
+        .and_then(move |key: u64, body: bytes::Bytes| {
+            let log = log.clone();
+            async move {
+                match log.append_kv(Uuid::new_v4(), key, body.to_vec()).await {
+                    Ok(off) => {
+                        let response = off.to_le_bytes().to_vec();
+                        Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::with_header(
+                                response,
+                                "Content-Type", "application/octet-stream"
+                            ),
+                            StatusCode::OK,
+                        ))
+                    },
+                    Err(_) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
+                        warp::reply::with_header(
+                            "error".as_bytes().to_vec(),
+                            "Content-Type", "application/octet-stream"
+                        ),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )),
+                }
+            }
+        });
+    
+    put_fast_route
+}
+
 /// 🚀 ULTRA-FAST LOOKUP ROUTES: Zero-allocation paths for maximum performance
 fn create_ultra_fast_lookup_routes(
     log: Arc<engine_crate::PersistentEventLog>,
 ) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     let v1 = warp::path("v1");
+
+    // 🚀 GET_FAST PATH: /v1/get_fast/{key} - Returns raw bytes for put_fast compatibility
+    let get_fast = {
+        let log = log.clone();
+        v1.and(warp::path("get_fast"))
+            .and(warp::path::param::<u64>())
+            .and(warp::get())
+            .and_then(move |key: u64| {
+                let log = log.clone();
+                async move {
+                    // Use ultra-fast lookup to check hot buffer first
+                    if let Some(offset) = log.lookup_key_ultra_fast(key) {
+                        if let Some(bytes) = log.get(offset).await {
+                            if let Ok(rec) = bincode::deserialize::<kyrodb_engine::Record>(&bytes) {
+                                let resp = warp::http::Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Content-Type", "application/octet-stream")
+                                    .body(rec.value)
+                                    .map_err(|_| warp::reject::reject())?;
+                                return Ok::<_, warp::Rejection>(resp);
+                            }
+                        }
+                    }
+                    let resp = warp::http::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Vec::new())
+                        .map_err(|_| warp::reject::reject())?;
+                    Ok::<_, warp::Rejection>(resp)
+                }
+            })
+    };
 
     // 🚀 ULTRA-FAST PATH: /v1/lookup_ultra/{key}
     let lookup_ultra = {
@@ -1002,7 +695,7 @@ fn create_ultra_fast_lookup_routes(
             })
     };
 
-    lookup_ultra.or(lookup_batch)
+    get_fast.or(lookup_ultra).or(lookup_batch)
 }
 
 ///  LEGACY ENDPOINTS: Existing functionality for compatibility
