@@ -3139,34 +3139,51 @@ impl AdaptiveRMI {
     }
     
     /// 🚀 OPTIMIZED 8-KEY SIMD: True vectorization with minimal overhead
+    /// 
+    /// This function processes 8 keys simultaneously using AVX2 instructions for maximum
+    /// throughput. It implements a three-phase lookup strategy with early exits for
+    /// optimal performance on modern x86_64 processors.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn lookup_8_keys_optimized_simd(&self, keys: &[u64]) -> [Option<u64>; 8] {
         use std::arch::x86_64::*;
         
-        // 🚀 EFFICIENT LOADING: Load keys directly from memory
+        // 🚀 BOUNDS VALIDATION: Enterprise-grade safety
+        if keys.len() < 8 {
+            // Fallback to scalar processing for insufficient keys
+            let mut results = [None; 8];
+            for (i, &key) in keys.iter().enumerate().take(8) {
+                results[i] = self.lookup(key);
+            }
+            return results;
+        }
+        
+        // 🚀 EFFICIENT LOADING: Load 8 keys into 2 AVX2 registers
+        // Each __m256i holds 4 u64 values (256 bits / 64 bits = 4)
         let keys_ptr = keys.as_ptr() as *const __m256i;
-        let keys_lo = _mm256_loadu_si256(keys_ptr);
-        let keys_hi = _mm256_loadu_si256(keys_ptr.add(1));
+        let keys_lo = _mm256_loadu_si256(keys_ptr);         // Keys 0-3
+        let keys_hi = _mm256_loadu_si256(keys_ptr.add(1));  // Keys 4-7
         
-        // 🚀 PIPELINE OPTIMIZATION: Overlap computation phases
+        // 🚀 PIPELINE OPTIMIZATION: Three-phase lookup with early exits
         
-        // Phase 1: Hot buffer (lock-free vectorized)
+        // Phase 1: Hot buffer lookup (highest probability, fastest access)
         let hot_results = self.simd_hot_buffer_lookup(keys_lo, keys_hi);
         
-        // 🚀 EARLY EXIT: If all found in hot buffer, skip remaining phases
-        if hot_results.iter().all(|r| r.is_some()) {
+        // 🚀 PERFORMANCE OPTIMIZATION: Early exit if all keys found in hot buffer
+        let hot_found_count = hot_results.iter().filter(|r| r.is_some()).count();
+        if hot_found_count == 8 {
             return hot_results;
         }
         
-        // Phase 2: Overflow buffer (only for missing keys)
+        // Phase 2: Overflow buffer lookup (for recently inserted, unsorted data)
         let overflow_results = self.simd_overflow_buffer_lookup(keys_lo, keys_hi, &hot_results);
         
-        // 🚀 EARLY EXIT: If all found in buffers, skip segment lookup
-        let found_in_buffers = hot_results.iter().zip(overflow_results.iter())
-            .all(|(hot, overflow)| hot.is_some() || overflow.is_some());
+        // 🚀 EARLY EXIT: Check if all keys found in buffers (hot + overflow)
+        let buffer_complete = (0..8).all(|i| {
+            hot_results[i].is_some() || overflow_results[i].is_some()
+        });
         
-        if found_in_buffers {
+        if buffer_complete {
             return [
                 hot_results[0].or(overflow_results[0]),
                 hot_results[1].or(overflow_results[1]),
@@ -3179,9 +3196,11 @@ impl AdaptiveRMI {
             ];
         }
 
+        // Phase 3: Segment lookup (for persistent, sorted data)
         let segment_results = self.simd_segment_lookup(keys_lo, keys_hi, &hot_results, &overflow_results);
         
-        // VECTORIZED RESULT COMBINATION: Efficiently combine results
+        // 🚀 VECTORIZED RESULT COMBINATION: Combine all three phases efficiently
+        // Priority: Hot buffer > Overflow buffer > Segments
         [
             hot_results[0].or(overflow_results[0]).or(segment_results[0]),
             hot_results[1].or(overflow_results[1]).or(segment_results[1]),
@@ -3195,13 +3214,20 @@ impl AdaptiveRMI {
     }
     
     /// 🚀 OPTIMIZED 16-KEY SIMD: True 16-key vectorization with maximum throughput
-    /// Process 16 keys simultaneously using 4 AVX2 registers for optimal performance
+    /// 
+    /// Process 16 keys simultaneously using 4 AVX2 registers for optimal performance.
+    /// This function represents the pinnacle of SIMD optimization for batch key lookups,
+    /// designed to saturate modern CPU pipelines and maximize cache efficiency.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn lookup_16_keys_optimized_simd(&self, keys: &[u64; 16]) -> [Option<u64>; 16] {
         use std::arch::x86_64::*;
         
+        // 🚀 ENTERPRISE SAFETY: Validate input array length at compile time
+        // Array type [u64; 16] ensures exactly 16 keys at compile time
+        
         // 🚀 EFFICIENT LOADING: Load all 16 keys into 4 AVX2 registers
+        // Each __m256i holds 4 u64 values, so 4 registers = 16 keys total
         let keys_ptr = keys.as_ptr() as *const __m256i;
         let keys_0 = _mm256_loadu_si256(keys_ptr);           // Keys 0-3
         let keys_1 = _mm256_loadu_si256(keys_ptr.add(1));    // Keys 4-7  
@@ -3222,8 +3248,9 @@ impl AdaptiveRMI {
             hot_results_4_7[4], hot_results_4_7[5], hot_results_4_7[6], hot_results_4_7[7],
         ];
         
-        // 🚀 EARLY EXIT: If all found in hot buffer, skip remaining phases
-        if hot_results.iter().all(|r| r.is_some()) {
+        // 🚀 PERFORMANCE OPTIMIZATION: Early exit if all 16 keys found in hot buffer
+        let hot_found_count = hot_results.iter().filter(|r| r.is_some()).count();
+        if hot_found_count == 16 {
             return hot_results;
         }
         
@@ -3238,28 +3265,21 @@ impl AdaptiveRMI {
             overflow_results_4_7[4], overflow_results_4_7[5], overflow_results_4_7[6], overflow_results_4_7[7],
         ];
         
-        // 🚀 EARLY EXIT: If all found in buffers, skip segment lookup
-        let found_in_buffers = hot_results.iter().zip(overflow_results.iter())
-            .all(|(hot, overflow)| hot.is_some() || overflow.is_some());
+        // 🚀 EARLY EXIT: Check if all keys found in buffers (hot + overflow)
+        let buffer_complete = (0..16).all(|i| {
+            hot_results[i].is_some() || overflow_results[i].is_some()
+        });
         
-        if found_in_buffers {
+        if buffer_complete {
             return [
-                hot_results[0].or(overflow_results[0]),
-                hot_results[1].or(overflow_results[1]),
-                hot_results[2].or(overflow_results[2]),
-                hot_results[3].or(overflow_results[3]),
-                hot_results[4].or(overflow_results[4]),
-                hot_results[5].or(overflow_results[5]),
-                hot_results[6].or(overflow_results[6]),
-                hot_results[7].or(overflow_results[7]),
-                hot_results[8].or(overflow_results[8]),
-                hot_results[9].or(overflow_results[9]),
-                hot_results[10].or(overflow_results[10]),
-                hot_results[11].or(overflow_results[11]),
-                hot_results[12].or(overflow_results[12]),
-                hot_results[13].or(overflow_results[13]),
-                hot_results[14].or(overflow_results[14]),
-                hot_results[15].or(overflow_results[15]),
+                hot_results[0].or(overflow_results[0]),   hot_results[1].or(overflow_results[1]),
+                hot_results[2].or(overflow_results[2]),   hot_results[3].or(overflow_results[3]),
+                hot_results[4].or(overflow_results[4]),   hot_results[5].or(overflow_results[5]),
+                hot_results[6].or(overflow_results[6]),   hot_results[7].or(overflow_results[7]),
+                hot_results[8].or(overflow_results[8]),   hot_results[9].or(overflow_results[9]),
+                hot_results[10].or(overflow_results[10]), hot_results[11].or(overflow_results[11]),
+                hot_results[12].or(overflow_results[12]), hot_results[13].or(overflow_results[13]),
+                hot_results[14].or(overflow_results[14]), hot_results[15].or(overflow_results[15]),
             ];
         }
         
@@ -3296,85 +3316,109 @@ impl AdaptiveRMI {
     }
     
     /// 🚀 LOCK-FREE SIMD HOT BUFFER LOOKUP: Vectorized hot buffer search
+    /// 
+    /// This function performs vectorized search through the hot buffer using AVX2 instructions.
+    /// It implements a lock-minimization strategy with single atomic snapshot for maximum
+    /// performance and maintains lock-free execution during the actual search phase.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_hot_buffer_lookup(&self, keys_lo: __m256i, keys_hi: __m256i) -> [Option<u64>; 8] {
+        use std::arch::x86_64::*;
+        
         let mut results = [None; 8];
         
-        // 🚀 SINGLE LOCK ACQUISITION: Get all data at once to minimize lock time
+        // 🚀 MINIMAL LOCK TIME: Single atomic snapshot acquisition
+        // Lock strategy: Get all data at once to minimize lock contention
         let buffer_snapshot = {
             let buffer = self.hot_buffer.buffer.lock();
             if buffer.is_empty() {
-                return results; // Early exit if buffer is empty
+                return results; // Early exit for empty buffer
             }
+            
+            // Create snapshot to enable lock-free processing
+            // Clone is necessary to release lock before SIMD processing
             buffer.iter().copied().collect::<Vec<_>>()
-        }; // Lock released immediately
+        }; // 🔒 Lock released immediately after snapshot
         
-        // 🚀 LOCK-FREE VECTORIZED SEARCH: No locks during actual search
-        // Extract all 8 keys first
+        // 🚀 LOCK-FREE VECTORIZED SEARCH: No locks during actual search operations
+        // Extract all 8 keys from SIMD registers for efficient processing
         let keys_array = [
-            _mm256_extract_epi64(keys_lo, 0) as u64,
-            _mm256_extract_epi64(keys_lo, 1) as u64,
-            _mm256_extract_epi64(keys_lo, 2) as u64,
-            _mm256_extract_epi64(keys_lo, 3) as u64,
-            _mm256_extract_epi64(keys_hi, 0) as u64,
-            _mm256_extract_epi64(keys_hi, 1) as u64,
-            _mm256_extract_epi64(keys_hi, 2) as u64,
-            _mm256_extract_epi64(keys_hi, 3) as u64,
+            _mm256_extract_epi64(keys_lo, 0) as u64,  // Key 0
+            _mm256_extract_epi64(keys_lo, 1) as u64,  // Key 1
+            _mm256_extract_epi64(keys_lo, 2) as u64,  // Key 2
+            _mm256_extract_epi64(keys_lo, 3) as u64,  // Key 3
+            _mm256_extract_epi64(keys_hi, 0) as u64,  // Key 4
+            _mm256_extract_epi64(keys_hi, 1) as u64,  // Key 5
+            _mm256_extract_epi64(keys_hi, 2) as u64,  // Key 6
+            _mm256_extract_epi64(keys_hi, 3) as u64,  // Key 7
         ];
         
-        // 🚀 VECTORIZED COMPARISON: Process 4 keys at a time with SIMD comparisons
+        // 🚀 CACHE-EFFICIENT VECTORIZED SEARCH: Process buffer in SIMD-friendly chunks
+        // Strategy: Reverse iteration for temporal locality (recent data first)
         if buffer_snapshot.len() >= 4 {
-            // Process in groups of 4 for better cache efficiency
-            for chunk_start in (0..buffer_snapshot.len()).step_by(4) {
+            // Large buffer: Use SIMD-accelerated search in 4-element chunks
+            for chunk_start in (0..buffer_snapshot.len()).step_by(4).rev() {
                 let chunk_end = (chunk_start + 4).min(buffer_snapshot.len());
                 let chunk = &buffer_snapshot[chunk_start..chunk_end];
                 
                 if chunk.len() >= 4 {
-                    // Load 4 buffer keys into SIMD register
-                    let buffer_keys = _mm256_set_epi64x(
-                        if chunk.len() > 3 { chunk[3].0 as i64 } else { 0 },
-                        if chunk.len() > 2 { chunk[2].0 as i64 } else { 0 },
-                        if chunk.len() > 1 { chunk[1].0 as i64 } else { 0 },
-                        chunk[0].0 as i64
-                    );
+                    // 🚀 VECTORIZED COMPARISON: Process 4 buffer entries simultaneously
+                    let chunk_keys = [chunk[0].0, chunk[1].0, chunk[2].0, chunk[3].0];
+                    let chunk_values = [chunk[0].1, chunk[1].1, chunk[2].1, chunk[3].1];
                     
-                    // Compare each search key against all 4 buffer keys simultaneously
-                    for (i, &search_key) in keys_array.iter().enumerate() {
-                        if results[i].is_some() { continue; } // Already found
-                        
-                        let search_vec = _mm256_set1_epi64x(search_key as i64);
-                        let matches = _mm256_cmpeq_epi64(search_vec, buffer_keys);
-                        let mask = _mm256_movemask_epi8(matches);
-                        
-                        // Check for matches and extract corresponding values
-                        if mask != 0 {
-                            for (j, &(k, v)) in chunk.iter().enumerate() {
-                                if k == search_key {
-                                    results[i] = Some(v);
-                                    break;
-                                }
-                            }
+                    // Load chunk keys into SIMD register
+                    let chunk_keys_vec = _mm256_loadu_si256(chunk_keys.as_ptr() as *const __m256i);
+                    
+                    // Compare each search key against chunk keys
+                    for (result_idx, &search_key) in keys_array.iter().enumerate() {
+                        if results[result_idx].is_some() {
+                            continue; // Skip already found keys
                         }
+                        
+                        // Broadcast search key to all 4 positions
+                        let search_vec = _mm256_set1_epi64x(search_key as i64);
+                        
+                        // Compare search key against all 4 chunk keys simultaneously
+                        let cmp_result = _mm256_cmpeq_epi64(search_vec, chunk_keys_vec);
+                        
+                        // Extract comparison mask and check for matches
+                        let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp_result));
+                        
+                        // Check each bit in mask for matches
+                        if mask & 0x01 != 0 { results[result_idx] = Some(chunk_values[0]); }
+                        else if mask & 0x02 != 0 { results[result_idx] = Some(chunk_values[1]); }
+                        else if mask & 0x04 != 0 { results[result_idx] = Some(chunk_values[2]); }
+                        else if mask & 0x08 != 0 { results[result_idx] = Some(chunk_values[3]); }
                     }
                 } else {
-                    // Scalar fallback for remaining items
-                    for &(k, v) in chunk {
-                        for (i, &search_key) in keys_array.iter().enumerate() {
-                            if results[i].is_none() && k == search_key {
-                                results[i] = Some(v);
+                    // Handle remaining entries with scalar search
+                    for &(k, v) in chunk.iter().rev() {
+                        for (result_idx, &search_key) in keys_array.iter().enumerate() {
+                            if results[result_idx].is_none() && search_key == k {
+                                results[result_idx] = Some(v);
                             }
                         }
                     }
                 }
+                
+                // 🚀 EARLY EXIT OPTIMIZATION: Stop if all keys found
+                if results.iter().all(|r| r.is_some()) {
+                    break;
+                }
             }
         } else {
-            // Small buffer: use scalar search
+            // Small buffer: Use optimized scalar search with reverse iteration
+            // Reverse iteration provides better temporal locality for recent insertions
             for &(k, v) in buffer_snapshot.iter().rev() {
-                for (i, &search_key) in keys_array.iter().enumerate() {
-                    if results[i].is_none() && k == search_key {
-                        results[i] = Some(v);
+                for (result_idx, &search_key) in keys_array.iter().enumerate() {
+                    if results[result_idx].is_none() && search_key == k {
+                        results[result_idx] = Some(v);
                     }
+                }
+                
+                // Early exit if all keys found
+                if results.iter().all(|r| r.is_some()) {
+                    break;
                 }
             }
         }
