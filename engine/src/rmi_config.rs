@@ -47,7 +47,7 @@ pub struct RmiOptimizationConfig {
 impl Default for RmiOptimizationConfig {
     fn default() -> Self {
         Self {
-            simd_batch_size: 16,
+            simd_batch_size: 16, // Updated for true 16-key SIMD processing
             cache_buffer_size: 64,
             prefetch_distance: 2,
             memory_pool_size: 16,
@@ -59,7 +59,7 @@ impl Default for RmiOptimizationConfig {
             enable_adaptive_batching: true,
             max_epsilon_bound: 256,
             min_epsilon_bound: 32,
-            simd_width: 8,
+            simd_width: 16, // Updated for true 16-key SIMD width
             enable_prefetching: true,
             prefetch_window_size: 1000,
             cache_line_alignment: 64,
@@ -72,10 +72,19 @@ impl RmiOptimizationConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
         
-        // Load SIMD batch size
+        // Load SIMD batch size with enhanced validation
         if let Ok(value) = env::var("KYRODB_SIMD_BATCH_SIZE") {
             if let Ok(size) = value.parse::<usize>() {
-                config.simd_batch_size = size.clamp(8, 64);
+                // Enhanced validation: ensure power of 2 and within safe bounds
+                if size > 0 && size <= 64 && size.is_power_of_two() {
+                    config.simd_batch_size = size;
+                } else {
+                    eprintln!("Warning: Invalid SIMD batch size {}, must be power of 2 between 1-64. Using default: {}", 
+                             size, config.simd_batch_size);
+                }
+            } else {
+                eprintln!("Warning: Could not parse SIMD batch size from '{}'. Using default: {}", 
+                         value, config.simd_batch_size);
             }
         }
         
@@ -151,10 +160,20 @@ impl RmiOptimizationConfig {
             }
         }
         
-        // Load SIMD width
+        // Load SIMD width with enhanced validation
         if let Ok(value) = env::var("KYRODB_SIMD_WIDTH") {
             if let Ok(width) = value.parse::<usize>() {
-                config.simd_width = width.clamp(4, 16);
+                // Validate SIMD width matches architectural capabilities
+                let valid_widths = [1, 4, 8, 16]; // 1=scalar, 4=NEON, 8/16=AVX2
+                if valid_widths.contains(&width) {
+                    config.simd_width = width;
+                } else {
+                    eprintln!("Warning: Invalid SIMD width {}, must be 1, 4, 8, or 16. Using default: {}", 
+                             width, config.simd_width);
+                }
+            } else {
+                eprintln!("Warning: Could not parse SIMD width from '{}'. Using default: {}", 
+                         value, config.simd_width);
             }
         }
         
@@ -170,8 +189,15 @@ impl RmiOptimizationConfig {
     
     /// Validate configuration parameters are within valid ranges
     pub fn validate(&self) -> Result<(), String> {
-        if self.simd_batch_size < 8 || self.simd_batch_size > 64 {
-            return Err("SIMD batch size must be between 8 and 64".to_string());
+        // Enhanced SIMD batch size validation
+        if self.simd_batch_size == 0 {
+            return Err("SIMD batch size cannot be zero".to_string());
+        }
+        if self.simd_batch_size > 64 {
+            return Err("SIMD batch size cannot exceed 64 keys".to_string());
+        }
+        if !self.simd_batch_size.is_power_of_two() {
+            return Err("SIMD batch size must be a power of 2".to_string());
         }
         
         if self.cache_buffer_size < 32 || self.cache_buffer_size > 256 {
@@ -202,12 +228,20 @@ impl RmiOptimizationConfig {
             return Err("Max epsilon bound must be greater than min epsilon bound".to_string());
         }
         
-        if self.simd_width < 4 || self.simd_width > 16 {
-            return Err("SIMD width must be between 4 and 16".to_string());
+        // Enhanced SIMD width validation
+        let valid_simd_widths = [1, 4, 8, 16]; // 1=scalar, 4=NEON, 8/16=AVX2
+        if !valid_simd_widths.contains(&self.simd_width) {
+            return Err("SIMD width must be 1, 4, 8, or 16".to_string());
         }
         
         if self.prefetch_window_size < 100 || self.prefetch_window_size > 10000 {
             return Err("Prefetch window size must be between 100 and 10000".to_string());
+        }
+        
+        // Cross-validation: ensure SIMD batch size is compatible with SIMD width
+        if self.simd_batch_size < self.simd_width {
+            return Err(format!("SIMD batch size ({}) must be at least as large as SIMD width ({})", 
+                              self.simd_batch_size, self.simd_width));
         }
         
         Ok(())
@@ -294,16 +328,22 @@ impl ConfigValidator {
         }
         
         // Additional validation checks
-        if config.simd_batch_size % 8 != 0 {
-            errors.push("SIMD batch size must be a multiple of 8".to_string());
+        if config.simd_batch_size % 8 != 0 && config.simd_batch_size != 1 && config.simd_batch_size != 2 && config.simd_batch_size != 4 {
+            errors.push("SIMD batch size must be 1, 2, 4, or a multiple of 8".to_string());
         }
         
+        // Ensure cache buffer size is properly aligned
         if config.cache_buffer_size % config.cache_line_alignment != 0 {
             errors.push("Cache buffer size must be aligned to cache line size".to_string());
         }
         
         if config.prefetch_distance > config.prefetch_window_size / 10 {
             errors.push("Prefetch distance too large for window size".to_string());
+        }
+        
+        // Validate SIMD configuration consistency
+        if config.simd_width > config.simd_batch_size {
+            errors.push("SIMD width cannot be larger than batch size".to_string());
         }
         
         if errors.is_empty() {

@@ -726,3 +726,134 @@ mod binary_protocol_shim {
 
 #[cfg(feature = "bench-no-metrics")]
 pub use binary_protocol_shim::*;
+
+/// Thread-safe metrics recording utilities
+/// 
+/// Provides consistent and thread-safe metrics recording to prevent
+/// race conditions and inconsistent values
+pub mod metrics_utils {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    
+    /// Thread-safe hit rate calculator
+    pub struct HitRateCalculator {
+        hits: Arc<AtomicU64>,
+        total: Arc<AtomicU64>,
+    }
+    
+    impl HitRateCalculator {
+        pub fn new() -> Self {
+            Self {
+                hits: Arc::new(AtomicU64::new(0)),
+                total: Arc::new(AtomicU64::new(0)),
+            }
+        }
+        
+        /// Record a hit
+        pub fn record_hit(&self) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.total.fetch_add(1, Ordering::Relaxed);
+        }
+        
+        /// Record a miss
+        pub fn record_miss(&self) {
+            self.total.fetch_add(1, Ordering::Relaxed);
+        }
+        
+        /// Record batch results
+        pub fn record_batch(&self, hits: u64, total: u64) {
+            self.hits.fetch_add(hits, Ordering::Relaxed);
+            self.total.fetch_add(total, Ordering::Relaxed);
+        }
+        
+        /// Get current hit rate (0.0 to 1.0)
+        pub fn hit_rate(&self) -> f64 {
+            let total = self.total.load(Ordering::Relaxed);
+            if total == 0 {
+                return 1.0; // Perfect hit rate for no operations
+            }
+            let hits = self.hits.load(Ordering::Relaxed);
+            hits as f64 / total as f64
+        }
+        
+        /// Get current statistics
+        pub fn stats(&self) -> (u64, u64) {
+            let hits = self.hits.load(Ordering::Relaxed);
+            let total = self.total.load(Ordering::Relaxed);
+            (hits, total)
+        }
+        
+        /// Reset counters
+        pub fn reset(&self) {
+            self.hits.store(0, Ordering::Relaxed);
+            self.total.store(0, Ordering::Relaxed);
+        }
+    }
+    
+    impl Default for HitRateCalculator {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    
+    /// Safely record metrics with proper error handling
+    #[cfg(not(feature = "bench-no-metrics"))]
+    pub fn record_rmi_lookup_result(result: &Option<u64>, latency_seconds: f64) {
+        // Record latency
+        crate::metrics::RMI_SINGLE_LOOKUP_LATENCY_SECONDS.observe(latency_seconds);
+        
+        // Record hit/miss
+        if result.is_some() {
+            crate::metrics::RMI_HITS_TOTAL.inc();
+        } else {
+            crate::metrics::RMI_MISSES_TOTAL.inc();
+        }
+    }
+    
+    /// Safely record batch metrics
+    #[cfg(not(feature = "bench-no-metrics"))]
+    pub fn record_rmi_batch_results(results: &[Option<u64>], latency_seconds: f64) {
+        // Record batch latency
+        crate::metrics::RMI_BATCH_LOOKUP_LATENCY_SECONDS.observe(latency_seconds);
+        
+        // Count hits and misses
+        let hits = results.iter().filter(|r| r.is_some()).count();
+        let misses = results.len() - hits;
+        
+        // Record metrics atomically
+        crate::metrics::RMI_HITS_TOTAL.inc_by(hits as f64);
+        crate::metrics::RMI_MISSES_TOTAL.inc_by(misses as f64);
+        
+        // Record batch size
+        crate::metrics::BINARY_BATCH_SIZE.observe(results.len() as f64);
+    }
+    
+    /// Update performance gauges
+    #[cfg(not(feature = "bench-no-metrics"))]
+    pub fn update_performance_gauges(
+        cache_hit_rate: f64,
+        prefetch_effectiveness: f64,
+        memory_pool_usage: f64,
+        current_batch_size: usize,
+    ) {
+        crate::metrics::RMI_CACHE_HIT_RATE.set(cache_hit_rate);
+        crate::metrics::RMI_PREFETCH_EFFECTIVENESS.set(prefetch_effectiveness);
+        crate::metrics::RMI_MEMORY_POOL_USAGE.set(memory_pool_usage);
+        crate::metrics::RMI_SIMD_BATCH_SIZE.set(current_batch_size as f64);
+    }
+    
+    // No-op implementations for bench-no-metrics
+    #[cfg(feature = "bench-no-metrics")]
+    pub fn record_rmi_lookup_result(_result: &Option<u64>, _latency_seconds: f64) {}
+    
+    #[cfg(feature = "bench-no-metrics")]
+    pub fn record_rmi_batch_results(_results: &[Option<u64>], _latency_seconds: f64) {}
+    
+    #[cfg(feature = "bench-no-metrics")]
+    pub fn update_performance_gauges(
+        _cache_hit_rate: f64,
+        _prefetch_effectiveness: f64,
+        _memory_pool_usage: f64,
+        _current_batch_size: usize,
+    ) {}
+}

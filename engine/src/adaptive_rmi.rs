@@ -1840,6 +1840,21 @@ pub struct AdaptiveRMI {
 impl AdaptiveRMI {
     /// Create new Adaptive RMI with default configuration
     pub fn new() -> Self {
+        // Load and validate RMI optimization configuration from environment
+        let rmi_config = crate::rmi_config::RmiOptimizationConfig::from_env();
+        if let Err(validation_errors) = crate::rmi_config::ConfigValidator::validate_all(&rmi_config) {
+            eprintln!("FATAL: Invalid RMI configuration detected:");
+            for error in &validation_errors {
+                eprintln!("  - {}", error);
+            }
+            eprintln!("Please fix configuration and restart the engine.");
+            std::process::exit(1);
+        }
+        
+        // Log validated configuration for debugging
+        eprintln!("Loaded optimized RMI configuration: SIMD width={}, batch size={}, cache buffer size={}",
+                 rmi_config.simd_width, rmi_config.simd_batch_size, rmi_config.cache_buffer_size);
+
         let capacity = std::env::var("KYRODB_HOT_BUFFER_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1967,8 +1982,16 @@ impl AdaptiveRMI {
     /// 🛡️ DEADLOCK FIX: Ultra-fast single-lock lookup to eliminate deadlock potential
     /// Uses optimistic atomic snapshot to avoid holding multiple locks simultaneously
     pub fn lookup(&self, key: u64) -> Option<u64> {
+        #[cfg(not(feature = "bench-no-metrics"))]
+        let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
+        
         // 1. Check hot buffer first (most recent data) - completely lock-free
         if let Some(value) = self.hot_buffer.get(key) {
+            #[cfg(not(feature = "bench-no-metrics"))]
+            {
+                timer.observe_duration();
+                crate::metrics::RMI_HITS_TOTAL.inc();
+            }
             return Some(value);
         }
 
@@ -1979,6 +2002,11 @@ impl AdaptiveRMI {
         };
         
         if let Some(value) = overflow_result {
+            #[cfg(not(feature = "bench-no-metrics"))]
+            {
+                timer.observe_duration();
+                crate::metrics::RMI_HITS_TOTAL.inc();
+            }
             return Some(value);
         }
 
@@ -1993,14 +2021,29 @@ impl AdaptiveRMI {
         }; // Router lock released immediately
         
         // Fast segment lookup with bounds validation (no retry loops needed)
-        if segment_id < segments_guard.len() {
+        let result = if segment_id < segments_guard.len() {
             // Use fast bounded search - guaranteed O(1) performance
-            return segments_guard[segment_id].bounded_search_fast(key);
+            segments_guard[segment_id].bounded_search_fast(key)
         } else {
             // Graceful degradation: use fallback search if prediction is out of bounds
-            return self.fallback_linear_search_with_segments_lock(&segments_guard, key);
-        }
+            #[cfg(not(feature = "bench-no-metrics"))]
+            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
+            
+            self.fallback_linear_search_with_segments_lock(&segments_guard, key)
+        };
         // Segment lock automatically released here - never hold multiple locks
+        
+        #[cfg(not(feature = "bench-no-metrics"))]
+        {
+            timer.observe_duration();
+            if result.is_some() {
+                crate::metrics::RMI_HITS_TOTAL.inc();
+            } else {
+                crate::metrics::RMI_MISSES_TOTAL.inc();
+            }
+        }
+        
+        result
     }
 
     /// DEPRECATED
@@ -3036,6 +3079,9 @@ impl AdaptiveRMI {
     /// SIMD optimization when available, falling back gracefully to scalar
     /// operations on unsupported architectures.
     pub fn lookup_batch_simd(&self, keys: &[u64]) -> Vec<Option<u64>> {
+        #[cfg(not(feature = "bench-no-metrics"))]
+        let timer = crate::metrics::RMI_BATCH_LOOKUP_LATENCY_SECONDS.start_timer();
+        
         let mut results = Vec::with_capacity(keys.len());
         
         // 🚀 ARM64 NEON PROCESSING: Optimized for Apple Silicon
@@ -3107,6 +3153,17 @@ impl AdaptiveRMI {
             for &key in keys {
                 results.push(self.lookup(key));
             }
+        }
+        
+        // Record batch metrics
+        #[cfg(not(feature = "bench-no-metrics"))]
+        {
+            timer.observe_duration();
+            let hits = results.iter().filter(|r| r.is_some()).count();
+            let misses = results.len() - hits;
+            crate::metrics::RMI_HITS_TOTAL.inc_by(hits as f64);
+            crate::metrics::RMI_MISSES_TOTAL.inc_by(misses as f64);
+            crate::metrics::BINARY_BATCH_SIZE.observe(keys.len() as f64);
         }
         
         results
