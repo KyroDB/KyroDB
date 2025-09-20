@@ -57,7 +57,7 @@ async fn show_simd_capabilities(db: &KyroDb) {
             println!("🎯 SIMD Width: {} keys per operation", capabilities.simd_width);
             
             if capabilities.has_avx2 {
-                println!("🎯 SIMD Mode: AVX2 (8 keys simultaneously)");
+                println!("🎯 SIMD Mode: AVX2 (16 keys simultaneously)");
             } else if capabilities.has_neon {
                 println!("🎯 SIMD Mode: ARM64 NEON (4 keys simultaneously)");
             } else {
@@ -254,7 +254,7 @@ fn show_final_performance_summary() {
     println!("  🎯 Hit Rate: {:.2}%", stats.cache_hit_rate);
     
     println!("\n🚀 Phase 4 SIMD Features Validated:");
-    println!("  ✅ AVX2 vectorized 8-key processing");
+    println!("  ✅ AVX2 vectorized 16-key processing");
     println!("  ✅ Adaptive batch size optimization");
     println!("  ✅ Graceful scalar fallback");
     println!("  ✅ Lock-free batch operations");
