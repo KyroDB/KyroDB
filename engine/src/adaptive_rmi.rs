@@ -2468,7 +2468,7 @@ impl AdaptiveRMI {
         F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
     {
         // Delegate to the new deadlock-free implementation
-        self.atomic_update_with_consistent_locking(segment_update_fn).await
+        self.atomic_update_with_consistent_locking(segment_update_fn).awaitno
     }
 
     /// 
