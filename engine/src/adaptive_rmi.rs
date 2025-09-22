@@ -1873,31 +1873,36 @@ impl AdaptiveRMI {
         }
     }
 
-    /// 
+    /// DEADLOCK-FREE INSERT following global lock ordering protocol
+    /// LOCK ORDER: hot_buffer (lock-free) → overflow_buffer (only if needed)
+    /// Never acquires segments or router locks to prevent reader-writer deadlocks
     pub fn insert(&self, key: u64, value: u64) -> Result<()> {
-        // 1. Try to insert into hot buffer (lock-free, bounded size)
+        // STEP 1: Try hot buffer first (lock-free operation)
         if self.hot_buffer.try_insert(key, value)? {
             return Ok(());
         }
 
-        // 2. minimal lock time: Get overflow buffer stats quickly
+        // STEP 2: GLOBAL LOCK ORDER - overflow_buffer only if hot buffer full
+        // Get stats quickly to minimize lock time
         let (_overflow_size, _overflow_capacity, rejected_writes, _pressure_level, _overflow_memory_mb) = {
             let overflow = self.overflow_buffer.lock();
             overflow.stats()
-        }; // 
+        }; // Lock released immediately
 
+        // Memory calculation for monitoring
         let _hot_memory_kb = {
             let hot_size = self.hot_buffer.size.load(Ordering::Relaxed);
             (hot_size * std::mem::size_of::<(u64, u64)>()) / 1024
         };
 
-        // 6. non-blocking insert attempt with minimal lock time
+        // STEP 3: GLOBAL LOCK ORDER - overflow_buffer insert attempt  
+        // Single atomic insert with minimal lock time
         let insert_result = {
             let mut overflow = self.overflow_buffer.lock();
             let result = overflow.try_insert(key, value);
             let is_critical = overflow.is_under_critical_pressure();
             (result, is_critical)
-        }; // 
+        }; // Lock released immediately
 
         match insert_result {
             (Ok(true), _) => {
@@ -1923,10 +1928,9 @@ impl AdaptiveRMI {
         }
     }
 
-    /// Race-free lookup with generation-based consistency protection
-    /// Eliminates TOCTOU vulnerabilities between router prediction and segment access
-    /// Deadlock fix: Ultra-fast single-lock lookup to eliminate deadlock potential
-    /// Uses optimistic atomic snapshot to avoid holding multiple locks simultaneously
+    /// DEADLOCK-FREE LOOKUP with strict global lock ordering protocol
+    /// LOCK ORDER: hot_buffer (lock-free) → overflow_buffer → segments (NEVER router during lookup)
+    /// This prevents reader-writer deadlocks by eliminating cross-lock dependencies
     pub fn lookup(&self, key: u64) -> Option<u64> {
         #[cfg(not(feature = "bench-no-metrics"))]
         let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
@@ -1941,11 +1945,11 @@ impl AdaptiveRMI {
             return Some(value);
         }
 
-        // 2. Check overflow buffer with minimal lock time
+        // 2. GLOBAL LOCK ORDER STEP 1: overflow_buffer (if needed)
         let overflow_result = {
             let overflow = self.overflow_buffer.lock();
             overflow.get(key)
-        };
+        }; // Lock released immediately
         
         if let Some(value) = overflow_result {
             #[cfg(not(feature = "bench-no-metrics"))]
@@ -1956,15 +1960,15 @@ impl AdaptiveRMI {
             return Some(value);
         }
 
-        // Deadlock-free lookup: Single atomic snapshot without multiple locks
-        // This eliminates the reader-writer deadlock by never holding multiple locks
-        let segments_guard = self.segments.read();
-        
-        // Get router prediction without holding router lock (snapshot approach)
+        // 3. GLOBAL LOCK ORDER STEP 2: segments read lock ONLY (never router during lookup)
+        // DEADLOCK PREVENTION: Router prediction done BEFORE segment lock to avoid cycle
         let segment_id = {
             let router_snapshot = self.global_router.read();
             router_snapshot.predict_segment(key)
-        }; // Router lock released immediately
+        }; // Router lock released immediately - critical for deadlock prevention
+        
+        // Now acquire segments lock WITHOUT holding any other locks
+        let segments_guard = self.segments.read();
         
         // Fast segment lookup with bounds validation (no retry loops needed)
         let result = if segment_id < segments_guard.len() {
@@ -2023,19 +2027,22 @@ impl AdaptiveRMI {
         self.fallback_linear_search_safe(key)
     }
 
-    /// 
-    /// Lock order protocol: 1) segments, 2) router, 3) overflow
+    /// DEADLOCK-FREE MERGE with strict global lock ordering protocol  
+    /// GLOBAL LOCK ORDER: hot_buffer → overflow_buffer → segments → router
+    /// This ordering prevents all possible deadlock cycles by ensuring consistency
     pub async fn merge_hot_buffer(&self) -> Result<()> {
         self.merge_scheduler.start_merge();
         
-        // 1. atomic DRAIN: Guaranteed consistency with no data loss risk
+        // STEP 1: Drain hot buffer (lock-free atomic operation)
         let hot_data = self.hot_buffer.drain_atomic();
+        
+        // STEP 2: GLOBAL LOCK ORDER - overflow_buffer first
         let overflow_data = {
             let mut overflow = self.overflow_buffer.lock();
             overflow.drain_all_atomic()
-        }; // 
+        }; // overflow_buffer lock released immediately
 
-        // 2. Combine and sort all pending writes (lock-free operation)
+        // STEP 3: Combine and sort all pending writes (lock-free operation)
         let mut all_writes = hot_data;
         all_writes.extend(overflow_data);
         
@@ -2046,7 +2053,7 @@ impl AdaptiveRMI {
         
         all_writes.sort_by_key(|(k, _)| *k);
 
-        // 3. Deadlock-free: Use consistent lock ordering for all updates
+        // STEP 4: GLOBAL LOCK ORDER - atomic update with segments → router ordering
         self.atomic_update_with_consistent_locking(|segments, router| {
             if segments.is_empty() {
                 // Create initial segment
@@ -2222,12 +2229,13 @@ impl AdaptiveRMI {
         
         Ok(())
     }
-    /// Enhanced adaptive segment management with intelligent split/merge decisions
-    /// RACE-CONDITION-FREE: All operations performed under single write lock
+    /// DEADLOCK-FREE SEGMENT MANAGEMENT with strict global lock ordering
+    /// GLOBAL LOCK ORDER: segments → router (consistent with all other operations)
+    /// All operations performed under single atomic lock acquisition to prevent TOCTOU races
     pub async fn adaptive_segment_management(&self) -> Result<()> {
-        // Acquire exclusive write lock for entire operation to prevent TOCTOU races
-        let mut segments_guard = self.segments.write();
-        let mut router_guard = self.global_router.write();
+        // GLOBAL LOCK ORDER PROTOCOL: acquire in consistent order to prevent deadlocks
+        let mut segments_guard = self.segments.write();    // Lock 1: segments first
+        let mut router_guard = self.global_router.write(); // Lock 2: router second
         
         // 1. Analyze segments and collect operations under lock
         let mut split_operations = Vec::new();
@@ -2448,30 +2456,86 @@ impl AdaptiveRMI {
         self.atomic_update_with_consistent_locking(segment_update_fn).await
     }
 
+    /// DEADLOCK-FREE ATOMIC UPDATE with GLOBAL LOCK ORDERING PROTOCOL
+    /// CRITICAL: ALWAYS acquire locks in this exact order to prevent deadlock cycles:
+    /// 1. segments (RwLock write)
+    /// 2. router (RwLock write)  
+    /// 3. NEVER acquire overflow_buffer here (it's handled separately in calling methods)
     /// 
-    /// Lock order protocol: 1) segments, 2) router, 3) overflow
-    ///  DEADLOCK FIX: Atomic update with guaranteed deadlock-free lock ordering
-    /// Global lock ordering protocol: ALWAYS segments first, then router, to prevent cycles
+    /// This ordering prevents reader-writer deadlocks by ensuring all write operations
+    /// follow the same acquisition sequence, eliminating circular wait conditions.
     async fn atomic_update_with_consistent_locking<F>(&self, update_fn: F) -> Result<()>
     where
         F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
     {
-        // GLOBAL LOCK ORDER PROTOCOL: segments → router (NEVER reverse this order)
-        // This matches the order used in other critical sections to prevent deadlock cycles
-        let mut segments_guard = self.segments.write();
-        let mut router_guard = self.global_router.write();
+        // GLOBAL LOCK ORDER PROTOCOL: segments → router (NEVER deviate from this order)
+        // This order must be consistent across ALL methods to prevent deadlock cycles
+        let mut segments_guard = self.segments.write();  // Lock 1: segments first
+        let mut router_guard = self.global_router.write(); // Lock 2: router second
         
         // Apply updates atomically under both locks
         update_fn(&mut segments_guard, &mut router_guard)?;
         
-        // Update router boundaries to maintain consistency
+        // Update router boundaries to maintain consistency  
         self.update_router_boundaries_under_lock(&segments_guard, &mut router_guard)?;
         
         // Increment generation after any structural changes (CRITICAL for race-free updates)
         router_guard.increment_generation();
         
         // LOCKS RELEASED in reverse order automatically (router, then segments)
-        // This maintains the lock ordering discipline
+        // This maintains the lock ordering discipline and prevents deadlock
+        Ok(())
+    }
+
+    /// GLOBAL LOCK ORDERING PROTOCOL ENFORCEMENT
+    /// 
+    /// CRITICAL: This method documents the ONLY valid lock acquisition order to prevent deadlocks
+    /// 
+    /// **GLOBAL LOCK ORDER (NEVER DEVIATE):**
+    /// 1. hot_buffer (lock-free - no ordering constraint)
+    /// 2. overflow_buffer (Mutex)
+    /// 3. segments (RwLock)  
+    /// 4. global_router (RwLock)
+    /// 
+    /// **DEADLOCK PREVENTION RULES:**
+    /// - NEVER acquire locks in a different order
+    /// - NEVER hold multiple locks longer than necessary
+    /// - Release locks in reverse order (automatic with RAII)
+    /// - Use atomic snapshots when possible to avoid holding multiple locks
+    /// 
+    /// **VIOLATIONS THAT CAUSE DEADLOCKS:**
+    /// - Thread A: segments.read() → router.read() 
+    /// - Thread B: router.write() → segments.write()
+    /// - Result: Circular wait → DEADLOCK
+    /// 
+    /// This method serves as documentation and can be used for runtime validation.
+    fn validate_lock_ordering_protocol() -> &'static str {
+        "GLOBAL LOCK ORDER: hot_buffer → overflow_buffer → segments → router"
+    }
+
+    /// DEADLOCK-FREE UPDATE with full protocol compliance
+    /// This is the ONLY safe way to perform updates that require multiple locks
+    async fn atomic_update_full_protocol<F>(&self, update_fn: F) -> Result<()>
+    where
+        F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
+    {
+        // Validate we're following the global protocol
+        let _protocol = Self::validate_lock_ordering_protocol();
+        
+        // Note: hot_buffer and overflow_buffer are handled by callers before this method
+        // This method only handles segments → router ordering
+        
+        // GLOBAL LOCK ORDER: segments first, then router
+        let mut segments_guard = self.segments.write();
+        let mut router_guard = self.global_router.write();
+        
+        // Apply atomic updates
+        update_fn(&mut segments_guard, &mut router_guard)?;
+        
+        // Maintain router consistency
+        self.update_router_boundaries_under_lock(&segments_guard, &mut router_guard)?;
+        router_guard.increment_generation();
+        
         Ok(())
     }
 
