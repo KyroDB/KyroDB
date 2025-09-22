@@ -11,7 +11,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use parking_lot::{RwLock, Mutex};
 use crossbeam_queue::SegQueue;
 use tokio::sync::Notify;
@@ -1092,8 +1092,10 @@ impl BackgroundMerger {
 /// - Reverse iteration for better temporal locality
 /// - Future: Will be replaced with HashMap-based O(1) lookups
 pub struct BoundedOverflowBuffer {
-    /// Buffer storage with strict capacity limit
-    data: VecDeque<(u64, u64)>,
+    /// O(1) lookup: Replace VecDeque with HashMap for fast access
+    data: HashMap<u64, u64>,
+    /// Maintain insertion order for eviction policy
+    insertion_order: VecDeque<u64>,
     /// Maximum capacity - hard limit
     max_capacity: usize,
     /// Rejection counter for back-pressure signaling
@@ -1109,7 +1111,8 @@ pub struct BoundedOverflowBuffer {
 impl BoundedOverflowBuffer {
     pub fn new(max_capacity: usize) -> Self {
         Self {
-            data: VecDeque::new(),
+            data: HashMap::new(),
+            insertion_order: VecDeque::new(),
             max_capacity,
             rejected_writes: AtomicUsize::new(0),
             pressure_level: AtomicUsize::new(0),
@@ -1197,24 +1200,42 @@ impl BoundedOverflowBuffer {
             }
         }
 
-        self.data.push_back((key, value));
+        // Evict oldest entries if at capacity
+        while self.data.len() >= self.max_capacity {
+            if let Some(oldest_key) = self.insertion_order.pop_front() {
+                self.data.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+
+        // O(1) insert with order tracking
+        let is_new_key = !self.data.contains_key(&key);
+        self.data.insert(key, value);
+        
+        // Only add to insertion order if it's a new key
+        if is_new_key {
+            self.insertion_order.push_back(key);
+        }
         
         self.update_accurate_memory_estimate(self.data.len());
         
         Ok(true)
     }
 
-    /// ENHANCED memory estimation with actual overhead calculation
+    /// Enhanced memory estimation with HashMap and VecDeque overhead calculation
     fn update_accurate_memory_estimate(&self, current_size: usize) {
         // More accurate estimation: 
-        // - 16 bytes per (u64, u64) pair
-        // - VecDeque overhead: ~24 bytes base + capacity * 8 bytes for pointers
+        // - 16 bytes per (u64, u64) pair in HashMap
+        // - HashMap overhead: ~24 bytes base + capacity * 24 bytes for entries
+        // - VecDeque overhead for insertion_order: ~24 bytes base + capacity * 8 bytes
         // - Pressure tracking overhead: ~64 bytes
         let pair_bytes = current_size * 16;
-        let vecdeque_overhead = 24 + (self.data.capacity() * 8);
+        let hashmap_overhead = 24 + (self.data.capacity() * 24);
+        let vecdeque_overhead = 24 + (self.insertion_order.capacity() * 8);
         let tracking_overhead = 64;
         
-        let total_bytes = pair_bytes + vecdeque_overhead + tracking_overhead;
+        let total_bytes = pair_bytes + hashmap_overhead + vecdeque_overhead + tracking_overhead;
         let estimated_mb = (total_bytes + 1024 * 1024 - 1) / (1024 * 1024); // Round up
         
         self.estimated_memory_mb.store(estimated_mb, Ordering::Release);
@@ -1229,36 +1250,25 @@ impl BoundedOverflowBuffer {
         }
     }
 
-    /// Search for a key in the buffer (LIFO order for recency)
-    /// O(1) hash lookup - replaces O(n) linear search for massive performance gain
-    /// 
-    /// This is the key fix for the overflow buffer performance sink.
-    /// Instead of iterating through all entries, we use a hybrid approach:
-    /// - HashMap for O(1) lookups 
-    /// - VecDeque for maintaining insertion order and existing API compatibility
+    /// O(1) lookup guaranteed with HashMap
+    /// This replaces the O(n) linear search with instant HashMap access
     pub fn get(&self, key: u64) -> Option<u64> {
-        // Fast path: Check if we have a recent cache of lookups
-        // For now, keeping the original implementation but with optimization hints
-        // In production, this would be replaced with a proper HashMap lookup
-        
-        // Optimization: Start from the end (most recent entries) for better cache locality
-        // This provides 2-3x speedup for temporal locality without breaking existing code
-        for &(k, v) in self.data.iter().rev() {
-            if k == key {
-                return Some(v);
-            }
-        }
-        None
+        self.data.get(&key).copied()
     }
 
-    /// ATOMIC drain operation with memory safety using std::mem::swap
+    /// ATOMIC drain operation with memory safety using std::mem::replace
     pub fn drain_all_atomic(&mut self) -> Vec<(u64, u64)> {
-        // Use atomic swap to ensure no partial drains
-        let mut temp_data = VecDeque::new();
-        std::mem::swap(&mut self.data, &mut temp_data);
+        // Use atomic replacement to ensure no partial drains
+        let temp_data = std::mem::replace(&mut self.data, HashMap::new());
+        let temp_order = std::mem::replace(&mut self.insertion_order, VecDeque::new());
         
-        let drained_count = temp_data.len();
-        let freed_bytes = Self::calculate_actual_memory_usage(&temp_data);
+        // Convert HashMap to Vec preserving insertion order
+        let result: Vec<(u64, u64)> = temp_order.into_iter()
+            .filter_map(|key| temp_data.get(&key).map(|&value| (key, value)))
+            .collect();
+        
+        let drained_count = result.len();
+        let freed_bytes = Self::calculate_actual_memory_usage_hashmap(&temp_data);
         
         // Reset pressure atomically
         self.pressure_level.store(0, Ordering::Release);
@@ -1268,32 +1278,39 @@ impl BoundedOverflowBuffer {
         println!("Atomic drain completed: {} entries, ~{}MB freed", 
                 drained_count, freed_bytes / (1024 * 1024));
         
-        // Convert to vector
-        temp_data.into_iter().collect()
+        result
     }
 
-    /// 
-    fn calculate_actual_memory_usage(data: &VecDeque<(u64, u64)>) -> usize {
-        // Accurate calculation: real VecDeque memory usage
-        let tuple_size = std::mem::size_of::<(u64, u64)>(); // Exactly 16 bytes
-        let capacity_bytes = data.capacity() * tuple_size;
-        let vecdeque_overhead = std::mem::size_of::<VecDeque<(u64, u64)>>();
+    /// Calculate actual memory usage for HashMap structure
+    fn calculate_actual_memory_usage_hashmap(data: &HashMap<u64, u64>) -> usize {
+        // Accurate calculation: real HashMap memory usage
+        let entry_size = std::mem::size_of::<(u64, u64)>(); // Exactly 16 bytes
+        let capacity_bytes = data.capacity() * entry_size;
+        let hashmap_overhead = std::mem::size_of::<HashMap<u64, u64>>();
         
-        capacity_bytes + vecdeque_overhead
+        capacity_bytes + hashmap_overhead
     }
 
-    /// 🛡️ HARD ENFORCEMENT against unbounded growth with circuit breaker
+    /// Hard enforcement against unbounded growth with circuit breaker
     /// Replaces soft limits with absolute hard limits
     pub fn enforce_hard_memory_limits(&mut self) -> Result<(), String> {
         let current_size = self.data.len();
-        let actual_memory_bytes = Self::calculate_actual_memory_usage(&self.data);
+        let actual_memory_bytes = Self::calculate_actual_memory_usage_hashmap(&self.data);
         let actual_memory_mb = actual_memory_bytes / (1024 * 1024);
         
         // Hard limit 1: absolute count limit (prevent integer overflow)
         if current_size > MAX_OVERFLOW_CAPACITY {
-            // 🛑 EMERGENCY TRUNCATION: Remove oldest entries to enforce hard limit
+            // Emergency truncation: Remove oldest entries to enforce hard limit
             let excess = current_size - MAX_OVERFLOW_CAPACITY;
-            self.data.drain(0..excess); // Remove from front (oldest entries)
+            
+            // Remove oldest entries using insertion order
+            for _ in 0..excess {
+                if let Some(oldest_key) = self.insertion_order.pop_front() {
+                    self.data.remove(&oldest_key);
+                } else {
+                    break;
+                }
+            }
             
             self.rejected_writes.fetch_add(excess, Ordering::Relaxed);
             
@@ -1303,13 +1320,21 @@ impl BoundedOverflowBuffer {
         
         // Hard limit 2: absolute memory limit (prevent OOM)
         if actual_memory_mb > SYSTEM_MEMORY_LIMIT_MB {
-            // 🛑 EMERGENCY TRUNCATION: Remove entries until under memory limit
+            // Emergency truncation: Remove entries until under memory limit
             let target_size = (SYSTEM_MEMORY_LIMIT_MB * 1024 * 1024) / std::mem::size_of::<(u64, u64)>();
             let safe_target = target_size.min(MAX_OVERFLOW_CAPACITY * 8 / 10); // 80% of max as safety margin
             
             if current_size > safe_target {
                 let truncate_count = current_size - safe_target;
-                self.data.drain(0..truncate_count); // Remove oldest entries
+                
+                // Remove oldest entries using insertion order
+                for _ in 0..truncate_count {
+                    if let Some(oldest_key) = self.insertion_order.pop_front() {
+                        self.data.remove(&oldest_key);
+                    } else {
+                        break;
+                    }
+                }
                 
                 self.rejected_writes.fetch_add(truncate_count, Ordering::Relaxed);
                 
@@ -3423,7 +3448,7 @@ impl AdaptiveRMI {
             if overflow.data.is_empty() {
                 return results; // Early exit if overflow is empty
             }
-            overflow.data.iter().copied().collect::<Vec<_>>()
+            overflow.data.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>()
         }; // Lock released immediately
         
         // VECTORIZED OVERFLOW SEARCH: Process missing keys in SIMD batches
@@ -3879,7 +3904,7 @@ impl AdaptiveRMI {
             
             // M4 MACBOOK OPTIMIZATION: Cache-efficient copy for unified memory
             let mut snapshot = Vec::with_capacity(overflow.data.len());
-            snapshot.extend(overflow.data.iter().copied());
+            snapshot.extend(overflow.data.iter().map(|(&k, &v)| (k, v)));
             snapshot
         };
         
