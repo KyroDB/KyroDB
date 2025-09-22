@@ -927,11 +927,20 @@ impl BoundedHotBuffer {
         }
     }
 
-    /// 
-    /// Try to insert into hot buffer - returns true if successful
-    pub fn try_insert(&self, key: u64, value: u64) -> Result<bool> {
-        // 🚀 DELEGATE to atomic implementation for guaranteed consistency
-        self.try_insert_atomic(key, value)
+    /// ✅ SINGLE AUTHORITATIVE IMPLEMENTATION
+    /// Try to insert into hot buffer - returns true if successful, false if at capacity
+    pub fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
+        let mut buffer = self.buffer.lock();
+        
+        // ✅ ATOMIC CHECK AND INSERT under single lock
+        if buffer.len() >= self.capacity {
+            return Ok(false);
+        }
+        
+        buffer.push_back((key, value));
+        self.size.store(buffer.len(), Ordering::Release);
+        
+        Ok(true)
     }
 
     /// Get value for key from hot buffer
@@ -979,27 +988,6 @@ impl BoundedHotBuffer {
         capacity * tuple_size + vec_overhead + mutex_overhead + atomic_overhead
     }
 
-    /// 🛡️ atomic insert with hard capacity enforcement
-    /// Prevents unbounded growth with absolute guarantees
-    pub fn try_insert_atomic(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
-        let mut buffer = self.buffer.lock();
-        
-        // Hard capacity check: absolute limit enforcement
-        if buffer.len() >= self.capacity {
-            return Ok(false); // Hard reject, no unbounded growth possible
-        }
-        
-        buffer.push_back((key, value));
-        let new_size = buffer.len();
-        
-        self.size.store(new_size, Ordering::Release);
-        
-        // 🛡️ DOUBLE-CHECK: Verify atomic consistency (safety assertion)
-        debug_assert_eq!(new_size, buffer.len(), "Hot buffer size inconsistency detected!");
-        
-        Ok(true)
-    }
-
     /// 🛡️ MEMORY LEAK FIX: Check buffer state using source of truth (actual buffer)
     /// Prevents inconsistency between atomic size and buffer length
     pub fn is_full(&self) -> bool {
@@ -1022,30 +1010,6 @@ impl BoundedHotBuffer {
         self.size.store(actual_len, Ordering::Release);
         
         actual_len as f32 / self.capacity as f32
-    }
-
-    /// 🛡️ MEMORY LEAK FIX: Robust lock-free insertion with consistent state management
-    /// Eliminates race condition between atomic size and actual buffer length
-    pub fn try_insert_lockfree(&self, key: u64, value: u64) -> Result<bool> {
-        // 🚀 OPTIMIZED APPROACH: Single lock acquisition with atomic validation
-        let mut buffer = self.buffer.lock();
-        
-        // 🛡️ RACE-FREE CHECK: Use actual buffer length under lock (source of truth)
-        if buffer.len() >= self.capacity {
-            // Sync atomic size with reality to prevent drift
-            self.size.store(buffer.len(), Ordering::Release);
-            return Ok(false);
-        }
-        
-        // Atomic insert: both buffer and size updated under same lock
-        buffer.push_back((key, value));
-        let new_len = buffer.len();
-        self.size.store(new_len, Ordering::Release);
-        
-        // 🛡️ CONSISTENCY VALIDATION: Ensure no drift between atomic and actual state
-        debug_assert_eq!(new_len, buffer.len(), "Critical: Buffer length inconsistency detected!");
-        
-        Ok(true)
     }
 }
 
@@ -2468,7 +2432,7 @@ impl AdaptiveRMI {
         F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
     {
         // Delegate to the new deadlock-free implementation
-        self.atomic_update_with_consistent_locking(segment_update_fn).awaitno
+        self.atomic_update_with_consistent_locking(segment_update_fn).await
     }
 
     /// 
