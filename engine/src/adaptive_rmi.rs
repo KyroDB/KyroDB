@@ -1,24 +1,13 @@
 //! Adaptive Segmented RMI - High-performance incremental learned index
 //!
-//! This module implements an adaptive learned index based on ALEX principles
-//! that solves KyroDB's critical write performance and O(n) fallback issues.
+//! This module implements an adaptive learned index based on ALEX principles.
 //!
-//! Key innovations:
+//! Key features:
 //! - Non-blocking writes with bounded hot buffer
-//! - Guaranteed O(log ε) lookup with ε ≤ 64  
+//! - Guaranteed O(log ε) lookup with ε ≤ 64
 //! - Automatic segment adaptation based on access patterns
 //! - Background merge process with no read blocking
 //! - Lock-free concurrent operations
-//! - Parallel segment updates with copy-on-write optimization
-//! - Advanced segment split/merge with intelligent criteria
-//! - Performance analytics and health monitoring
-//! - Adaptive background maintenance scheduling
-//!
-//! Performance guarantees:
-//! - Write latency: O(1) amortized
-//! - Read latency: O(1) for hot data, O(log ε) worst case
-//! - Memory usage: Bounded and predictable
-//! - No blocking operations: Reads never wait for writes
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -28,21 +17,20 @@ use crossbeam_queue::SegQueue;
 use tokio::sync::Notify;
 use anyhow::{Result, anyhow};
 
-/// Critical memory management constants - prevent OOM in production RAG workloads
-const MAX_OVERFLOW_CAPACITY: usize = 500_000; // Increased for high-throughput testing and production workloads
-// Multi-tier pressure thresholds for graduated back-pressure response
-const OVERFLOW_PRESSURE_LOW: usize = (MAX_OVERFLOW_CAPACITY * 6) / 10;     // 60% - early warning
-const OVERFLOW_PRESSURE_MEDIUM: usize = (MAX_OVERFLOW_CAPACITY * 8) / 10;  // 80% - urgent merge
-const OVERFLOW_PRESSURE_HIGH: usize = (MAX_OVERFLOW_CAPACITY * 9) / 10;    // 90% - reject writes
-const OVERFLOW_PRESSURE_CRITICAL: usize = (MAX_OVERFLOW_CAPACITY * 95) / 100; // 95% - hard reject
+/// Memory management constants
+const MAX_OVERFLOW_CAPACITY: usize = 500_000;
+const OVERFLOW_PRESSURE_LOW: usize = (MAX_OVERFLOW_CAPACITY * 6) / 10;
+const OVERFLOW_PRESSURE_MEDIUM: usize = (MAX_OVERFLOW_CAPACITY * 8) / 10;
+const OVERFLOW_PRESSURE_HIGH: usize = (MAX_OVERFLOW_CAPACITY * 9) / 10;
+const OVERFLOW_PRESSURE_CRITICAL: usize = (MAX_OVERFLOW_CAPACITY * 95) / 100;
 
-/// Memory safety circuit breaker for system-wide protection
-const SYSTEM_MEMORY_LIMIT_MB: usize = if cfg!(test) { 10 } else { 2048 }; // Test: 10MB, Production: 2GB
-const MEMORY_CHECK_INTERVAL_MS: u64 = 1000; // Check memory usage every second
+/// Memory safety circuit breaker
+const SYSTEM_MEMORY_LIMIT_MB: usize = if cfg!(test) { 10 } else { 2048 };
+const MEMORY_CHECK_INTERVAL_MS: u64 = 1000;
 
-/// Adaptive timing constants for CPU pressure detection and container throttling protection
-const BASE_MERGE_INTERVAL_MS: u64 = 200;  // ULTRA-LIGHTWEIGHT: 5x longer to prioritize HTTP server
-const BASE_MANAGEMENT_INTERVAL_SEC: u64 = 30;  // 6x longer for better CPU efficiency
+/// Background task timing constants
+const BASE_MERGE_INTERVAL_MS: u64 = 200;
+const BASE_MANAGEMENT_INTERVAL_SEC: u64 = 30;
 const BASE_STATS_INTERVAL_SEC: u64 = 30;
 const MAX_INTERVAL_MULTIPLIER: u64 = 8;
 
@@ -171,7 +159,7 @@ impl BackgroundErrorHandler {
         
         if error_count > 1 {
             let backoff_secs = std::cmp::min(2_u64.pow((error_count - 1) as u32), 60);
-            println!("🔄 Backing off merge operations for {} seconds", backoff_secs);
+            println!("Backing off merge operations for {} seconds", backoff_secs);
             tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
         }
         
@@ -288,7 +276,7 @@ struct SegmentMergeOperation {
     combined_access: u64,
 }
 
-/// 🚀 PHASE 4: SIMD Capabilities Information
+/// SIMD capabilities information
 #[derive(Debug, Clone)]
 pub struct SIMDCapabilities {
     pub has_avx2: bool,
@@ -927,12 +915,12 @@ impl BoundedHotBuffer {
         }
     }
 
-    /// ✅ SINGLE AUTHORITATIVE IMPLEMENTATION
+    /// Single authoritative implementation
     /// Try to insert into hot buffer - returns true if successful, false if at capacity
     pub fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
         let mut buffer = self.buffer.lock();
         
-        // ✅ ATOMIC CHECK AND INSERT under single lock
+        // Atomic check and insert under single lock
         if buffer.len() >= self.capacity {
             return Ok(false);
         }
@@ -994,7 +982,7 @@ impl BoundedHotBuffer {
         let buffer = self.buffer.lock();
         let actual_len = buffer.len();
         
-        // 🚀 SYNC atomic size with reality to prevent drift
+        // Sync atomic size with reality to prevent drift
         self.size.store(actual_len, Ordering::Release);
         
         actual_len >= self.capacity
@@ -1006,7 +994,7 @@ impl BoundedHotBuffer {
         let buffer = self.buffer.lock();
         let actual_len = buffer.len();
         
-        // 🚀 SYNC atomic size with reality to prevent drift  
+        // Sync atomic size with reality to prevent drift  
         self.size.store(actual_len, Ordering::Release);
         
         actual_len as f32 / self.capacity as f32
@@ -1242,7 +1230,7 @@ impl BoundedOverflowBuffer {
     }
 
     /// Search for a key in the buffer (LIFO order for recency)
-    /// 🚀 O(1) HASH LOOKUP - Replaces O(n) linear search for massive performance gain
+    /// O(1) hash lookup - replaces O(n) linear search for massive performance gain
     /// 
     /// This is the key fix for the overflow buffer performance sink.
     /// Instead of iterating through all entries, we use a hybrid approach:
@@ -1253,7 +1241,7 @@ impl BoundedOverflowBuffer {
         // For now, keeping the original implementation but with optimization hints
         // In production, this would be replaced with a proper HashMap lookup
         
-        // 🔧 OPTIMIZATION: Start from the end (most recent entries) for better cache locality
+        // Optimization: Start from the end (most recent entries) for better cache locality
         // This provides 2-3x speedup for temporal locality without breaking existing code
         for &(k, v) in self.data.iter().rev() {
             if k == key {
@@ -1678,7 +1666,7 @@ impl CPUPressureDetector {
                                 if avg_pressure > 50.0 {
                                     signals += 2;
                                     *max_signal_strength = (*max_signal_strength).max(3); // High
-                                    println!("📊 CPU pressure stall: {:.1}%", avg_pressure);
+                                    println!("CPU pressure stall: {:.1}%", avg_pressure);
                                 } else if avg_pressure > 20.0 {
                                     signals += 1;
                                 }
@@ -1867,7 +1855,7 @@ impl AdaptiveRMI {
             return Ok(());
         }
 
-        // 2. ✅ minimal lock time: Get overflow buffer stats quickly
+        // 2. minimal lock time: Get overflow buffer stats quickly
         let (_overflow_size, _overflow_capacity, rejected_writes, _pressure_level, _overflow_memory_mb) = {
             let overflow = self.overflow_buffer.lock();
             overflow.stats()
@@ -1878,7 +1866,7 @@ impl AdaptiveRMI {
             (hot_size * std::mem::size_of::<(u64, u64)>()) / 1024
         };
 
-        // 6. ✅ non-blocking insert attempt with minimal lock time
+        // 6. non-blocking insert attempt with minimal lock time
         let insert_result = {
             let mut overflow = self.overflow_buffer.lock();
             let result = overflow.try_insert(key, value);
@@ -1910,9 +1898,9 @@ impl AdaptiveRMI {
         }
     }
 
-    /// � race-free lookup with generation-based consistency protection
+    /// Race-free lookup with generation-based consistency protection
     /// Eliminates TOCTOU vulnerabilities between router prediction and segment access
-    /// 🛡️ DEADLOCK FIX: Ultra-fast single-lock lookup to eliminate deadlock potential
+    /// Deadlock fix: Ultra-fast single-lock lookup to eliminate deadlock potential
     /// Uses optimistic atomic snapshot to avoid holding multiple locks simultaneously
     pub fn lookup(&self, key: u64) -> Option<u64> {
         #[cfg(not(feature = "bench-no-metrics"))]
@@ -1943,7 +1931,7 @@ impl AdaptiveRMI {
             return Some(value);
         }
 
-        // 🚀 DEADLOCK-FREE LOOKUP: Single atomic snapshot without multiple locks
+        // Deadlock-free lookup: Single atomic snapshot without multiple locks
         // This eliminates the reader-writer deadlock by never holding multiple locks
         let segments_guard = self.segments.read();
         
@@ -2015,7 +2003,7 @@ impl AdaptiveRMI {
     pub async fn merge_hot_buffer(&self) -> Result<()> {
         self.merge_scheduler.start_merge();
         
-        // 1. ✅ atomic DRAIN: Guaranteed consistency with no data loss risk
+        // 1. atomic DRAIN: Guaranteed consistency with no data loss risk
         let hot_data = self.hot_buffer.drain_atomic();
         let overflow_data = {
             let mut overflow = self.overflow_buffer.lock();
@@ -2033,7 +2021,7 @@ impl AdaptiveRMI {
         
         all_writes.sort_by_key(|(k, _)| *k);
 
-        // 3. ✅ DEADLOCK-FREE: Use consistent lock ordering for all updates
+        // 3. Deadlock-free: Use consistent lock ordering for all updates
         self.atomic_update_with_consistent_locking(|segments, router| {
             if segments.is_empty() {
                 // Create initial segment
@@ -2046,7 +2034,7 @@ impl AdaptiveRMI {
                 // Update router for single segment (empty boundaries route all to segment 0)
                 router.update_boundaries(vec![]);
                 
-                println!("✅ Created initial segment with {} keys (range: {} to {})", 
+                println!("Created initial segment with {} keys (range: {} to {})", 
                          all_writes.len(), first_key, last_key);
                 return Ok(());
             }
@@ -2330,7 +2318,7 @@ impl AdaptiveRMI {
         // Update router generation again after structural changes
         router.increment_generation();
         
-        println!("✅ Split segment {} at position {} (generation: {})", 
+        println!("Split segment {} at position {} (generation: {})", 
                 split_op.segment_id, split_op.split_point, router.get_generation());
         
         Ok(())
@@ -2370,7 +2358,7 @@ impl AdaptiveRMI {
         router.increment_generation();
         
         println!(
-            "✅ Merged segments {} and {} (combined_access: {}, generation: {})", 
+            "Merged segments {} and {} (combined_access: {}, generation: {})", 
             merge_op.segment_id_1, 
             merge_op.segment_id_2, 
             merge_op.combined_access,
@@ -2551,7 +2539,7 @@ impl AdaptiveRMI {
             let mut emergency_mode = false;
             let mut last_emergency_check = std::time::Instant::now();
             
-            println!("🚀 Starting container-aware background maintenance with CPU throttling protection");
+            println!("Starting container-aware background maintenance with CPU throttling protection");
             
             loop {
                 loop_iteration_count += 1;
@@ -2562,8 +2550,8 @@ impl AdaptiveRMI {
                     let elapsed_since_check = now.duration_since(last_circuit_breaker_check);
                     
                     if elapsed_since_check.as_secs() < 60 && loop_iteration_count > MAX_ITERATIONS_PER_MINUTE {
-                        eprintln!("🚨 CIRCUIT BREAKER ACTIVATED: Background loop running too fast");
-                        eprintln!("🔧 {} iterations in {} seconds, limiting iterations", loop_iteration_count, elapsed_since_check.as_secs());
+                        eprintln!("CIRCUIT BREAKER ACTIVATED: Background loop running too fast");
+                        eprintln!("{} iterations in {} seconds, limiting iterations", loop_iteration_count, elapsed_since_check.as_secs());
                         
                         // ZERO-LATENCY: Just reset counters, never sleep
                         // HTTP performance is more important than preventing CPU spinning
@@ -2593,16 +2581,16 @@ impl AdaptiveRMI {
                         last_emergency_check = now;
                         
                         if emergency_mode {
-                            println!("🚨 EMERGENCY MODE ACTIVATED - CPU pressure critical (level {}, {} consecutive throttles)", 
+                            println!("EMERGENCY MODE ACTIVATED - CPU pressure critical (level {}, {} consecutive throttles)", 
                                 _pressure_level, consecutive_throttles);
-                            println!("🔧 Environment: {}, switching to survival mode operations", environment);
+                            println!("Environment: {}, switching to survival mode operations", environment);
                         } else {
-                            println!("✅ Emergency mode deactivated - CPU pressure normalized");
+                            println!("Emergency mode deactivated - CPU pressure normalized");
                         }
                     }
                     
                     if multiplier > 1 {
-                        println!("🔧 CPU pressure detected (level {}, env: {}) - intervals scaled by {}x", 
+                        println!("CPU pressure detected (level {}, env: {}) - intervals scaled by {}x", 
                             pressure, environment, multiplier);
                         
                         // Dynamic base interval adjustment based on pressure
@@ -2629,7 +2617,7 @@ impl AdaptiveRMI {
                         // Emergency merge with minimal CPU usage
                         match self.emergency_minimal_merge().await {
                             Ok(_) => {
-                                println!("✅ Emergency merge completed");
+                                println!("Emergency merge completed");
                                 error_handler.reset_merge_errors();
                             }
                             Err(e) => {
@@ -2639,11 +2627,11 @@ impl AdaptiveRMI {
                         }
                     }
                     
-                    // ULTRA-FAST: No sleeping in emergency mode, just continue
+                    // No sleeping in emergency mode, just continue
                     continue; // Skip normal operations in emergency mode
                 }
                 
-                // ZERO-LATENCY MODE: Disable yielding and sleeping for maximum HTTP performance
+                // Zero-latency mode: Disable yielding and sleeping for maximum HTTP performance
                 // Background tasks should never block HTTP responses
                 let current_pressure = cpu_detector.current_pressure();
                 
@@ -2658,7 +2646,7 @@ impl AdaptiveRMI {
                 
                 // Priority 1: Urgent merges (override all pressure limits)
                 if urgent_merge_needed {
-                    println!("⚡ Urgent merge required due to memory pressure");
+                    println!("Urgent merge required due to memory pressure");
                     
                     // CRITICAL FIX: No yielding before urgent operations - they need immediate execution
                     let merge_start = std::time::Instant::now();
@@ -2667,7 +2655,7 @@ impl AdaptiveRMI {
                             let completion_time = merge_start.elapsed();
                             merge_adaptive.optimize_interval(completion_time);
                             error_handler.reset_merge_errors();
-                            println!("✅ Urgent merge completed in {:?}", completion_time);
+                            println!("Urgent merge completed in {:?}", completion_time);
                         }
                         Err(e) => {
                             merge_adaptive.increase_interval();
@@ -2713,7 +2701,7 @@ impl AdaptiveRMI {
                                 let completion_time = merge_start.elapsed();
                                 merge_adaptive.optimize_interval(completion_time);
                                 error_handler.reset_merge_errors();
-                                println!("✅ Merge completed in {:?}", completion_time);
+                                println!("Merge completed in {:?}", completion_time);
                             }
                             Err(e) => {
                                 merge_adaptive.increase_interval();
@@ -2754,7 +2742,7 @@ impl AdaptiveRMI {
                 
                 // Priority 4: Statistics and monitoring (very low priority)
                 if now.duration_since(loop_start) >= stats_adaptive.current() {
-                    // 🚀 ULTRA-FAST: Skip stats completely during any load to maintain HTTP performance
+                    // Skip stats completely during any load to maintain HTTP performance
                     if current_pressure >= 1 {
                         continue; // Skip stats entirely instead of sleeping
                     }
@@ -2769,12 +2757,12 @@ impl AdaptiveRMI {
                     let (_pressure_level, consecutive_throttles, _is_container, environment) = cpu_detector.get_pressure_stats();
                     
                     if merge_errors > 0 || mgmt_errors > 0 || _pressure_level > 0 {
-                        println!("📊 Status - Errors: {}M/{}G, Pressure: L{} ({} throttles), Env: {}", 
+                        println!("Status - Errors: {}M/{}G, Pressure: L{} ({} throttles), Env: {}", 
                             merge_errors, mgmt_errors, _pressure_level, consecutive_throttles, environment);
                     }
                     
                     if _pressure_level == 0 {
-                        println!("⏱️  Intervals - merge: {:?}, mgmt: {:?}, stats: {:?}",
+                        println!("Intervals - merge: {:?}, mgmt: {:?}, stats: {:?}",
                             merge_adaptive.current(), management_adaptive.current(), stats_adaptive.current());
                     }
                     
@@ -2782,7 +2770,7 @@ impl AdaptiveRMI {
                     stats_adaptive.optimize_interval(completion_time);
                 }
                 
-                // 🚀 ZERO-LATENCY MODE: No sleeping in background maintenance
+                // Zero-latency mode: No sleeping in background maintenance
                 // HTTP requests must have absolute priority over background tasks
                 // Let tokio scheduler handle task scheduling efficiently
                 // Only yield control, never sleep - this allows HTTP requests to be processed immediately
@@ -2809,10 +2797,10 @@ impl AdaptiveRMI {
             return Ok(());
         }
         
-        println!("🔧 Emergency merging {} overflow entries", overflow_data.len());
+        println!("Emergency merging {} overflow entries", overflow_data.len());
         
         if overflow_data.len() > 100_000 {
-            eprintln!("🚨 EMERGENCY ABORT: Too many overflow entries ({}), potential infinite loop", overflow_data.len());
+            eprintln!("EMERGENCY ABORT: Too many overflow entries ({}), potential infinite loop", overflow_data.len());
             return Err(anyhow::anyhow!("Emergency merge aborted: overflow data too large ({})", overflow_data.len()));
         }
         
@@ -2854,7 +2842,7 @@ impl AdaptiveRMI {
             Ok(())
         }).await?;
         
-        println!("✅ Emergency merge completed successfully");
+        println!("Emergency merge completed successfully");
         Ok(())
     }
 
@@ -2898,7 +2886,7 @@ impl AdaptiveRMI {
         let hot_buffer_utilization = self.hot_buffer.utilization();
         let (overflow_size, _overflow_capacity, _rejected_writes, _pressure, _memory_mb) = self.overflow_buffer.lock().stats();
         
-        // 🎯 ACCURATE TOTAL: Include both segments AND buffer contents
+        // Accurate total: Include both segments AND buffer contents
         let segment_keys: usize = segments.iter().map(|s| s.len()).sum();
         let total_keys = segment_keys + hot_buffer_size + overflow_size; // Include ALL data
         let segment_count = segments.len();
@@ -3003,12 +2991,12 @@ impl AdaptiveRMI {
     }
 
     // ============================================================================
-    // 🚀 PHASE 4: SIMD-OPTIMIZED BATCH PROCESSING
+    // SIMD-optimized batch processing
     // ============================================================================
     
-    /// 🚀 SIMD BATCH LOOKUP: Process multiple keys with vectorized operations
+    /// SIMD batch lookup: Process multiple keys with vectorized operations
     /// 
-    /// This method provides enterprise-grade batch processing with automatic
+    /// This method provides batch processing with automatic
     /// SIMD optimization when available, falling back gracefully to scalar
     /// operations on unsupported architectures.
     pub fn lookup_batch_simd(&self, keys: &[u64]) -> Vec<Option<u64>> {
@@ -3017,14 +3005,14 @@ impl AdaptiveRMI {
         
         let mut results = Vec::with_capacity(keys.len());
         
-        // 🚀 ARM64 NEON PROCESSING: Optimized for Apple Silicon
+        // ARM64 NEON processing: Optimized for Apple Silicon
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
             // Process in chunks of 16 keys for optimal cache performance on ARM64
             const OPTIMAL_CHUNK_SIZE: usize = 16;
             
             for chunk in keys.chunks(OPTIMAL_CHUNK_SIZE) {
-                // Process 4 keys at a time within each chunk (NEON width)
+                // Process 4 keys with 2 NEON operations (2 keys per register)
                 for neon_group in chunk.chunks(4) {
                     if neon_group.len() == 4 {
                         let neon_results = self.lookup_4_keys_neon_optimized(neon_group);
@@ -3039,14 +3027,14 @@ impl AdaptiveRMI {
             }
         }
         
-        // 🚀 x86_64 AVX2 PROCESSING: Optimized for Intel/AMD
+        // x86_64 AVX2 processing: Optimized for Intel/AMD
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             // Process in chunks of 64 keys for optimal cache performance
             const OPTIMAL_CHUNK_SIZE: usize = 64;
             
             for chunk in keys.chunks(OPTIMAL_CHUNK_SIZE) {
-                // 🚀 TRUE 16-KEY SIMD PROCESSING: Process 16 keys at a time for maximum throughput
+                // True 16-key SIMD processing: Process 16 keys at a time for maximum throughput
                 for simd_group in chunk.chunks(16) {
                     if simd_group.len() == 16 {
                         // Convert slice to array for 16-key SIMD processing
@@ -3077,7 +3065,7 @@ impl AdaptiveRMI {
             }
         }
         
-        // 🚀 COMPATIBILITY PATH: Scalar processing for other architectures
+        //  COMPATIBILITY PATH: Scalar processing for other architectures
         #[cfg(not(any(
             all(target_arch = "x86_64", target_feature = "avx2"),
             all(target_arch = "aarch64", target_feature = "neon")
@@ -3102,17 +3090,16 @@ impl AdaptiveRMI {
         results
     }
     
-    /// 🚀 OPTIMIZED 8-KEY SIMD: True vectorization with minimal overhead
+    /// Optimized 8-key SIMD: Process 8 keys using AVX2 instructions
     /// 
-    /// This function processes 8 keys simultaneously using AVX2 instructions for maximum
-    /// throughput. It implements a three-phase lookup strategy with early exits for
-    /// optimal performance on modern x86_64 processors.
+    /// Uses 2 AVX2 registers (2 separate 4-wide operations) for optimal performance.
+    /// Technical reality: Each AVX2 register processes 4 u64 values (256 bits ÷ 64 bits = 4)
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn lookup_8_keys_optimized_simd(&self, keys: &[u64]) -> [Option<u64>; 8] {
         use std::arch::x86_64::*;
         
-        // 🚀 BOUNDS VALIDATION: Enterprise-grade safety
+        // Bounds validation for safety
         if keys.len() < 8 {
             // Fallback to scalar processing for insufficient keys
             let mut results = [None; 8];
@@ -3122,27 +3109,27 @@ impl AdaptiveRMI {
             return results;
         }
         
-        // 🚀 EFFICIENT LOADING: Load 8 keys into 2 AVX2 registers
-        // Each __m256i holds 4 u64 values (256 bits / 64 bits = 4)
+        // Load 8 keys into 2 AVX2 registers
+        // Each __m256i holds exactly 4 u64 values (256 bits ÷ 64 bits = 4)
         let keys_ptr = keys.as_ptr() as *const __m256i;
-        let keys_lo = _mm256_loadu_si256(keys_ptr);         // Keys 0-3
-        let keys_hi = _mm256_loadu_si256(keys_ptr.add(1));  // Keys 4-7
+        let keys_lo = _mm256_loadu_si256(keys_ptr);         // Keys 0-3 (register 1)
+        let keys_hi = _mm256_loadu_si256(keys_ptr.add(1));  // Keys 4-7 (register 2)
         
-        // 🚀 PIPELINE OPTIMIZATION: Three-phase lookup with early exits
+       
         
-        // Phase 1: Hot buffer lookup (highest probability, fastest access)
+        // Hot buffer lookup (highest probability, fastest access)
         let hot_results = self.simd_hot_buffer_lookup(keys_lo, keys_hi);
         
-        // 🚀 PERFORMANCE OPTIMIZATION: Early exit if all keys found in hot buffer
+        //  PERFORMANCE OPTIMIZATION: Early exit if all keys found in hot buffer
         let hot_found_count = hot_results.iter().filter(|r| r.is_some()).count();
         if hot_found_count == 8 {
             return hot_results;
         }
         
-        // Phase 2: Overflow buffer lookup (for recently inserted, unsorted data)
+        //Overflow buffer lookup (for recently inserted, unsorted data)
         let overflow_results = self.simd_overflow_buffer_lookup(keys_lo, keys_hi, &hot_results);
         
-        // 🚀 EARLY EXIT: Check if all keys found in buffers (hot + overflow)
+        // EARLY EXIT: Check if all keys found in buffers (hot + overflow)
         let buffer_complete = (0..8).all(|i| {
             hot_results[i].is_some() || overflow_results[i].is_some()
         });
@@ -3160,10 +3147,10 @@ impl AdaptiveRMI {
             ];
         }
 
-        // Phase 3: Segment lookup (for persistent, sorted data)
+        //  Segment lookup (for persistent, sorted data)
         let segment_results = self.simd_segment_lookup(keys_lo, keys_hi, &hot_results, &overflow_results);
         
-        // 🚀 VECTORIZED RESULT COMBINATION: Combine all three phases efficiently
+        
         // Priority: Hot buffer > Overflow buffer > Segments
         [
             hot_results[0].or(overflow_results[0]).or(segment_results[0]),
@@ -3177,30 +3164,33 @@ impl AdaptiveRMI {
         ]
     }
     
-    /// 🚀 OPTIMIZED 16-KEY SIMD: True 16-key vectorization with maximum throughput
+    /// Optimized 16-key SIMD: True 16-key vectorization with maximum throughput
     /// 
     /// Process 16 keys simultaneously using 4 AVX2 registers for optimal performance.
     /// This function represents the pinnacle of SIMD optimization for batch key lookups,
     /// designed to saturate modern CPU pipelines and maximize cache efficiency.
+    ///  16-key processing: Uses 4 AVX2 registers (4 separate 4-wide operations)
+    /// 
+    /// Technical reality:
+    /// - Each AVX2 register processes 4 u64 values (256 bits ÷ 64 bits = 4)
+    /// - To process 16 keys: requires 4 separate register operations
+    /// - Performance benefit: reduced function call overhead, better instruction pipelining
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn lookup_16_keys_optimized_simd(&self, keys: &[u64; 16]) -> [Option<u64>; 16] {
         use std::arch::x86_64::*;
         
-        // 🚀 ENTERPRISE SAFETY: Validate input array length at compile time
-        // Array type [u64; 16] ensures exactly 16 keys at compile time
-        
-        // 🚀 EFFICIENT LOADING: Load all 16 keys into 4 AVX2 registers
-        // Each __m256i holds 4 u64 values, so 4 registers = 16 keys total
+        // Load 16 keys into 4 AVX2 registers
+        // Each __m256i holds exactly 4 u64 values (256 bits ÷ 64 bits = 4)
         let keys_ptr = keys.as_ptr() as *const __m256i;
-        let keys_0 = _mm256_loadu_si256(keys_ptr);           // Keys 0-3
-        let keys_1 = _mm256_loadu_si256(keys_ptr.add(1));    // Keys 4-7  
-        let keys_2 = _mm256_loadu_si256(keys_ptr.add(2));    // Keys 8-11
-        let keys_3 = _mm256_loadu_si256(keys_ptr.add(3));    // Keys 12-15
+        let keys_0 = _mm256_loadu_si256(keys_ptr);           // Keys 0-3 (register 1)
+        let keys_1 = _mm256_loadu_si256(keys_ptr.add(1));    // Keys 4-7 (register 2)
+        let keys_2 = _mm256_loadu_si256(keys_ptr.add(2));    // Keys 8-11 (register 3)
+        let keys_3 = _mm256_loadu_si256(keys_ptr.add(3));    // Keys 12-15 (register 4)
         
-        // 🚀 PIPELINE OPTIMIZATION: Process in phases for maximum efficiency
+        // Processing: 4 separate 4-wide SIMD operations
         
-        // Phase 1: Hot buffer lookup for all 16 keys
+        //  Hot buffer lookup for all 16 keys
         let hot_results_0_3 = self.simd_hot_buffer_lookup(keys_0, keys_1);
         let hot_results_4_7 = self.simd_hot_buffer_lookup(keys_2, keys_3);
         
@@ -3212,13 +3202,13 @@ impl AdaptiveRMI {
             hot_results_4_7[4], hot_results_4_7[5], hot_results_4_7[6], hot_results_4_7[7],
         ];
         
-        // 🚀 PERFORMANCE OPTIMIZATION: Early exit if all 16 keys found in hot buffer
+        //  PERFORMANCE OPTIMIZATION: Early exit if all 16 keys found in hot buffer
         let hot_found_count = hot_results.iter().filter(|r| r.is_some()).count();
         if hot_found_count == 16 {
             return hot_results;
         }
         
-        // Phase 2: Overflow buffer lookup for missing keys
+        // Overflow buffer lookup for missing keys
         let overflow_results_0_3 = self.simd_overflow_buffer_lookup(keys_0, keys_1, &hot_results_0_3);
         let overflow_results_4_7 = self.simd_overflow_buffer_lookup(keys_2, keys_3, &hot_results_4_7);
         
@@ -3229,7 +3219,7 @@ impl AdaptiveRMI {
             overflow_results_4_7[4], overflow_results_4_7[5], overflow_results_4_7[6], overflow_results_4_7[7],
         ];
         
-        // 🚀 EARLY EXIT: Check if all keys found in buffers (hot + overflow)
+        // EARLY EXIT: Check if all keys found in buffers (hot + overflow)
         let buffer_complete = (0..16).all(|i| {
             hot_results[i].is_some() || overflow_results[i].is_some()
         });
@@ -3247,7 +3237,7 @@ impl AdaptiveRMI {
             ];
         }
         
-        // Phase 3: Segment lookup for still missing keys
+        // Segment lookup for still missing keys
         let segment_results_0_3 = self.simd_segment_lookup(keys_0, keys_1, &hot_results_0_3, &overflow_results_0_3);
         let segment_results_4_7 = self.simd_segment_lookup(keys_2, keys_3, &hot_results_4_7, &overflow_results_4_7);
         
@@ -3258,7 +3248,7 @@ impl AdaptiveRMI {
             segment_results_4_7[4], segment_results_4_7[5], segment_results_4_7[6], segment_results_4_7[7],
         ];
         
-        // 🚀 VECTORIZED RESULT COMBINATION: Efficiently combine all 16 results
+        // VECTORIZED RESULT COMBINATION: Efficiently combine all 16 results
         [
             hot_results[0].or(overflow_results[0]).or(segment_results[0]),
             hot_results[1].or(overflow_results[1]).or(segment_results[1]),
@@ -3279,7 +3269,7 @@ impl AdaptiveRMI {
         ]
     }
     
-    /// 🚀 LOCK-FREE SIMD HOT BUFFER LOOKUP: Vectorized hot buffer search
+    /// LOCK-FREE SIMD HOT BUFFER LOOKUP: Vectorized hot buffer search
     /// 
     /// This function performs vectorized search through the hot buffer using AVX2 instructions.
     /// It implements a lock-minimization strategy with single atomic snapshot for maximum
@@ -3291,7 +3281,7 @@ impl AdaptiveRMI {
         
         let mut results = [None; 8];
         
-        // 🚀 MINIMAL LOCK TIME: Single atomic snapshot acquisition
+        // MINIMAL LOCK TIME: Single atomic snapshot acquisition
         // Lock strategy: Get all data at once to minimize lock contention
         let buffer_snapshot = {
             let buffer = self.hot_buffer.buffer.lock();
@@ -3302,9 +3292,9 @@ impl AdaptiveRMI {
             // Create snapshot to enable lock-free processing
             // Clone is necessary to release lock before SIMD processing
             buffer.iter().copied().collect::<Vec<_>>()
-        }; // 🔒 Lock released immediately after snapshot
+        }; // Lock released immediately after snapshot
         
-        // 🚀 LOCK-FREE VECTORIZED SEARCH: No locks during actual search operations
+        // LOCK-FREE VECTORIZED SEARCH: No locks during actual search operations
         // Extract all 8 keys from SIMD registers for efficient processing
         let keys_array = [
             _mm256_extract_epi64(keys_lo, 0) as u64,  // Key 0
@@ -3317,7 +3307,7 @@ impl AdaptiveRMI {
             _mm256_extract_epi64(keys_hi, 3) as u64,  // Key 7
         ];
         
-        // 🚀 CACHE-EFFICIENT VECTORIZED SEARCH: Process buffer in SIMD-friendly chunks
+        // CACHE-EFFICIENT VECTORIZED SEARCH: Process buffer in SIMD-friendly chunks
         // Strategy: Reverse iteration for temporal locality (recent data first)
         if buffer_snapshot.len() >= 4 {
             // Large buffer: Use SIMD-accelerated search in 4-element chunks
@@ -3326,7 +3316,7 @@ impl AdaptiveRMI {
                 let chunk = &buffer_snapshot[chunk_start..chunk_end];
                 
                 if chunk.len() >= 4 {
-                    // 🚀 VECTORIZED COMPARISON: Process 4 buffer entries simultaneously
+                    //  VECTORIZED COMPARISON: Process 4 buffer entries simultaneously
                     let chunk_keys = [chunk[0].0, chunk[1].0, chunk[2].0, chunk[3].0];
                     let chunk_values = [chunk[0].1, chunk[1].1, chunk[2].1, chunk[3].1];
                     
@@ -3365,7 +3355,7 @@ impl AdaptiveRMI {
                     }
                 }
                 
-                // 🚀 EARLY EXIT OPTIMIZATION: Stop if all keys found
+                // EARLY EXIT OPTIMIZATION: Stop if all keys found
                 if results.iter().all(|r| r.is_some()) {
                     break;
                 }
@@ -3503,7 +3493,7 @@ impl AdaptiveRMI {
     ) -> [Option<u64>; 8] {
         let mut results = [None; 8];
         
-        // 🚀 EARLY EXIT: Check if we need to do segment lookup at all
+        //  EARLY EXIT: Check if we need to do segment lookup at all
         let need_segment_lookup = (0..8).any(|i| {
             hot_results[i].is_none() && overflow_results[i].is_none()
         });
@@ -3592,7 +3582,7 @@ impl AdaptiveRMI {
             return None;
         }
         
-        // 🚀 BOUNDED SEARCH WINDOW: Limit search to small window around prediction
+        //  BOUNDED SEARCH WINDOW: Limit search to small window around prediction
         const SEARCH_WINDOW: usize = 8; // Must be multiple of 4 for SIMD
         let data_len = data.len();
         
@@ -3657,7 +3647,7 @@ impl AdaptiveRMI {
         }
     }
     
-    /// 🚀 TRUE SIMD SEGMENT PREDICTION: Vectorized routing model prediction
+    ///  TRUE SIMD SEGMENT PREDICTION: Vectorized routing model prediction
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_predict_segments(
@@ -3682,7 +3672,7 @@ impl AdaptiveRMI {
         let clamped_lo = _mm256_min_epi64(prefixes_lo, max_index);
         let clamped_hi = _mm256_min_epi64(prefixes_hi, max_index);
         
-        // 🚀 FULLY VECTORIZED GATHER: Use AVX2 gather for true vectorized lookup
+        // FULLY VECTORIZED GATHER: Use AVX2 gather for true vectorized lookup
         // This replaces 8 scalar memory accesses with 2 vectorized gather operations
         let router_ptr = router.router.as_ptr() as *const i32; // Cast to i32 for _mm256_i64gather_epi32
         
@@ -3709,16 +3699,17 @@ impl AdaptiveRMI {
         ]
     }
     
-    /// 🚀 ARM64 NEON: 4-key vectorized lookup optimized for Apple Silicon
+    /// ARM64 NEON: 4-key processing using 2 NEON registers (2 separate 2-wide operations)
     /// 
-    /// This function leverages ARM64 NEON instructions for optimal performance on Apple Silicon
-    /// processors (M1, M2, M3, M4). It implements unified memory architecture optimizations
-    /// and advanced prefetching strategies designed for Apple's custom silicon.
+   
+    /// - Each NEON register holds 2 u64 values (128 bits ÷ 64 bits = 2)
+    /// - To process 4 keys: requires 2 separate register operations  
+    /// - Performance benefit: instruction pipelining, reduced function call overhead
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     pub fn lookup_4_keys_neon_optimized(&self, keys: &[u64]) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
         
-        // 🚀 APPLE SILICON SAFETY: Validate input for enterprise robustness
+        // Bounds validation for safety
         if keys.len() < 4 {
             // Fallback to scalar processing for insufficient keys
             let mut results = [None; 4];
@@ -3729,26 +3720,26 @@ impl AdaptiveRMI {
         }
         
         unsafe {
-            // 🚀 NEON LOADING: Load 4 keys into 2 NEON 128-bit registers  
-            // Each uint64x2_t holds 2 u64 values (128 bits / 64 bits = 2)
-            let _keys_vec1 = vld1q_u64([keys[0], keys[1]].as_ptr());  // Keys 0-1
-            let _keys_vec2 = vld1q_u64([keys[2], keys[3]].as_ptr());  // Keys 2-3
+            // NEON loading: Load 4 keys into 2 NEON 128-bit registers  
+            // Each uint64x2_t holds exactly 2 u64 values (128 bits ÷ 64 bits = 2)
+            let _keys_vec1 = vld1q_u64([keys[0], keys[1]].as_ptr());  // Keys 0-1 (register 1)
+            let _keys_vec2 = vld1q_u64([keys[2], keys[3]].as_ptr());  // Keys 2-3 (register 2)
             
-            // 🚀 UNIFIED MEMORY OPTIMIZATION: Leverage Apple Silicon's unified memory architecture
+            // Unified memory optimization: Leverage Apple Silicon's unified memory architecture
             // Apple Silicon has faster memory access patterns due to unified memory
             
-            // Phase 1: Hot buffer (prioritized for Apple Silicon's large cache)
+            // Hot buffer (prioritized for Apple Silicon's large cache)
             let hot_results = self.neon_hot_buffer_lookup(keys);
             
-            // 🚀 EARLY EXIT: Apple Silicon branch predictor optimization
+            //  EARLY EXIT: Apple Silicon branch predictor optimization
             if hot_results.iter().all(|r| r.is_some()) {
                 return hot_results;
             }
             
-            // Phase 2: Overflow buffer (optimized for M4's advanced cache hierarchy)
+            //  Overflow buffer (optimized for M4's advanced cache hierarchy)
             let overflow_results = self.neon_overflow_buffer_lookup(keys, &hot_results);
             
-            // 🚀 APPLE SILICON EARLY EXIT: Optimized for M4's execution units
+            // APPLE SILICON EARLY EXIT: Optimized for M4's execution units
             let found_in_buffers = hot_results.iter().zip(overflow_results.iter())
                 .all(|(hot, overflow)| hot.is_some() || overflow.is_some());
             
@@ -3761,10 +3752,10 @@ impl AdaptiveRMI {
                 ];
             }
             
-            // Phase 3: Segments (optimized for Apple Silicon's wide execution)
+            // Segments (optimized for Apple Silicon's wide execution)
             let segment_results = self.neon_segment_lookup(keys, &hot_results, &overflow_results);
             
-            // 🚀 NEON RESULT COMBINATION: Optimized for Apple Silicon's execution pipeline
+            // NEON RESULT COMBINATION: Optimized for Apple Silicon's execution pipeline
             [
                 hot_results[0].or(overflow_results[0]).or(segment_results[0]),
                 hot_results[1].or(overflow_results[1]).or(segment_results[1]),
@@ -3774,7 +3765,7 @@ impl AdaptiveRMI {
         }
     }
 
-    /// 🚀 ARM64 NEON HOT BUFFER: Vectorized hot buffer search for Apple Silicon
+    /// ARM64 NEON HOT BUFFER: Vectorized hot buffer search for Apple Silicon
     /// 
     /// Enterprise-grade NEON implementation optimized for M1/M2/M3/M4 MacBooks
     /// with unified memory architecture and cache hierarchy awareness.
@@ -3782,10 +3773,10 @@ impl AdaptiveRMI {
     fn neon_hot_buffer_lookup(&self, keys: &[u64]) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
         
-        // 🚀 PHASE 1: Early exit optimization for enterprise performance
+        //  Early exit optimization for enterprise performance
         let mut results = [None; 4];
         
-        // 🚀 APPLE SILICON OPTIMIZATION: Single atomic lock acquisition
+        // APPLE SILICON OPTIMIZATION: Single atomic lock acquisition
         // Leverages unified memory architecture for optimal cache coherency
         let buffer_snapshot = {
             let buffer = self.hot_buffer.buffer.lock();
@@ -3793,36 +3784,36 @@ impl AdaptiveRMI {
                 return results; // Early exit for empty buffer
             }
             
-            // 🚀 M4 MACBOOK OPTIMIZATION: Cache-aligned copy for unified memory
+            // M4 MACBOOK OPTIMIZATION: Cache-aligned copy for unified memory
             let mut snapshot = Vec::with_capacity(buffer.len());
             snapshot.extend(buffer.iter().copied());
             snapshot
         };
         
-        // 🚀 PHASE 2: NEON vectorized search with Apple Silicon optimizations
+        //  NEON vectorized search with Apple Silicon optimizations
         unsafe {
             let mut found_count = 0;
             
-            // 🚀 NEON 128-BIT PROCESSING: Process buffer in optimal chunks
+            // NEON 128-BIT PROCESSING: Process buffer in optimal chunks
             for chunk in buffer_snapshot.chunks(2) {
                 if found_count >= 4 { break; } // Early exit when all found
                 
                 if chunk.len() >= 2 {
-                    // 🚀 NEON VECTOR LOAD: Load 2 key-value pairs into 128-bit registers
+                    // NEON VECTOR LOAD: Load 2 key-value pairs into 128-bit registers
                     let buffer_keys = vld1q_u64([chunk[0].0, chunk[1].0].as_ptr());
                     let _buffer_values = vld1q_u64([chunk[0].1, chunk[1].1].as_ptr());
                     
-                    // 🚀 PARALLEL SEARCH: Compare all 4 search keys against buffer chunk
+                    //  PARALLEL SEARCH: Compare all 4 search keys against buffer chunk
                     for (i, &search_key) in keys.iter().enumerate() {
                         if results[i].is_some() { continue; } // Skip already found
                         
-                        // 🚀 NEON BROADCAST: Duplicate search key across 128-bit vector
+                        // NEON BROADCAST: Duplicate search key across 128-bit vector
                         let search_vec = vdupq_n_u64(search_key);
                         
-                        // 🚀 NEON COMPARISON: Vectorized equality check
+                        // NEON COMPARISON: Vectorized equality check
                         let matches = vceqq_u64(search_vec, buffer_keys);
                         
-                        // 🚀 APPLE SILICON CONDITIONAL: Extract match results efficiently
+                        // APPLE SILICON CONDITIONAL: Extract match results efficiently
                         let match0 = vgetq_lane_u64(matches, 0);
                         let match1 = vgetq_lane_u64(matches, 1);
                         
@@ -3835,7 +3826,7 @@ impl AdaptiveRMI {
                         }
                     }
                 } else {
-                    // 🚀 SCALAR FALLBACK: Handle remaining single elements efficiently
+                    // SCALAR FALLBACK: Handle remaining single elements efficiently
                     for &(k, v) in chunk {
                         for (i, &search_key) in keys.iter().enumerate() {
                             if results[i].is_none() && k == search_key {
@@ -3850,11 +3841,11 @@ impl AdaptiveRMI {
             }
         }
         
-        // 🚀 PHASE 3: Return enterprise-validated results
+        // Return enterprise-validated results
         results
     }
 
-    /// 🚀 ARM64 NEON OVERFLOW BUFFER: Selective vectorized overflow search for Apple Silicon
+    /// ARM64 NEON OVERFLOW BUFFER: Selective vectorized overflow search for Apple Silicon
     ///
     /// Implements enterprise-grade NEON optimizations with selective search logic.
     /// Only searches for keys not found in hot buffer, maximizing Apple Silicon efficiency.
@@ -3862,15 +3853,15 @@ impl AdaptiveRMI {
     fn neon_overflow_buffer_lookup(&self, keys: &[u64], hot_results: &[Option<u64>; 4]) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
         
-        // 🚀 PHASE 1: Initialize results and early exits
+        // Initialize results and early exits
         let mut results = [None; 4];
         
-        // 🚀 ENTERPRISE OPTIMIZATION: Skip if all keys found in hot buffer
+        // ENTERPRISE OPTIMIZATION: Skip if all keys found in hot buffer
         if hot_results.iter().all(|r| r.is_some()) {
             return results;
         }
         
-        // 🚀 SELECTIVE SEARCH: Count keys that need overflow lookup
+        // SELECTIVE SEARCH: Count keys that need overflow lookup
         let unfound_keys: Vec<usize> = (0..4)
             .filter(|&i| hot_results[i].is_none())
             .collect();
@@ -3879,45 +3870,45 @@ impl AdaptiveRMI {
             return results;
         }
         
-        // 🚀 APPLE SILICON OPTIMIZATION: Atomic overflow buffer snapshot
+        // APPLE SILICON OPTIMIZATION: Atomic overflow buffer snapshot
         let overflow_snapshot = {
             let overflow = self.overflow_buffer.lock();
             if overflow.data.is_empty() {
                 return results;
             }
             
-            // 🚀 M4 MACBOOK OPTIMIZATION: Cache-efficient copy for unified memory
+            // M4 MACBOOK OPTIMIZATION: Cache-efficient copy for unified memory
             let mut snapshot = Vec::with_capacity(overflow.data.len());
             snapshot.extend(overflow.data.iter().copied());
             snapshot
         };
         
-        // 🚀 PHASE 2: NEON vectorized overflow search
+        //  NEON vectorized overflow search
         unsafe {
             let mut found_count = 0;
             let target_count = unfound_keys.len();
             
-            // 🚀 NEON 128-BIT PROCESSING: Process overflow in vectorized chunks
+            // NEON 128-BIT PROCESSING: Process overflow in vectorized chunks
             for chunk in overflow_snapshot.chunks(2) {
                 if found_count >= target_count { break; } // Early exit optimization
                 
                 if chunk.len() >= 2 {
-                    // 🚀 NEON VECTOR LOAD: Load 2 overflow key-value pairs
+                    // NEON VECTOR LOAD: Load 2 overflow key-value pairs
                     let buffer_keys = vld1q_u64([chunk[0].0, chunk[1].0].as_ptr());
                     
-                    // 🚀 SELECTIVE SEARCH: Only check unfound keys from hot buffer
+                    // SELECTIVE SEARCH: Only check unfound keys from hot buffer
                     for &idx in &unfound_keys {
                         if results[idx].is_some() { continue; } // Skip already found
                         
                         let search_key = keys[idx];
                         
-                        // 🚀 NEON BROADCAST: Duplicate search key across 128-bit vector
+                        // NEON BROADCAST: Duplicate search key across 128-bit vector
                         let search_vec = vdupq_n_u64(search_key);
                         
-                        // 🚀 NEON COMPARISON: Vectorized equality check
+                        // NEON COMPARISON: Vectorized equality check
                         let matches = vceqq_u64(search_vec, buffer_keys);
                         
-                        // 🚀 APPLE SILICON CONDITIONAL: Extract match results efficiently
+                        // APPLE SILICON CONDITIONAL: Extract match results efficiently
                         let match0 = vgetq_lane_u64(matches, 0);
                         let match1 = vgetq_lane_u64(matches, 1);
                         
@@ -3930,7 +3921,7 @@ impl AdaptiveRMI {
                         }
                     }
                 } else {
-                    // 🚀 SCALAR FALLBACK: Handle remaining single elements efficiently
+                    // SCALAR FALLBACK: Handle remaining single elements efficiently
                     for &(k, v) in chunk {
                         for &idx in &unfound_keys {
                             if results[idx].is_none() && keys[idx] == k {
@@ -3945,11 +3936,11 @@ impl AdaptiveRMI {
             }
         }
         
-        // 🚀 PHASE 3: Return enterprise-validated results
+        //  Return enterprise-validated results
         results
     }
 
-    /// 🚀 ARM64 NEON SEGMENT LOOKUP: Vectorized segment prediction and search for Apple Silicon
+    /// ARM64 NEON SEGMENT LOOKUP: Vectorized segment prediction and search for Apple Silicon
     ///
     /// Enterprise-grade NEON implementation with vectorized prediction and bounded search.
     /// Optimized for M1/M2/M3/M4 MacBooks with unified memory architecture.
@@ -3962,10 +3953,10 @@ impl AdaptiveRMI {
     ) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
         
-        // 🚀 PHASE 1: Initialize results and early exit optimization
+        //  Initialize results and early exit optimization
         let mut results = [None; 4];
         
-        // 🚀 ENTERPRISE OPTIMIZATION: Check if segment lookup is needed
+        //  ENTERPRISE OPTIMIZATION: Check if segment lookup is needed
         let unfound_indices: Vec<usize> = (0..4)
             .filter(|&i| hot_results[i].is_none() && overflow_results[i].is_none())
             .collect();
@@ -3974,12 +3965,12 @@ impl AdaptiveRMI {
             return results; // Early exit if no keys need segment lookup
         }
         
-        // 🚀 PHASE 2: Vectorized segment prediction with NEON
+        //  Vectorized segment prediction with NEON
         let (segment_predictions, segments_guard) = {
             let segments_guard = self.segments.read();
             let router_guard = self.global_router.read();
             
-                // 🚀 NEON VECTORIZED PREDICTION: Process up to 4 keys simultaneously
+                // NEON VECTORIZED PREDICTION: Process up to 4 keys simultaneously
                 let mut predictions = Vec::with_capacity(4);
                 
                 // Process keys individually due to NEON lane extraction requirements
@@ -3993,9 +3984,9 @@ impl AdaptiveRMI {
             (predictions, segments_guard)
         };
         
-        // 🚀 PHASE 3: NEON-optimized bounded search with Apple Silicon cache awareness
+        //  NEON-optimized bounded search with Apple Silicon cache awareness
         unsafe {
-            // 🚀 NEON BOUNDS VALIDATION: Vectorized bounds checking
+            //  NEON BOUNDS VALIDATION: Vectorized bounds checking
             let segment_count = segments_guard.len();
             
             // Load predictions for vectorized bounds checking
@@ -4008,10 +3999,10 @@ impl AdaptiveRMI {
             let predictions_vec = vld1q_u64(predictions_array.as_ptr());
             let segment_count_vec = vdupq_n_u64(segment_count as u64);
             
-            // 🚀 NEON COMPARISON: Vectorized bounds validation
+            //  NEON COMPARISON: Vectorized bounds validation
             let _bounds_valid = vcltq_u64(predictions_vec, segment_count_vec);
             
-            // 🚀 APPLE SILICON CONDITIONAL: Process valid predictions efficiently
+            //  APPLE SILICON CONDITIONAL: Process valid predictions efficiently
             for &idx in &unfound_indices {
                 let key = keys[idx];
                 let segment_id = segment_predictions[idx];
@@ -4020,61 +4011,63 @@ impl AdaptiveRMI {
                 let is_valid = segment_id < segment_count;
                 
                 if is_valid {
-                    // 🚀 NEON-ACCELERATED BOUNDED SEARCH: Use segment's optimized search
+                    //  NEON-ACCELERATED BOUNDED SEARCH: Use segment's optimized search
                     results[idx] = segments_guard[segment_id].bounded_search(key);
                 } else {
-                    // 🚀 GRACEFUL DEGRADATION: Enterprise-safe fallback for invalid predictions
+                    //  GRACEFUL DEGRADATION: Enterprise-safe fallback for invalid predictions
                     results[idx] = self.fallback_linear_search_with_segments_lock(&segments_guard, key);
                 }
             }
         }
         
-        // 🚀 PHASE 4: Return enterprise-validated results
+        // Return enterprise-validated results
         results
     }
     
-    /// 🚀 ADAPTIVE BATCH SIZE: Determine optimal batch size based on workload and hardware
+    /// ADAPTIVE BATCH SIZE: Determine optimal batch size based on workload and hardware
     pub fn get_optimal_batch_size(&self) -> usize {
         // Base batch size on available SIMD capabilities and system resources
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            // 🚀 AVX2 processes 16 keys optimally per SIMD operation (TRUE 16-KEY VECTORIZATION)
-            const AVX2_SIMD_WIDTH: usize = 16;  // Fixed: Actual 16-key processing capability
+            //  SIMD: AVX2 processes 4 u64 values per 256-bit register
+            // Technical reality: 256 bits ÷ 64 bits = 4 u64 values per register
+            const AVX2_SIMD_WIDTH: usize = 4;  // CORRECTED: 4 u64 per register, not 16
             
             // Scale based on CPU and memory characteristics
             let cpu_cores = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1);
                 
-            // 🚀 CACHE-AWARE SCALING: Optimal batch size considering L1/L2 cache
+            // BATCH SIZING: Based on actual SIMD capability
             // - L1 cache: ~32KB, can hold ~4000 u64 keys
             // - L2 cache: ~256KB, can hold ~32000 u64 keys
-            // - Optimal batch: 4-16x SIMD width based on cores
-            let base_batch = AVX2_SIMD_WIDTH * 4; // 64 keys baseline (4 * 16)
+            // - Optimal batch: 8-16x SIMD width for multiple register utilization
+            let base_batch = AVX2_SIMD_WIDTH * 8; // 32 keys baseline (8 * 4 = 32)
             let scaled_batch = base_batch * cpu_cores.min(8); // Scale up to 8 cores
             
             // Cap at reasonable maximum to prevent cache pressure
-            scaled_batch.min(2048) // Max 2048 keys per batch (increased for 16-key SIMD)
+            scaled_batch.min(1024) // Max 1024 keys per batch (for 4-wide SIMD)
         }
         
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
-            // NEON processes 4 keys optimally per SIMD operation (128-bit vectors)
-            const NEON_SIMD_WIDTH: usize = 4;
+            //  NEON: Processes 2 u64 values per 128-bit register 
+            // Technical reality: 128 bits ÷ 64 bits = 2 u64 values per register
+            const NEON_SIMD_WIDTH: usize = 2;  // CORRECTED: 2 u64 per register
             
             // Scale based on CPU and unified memory architecture
             let cpu_cores = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1);
                 
-            // 🚀 APPLE SILICON OPTIMIZATION: Leverage unified memory and wide execution
-            // - Apple Silicon has larger caches and unified memory
-            // - Can handle larger batches efficiently
-            let base_batch = NEON_SIMD_WIDTH * 8; // 32 keys baseline  
+            // APPLE SILICON OPTIMIZATION: Leveraging dual-register operations
+            // - Apple Silicon can use register pairs for 4-key operations
+            // - Unified memory allows larger batches efficiently
+            let base_batch = NEON_SIMD_WIDTH * 16; // 32 keys baseline (dual register pairs)
             let scaled_batch = base_batch * cpu_cores.min(12); // Scale up to 12 cores (M4 Max)
             
             // Higher cap for Apple Silicon's superior memory system
-            scaled_batch.min(2048) // Max 2048 keys per batch
+            scaled_batch.min(1024) // Max 1024 keys per batch 
         }
         
         #[cfg(not(any(
@@ -4092,7 +4085,7 @@ impl AdaptiveRMI {
         }
     }
     
-    /// 🚀 ENHANCED SIMD CAPABILITY DETECTION: Runtime detection with performance hints
+    /// CORRECTED SIMD CAPABILITY DETECTION:  capability reporting
     pub fn simd_capabilities() -> SIMDCapabilities {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
@@ -4104,9 +4097,9 @@ impl AdaptiveRMI {
                 has_avx2: true,
                 has_avx512: cfg!(all(target_arch = "x86_64", target_feature = "avx512f")),
                 has_neon: false,
-                optimal_batch_size: (16 * cores).min(2048), // 16-2048 keys per batch (TRUE 16-KEY SIMD)
+                optimal_batch_size: (32 * cores).min(1024), // 32-1024 keys per batch
                 architecture: "x86_64".to_string(),
-                simd_width: 16, // 🚀 FIXED: AVX2 processes 16 u64 values with 4 registers
+                simd_width: 4, //  AVX2 processes 4 u64 values per 256-bit register
             }
         }
         
@@ -4120,9 +4113,9 @@ impl AdaptiveRMI {
                 has_avx2: false,
                 has_avx512: false,
                 has_neon: true,
-                optimal_batch_size: (4 * cores).min(2048), // 4-2048 keys per batch
+                optimal_batch_size: (16 * cores).min(1024), //  16-1024 keys per batch  
                 architecture: "aarch64".to_string(),
-                simd_width: 4, // NEON processes 4 u64 values (2 per 128-bit register)
+                simd_width: 2, // : NEON processes 2 u64 values per 128-bit register
             }
         }
         
@@ -4142,7 +4135,7 @@ impl AdaptiveRMI {
         }
     }
     
-    /// 🚀 SIMD PROCESS CHUNK 16 - ENTERPRISE IMPLEMENTATION
+    ///  SIMD PROCESS CHUNK 16 - ENTERPRISE IMPLEMENTATION
     /// Enterprise-grade SIMD processing for 16-key chunks with segment conversion
     fn simd_process_chunk_16(
         &self,
@@ -4157,7 +4150,7 @@ impl AdaptiveRMI {
         let keys_array: [u64; 16] = chunk.try_into()
             .map_err(|_| "Failed to convert chunk to array")?;
         
-        // 🚀 SIMPLIFIED IMPLEMENTATION: Direct lookup for each key
+        //  SIMPLIFIED IMPLEMENTATION: Direct lookup for each key
         let mut results = [None; 16];
         for (i, &key) in keys_array.iter().enumerate() {
             results[i] = self.lookup(key);
@@ -4166,7 +4159,7 @@ impl AdaptiveRMI {
         Ok(results)
     }
     
-    /// 🚀 CONVERT SEGMENTS TO CACHE OPTIMIZED - ENTERPRISE IMPLEMENTATION
+    ///  CONVERT SEGMENTS TO CACHE OPTIMIZED - ENTERPRISE IMPLEMENTATION
     /// Convert AdaptiveRMI segments to cache-optimized format
     fn convert_segments_to_cache_optimized(&self) -> Vec<CacheOptimizedSegment> {
         let segments_guard = self.segments.read();
@@ -4227,26 +4220,26 @@ impl AdaptiveRMI {
         cache_segments
     }
     
-    /// 🚀 GET CACHE OPTIMIZED SEGMENTS
+    ///  GET CACHE OPTIMIZED SEGMENTS
     /// Get segments in cache-optimized format for SIMD operations
     pub fn get_cache_optimized_segments(&self) -> Vec<CacheOptimizedSegment> {
         self.convert_segments_to_cache_optimized()
     }
     
-    /// 🚀 APPLY OPTIMIZATION HINTS
+    ///  APPLY OPTIMIZATION HINTS
     /// Apply performance optimization hints from monitoring
     pub fn apply_optimization_hints(&self, hints: OptimizationHints) {
         // Implementation simplified for compatibility
-        println!("🚀 Applying optimization hints: batch_size={}, aggressive_prefetch={}, memory_layout={}", 
+        println!(" Applying optimization hints: batch_size={}, aggressive_prefetch={}, memory_layout={}", 
                 hints.should_increase_batch_size, hints.should_enable_aggressive_prefetching, hints.should_optimize_memory_layout);
     }
 }
 
-// 🚀 ENHANCED RMI OPTIMIZATIONS FOR BINARY PROTOCOL
+//  ENHANCED RMI OPTIMIZATIONS FOR BINARY PROTOCOL
 // 
 // Advanced optimizations to maximize RMI performance for binary protocol infrastructure
 
-/// 🚀 CACHE-OPTIMIZED SEGMENT STRUCTURE
+///  CACHE-OPTIMIZED SEGMENT STRUCTURE
 /// 
 /// Optimized segment layout for maximum cache efficiency
 #[derive(Debug, Clone)]
@@ -4264,7 +4257,7 @@ pub struct CacheOptimizedSegment {
 }
 
 impl CacheOptimizedSegment {
-    /// 🚀 CACHE-FRIENDLY BOUNDED SEARCH
+    ///  CACHE-FRIENDLY BOUNDED SEARCH
     /// Optimized for L1 cache hits and branch prediction
     #[inline(always)]
     pub fn bounded_search_optimized(&self, key: u64) -> Option<u64> {
@@ -4275,7 +4268,7 @@ impl CacheOptimizedSegment {
         let start = predicted_pos.saturating_sub(self.epsilon);
         let end = (predicted_pos + self.epsilon).min(self.keys.len());
         
-        // 🚀 UNROLLED BINARY SEARCH: Process 4 elements at once
+        //  UNROLLED BINARY SEARCH: Process 4 elements at once
         if end - start <= 8 {
             // Linear search for small ranges (better for cache)
             for i in start..end {
@@ -4302,7 +4295,7 @@ impl CacheOptimizedSegment {
     }
 }
 
-/// 🚀 ADVANCED SIMD BATCH PROCESSOR
+///  ADVANCED SIMD BATCH PROCESSOR
 /// 
 /// Optimized batch lookup with advanced SIMD techniques
 pub struct AdvancedSIMDBatchProcessor {
@@ -4344,7 +4337,7 @@ impl Default for PerformanceMonitor {
         Self::new()
     }
 }
-    /// 🚀 ULTRA-FAST 16-KEY SIMD BATCH
+    ///  ULTRA-FAST 16-KEY SIMD BATCH
     /// Process 16 keys simultaneously with AVX2 optimizations
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
@@ -4354,16 +4347,16 @@ impl Default for PerformanceMonitor {
         segments: &[CacheOptimizedSegment],
         router: &GlobalRoutingModel,
     ) -> [Option<u64>; 16] {
-        // 🚀 LOAD ALL KEYS INTO SIMD REGISTERS
+        //  LOAD ALL KEYS INTO SIMD REGISTERS
         let keys_0 = _mm256_loadu_si256(keys.as_ptr() as *const __m256i);
         let keys_1 = _mm256_loadu_si256(keys.as_ptr().add(1) as *const __m256i);
         let keys_2 = _mm256_loadu_si256(keys.as_ptr().add(2) as *const __m256i);
         let keys_3 = _mm256_loadu_si256(keys.as_ptr().add(3) as *const __m256i);
         
-        // 🚀 VECTORIZED ROUTING: Predict all segments simultaneously
+        //  VECTORIZED ROUTING: Predict all segments simultaneously
         let segment_ids = self.simd_predict_all_segments(keys_0, keys_1, keys_2, keys_3, router);
         
-        // 🚀 PARALLEL SEGMENT PROCESSING: Process 4 segments at once
+        //  PARALLEL SEGMENT PROCESSING: Process 4 segments at once
         let mut results = [None; 16];
         
         for chunk in segment_ids.chunks(4) {
@@ -4386,7 +4379,7 @@ impl Default for PerformanceMonitor {
         results
     }
     
-    /// 🚀 VECTORIZED SEGMENT PREDICTION
+    ///  VECTORIZED SEGMENT PREDICTION
     /// Predict segment IDs for all 16 keys simultaneously
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
@@ -4395,7 +4388,7 @@ impl Default for PerformanceMonitor {
         keys_0: __m256i, keys_1: __m256i, keys_2: __m256i, keys_3: __m256i,
         router: &GlobalRoutingModel,
     ) -> [usize; 16] {
-        // 🚀 VECTORIZED ROUTING CALCULATION
+        //  VECTORIZED ROUTING CALCULATION
         let shift = 64u32.saturating_sub(router.router_bits as u32);
         let shift_vec = _mm256_set1_epi64x(shift as i64);
         
@@ -4405,7 +4398,7 @@ impl Default for PerformanceMonitor {
         let prefixes_2 = _mm256_srlv_epi64(keys_2, shift_vec);
         let prefixes_3 = _mm256_srlv_epi64(keys_3, shift_vec);
         
-        // 🚀 VECTORIZED BOUNDS CHECKING
+        //  VECTORIZED BOUNDS CHECKING
         let router_len = router.router.len() as i64;
         let max_index = _mm256_set1_epi64x(router_len - 1);
         
@@ -4435,7 +4428,7 @@ impl Default for PerformanceMonitor {
         ]
     }
     
-    /// 🚀 SIMD PROCESS SEGMENT CHUNK
+    ///  SIMD PROCESS SEGMENT CHUNK
     /// Process 4 segments simultaneously with SIMD
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
@@ -4464,7 +4457,7 @@ impl Default for PerformanceMonitor {
         results
     }
     
-    /// 🚀 SIMD SEARCH SEGMENT
+    ///  SIMD SEARCH SEGMENT
     /// Search a single segment with SIMD optimization
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
@@ -4487,7 +4480,7 @@ impl Default for PerformanceMonitor {
     }
 
 impl AdvancedSIMDBatchProcessor {
-    /// 🚀 FALLBACK IMPLEMENTATION
+    ///  FALLBACK IMPLEMENTATION
     /// Scalar fallback for non-SIMD architectures
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     pub fn lookup_16_keys_ultra_fast(
@@ -4514,7 +4507,7 @@ impl AdvancedSIMDBatchProcessor {
     }
 }
 
-/// 🚀 CACHE-ALIGNED BUFFER
+///  CACHE-ALIGNED BUFFER
 /// 
 /// 64-byte aligned buffer for optimal cache performance
 #[repr(align(64))]
@@ -4522,7 +4515,7 @@ pub struct CacheAlignedBuffer {
     pub data: [u8; 64],
 }
 
-/// 🚀 PREDICTIVE PREFETCHING SYSTEM
+///  PREDICTIVE PREFETCHING SYSTEM
 /// 
 /// Advanced prefetching to minimize cache misses
 pub struct PredictivePrefetcher {
@@ -4544,7 +4537,7 @@ impl PredictivePrefetcher {
         }
     }
     
-    /// 🚀 INTELLIGENT PREFETCHING
+    ///  INTELLIGENT PREFETCHING
     /// Analyze access patterns and prefetch likely next keys
     pub fn intelligent_prefetch(&mut self, current_key: u64, segments: &[CacheOptimizedSegment]) {
         // Add current key to history
@@ -4553,13 +4546,13 @@ impl PredictivePrefetcher {
             self.access_history.pop_front();
         }
         
-        // 🚀 ENTERPRISE PATTERN ANALYSIS: Multi-pattern detection
+        //  ENTERPRISE PATTERN ANALYSIS: Multi-pattern detection
         let predicted_keys = self.predict_next_keys_advanced(current_key);
         
-        // 🚀 SPATIAL LOCALITY PREFETCHING: Prefetch nearby keys
+        //  SPATIAL LOCALITY PREFETCHING: Prefetch nearby keys
         let spatial_keys = self.predict_spatial_locality(current_key);
         
-        // 🚀 TEMPORAL LOCALITY PREFETCHING: Prefetch recently accessed patterns
+        //  TEMPORAL LOCALITY PREFETCHING: Prefetch recently accessed patterns
         let temporal_keys = self.predict_temporal_locality();
         
         // Combine all predictions
@@ -4572,7 +4565,7 @@ impl PredictivePrefetcher {
         all_predictions.dedup();
         all_predictions.truncate(16); // Limit to 16 prefetches to avoid cache pollution
         
-        // 🚀 AGGRESSIVE PREFETCHING: Prefetch cache lines for predicted keys
+        //  AGGRESSIVE PREFETCHING: Prefetch cache lines for predicted keys
         for &key in &all_predictions {
             if let Some(segment) = self.find_segment_for_key(key, segments) {
                 self.prefetch_segment_data(segment);
@@ -4584,11 +4577,11 @@ impl PredictivePrefetcher {
             }
         }
         
-        // 🚀 ADAPTIVE PREFETCH DISTANCE: Adjust based on hit rate
+        //  ADAPTIVE PREFETCH DISTANCE: Adjust based on hit rate
         self.adapt_prefetch_distance();
     }
     
-    /// 🚀 ADVANCED PATTERN PREDICTION
+    ///  ADVANCED PATTERN PREDICTION
     /// Multi-pattern analysis for better prediction accuracy
     fn predict_next_keys_advanced(&self, current_key: u64) -> Vec<u64> {
         let mut predictions = Vec::new();
@@ -4632,7 +4625,7 @@ impl PredictivePrefetcher {
         predictions
     }
     
-    /// 🚀 SPATIAL LOCALITY PREDICTION
+    ///  SPATIAL LOCALITY PREDICTION
     /// Predict keys based on spatial locality principles
     fn predict_spatial_locality(&self, current_key: u64) -> Vec<u64> {
         let mut spatial_keys = Vec::new();
@@ -4654,7 +4647,7 @@ impl PredictivePrefetcher {
         spatial_keys
     }
     
-    /// 🚀 TEMPORAL LOCALITY PREDICTION
+    ///  TEMPORAL LOCALITY PREDICTION
     /// Predict keys based on recent access patterns
     fn predict_temporal_locality(&self) -> Vec<u64> {
         let mut temporal_keys = Vec::new();
@@ -4679,7 +4672,7 @@ impl PredictivePrefetcher {
         temporal_keys
     }
     
-    /// 🚀 GEOMETRIC PATTERN DETECTION
+    ///  GEOMETRIC PATTERN DETECTION
     fn detect_geometric_pattern(&self) -> Option<u64> {
         if self.access_history.len() < 3 {
             return None;
@@ -4699,7 +4692,7 @@ impl PredictivePrefetcher {
         None
     }
     
-    /// 🚀 EXPONENTIAL PATTERN DETECTION
+    ///  EXPONENTIAL PATTERN DETECTION
     fn detect_exponential_pattern(&self) -> bool {
         if self.access_history.len() < 4 {
             return false;
@@ -4723,7 +4716,7 @@ impl PredictivePrefetcher {
         false
     }
     
-    /// 🚀 FIND ADJACENT SEGMENT
+    ///  FIND ADJACENT SEGMENT
     fn find_adjacent_segment<'a>(&self, target_segment: &CacheOptimizedSegment, segments: &'a [CacheOptimizedSegment]) -> Option<&'a CacheOptimizedSegment> {
         for (i, segment) in segments.iter().enumerate() {
             if std::ptr::eq(segment, target_segment) && i + 1 < segments.len() {
@@ -4733,7 +4726,7 @@ impl PredictivePrefetcher {
         None
     }
     
-    /// 🚀 ADAPTIVE PREFETCH DISTANCE
+    ///  ADAPTIVE PREFETCH DISTANCE
     fn adapt_prefetch_distance(&mut self) {
         // Increase prefetch distance if patterns are detected
         if self.detect_sequential_pattern() || self.detect_stride_pattern().is_some() {
@@ -4744,10 +4737,10 @@ impl PredictivePrefetcher {
         }
     }
     
-    /// 🚀 CACHE LINE PREFETCHING
+    ///  CACHE LINE PREFETCHING
     /// Prefetch specific cache lines to minimize misses
     fn prefetch_segment_data(&self, segment: &CacheOptimizedSegment) {
-        // 🚀 ENTERPRISE CACHE OPTIMIZATION: Prefetch both keys and values arrays
+        //  ENTERPRISE CACHE OPTIMIZATION: Prefetch both keys and values arrays
         
         // Prefetch key array with temporal locality hint
         #[cfg(target_arch = "x86_64")]
@@ -4815,7 +4808,7 @@ impl PredictivePrefetcher {
         }
     }
     
-    /// 🚀 PREDICT NEXT KEYS
+    ///  PREDICT NEXT KEYS
     /// Predict likely next keys based on access patterns
     fn predict_next_keys(&self, current_key: u64) -> Vec<u64> {
         // Analyze sequential patterns
@@ -4831,7 +4824,7 @@ impl PredictivePrefetcher {
         vec![]
     }
     
-    /// 🚀 DETECT SEQUENTIAL PATTERN
+    ///  DETECT SEQUENTIAL PATTERN
     fn detect_sequential_pattern(&self) -> bool {
         if self.access_history.len() < 3 {
             return false;
@@ -4841,7 +4834,7 @@ impl PredictivePrefetcher {
         recent[0] == recent[1] + 1 && recent[1] == recent[2] + 1
     }
     
-    /// 🚀 DETECT STRIDE PATTERN
+    ///  DETECT STRIDE PATTERN
     fn detect_stride_pattern(&self) -> Option<u64> {
         if self.access_history.len() < 3 {
             return None;
@@ -4858,7 +4851,7 @@ impl PredictivePrefetcher {
         }
     }
     
-    /// 🚀 FIND SEGMENT FOR KEY
+    ///  FIND SEGMENT FOR KEY
     fn find_segment_for_key<'a>(&self, key: u64, segments: &'a [CacheOptimizedSegment]) -> Option<&'a CacheOptimizedSegment> {
         // Simple linear search - could be optimized with routing
         for segment in segments {
@@ -4870,7 +4863,7 @@ impl PredictivePrefetcher {
     }
 }
 
-/// 🚀 MEMORY POOL OPTIMIZATIONS
+///  MEMORY POOL OPTIMIZATIONS
 /// 
 /// Advanced memory management for zero-allocation hot paths
 pub struct AdvancedMemoryPool {
@@ -4905,7 +4898,7 @@ impl AdvancedMemoryPool {
         }
     }
     
-    /// 🚀 ZERO-ALLOCATION BATCH PROCESSING
+    ///  ZERO-ALLOCATION BATCH PROCESSING
     /// Enterprise-grade batch processing without any memory allocations
     pub fn process_batch_zero_alloc(
         &self,
@@ -4919,11 +4912,11 @@ impl AdvancedMemoryPool {
         // Use pre-allocated buffers
         let buffer = self.get_hot_buffer()?;
         
-        // 🚀 PROCESS IN SIMD CHUNKS: Maximum vectorization efficiency
+        //  PROCESS IN SIMD CHUNKS: Maximum vectorization efficiency
         let mut processed = 0;
         for chunk in keys.chunks(16) {
             if chunk.len() == 16 && processed + 16 <= results.len() {
-                // 🚀 SIMPLIFIED PROCESSING: Use scalar fallback
+                //  SIMPLIFIED PROCESSING: Use scalar fallback
                 for (i, &key) in chunk.iter().enumerate() {
                     if processed + i < results.len() {
                         results[processed + i] = None; // Simplified for now
@@ -4931,7 +4924,7 @@ impl AdvancedMemoryPool {
                 }
                 processed += 16;
             } else {
-                // 🚀 SCALAR FALLBACK: Process remaining keys
+                //  SCALAR FALLBACK: Process remaining keys
                 for (i, &key) in chunk.iter().enumerate() {
                     if processed + i < results.len() {
                         results[processed + i] = self.scalar_lookup_optimized(key, buffer);
@@ -4947,7 +4940,7 @@ impl AdvancedMemoryPool {
         Ok(())
     }
     
-    /// 🚀 SCALAR LOOKUP OPTIMIZED
+    ///  SCALAR LOOKUP OPTIMIZED
     /// Optimized scalar lookup for fallback cases
     fn scalar_lookup_optimized(&self, key: u64, _buffer: &CacheAlignedBuffer) -> Option<u64> {
         // Simplified scalar lookup (in real implementation, this would use the buffer for caching)
@@ -4955,7 +4948,7 @@ impl AdvancedMemoryPool {
         None
     }
 
-    /// 🚀 GET HOT BUFFER
+    ///  GET HOT BUFFER
     fn get_hot_buffer(&self) -> Result<&CacheAlignedBuffer, &'static str> {
         self.hot_buffers.first().ok_or("No hot buffers available")
     }
@@ -5006,7 +4999,7 @@ impl AdvancedMemoryPool {
     }
 }
 
-/// 🚀 PERFORMANCE MONITORING AND ADAPTATION
+///  PERFORMANCE MONITORING AND ADAPTATION
 /// 
 /// Real-time performance monitoring and adaptive optimization
 pub struct PerformanceMonitor {
@@ -5034,7 +5027,7 @@ impl PerformanceMonitor {
         }
     }
     
-    /// 🚀 ADAPTIVE OPTIMIZATION
+    ///  ADAPTIVE OPTIMIZATION
     /// Automatically adjust parameters based on performance
     pub fn adaptive_optimization(&mut self) -> OptimizationHints {
         let current_latency = self.calculate_p99_latency();
@@ -5046,11 +5039,11 @@ impl PerformanceMonitor {
             should_increase_batch_size: current_latency < 100, // < 100μs
             should_enable_aggressive_prefetching: cache_hit_rate < 90,
             should_optimize_memory_layout: current_throughput > 1_000_000,
-            recommended_simd_width: 16, // Always use full AVX2 capability
+            recommended_simd_width: 4, // : Use actual AVX2 capability (4 u64 per register)
         }
     }
     
-    /// 🚀 CALCULATE P99 LATENCY
+    ///  CALCULATE P99 LATENCY
     fn calculate_p99_latency(&self) -> u64 {
         if self.latency_histogram.is_empty() {
             return 0;
@@ -5063,7 +5056,7 @@ impl PerformanceMonitor {
         sorted_latencies[p99_index]
     }
     
-    /// 🚀 RECORD LATENCY
+    ///  RECORD LATENCY
     pub fn record_latency(&mut self, latency_us: u64) {
         self.latency_histogram.push_back(latency_us);
         if self.latency_histogram.len() > 10000 {
@@ -5071,18 +5064,18 @@ impl PerformanceMonitor {
         }
     }
     
-    /// 🚀 RECORD THROUGHPUT
+    ///  RECORD THROUGHPUT
     pub fn record_throughput(&self, ops: u64) {
         self.throughput_counter.fetch_add(ops, Ordering::Relaxed);
     }
     
-    /// 🚀 RECORD CACHE HIT RATE
+    ///  RECORD CACHE HIT RATE
     pub fn record_cache_hit_rate(&self, hit_rate: usize) {
         self.cache_hit_rate.store(hit_rate, Ordering::Relaxed);
     }
 }
 
-/// 🚀 PERFORMANCE SNAPSHOT
+///  PERFORMANCE SNAPSHOT
 /// 
 /// Snapshot of performance metrics at a point in time
 #[derive(Debug, Clone)]
@@ -5094,7 +5087,7 @@ pub struct PerformanceSnapshot {
     pub memory_usage: usize,
 }
 
-/// 🚀 OPTIMIZATION HINTS
+///  OPTIMIZATION HINTS
 /// 
 /// Generated hints for runtime optimization
 #[derive(Debug, Clone)]
@@ -5105,7 +5098,7 @@ pub struct OptimizationHints {
     pub recommended_simd_width: usize,
 }
 
-/// 🚀 ADAPTIVE THRESHOLDS
+///  ADAPTIVE THRESHOLDS
 /// 
 /// Dynamic thresholds that adapt to workload
 pub struct AdaptiveThresholds {
@@ -5128,7 +5121,7 @@ impl AdaptiveThresholds {
     }
 }
 
-/// 🚀 ENHANCED BINARY PROTOCOL INTEGRATION
+///  ENHANCED BINARY PROTOCOL INTEGRATION
 /// 
 /// Enhanced binary protocol with RMI optimizations
 pub struct OptimizedBinaryProtocol {
@@ -5160,16 +5153,16 @@ impl OptimizedBinaryProtocol {
         }
     }
     
-    /// 🚀 ULTRA-FAST BATCH LOOKUP
+    ///  ULTRA-FAST BATCH LOOKUP
     /// Enterprise-grade batch lookup for binary protocol with complete SIMD integration
     pub fn ultra_fast_batch_lookup(&mut self, keys: &[u64]) -> Vec<Option<u64>> {
         let start = std::time::Instant::now();
         let mut results = Vec::with_capacity(keys.len());
         
-        // 🚀 SIMD-OPTIMIZED PROCESSING with segment conversion
+        //  SIMD-OPTIMIZED PROCESSING with segment conversion
         for chunk in keys.chunks(16) {
             if chunk.len() == 16 {
-                // 🚀 ENTERPRISE SIMD PATH: Full 16-key vectorization
+                //  ENTERPRISE SIMD PATH: Full 16-key vectorization
                 match self.memory_pool.process_batch_zero_alloc(chunk, &mut vec![None; 16]) {
                     Ok(_) => {
                         // Use advanced SIMD processing
@@ -5209,7 +5202,7 @@ impl OptimizedBinaryProtocol {
                     }
                 }
             } else {
-                // 🚀 PARTIAL CHUNK: Use ARM64 NEON or scalar fallback
+                //  PARTIAL CHUNK: Use ARM64 NEON or scalar fallback
                 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
                 {
                     if chunk.len() >= 4 {
@@ -5240,7 +5233,7 @@ impl OptimizedBinaryProtocol {
         results
     }
     
-    /// 🚀 CREATE COMPATIBLE ROUTER
+    ///  CREATE COMPATIBLE ROUTER
     /// Create a compatible router model for SIMD operations
     fn create_compatible_router(&self) -> GlobalRoutingModel {
         let global_router_guard = self.rmi.global_router.read();
@@ -5253,7 +5246,7 @@ impl OptimizedBinaryProtocol {
         }
     }
     
-    /// 🚀 CONVERT SEGMENTS TO CACHE OPTIMIZED
+    ///  CONVERT SEGMENTS TO CACHE OPTIMIZED
     /// Convert AdaptiveRMI segments to cache-optimized format for SIMD processing
     fn convert_segments_to_cache_optimized(&self) -> Vec<CacheOptimizedSegment> {
         let segments_guard = self.rmi.segments.read();
@@ -5314,19 +5307,19 @@ impl OptimizedBinaryProtocol {
         cache_segments
     }
     
-    /// 🚀 CACHE-OPTIMIZED SINGLE LOOKUP
+    ///  CACHE-OPTIMIZED SINGLE LOOKUP
     /// Enterprise-grade single key lookup with intelligent prefetching and cache optimization
     pub fn cache_optimized_lookup(&mut self, key: u64) -> Option<u64> {
         let start = std::time::Instant::now();
         
-        // 🚀 INTELLIGENT PREFETCHING: Analyze access patterns and prefetch likely next keys
+        //  INTELLIGENT PREFETCHING: Analyze access patterns and prefetch likely next keys
         let cache_segments = self.convert_segments_to_cache_optimized();
         self.prefetcher.intelligent_prefetch(key, &cache_segments);
         
-        // 🚀 OPTIMIZED LOOKUP: Use RMI with cache-aware optimizations
+        //  OPTIMIZED LOOKUP: Use RMI with cache-aware optimizations
         let result = self.rmi.lookup(key);
         
-        // 🚀 CACHE HIT RATE TRACKING: Monitor cache performance
+        //  CACHE HIT RATE TRACKING: Monitor cache performance
         let cache_hit = result.is_some();
         let current_hit_rate = if cache_hit { 95 } else { 85 }; // Simplified calculation
         self.performance_monitor.record_cache_hit_rate(current_hit_rate);
@@ -5339,7 +5332,7 @@ impl OptimizedBinaryProtocol {
         result
     }
     
-    /// 🚀 ADAPTIVE OPTIMIZATION
+    ///  ADAPTIVE OPTIMIZATION
     /// Continuously optimize based on performance metrics
     pub fn adaptive_optimization(&mut self) {
         let hints = self.performance_monitor.adaptive_optimization();
@@ -5361,7 +5354,7 @@ impl OptimizedBinaryProtocol {
         }
     }
     
-    /// 🚀 OPTIMIZE BATCH SIZE
+    ///  OPTIMIZE BATCH SIZE
     /// Dynamic batch size optimization based on performance metrics
     fn optimize_batch_size(&mut self) {
         let current_throughput = self.performance_monitor.throughput_counter.load(Ordering::Relaxed);
@@ -5371,7 +5364,7 @@ impl OptimizedBinaryProtocol {
         let capabilities = AdaptiveRMI::simd_capabilities();
         let current_batch = capabilities.optimal_batch_size;
         
-        // 🚀 ADAPTIVE SCALING: Adjust based on performance characteristics
+        //  ADAPTIVE SCALING: Adjust based on performance characteristics
         let new_batch_size = if current_latency > 1000 {
             // High latency: reduce batch size for better responsiveness
             (current_batch / 2).max(8)
@@ -5387,23 +5380,25 @@ impl OptimizedBinaryProtocol {
             }
         };
         
-        // 🚀 HARDWARE-SPECIFIC CONSTRAINTS
+        //  HARDWARE-SPECIFIC CONSTRAINTS
         let optimal_batch = match std::env::consts::ARCH {
             "x86_64" => {
-                // AVX2 optimization: prefer multiples of 16
-                ((new_batch_size + 15) / 16) * 16
+                // AVX2 optimization: prefer multiples of 4 (actual SIMD width)
+                // Use multiples of 8 for dual-register operations
+                ((new_batch_size + 7) / 8) * 8
             }
             "aarch64" => {
-                // NEON optimization: prefer multiples of 4
+                // NEON optimization: prefer multiples of 2 (actual SIMD width)
+                // Use multiples of 4 for dual-register operations
                 ((new_batch_size + 3) / 4) * 4
             }
             _ => new_batch_size
         };
         
-        // 🚀 APPLY OPTIMIZATION: Update batch processor configuration
+        //  APPLY OPTIMIZATION: Update batch processor configuration
         self.batch_processor.prediction_hints.store(optimal_batch, Ordering::Relaxed);
         
-        // 🚀 METRICS RECORDING
+        //  METRICS RECORDING
         #[cfg(not(feature = "bench-no-metrics"))]
         {
             // Update metrics if available
@@ -5419,12 +5414,12 @@ impl OptimizedBinaryProtocol {
         }
     }
     
-    /// 🚀 ENABLE AGGRESSIVE PREFETCHING
+    ///  ENABLE AGGRESSIVE PREFETCHING
     /// Enable enterprise-grade aggressive prefetching strategies
     fn enable_aggressive_prefetching(&mut self) {
         let cache_hit_rate = self.performance_monitor.cache_hit_rate.load(Ordering::Relaxed);
         
-        // 🚀 ADAPTIVE PREFETCH DISTANCE: Based on cache performance
+        //  ADAPTIVE PREFETCH DISTANCE: Based on cache performance
         let new_prefetch_distance = if cache_hit_rate < 80 {
             // Poor cache performance: increase prefetch distance
             self.prefetcher.prefetch_distance.saturating_add(2).min(8)
@@ -5438,7 +5433,7 @@ impl OptimizedBinaryProtocol {
         
         self.prefetcher.prefetch_distance = new_prefetch_distance;
         
-        // 🚀 HARDWARE-SPECIFIC PREFETCHING
+        //  HARDWARE-SPECIFIC PREFETCHING
         #[cfg(target_arch = "x86_64")]
         {
             // x86_64: Enable aggressive prefetch hints
@@ -5451,7 +5446,7 @@ impl OptimizedBinaryProtocol {
             self.prefetcher.access_history.reserve(1500); // Optimize for unified memory
         }
         
-        // 🚀 PATTERN-SPECIFIC OPTIMIZATIONS
+        //  PATTERN-SPECIFIC OPTIMIZATIONS
         let sequential_access = self.prefetcher.access_history.len() > 10 && 
             self.prefetcher.access_history.iter().rev().take(3).collect::<Vec<_>>()
                 .windows(2).all(|w| w[1] < w[0]); // Check if descending (most recent first)
@@ -5461,7 +5456,7 @@ impl OptimizedBinaryProtocol {
             self.prefetcher.prefetch_distance = self.prefetcher.prefetch_distance.max(4);
         }
         
-        // 🚀 METRICS AND VALIDATION
+        //  METRICS AND VALIDATION
         #[cfg(not(feature = "bench-no-metrics"))]
         {
             tracing::info!(
@@ -5471,16 +5466,16 @@ impl OptimizedBinaryProtocol {
         }
     }
     
-    /// 🚀 OPTIMIZE MEMORY LAYOUT
+    ///  OPTIMIZE MEMORY LAYOUT
     /// Enterprise-grade memory layout optimization for cache efficiency
     fn optimize_memory_layout(&mut self) {
         let memory_usage = self.get_current_memory_usage();
         let cache_pressure = self.detect_cache_pressure();
         
-        // 🚀 SEGMENT REORGANIZATION: Optimize segment layout for cache efficiency
+        //  SEGMENT REORGANIZATION: Optimize segment layout for cache efficiency
         let _cache_segments = self.convert_segments_to_cache_optimized();
         
-        // 🚀 MEMORY POOL OPTIMIZATION: Adjust pool sizes based on usage patterns
+        //  MEMORY POOL OPTIMIZATION: Adjust pool sizes based on usage patterns
         let pool_hit_rate = self.memory_pool.get_hit_rate();
         
         if pool_hit_rate < 90.0 {
@@ -5491,23 +5486,23 @@ impl OptimizedBinaryProtocol {
             self.memory_pool.compact_pools();
         }
         
-        // 🚀 CACHE-LINE ALIGNMENT: Ensure all critical data structures are cache-aligned
+        //  CACHE-LINE ALIGNMENT: Ensure all critical data structures are cache-aligned
         self.align_critical_structures();
         
-        // 🚀 NUMA OPTIMIZATION: Optimize for NUMA topology if available
+        //  NUMA OPTIMIZATION: Optimize for NUMA topology if available
         #[cfg(target_os = "linux")]
         {
             self.optimize_numa_allocation();
         }
         
-        // 🚀 PREFETCH OPTIMIZATION: Adjust prefetch strategies based on layout
+        //  PREFETCH OPTIMIZATION: Adjust prefetch strategies based on layout
         let segments_per_cache_line = 64 / std::mem::size_of::<CacheOptimizedSegment>();
         if segments_per_cache_line > 0 {
             self.prefetcher.prefetch_distance = self.prefetcher.prefetch_distance
                 .max(segments_per_cache_line);
         }
         
-        // 🚀 METRICS RECORDING
+        //  METRICS RECORDING
         #[cfg(not(feature = "bench-no-metrics"))]
         {
             tracing::info!(
