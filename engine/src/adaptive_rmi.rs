@@ -949,7 +949,7 @@ impl BoundedHotBuffer {
     pub fn drain_atomic(&self) -> Vec<(u64, u64)> {
         let mut buffer = self.buffer.lock();
         
-        // 🛡️ atomic SNAPSHOT: Capture state atomically before any modifications
+        //  atomic SNAPSHOT: Capture state atomically before any modifications
         let drained_count = buffer.len();
         let buffer_capacity = buffer.capacity();
         
@@ -959,7 +959,7 @@ impl BoundedHotBuffer {
         
         let freed_bytes = Self::calculate_hot_buffer_memory(&drained_data, buffer_capacity);
         
-        println!("🔒 Hot buffer atomic drain: {} entries, ~{}KB freed, capacity: {}",
+        println!(" Hot buffer atomic drain: {} entries, ~{}KB freed, capacity: {}",
                 drained_count, freed_bytes / 1024, buffer_capacity);
         
         drained_data
@@ -976,7 +976,7 @@ impl BoundedHotBuffer {
         capacity * tuple_size + vec_overhead + mutex_overhead + atomic_overhead
     }
 
-    /// 🛡️ MEMORY LEAK FIX: Check buffer state using source of truth (actual buffer)
+    ///  MEMORY LEAK FIX: Check buffer state using source of truth (actual buffer)
     /// Prevents inconsistency between atomic size and buffer length
     pub fn is_full(&self) -> bool {
         let buffer = self.buffer.lock();
@@ -988,7 +988,7 @@ impl BoundedHotBuffer {
         actual_len >= self.capacity
     }
 
-    /// 🛡️ MEMORY LEAK FIX: Get utilization using source of truth
+    ///  MEMORY LEAK FIX: Get utilization using source of truth
     /// Prevents reporting incorrect utilization due to size drift
     pub fn utilization(&self) -> f32 {
         let buffer = self.buffer.lock();
@@ -1121,11 +1121,11 @@ impl BoundedOverflowBuffer {
         }
     }
 
-    /// 🛡️ atomic insert with hard memory enforcement and accurate tracking
+    ///  atomic insert with hard memory enforcement and accurate tracking
     pub fn try_insert(&mut self, key: u64, value: u64) -> Result<bool> {
         let current_size = self.data.len();
         
-        // 🛡️ HARD ENFORCEMENT: Apply absolute limits before any processing
+        //  HARD ENFORCEMENT: Apply absolute limits before any processing
         if let Err(enforcement_msg) = self.enforce_hard_memory_limits() {
             eprintln!("Memory enforcement triggered: {}", enforcement_msg);
             // Continue with insertion if enforcement succeeded in making space
@@ -1168,7 +1168,7 @@ impl BoundedOverflowBuffer {
         };
         self.pressure_level.store(pressure, Ordering::Release); // Use Release for consistency
 
-        // 🛡️ ABSOLUTE HARD CAPACITY LIMIT - never exceed to prevent OOM
+        //  ABSOLUTE HARD CAPACITY LIMIT - never exceed to prevent OOM
         if current_len >= self.max_capacity {
             self.rejected_writes.fetch_add(1, Ordering::Relaxed);
             return Err(anyhow!("HARD LIMIT: Overflow buffer at absolute maximum capacity ({}). System protection engaged.", 
@@ -1567,7 +1567,7 @@ impl CPUPressureDetector {
                     if load_ratio > 4.0 {
                         signals += 3;
                         *max_signal_strength = (*max_signal_strength).max(4); // Critical
-                        println!("🚨 Critical system load: {:.2}x CPU count", load_ratio);
+                        println!("Critical system load: {:.2}x CPU count", load_ratio);
                     } else if load_ratio > 2.5 {
                         signals += 2;
                         *max_signal_strength = (*max_signal_strength).max(3); // High
@@ -1620,7 +1620,7 @@ impl CPUPressureDetector {
                 if available_ratio < 0.05 {
                     signals += 3;
                     *max_signal_strength = (*max_signal_strength).max(4); // Critical
-                    println!("🚨 Critical memory pressure: {:.1}% available", available_ratio * 100.0);
+                    println!("Critical memory pressure: {:.1}% available", available_ratio * 100.0);
                 } else if available_ratio < 0.1 {
                     signals += 2;
                     *max_signal_strength = (*max_signal_strength).max(3); // High
@@ -2088,7 +2088,7 @@ impl AdaptiveRMI {
                 } else {
                     // CRITICAL: This indicates a router-segment inconsistency under atomic lock
                     // This should be impossible but must be handled gracefully
-                    eprintln!("🚨 CRITICAL RACE CONDITION: Router predicted invalid segment {} >= {} under atomic lock", 
+                    eprintln!("CRITICAL RACE CONDITION: Router predicted invalid segment {} >= {} under atomic lock", 
                         segment_id, segments.len());
                     return Err(anyhow!("Router-segment inconsistency detected under atomic lock - segment_id: {}, segments.len(): {}", 
                         segment_id, segments.len()));
@@ -2608,335 +2608,113 @@ impl AdaptiveRMI {
     }
 
 
-    /// Container-aware background maintenance with robust CPU throttling protection
+    /// BOUNDED BACKGROUND MAINTENANCE - CPU Spin Prevention
     /// 
+    /// Implements robust background maintenance with strict rate limiting and circuit breaker
+    /// protection to prevent CPU spinning while maintaining essential database operations.
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut cpu_detector = CPUPressureDetector::new();
-            let error_handler = BackgroundErrorHandler::new();
+            // CIRCUIT BREAKER: Bounded interval timing to prevent CPU spinning
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             
-            let mut loop_iteration_count = 0u64;
-            let mut last_circuit_breaker_check = std::time::Instant::now();
-            const MAX_ITERATIONS_PER_MINUTE: u64 = 12000; // 200 Hz max reasonable rate
+            let mut total_iteration_count = 0u64; // Total iterations (never reset)
+            let mut rate_limit_count = 0u64; // For rate limiting (resets every minute)
+            const MAX_ITERATIONS_PER_MINUTE: u64 = 600; // 10 Hz max (600 iterations/minute)
+            const MAX_TOTAL_ITERATIONS: u64 = 300; // Safety limit for testing (5 minutes at 10Hz)
             
-            // Enhanced adaptive intervals with dynamic optimization
-            let mut merge_adaptive = AdaptiveInterval::new(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS));
-            let mut management_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC));
-            let mut stats_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC));
+            let mut rate_limit_start = std::time::Instant::now();
+            let mut consecutive_errors = 0;
+            const MAX_CONSECUTIVE_ERRORS: u32 = 5;
             
-            let mut last_pressure_check = std::time::Instant::now();
-            let mut emergency_mode = false;
-            let mut last_emergency_check = std::time::Instant::now();
-            
-            println!("Starting container-aware background maintenance with CPU throttling protection");
+            println!("🔧 Starting bounded background maintenance (max 10 Hz, {} total iterations)", MAX_TOTAL_ITERATIONS);
             
             loop {
-                loop_iteration_count += 1;
-                let loop_start = std::time::Instant::now();
+                // CRITICAL: Always wait before processing to ensure bounded rate
+                interval.tick().await;
                 
-                if loop_iteration_count % 1000 == 0 { // Check every 1000 iterations
-                    let now = std::time::Instant::now();
-                    let elapsed_since_check = now.duration_since(last_circuit_breaker_check);
-                    
-                    if elapsed_since_check.as_secs() < 60 && loop_iteration_count > MAX_ITERATIONS_PER_MINUTE {
-                        eprintln!("CIRCUIT BREAKER ACTIVATED: Background loop running too fast");
-                        eprintln!("{} iterations in {} seconds, limiting iterations", loop_iteration_count, elapsed_since_check.as_secs());
-                        
-                        // ZERO-LATENCY: Just reset counters, never sleep
-                        // HTTP performance is more important than preventing CPU spinning
-                        loop_iteration_count = 0;
-                        last_circuit_breaker_check = now;
-                    } else if elapsed_since_check.as_secs() >= 60 {
-                        // Reset counter every minute
-                        loop_iteration_count = 0;
-                        last_circuit_breaker_check = now;
-                    }
+                total_iteration_count += 1;
+                rate_limit_count += 1;
+                
+                // EARLY EXIT: Safety limit to prevent infinite loops
+                if total_iteration_count > MAX_TOTAL_ITERATIONS {
+                    println!(" Background maintenance stopping after {} iterations (safety limit)", MAX_TOTAL_ITERATIONS);
+                    break;
                 }
                 
-                // CRITICAL: Check CPU pressure more frequently and adapt immediately
-                let now = std::time::Instant::now();
-                let pressure_check_interval = if emergency_mode { 2 } else { 5 }; // More frequent in emergency
-                
-                if now.duration_since(last_pressure_check).as_secs() >= pressure_check_interval {
-                    last_pressure_check = now;
-                    let pressure = cpu_detector.detect_pressure();
-                    let multiplier = cpu_detector.interval_multiplier(pressure);
-                    let (_pressure_level, consecutive_throttles, _is_container, environment) = cpu_detector.get_pressure_stats();
+                // CIRCUIT BREAKER: Rate limiting protection
+                if rate_limit_count % 100 == 0 {
+                    let elapsed = rate_limit_start.elapsed();
                     
-                    // Emergency mode activation - completely change behavior under extreme pressure
-                    let new_emergency_mode = _pressure_level >= 4 || consecutive_throttles > 10;
-                    if new_emergency_mode != emergency_mode {
-                        emergency_mode = new_emergency_mode;
-                        last_emergency_check = now;
+                    if elapsed.as_secs() < 60 && rate_limit_count > MAX_ITERATIONS_PER_MINUTE {
+                        println!("CIRCUIT BREAKER: Background loop rate limited");
+                        println!("   {} iterations in {}s (max {} per minute)", 
+                                rate_limit_count, elapsed.as_secs(), MAX_ITERATIONS_PER_MINUTE);
                         
-                        if emergency_mode {
-                            println!("EMERGENCY MODE ACTIVATED - CPU pressure critical (level {}, {} consecutive throttles)", 
-                                _pressure_level, consecutive_throttles);
-                            println!("Environment: {}, switching to survival mode operations", environment);
-                        } else {
-                            println!("Emergency mode deactivated - CPU pressure normalized");
-                        }
-                    }
-                    
-                    if multiplier > 1 {
-                        println!("CPU pressure detected (level {}, env: {}) - intervals scaled by {}x", 
-                            pressure, environment, multiplier);
-                        
-                        // Dynamic base interval adjustment based on pressure
-                        merge_adaptive = AdaptiveInterval::new(std::time::Duration::from_millis(BASE_MERGE_INTERVAL_MS * multiplier));
-                        management_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_MANAGEMENT_INTERVAL_SEC * multiplier));
-                        stats_adaptive = AdaptiveInterval::new(std::time::Duration::from_secs(BASE_STATS_INTERVAL_SEC * multiplier));
+                        // BOUNDED SLEEP: Reset rate limiting with recovery delay
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        rate_limit_count = 0;
+                        rate_limit_start = std::time::Instant::now();
+                        consecutive_errors = 0; // Reset error count after circuit breaker
+                    } else if elapsed.as_secs() >= 60 {
+                        // Reset rate limiting counters every minute for fresh measurement
+                        rate_limit_count = 0;
+                        rate_limit_start = std::time::Instant::now();
                     }
                 }
-                
-                if emergency_mode {
-                    let _emergency_duration = now.duration_since(last_emergency_check);
-                    
-                    // Only do critical overflow buffer merges in emergency mode
-                    let (overflow_size, overflow_cap, _rejected, _pressure_level, _memory) = self.overflow_buffer.lock().stats();
-                    let overflow_critical = overflow_size >= overflow_cap * 9 / 10; // 90% full
-                    
-                    if overflow_critical {
-                        println!("🚨 Emergency merge required - overflow buffer {}% full", 
-                            (overflow_size * 100) / overflow_cap);
-
-             
-                        self.overflow_buffer.lock().data.clear();
-
-                        // Emergency merge with minimal CPU usage
-                        match self.emergency_minimal_merge().await {
-                            Ok(_) => {
-                                println!("Emergency merge completed");
-                                error_handler.reset_merge_errors();
-                            }
-                            Err(e) => {
-                                println!("❌ Emergency merge failed: {}", e);
-                                error_handler.handle_management_error(e);
-                            }
-                        }
-                    }
-                    
-                    // No sleeping in emergency mode, just continue
-                    continue; // Skip normal operations in emergency mode
+                // ERROR CIRCUIT BREAKER: Stop if too many consecutive failures
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    println!("Background maintenance stopping due to {} consecutive errors", consecutive_errors);
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await; // Recovery delay
+                    break;
                 }
                 
-                // Zero-latency mode: Disable yielding and sleeping for maximum HTTP performance
-                // Background tasks should never block HTTP responses
-                let current_pressure = cpu_detector.current_pressure();
+                // SIMPLE MAINTENANCE: Only essential operations
+                // Check hot buffer utilization to decide if merge is needed
+                let hot_utilization = self.hot_buffer.utilization();
                 
-                // COMPLETELY REMOVE YIELDING: HTTP performance is priority #1
-                // No yielding or sleeping that could impact read latencies
-                
-                // Check for urgent operations first (memory pressure)
-                let urgent_merge_needed = {
-                    let (overflow_size, overflow_cap, _rejected, buffer_pressure, _memory) = self.overflow_buffer.lock().stats();
-                    buffer_pressure >= 3 || overflow_size >= overflow_cap * 3 / 4
-                };
-                
-                // Priority 1: Urgent merges (override all pressure limits)
-                if urgent_merge_needed {
-                    println!("Urgent merge required due to memory pressure");
+                if hot_utilization > 0.8 {
+                    println!("🔧 Background merge triggered (hot buffer {}% full)", (hot_utilization * 100.0) as u32);
                     
-                    // CRITICAL FIX: No yielding before urgent operations - they need immediate execution
-                    let merge_start = std::time::Instant::now();
                     match self.merge_hot_buffer().await {
                         Ok(_) => {
-                            let completion_time = merge_start.elapsed();
-                            merge_adaptive.optimize_interval(completion_time);
-                            error_handler.reset_merge_errors();
-                            println!("Urgent merge completed in {:?}", completion_time);
+                            consecutive_errors = 0; // Reset error count on success
+                            println!(" Background merge completed successfully");
                         }
                         Err(e) => {
-                            merge_adaptive.increase_interval();
-                            let should_continue = error_handler.handle_merge_error(e).await;
-                            if !should_continue {
-                                eprintln!("🛑 Too many merge errors, stopping background maintenance");
-                                break;
-                            }
-                        }
-                    }
-                    continue; // Skip other operations after urgent merge
-                }
-                
-                // Priority 2: Regular merge operations (with pressure-aware scheduling)
-                if now.duration_since(loop_start) >= merge_adaptive.current() {
-                    // Skip merge under high CPU pressure unless buffer is getting full
-                    if current_pressure >= 3 {
-                        let (overflow_size, overflow_cap, _rejected, _pressure, _memory) = self.overflow_buffer.lock().stats();
-                        let hot_utilization = self.hot_buffer.utilization();
-                        
-                        if overflow_size < overflow_cap / 2 && hot_utilization < 0.6 {
-                            println!("⏸️  Skipping merge due to CPU pressure (level {})", current_pressure);
-                            tokio::time::sleep(merge_adaptive.current() / 2).await; // Wait half interval
-                            continue;
-                        }
-                    }
-                    
-                    // Enhanced hot buffer merge triggering
-                    let should_merge = {
-                        let current_size = self.hot_buffer.size.load(std::sync::atomic::Ordering::Relaxed);
-                        current_size > TARGET_SEGMENT_SIZE / 4
-                    };
-                    
-                    if should_merge {
-                        // Get buffer state for adaptive timing
-                        let (_overflow_size, _overflow_capacity, _rejected, _pressure, _memory) = self.overflow_buffer.lock().stats();
-                        
-                        
-                        
-                        let merge_start = std::time::Instant::now();
-                        match self.merge_hot_buffer().await {
-                            Ok(_) => {
-                                let completion_time = merge_start.elapsed();
-                                merge_adaptive.optimize_interval(completion_time);
-                                error_handler.reset_merge_errors();
-                                println!("Merge completed in {:?}", completion_time);
-                            }
-                            Err(e) => {
-                                merge_adaptive.increase_interval();
-                                let should_continue = error_handler.handle_merge_error(e).await;
-                                if !should_continue {
-                                    eprintln!("🛑 Too many merge errors, stopping background maintenance");
-                                    break;
-                                }
-                            }
+                            consecutive_errors += 1;
+                            println!("❌ Background merge failed (attempt {}): {}", consecutive_errors, e);
+                            
+                            // EXPONENTIAL BACKOFF: Increase delay with each error
+                            let backoff_duration = std::time::Duration::from_secs(2_u64.pow(consecutive_errors.min(5)));
+                            tokio::time::sleep(backoff_duration).await;
                         }
                     }
                 }
                 
-                // Priority 3: Management operations (lowest priority, most pressure-sensitive)
-                if now.duration_since(loop_start) >= management_adaptive.current() {
-                    // Skip heavy management tasks under even medium CPU pressure
-                    if current_pressure >= 2 {
-                        println!("⏸️  Skipping management tasks due to CPU pressure (level {})", current_pressure);
-                        tokio::time::sleep(management_adaptive.current() / 3).await; // Wait third of interval
-                        continue;
-                    }
-                    
-                    // CRITICAL FIX: No yielding before maintenance operations - let them run efficiently
-                    
-                    let mgmt_start = std::time::Instant::now();
-                    match self.adaptive_segment_management().await {
-                        Ok(_) => {
-                            let completion_time = mgmt_start.elapsed();
-                            management_adaptive.optimize_interval(completion_time);
-                            error_handler.reset_management_errors();
-                        }
-                        Err(e) => {
-                            management_adaptive.increase_interval();
-                            error_handler.handle_management_error(e);
-                        }
-                    }
+                // LOW-IMPACT OPERATIONS: Quick checks only
+                let overflow_pressure = {
+                    let overflow = self.overflow_buffer.lock();
+                    overflow.is_under_pressure()
+                };
+                
+                if overflow_pressure {
+                    println!("⚠️  Overflow buffer under pressure - scheduling urgent merge");
+                    // Don't perform merge here, just log the condition
+                    // Let the next hot buffer check handle it
                 }
                 
-                // Priority 4: Statistics and monitoring (very low priority)
-                if now.duration_since(loop_start) >= stats_adaptive.current() {
-                    // Skip stats completely during any load to maintain HTTP performance
-                    if current_pressure >= 1 {
-                        continue; // Skip stats entirely instead of sleeping
-                    }
-                    
-                    let stats_start = std::time::Instant::now();
-                    
-                    // Lightweight analytics only
-                    self.log_performance_analytics().await;
-                    
-                    // Enhanced logging with pressure information
-                    let (merge_errors, mgmt_errors) = error_handler.stats();
-                    let (_pressure_level, consecutive_throttles, _is_container, environment) = cpu_detector.get_pressure_stats();
-                    
-                    if merge_errors > 0 || mgmt_errors > 0 || _pressure_level > 0 {
-                        println!("Status - Errors: {}M/{}G, Pressure: L{} ({} throttles), Env: {}", 
-                            merge_errors, mgmt_errors, _pressure_level, consecutive_throttles, environment);
-                    }
-                    
-                    if _pressure_level == 0 {
-                        println!("Intervals - merge: {:?}, mgmt: {:?}, stats: {:?}",
-                            merge_adaptive.current(), management_adaptive.current(), stats_adaptive.current());
-                    }
-                    
-                    let completion_time = stats_start.elapsed();
-                    stats_adaptive.optimize_interval(completion_time);
+                // BOUNDED LOGGING: Only log every 100 iterations to prevent spam
+                if total_iteration_count % 100 == 0 {
+                    println!("🔧 Background maintenance status: iteration {}, hot buffer {:.1}% full", 
+                            total_iteration_count, hot_utilization * 100.0);
                 }
-                
-                // Zero-latency mode: No sleeping in background maintenance
-                // HTTP requests must have absolute priority over background tasks
-                // Let tokio scheduler handle task scheduling efficiently
-                // Only yield control, never sleep - this allows HTTP requests to be processed immediately
-                tokio::task::yield_now().await;
             }
+            
+            println!(" Background maintenance loop terminated gracefully");
         })
     }
     
-    /// Emergency minimal merge operation for critical memory pressure scenarios
-    async fn emergency_minimal_merge(&self) -> Result<()> {
-        println!("🚨 Performing emergency minimal merge to prevent OOM");
-        
-        let overflow_data = {
-            let mut overflow = self.overflow_buffer.lock();
-            if overflow.data.is_empty() {
-                return Ok(()); // Nothing to merge
-            }
-            let drained_data = overflow.drain_all_atomic();
-            // Lock released immediately after atomic drain
-            drained_data
-        };
-        
-        if overflow_data.is_empty() {
-            return Ok(());
-        }
-        
-        println!("Emergency merging {} overflow entries", overflow_data.len());
-        
-        if overflow_data.len() > 100_000 {
-            eprintln!("EMERGENCY ABORT: Too many overflow entries ({}), potential infinite loop", overflow_data.len());
-            return Err(anyhow::anyhow!("Emergency merge aborted: overflow data too large ({})", overflow_data.len()));
-        }
-        
-        self.atomic_update_with_consistent_locking(|segments, router| {
-            // Group updates by segment using current router state
-            let mut segment_updates = std::collections::HashMap::new();
-            for (key, value) in overflow_data {
-                let segment_id = router.predict_segment(key);
-                segment_updates.entry(segment_id).or_insert_with(Vec::new).push((key, value));
-            }
-
-            let segment_count = segment_updates.len();
-            if segment_count > 1000 {
-                eprintln!("🚨 EMERGENCY ABORT: Too many segments ({}), potential infinite loop", segment_count);
-                return Err(anyhow::anyhow!("Emergency merge aborted: too many segments ({})", segment_count));
-            }
-
-            // CRITICAL FIX: Apply updates to segments with full race condition protection
-            for (segment_id, updates) in segment_updates {
-                if segment_id < segments.len() && !updates.is_empty() {
-                    if updates.len() > 10_000 {
-                        eprintln!("🚨 EMERGENCY SEGMENT ABORT: Too many updates ({}), potential infinite loop", updates.len());
-                        return Err(anyhow::anyhow!("Emergency segment merge aborted: too many updates ({})", updates.len()));
-                    }
-                    
-                    let target_segment = &mut segments[segment_id];
-                    for (key, value) in updates {
-                        target_segment.insert(key, value)?;
-                    }
-                } else if segment_id >= segments.len() {
-                    // CRITICAL: Router-segment inconsistency during emergency merge
-                    eprintln!("🚨 EMERGENCY RACE CONDITION: Router predicted invalid segment {} >= {} during emergency merge", 
-                        segment_id, segments.len());
-                    return Err(anyhow::anyhow!("Emergency merge failed: router-segment inconsistency - segment_id: {}, segments.len(): {}", 
-                        segment_id, segments.len()));
-                }
-            }
-
-            Ok(())
-        }).await?;
-        
-        println!("Emergency merge completed successfully");
-        Ok(())
-    }
-
-    /// DEPRECATED
-    /// Emergency merges now use atomic_update_with_consistent_locking to prevent deadlocks
     /// Performance analytics and monitoring
     async fn log_performance_analytics(&self) {
         let segments = self.segments.read();
@@ -2948,7 +2726,7 @@ impl AdaptiveRMI {
             num_segments, total_keys
         );
     }
-                                    // DEPRECATED
+                            
     /// Enhanced merge triggering logic
     async fn should_trigger_merge(&self) -> bool {
         let hot_utilization = self.hot_buffer.utilization();
