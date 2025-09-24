@@ -9,7 +9,7 @@ repository = "https://github.com/vatskishan03/KyroDB"
 homepage = "https://github.com/vatskishan03/KyroDB"
 documentation = "https://github.com/vatskishan03/KyroDB"
 readme = "../README.md"
-keywords = ["database", "kv", "learned-index", "rmi", "performance", "durability", "wal"]
+keywords = ["database", "learned-index", "rmi", "performance", "durability"]
 categories = ["database-implementations", "data-structures", "concurrency"]
 build = "build.rs"
 
