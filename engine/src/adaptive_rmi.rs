@@ -17,9 +17,19 @@ use crossbeam_queue::SegQueue;
 use tokio::sync::Notify;
 use anyhow::{Result, anyhow};
 
-// Architecture-specific SIMD imports
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::__m256i;
+// Architecture-specific SIMD imports with proper conditional compilation
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+use std::arch::x86_64::{
+    __m256i, _mm256_loadu_si256, _mm256_extract_epi64, _mm256_set1_epi64x,
+    _mm256_set_epi64x, _mm256_cmpeq_epi64, _mm256_movemask_epi8, _mm256_srlv_epi64,
+    _mm256_min_epi64, _mm256_i64gather_epi32, _mm256_cvtepi32_epi64, 
+    _mm256_castsi256_si128, _mm256_extracti128_si256
+};
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+use std::arch::aarch64::{
+    vld1q_u64, vdupq_n_u64, vceqq_u64, vgetq_lane_u64, vcltq_u64, uint64x2_t
+};
 
 /// Memory management constants
 const MAX_OVERFLOW_CAPACITY: usize = 500_000;
@@ -3416,7 +3426,7 @@ impl AdaptiveRMI {
                                 );
                             } else {
                                 // Scalar bounded search for small segments
-                                results[result_idx] = segment.bounded_search_fast(key);
+                                results[result_idx] = segment.bounded_search(key);
                             }
                             simd_processed[result_idx % 4] = true;
                         } else if segment_id >= segments_guard.len() {
@@ -3428,7 +3438,7 @@ impl AdaptiveRMI {
                     // Scalar fallback for remaining keys with bounds checking
                     for &(result_idx, key, segment_id) in chunk {
                         if segment_id < segments_guard.len() {
-                            results[result_idx] = segments_guard[segment_id].bounded_search_fast(key);
+                            results[result_idx] = segments_guard[segment_id].bounded_search(key);
                         } else {
                             // Graceful degradation: use fallback search if prediction is out of bounds
                             results[result_idx] = self.fallback_linear_search_with_segments_lock(&segments_guard, key);
@@ -4211,7 +4221,9 @@ impl Default for PerformanceMonitor {
         Self::new()
     }
 }
-    ///  ULTRA-FAST 16-KEY SIMD BATCH
+
+impl AdvancedSIMDBatchProcessor {
+    /// ULTRA-FAST 16-KEY SIMD BATCH
     /// Process 16 keys simultaneously with AVX2 optimizations
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
@@ -4221,20 +4233,20 @@ impl Default for PerformanceMonitor {
         segments: &[CacheOptimizedSegment],
         router: &GlobalRoutingModel,
     ) -> [Option<u64>; 16] {
-        //  LOAD ALL KEYS INTO SIMD REGISTERS
+        // LOAD ALL KEYS INTO SIMD REGISTERS
         let keys_0 = _mm256_loadu_si256(keys.as_ptr() as *const __m256i);
-        let keys_1 = _mm256_loadu_si256(keys.as_ptr().add(1) as *const __m256i);
-        let keys_2 = _mm256_loadu_si256(keys.as_ptr().add(2) as *const __m256i);
-        let keys_3 = _mm256_loadu_si256(keys.as_ptr().add(3) as *const __m256i);
+        let keys_1 = _mm256_loadu_si256(keys.as_ptr().add(4) as *const __m256i);
+        let keys_2 = _mm256_loadu_si256(keys.as_ptr().add(8) as *const __m256i);
+        let keys_3 = _mm256_loadu_si256(keys.as_ptr().add(12) as *const __m256i);
         
-        //  VECTORIZED ROUTING: Predict all segments simultaneously
+        // VECTORIZED ROUTING: Predict all segments simultaneously
         let segment_ids = self.simd_predict_all_segments(keys_0, keys_1, keys_2, keys_3, router);
         
-        //  PARALLEL SEGMENT PROCESSING: Process 4 segments at once
+        // PARALLEL SEGMENT PROCESSING: Process 4 segments at once
         let mut results = [None; 16];
         
         for chunk in segment_ids.chunks(4) {
-            if chunk.len() == 4 {
+            if chunk.len() == 4 && chunk.iter().all(|&id| id < segments.len()) {
                 let segment_results = self.simd_process_segment_chunk(
                     keys_0, keys_1, keys_2, keys_3,
                     &segments[chunk[0]], &segments[chunk[1]], 
@@ -4253,7 +4265,7 @@ impl Default for PerformanceMonitor {
         results
     }
     
-    ///  VECTORIZED SEGMENT PREDICTION
+    /// VECTORIZED SEGMENT PREDICTION
     /// Predict segment IDs for all 16 keys simultaneously
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
@@ -4262,7 +4274,7 @@ impl Default for PerformanceMonitor {
         keys_0: __m256i, keys_1: __m256i, keys_2: __m256i, keys_3: __m256i,
         router: &GlobalRoutingModel,
     ) -> [usize; 16] {
-        //  VECTORIZED ROUTING CALCULATION
+        // VECTORIZED ROUTING CALCULATION
         let shift = 64u32.saturating_sub(router.router_bits as u32);
         let shift_vec = _mm256_set1_epi64x(shift as i64);
         
@@ -4272,7 +4284,7 @@ impl Default for PerformanceMonitor {
         let prefixes_2 = _mm256_srlv_epi64(keys_2, shift_vec);
         let prefixes_3 = _mm256_srlv_epi64(keys_3, shift_vec);
         
-        //  VECTORIZED BOUNDS CHECKING
+        // VECTORIZED BOUNDS CHECKING
         let router_len = router.router.len() as i64;
         let max_index = _mm256_set1_epi64x(router_len - 1);
         
@@ -4302,7 +4314,7 @@ impl Default for PerformanceMonitor {
         ]
     }
     
-    ///  SIMD PROCESS SEGMENT CHUNK
+    /// SIMD PROCESS SEGMENT CHUNK
     /// Process 4 segments simultaneously with SIMD
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
@@ -4330,8 +4342,8 @@ impl Default for PerformanceMonitor {
         
         results
     }
-    
-    ///  SIMD SEARCH SEGMENT
+
+    /// SIMD SEARCH SEGMENT
     /// Search a single segment with SIMD optimization
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
@@ -4353,7 +4365,6 @@ impl Default for PerformanceMonitor {
         results
     }
 
-impl AdvancedSIMDBatchProcessor {
     ///  FALLBACK IMPLEMENTATION
     /// Scalar fallback for non-SIMD architectures
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
