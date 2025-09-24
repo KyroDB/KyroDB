@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Professional installation script with system service integration
 - Enterprise-grade observability and health monitoring
 
+### Fixed
+- **Critical**: SIMD compilation issues on non-AVX2 systems
+- **Architecture**: Proper conditional compilation for x86_64 AVX2 and ARM64 NEON
+- **Installation**: Universal installation compatibility across all architectures
+
 ### Technical Foundation
 - Rust-based implementation with memory safety guarantees
 - Adaptive RMI with intelligent segment management

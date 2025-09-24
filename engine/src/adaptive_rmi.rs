@@ -17,6 +17,10 @@ use crossbeam_queue::SegQueue;
 use tokio::sync::Notify;
 use anyhow::{Result, anyhow};
 
+// Architecture-specific SIMD imports
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::__m256i;
+
 /// Memory management constants
 const MAX_OVERFLOW_CAPACITY: usize = 500_000;
 const OVERFLOW_PRESSURE_LOW: usize = (MAX_OVERFLOW_CAPACITY * 6) / 10;
@@ -4167,10 +4171,10 @@ impl CacheOptimizedSegment {
 /// Optimized batch lookup with advanced SIMD techniques
 pub struct AdvancedSIMDBatchProcessor {
     /// Pre-allocated SIMD registers for hot paths
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     simd_registers: Vec<__m256i>,
-    #[cfg(not(target_arch = "x86_64"))]
-    simd_registers: Vec<u64>, // Fallback for non-x86_64
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    simd_registers: Vec<u64>, // Fallback for non-AVX2
     /// Cache-aligned memory pools
     memory_pools: Vec<CacheAlignedBuffer>,
     /// Branch prediction hints
@@ -4180,6 +4184,9 @@ pub struct AdvancedSIMDBatchProcessor {
 impl Default for AdvancedSIMDBatchProcessor {
     fn default() -> Self {
         Self {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            simd_registers: Vec::new(),
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
             simd_registers: Vec::new(),
             memory_pools: Vec::new(),
             prediction_hints: AtomicUsize::new(0),

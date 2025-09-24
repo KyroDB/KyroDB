@@ -26,17 +26,28 @@ This inaugural release represents the completion of **Phase 0: Foundation Rescue
 ### 🔧 **Installation**
 
 ```bash
-# Install from crates.io
+# Standard installation (works on all architectures)
 cargo install kyrodb-engine --features learned-index
 
-# Or build from source
+# With SIMD optimization (x86_64 + AVX2)
+RUSTFLAGS="-C target-feature=+avx2" cargo install kyrodb-engine --features learned-index
+
+# With SIMD optimization (ARM64 + NEON)  
+RUSTFLAGS="-C target-feature=+neon" cargo install kyrodb-engine --features learned-index
+
+# Build from source with native optimizations
 git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
-cargo build --release --features learned-index
+RUSTFLAGS="-C target-cpu=native" cargo build --release --features learned-index
 
 # Start server
 ./target/release/kyrodb-engine serve 127.0.0.1 3030
 ```
+
+### ⚠️ **Architecture Notes**
+- **x86_64**: AVX2 support provides 4-wide SIMD operations for maximum performance
+- **ARM64**: NEON support provides 2-wide SIMD operations  
+- **Universal**: Scalar fallback operations work on all architectures without SIMD features
 
 ### 📚 **Documentation**
 - **API Reference**: Complete HTTP endpoint documentation
