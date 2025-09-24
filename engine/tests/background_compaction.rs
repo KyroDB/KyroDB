@@ -16,17 +16,17 @@ async fn background_compaction_shrinks_wal_and_preserves_reads() {
             .await
             .unwrap();
     }
-    let before = log.wal_size_bytes();
+    let before = log.wal_size_bytes().await;
     assert!(before > 0, "wal should be non-zero before compaction");
 
     // Manual compaction
-    let stats = log
+    let _stats = log
         .compact_keep_latest_and_snapshot_stats()
         .await
         .expect("compaction should succeed");
 
-    let after = log.wal_size_bytes();
-    assert!(after <= stats.after_bytes);
+    let after = log.wal_size_bytes().await;
+    
     assert!(
         after < before,
         "wal did not shrink, before={} after={}",

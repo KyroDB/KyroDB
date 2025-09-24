@@ -1,6 +1,4 @@
-/// Example demonstrating the Adaptive Segmented RMI implemen    // Demonstrate bounded search guarantees
-    println!("\n🔒 Bounded Search Performance Validation");
-    println!("======================================");ion
+/// Example demonstrating the Adaptive Segmented RMI implementation
 /// 
 /// This example shows how the new adaptive RMI provides:
 /// - Bounded O(log ε) performance with ε ≤ 64

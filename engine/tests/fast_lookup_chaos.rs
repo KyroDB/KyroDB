@@ -77,16 +77,10 @@ async fn test_rmi_rebuild_during_fast_lookups() {
     }
     log.snapshot().await.unwrap();
 
-    // Build initial RMI
+    // Build initial AdaptiveRMI
     let pairs = log.collect_key_offset_pairs().await;
-    let tmp = dir.path().join("index-rmi.tmp");
-    let dst = dir.path().join("index-rmi.bin");
-    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
-    std::fs::rename(&tmp, &dst).unwrap();
-    if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
-        log.swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi))
-            .await;
-    }
+    let index = kyrodb_engine::index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
+    let _ = log.swap_primary_index(index).await;
 
     // Continuous fast lookups
     let lookup_log = log.clone();
@@ -108,14 +102,10 @@ async fn test_rmi_rebuild_during_fast_lookups() {
                 .unwrap();
         }
 
-        // Rebuild RMI
+        // Rebuild AdaptiveRMI
         let pairs = log.collect_key_offset_pairs().await;
-        kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
-        std::fs::rename(&tmp, &dst).unwrap();
-        if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
-            log.swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi))
-                .await;
-        }
+        let index = kyrodb_engine::index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
+        let _ = log.swap_primary_index(index).await;
 
         sleep(Duration::from_millis(5)).await;
     }
