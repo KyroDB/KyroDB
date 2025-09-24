@@ -131,3 +131,4 @@ bench_server.log
 .cursor/rules/rules.mdc
 Implementation.md
 test_dual_protocol.py
+release_v0_1_0.sh
