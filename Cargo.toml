@@ -17,8 +17,8 @@ tempfile = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["KyroDB Team <kishanvats2003@gmail.com>"]
-license = "Apache-2.0"
+authors = ["KyroDB Team <kishan@kyrodb.com>"]
+license = "BUSL-1.1"
 repository = "https://github.com/vatskishan03/KyroDB"
 keywords = ["database", "kv", "learned-index", "rmi", "performance"]
 categories = ["database-implementations", "data-structures"]

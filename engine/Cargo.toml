@@ -2,8 +2,8 @@
 name = "kyrodb-engine"
 version = "0.1.0"
 edition = "2021"
-authors = ["KyroDB Team <kishanvats2003@gmail.com>"]
-license = "Apache-2.0"
+authors = ["KyroDB Team <kishan@kyrodb.com>"]
+license = "BUSL-1.1"
 description = "High-performance database engine with learned indexes (RMI)"
 repository = "https://github.com/vatskishan03/KyroDB"
 homepage = "https://github.com/vatskishan03/KyroDB"

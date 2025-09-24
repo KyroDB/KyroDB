@@ -1,6 +1,6 @@
 # KyroDB — High-Performance Key-Value Database with Learned Indexes
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](https://mariadb.com/bsl11-faq/)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
 [![CI](https://github.com/vatskishan03/KyroDB/actions/workflows/ci.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
 
@@ -154,6 +154,12 @@ cargo +nightly fuzz run rmi_probe
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+This project is licensed under the **Business Source License 1.1 (BSL 1.1)**.
+
+- **Permitted Use**: You can use KyroDB for development, testing, and for production use in deployments with up to 3 nodes and 1TB of data.
+- **Prohibited Use**: Offering KyroDB as a commercial managed database service is not allowed.
+- **Change License**: On **September 24, 2029**, the license will automatically convert to the **GNU Affero General Public License v3.0 (AGPLv3)**.
+
+See the [LICENSE](LICENSE) file for the full terms.
 
 **KyroDB: Foundation-first AI‑native database** 🚀
