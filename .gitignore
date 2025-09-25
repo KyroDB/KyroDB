@@ -131,4 +131,5 @@ bench_server.log
 .cursor/rules/rules.mdc
 Implementation.md
 test_dual_protocol.py
-release_v0_1_0.sh
+PERFORMANCE_VALIDATION_REPORT.md
+bench/results/quick_33b60ec_20250925_050857/BENCHMARK_SUMMARY.md
