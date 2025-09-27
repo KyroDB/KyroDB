@@ -1411,6 +1411,7 @@ dependencies = [
  "clap",
  "crc32c",
  "criterion",
+ "crossbeam-epoch",
  "crossbeam-queue",
  "dashmap",
  "fail",
