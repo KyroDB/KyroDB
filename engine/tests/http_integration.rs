@@ -1,6 +1,5 @@
 #[cfg(feature = "http-test")]
 mod http_integration_tests {
-    use kyrodb_engine::Server;
     use serde_json::json;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -14,7 +13,7 @@ mod http_integration_tests {
         for _ in 0..30 {
             if let Ok(resp) = timeout(
                 Duration::from_secs(2),
-                client.get(&format!("{}/health", BASE_URL)).send(),
+                client.get(&format!("{}/v1/health", BASE_URL)).send(),
             )
             .await
             {
@@ -39,7 +38,7 @@ mod http_integration_tests {
         let client = reqwest::Client::new();
         let resp = timeout(
             TEST_TIMEOUT,
-            client.get(&format!("{}/health", BASE_URL)).send(),
+            client.get(&format!("{}/v1/health", BASE_URL)).send(),
         )
         .await
         .expect("Request timed out")
@@ -51,88 +50,21 @@ mod http_integration_tests {
     }
 
     #[tokio::test]
-    async fn test_build_info_endpoint() {
+    async fn test_put_fast_and_get_fast() {
         if let Err(_) = wait_for_server_ready().await {
             eprintln!("Skipping test - server not available");
             return;
         }
         let client = reqwest::Client::new();
-        let resp = timeout(
-            TEST_TIMEOUT,
-            client.get(&format!("{}/build_info", BASE_URL)).send(),
-        )
-        .await
-        .expect("Request timed out")
-        .expect("Request failed");
+    let test_key = 42u64;
+    let test_value: u64 = 4242;
 
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.expect("Invalid JSON response");
-        assert!(body["version"].is_string());
-    }
-
-    #[tokio::test]
-    async fn test_offset_endpoint() {
-        if let Err(_) = wait_for_server_ready().await {
-            eprintln!("Skipping test - server not available");
-            return;
-        }
-        let client = reqwest::Client::new();
-        let resp = timeout(
-            TEST_TIMEOUT,
-            client.get(&format!("{}/v1/offset", BASE_URL)).send(),
-        )
-        .await
-        .expect("Request timed out")
-        .expect("Request failed");
-
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.expect("Invalid JSON response");
-        assert!(body["offset"].is_number());
-    }
-
-    #[tokio::test]
-    async fn test_append_endpoint() {
-        if let Err(_) = wait_for_server_ready().await {
-            eprintln!("Skipping test - server not available");
-            return;
-        }
-
-        let client = reqwest::Client::new();
-        let payload = json!({"payload": "test_data"});
-
-        let resp = timeout(
-            TEST_TIMEOUT,
-            client
-                .post(&format!("{}/v1/append", BASE_URL))
-                .json(&payload)
-                .send(),
-        )
-        .await
-        .expect("Request timed out")
-        .expect("Request failed");
-
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.expect("Invalid JSON response");
-        assert!(body["offset"].is_number());
-    }
-
-    #[tokio::test]
-    async fn test_put_and_lookup_endpoints() {
-        if let Err(_) = wait_for_server_ready().await {
-            eprintln!("Skipping test - server not available");
-            return;
-        }
-        let client = reqwest::Client::new();
-        let test_key = 42u64;
-        let test_value = "integration_test_value";
-
-        // PUT
-        let put_payload = json!({"key": test_key, "value": test_value});
         let put_resp = timeout(
             TEST_TIMEOUT,
             client
-                .post(&format!("{}/v1/put", BASE_URL))
-                .json(&put_payload)
+                .post(&format!("{}/v1/put_fast/{}", BASE_URL, test_key))
+                .header("Content-Type", "application/octet-stream")
+                .body(test_value.to_le_bytes().to_vec())
                 .send(),
         )
         .await
@@ -140,28 +72,65 @@ mod http_integration_tests {
         .expect("Request failed");
 
         assert_eq!(put_resp.status(), 200);
-        let put_body: serde_json::Value = put_resp.json().await.expect("Invalid JSON response");
-        assert!(put_body["offset"].is_number());
 
-        // Give some time for the write to be processed
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // LOOKUP
-        let lookup_resp = timeout(
+        let get_resp = timeout(
             TEST_TIMEOUT,
             client
-                .get(&format!("{}/v1/lookup?key={}", BASE_URL, test_key))
+                .get(&format!("{}/v1/get_fast/{}", BASE_URL, test_key))
                 .send(),
         )
         .await
         .expect("Request timed out")
         .expect("Request failed");
 
-        assert_eq!(lookup_resp.status(), 200);
-        let lookup_body: serde_json::Value =
-            lookup_resp.json().await.expect("Invalid JSON response");
-        assert_eq!(lookup_body["key"], test_key);
-        assert_eq!(lookup_body["value"], test_value);
+        assert_eq!(get_resp.status(), 200);
+        let bytes = get_resp.bytes().await.expect("Failed to read value bytes");
+        assert_eq!(bytes.len(), 8);
+        let returned_value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        assert_eq!(returned_value, test_value);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_ultra_endpoint() {
+        if let Err(_) = wait_for_server_ready().await {
+            eprintln!("Skipping test - server not available");
+            return;
+        }
+
+        let client = reqwest::Client::new();
+        let test_key = 99u64;
+        let test_value: u64 = 9001;
+
+        let _ = timeout(
+            TEST_TIMEOUT,
+            client
+                .post(&format!("{}/v1/put_fast/{}", BASE_URL, test_key))
+                .header("Content-Type", "application/octet-stream")
+                .body(test_value.to_le_bytes().to_vec())
+                .send(),
+        )
+        .await
+        .expect("Request timed out")
+        .expect("Request failed");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let resp = timeout(
+            TEST_TIMEOUT,
+            client
+                .get(&format!("{}/v1/lookup_ultra/{}", BASE_URL, test_key))
+                .send(),
+        )
+        .await
+        .expect("Request timed out")
+        .expect("Request failed");
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("Invalid JSON response");
+        assert_eq!(body["key"], test_key);
+        assert_eq!(body["value"], serde_json::json!(test_value));
     }
 
     #[tokio::test]
@@ -223,22 +192,23 @@ mod http_integration_tests {
         }
         let client = reqwest::Client::new();
 
-        // First add some data
-        for i in 0..10u64 {
-            let put_payload = json!({"key": i, "value": format!("value_{}", i)});
+        for key in 0..5u64 {
+            let value = key + 100;
             let _ = timeout(
                 TEST_TIMEOUT,
                 client
-                    .post(&format!("{}/v1/put", BASE_URL))
-                    .json(&put_payload)
+                    .post(&format!("{}/v1/put_fast/{}", BASE_URL, key))
+                    .header("Content-Type", "application/octet-stream")
+                    .body(value.to_le_bytes().to_vec())
                     .send(),
             )
-            .await;
+            .await
+            .expect("Request timed out")
+            .expect("Request failed");
         }
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Build RMI
         let resp = timeout(
             TEST_TIMEOUT,
             client.post(&format!("{}/v1/rmi/build", BASE_URL)).send(),
@@ -261,118 +231,85 @@ mod http_integration_tests {
     }
 
     #[tokio::test]
-    async fn test_sql_endpoint() {
+    async fn test_lookup_batch_endpoint() {
         if let Err(_) = wait_for_server_ready().await {
             eprintln!("Skipping test - server not available");
             return;
         }
 
         let client = reqwest::Client::new();
-
-        // Test INSERT
-        let insert_sql = json!({"sql": "INSERT INTO kv VALUES (123, 'sql_test_value')"});
-        let insert_resp = timeout(
-            TEST_TIMEOUT,
-            client
-                .post(&format!("{}/v1/sql", BASE_URL))
-                .json(&insert_sql)
-                .send(),
-        )
-        .await
-        .expect("Request timed out")
-        .expect("Request failed");
-
-        assert_eq!(insert_resp.status(), 200);
-        let insert_body: serde_json::Value =
-            insert_resp.json().await.expect("Invalid JSON response");
-        assert!(insert_body["ack"]["offset"].is_number());
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Test SELECT
-        let select_sql = json!({"sql": "SELECT * FROM kv WHERE key = 123"});
-        let select_resp = timeout(
-            TEST_TIMEOUT,
-            client
-                .post(&format!("{}/v1/sql", BASE_URL))
-                .json(&select_sql)
-                .send(),
-        )
-        .await
-        .expect("Request timed out")
-        .expect("Request failed");
-
-        assert_eq!(select_resp.status(), 200);
-        let select_body: serde_json::Value =
-            select_resp.json().await.expect("Invalid JSON response");
-        assert!(select_body.is_array());
-        if let Some(first_row) = select_body.as_array().and_then(|arr| arr.first()) {
-            assert_eq!(first_row["key"], 123);
+        let keys = vec![5u64, 6u64, 7u64];
+        for key in &keys {
+            let value = key + 1234;
+            let _ = timeout(
+                TEST_TIMEOUT,
+                client
+                    .post(&format!("{}/v1/put_fast/{}", BASE_URL, key))
+                    .header("Content-Type", "application/octet-stream")
+                    .body(value.to_le_bytes().to_vec())
+                    .send(),
+            )
+            .await
+            .expect("Request timed out")
+            .expect("Request failed");
         }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let resp = timeout(
+            TEST_TIMEOUT,
+            client
+                .post(&format!("{}/v1/lookup_batch", BASE_URL))
+                .json(&keys)
+                .send(),
+        )
+        .await
+        .expect("Request timed out")
+        .expect("Request failed");
+
+        assert_eq!(resp.status(), 200);
+        let payload: serde_json::Value = resp.json().await.expect("Invalid JSON response");
+        assert!(payload.is_array());
+        assert_eq!(payload.as_array().unwrap().len(), keys.len());
     }
 
     #[tokio::test]
-    async fn test_fast_endpoints() {
+    async fn test_warmup_endpoint() {
         if let Err(_) = wait_for_server_ready().await {
             eprintln!("Skipping test - server not available");
             return;
         }
+
         let client = reqwest::Client::new();
-        let test_key = 999u64;
-        let test_value = "fast_endpoint_test";
-
-        // First add test data
-        let put_payload = json!({"key": test_key, "value": test_value});
-        let _ = timeout(
+        let resp = timeout(
             TEST_TIMEOUT,
-            client
-                .post(&format!("{}/v1/put", BASE_URL))
-                .json(&put_payload)
-                .send(),
+            client.post(&format!("{}/v1/warmup", BASE_URL)).send(),
         )
         .await
         .expect("Request timed out")
         .expect("Request failed");
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("Invalid JSON response");
+        assert_eq!(body["warmup"], "initiated");
+    }
 
-        // Test lookup_fast (should return offset as bytes)
-        let lookup_resp = timeout(
-            TEST_TIMEOUT,
-            client
-                .get(&format!("{}/v1/lookup_fast/{}", BASE_URL, test_key))
-                .send(),
-        )
-        .await
-        .expect("Request timed out")
-        .expect("Request failed");
-
-        if lookup_resp.status() == 200 {
-            let bytes = lookup_resp
-                .bytes()
-                .await
-                .expect("Failed to get response bytes");
-            assert_eq!(bytes.len(), 8); // u64 offset should be 8 bytes
+    #[tokio::test]
+    async fn test_compact_endpoint() {
+        if let Err(_) = wait_for_server_ready().await {
+            eprintln!("Skipping test - server not available");
+            return;
         }
 
-        // Test get_fast (should return value directly)
-        let get_resp = timeout(
+        let client = reqwest::Client::new();
+        let resp = timeout(
             TEST_TIMEOUT,
-            client
-                .get(&format!("{}/v1/get_fast/{}", BASE_URL, test_key))
-                .send(),
+            client.post(&format!("{}/v1/compact", BASE_URL)).send(),
         )
         .await
         .expect("Request timed out")
         .expect("Request failed");
 
-        if get_resp.status() == 200 {
-            let value_bytes = get_resp
-                .bytes()
-                .await
-                .expect("Failed to get response bytes");
-            let value_str = String::from_utf8_lossy(&value_bytes);
-            assert_eq!(value_str, test_value);
-        }
+        assert!(resp.status().is_success());
     }
 }

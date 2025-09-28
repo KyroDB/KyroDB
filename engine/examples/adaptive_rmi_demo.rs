@@ -66,32 +66,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bounded_analytics = adaptive_rmi.get_bounded_search_analytics();
     println!("📊 Bounded Search Analytics:");
     println!("  • Total segments: {}", bounded_analytics.total_segments);
-    println!("  • Segments with bounded guarantee: {}/{} ({:.1}%)", 
-        bounded_analytics.segments_with_bounded_guarantee,
-        bounded_analytics.total_segments,
+    println!("  • Total lookups recorded: {}", bounded_analytics.total_lookups);
+    println!(
+        "  • Bounded guarantee ratio: {:.1}%",
         bounded_analytics.bounded_guarantee_ratio * 100.0
     );
-    println!("  • Overall error rate: {:.2}%", bounded_analytics.overall_error_rate * 100.0);
-    println!("  • Max search window observed: {} elements", bounded_analytics.max_search_window_observed);
-    println!("  • Performance classification: {}", bounded_analytics.performance_classification);
+    println!(
+        "  • Overall error rate: {:.2}%",
+        bounded_analytics.overall_error_rate * 100.0
+    );
+    println!(
+        "  • Max search window observed: {} elements",
+        bounded_analytics.max_search_window_observed
+    );
     
     let system_validation = adaptive_rmi.validate_bounded_search_guarantees();
     println!("\n✅ System-wide Bounded Search Validation:");
     println!("  • System meets guarantees: {}", system_validation.system_meets_guarantees);
-    println!("  • Worst-case complexity: {}", system_validation.worst_case_complexity);
+    println!(
+        "  • Max observed search window: {}",
+        system_validation.max_search_window_observed
+    );
     println!("  • Performance level: {}", system_validation.performance_level);
     println!("  • Segments needing attention: {}", system_validation.segments_needing_attention);
     println!("  • Recommendation: {}", system_validation.recommendation);
 
     // Demonstrate per-segment bounded search details
     println!("\n📈 Per-Segment Bounded Search Details:");
-    for (i, (stats, validation)) in bounded_analytics.segment_details.iter().enumerate() {
-        println!("  Segment {}: {} lookups, {:.1}% error rate, max window: {} -> {}",
+    for (i, stats) in bounded_analytics.per_segment_stats.iter().enumerate() {
+        println!(
+            "  Segment {}: {} lookups, {:.1}% error rate, max window: {}",
             i,
             stats.total_lookups,
             stats.error_rate * 100.0,
-            stats.max_search_window,
-            validation.performance_class
+            stats.max_search_window
         );
     }
     

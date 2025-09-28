@@ -1,7 +1,5 @@
 //! Performance validation test for KyroDb optimizations
 
-use std::time::Instant;
-
 fn main() {
     println!("🔧 KyroDb Performance Optimizations Validation");
     println!("==============================================");

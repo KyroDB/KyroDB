@@ -11,26 +11,6 @@ use uuid::Uuid;
 use warp::http::StatusCode;
 use warp::Filter;
 
-/// Custom API error types for HTTP endpoints
-#[derive(Debug)]
-enum ApiError {
-    BadRequest(String),
-    NotFound(String),
-    InternalError(String),
-}
-
-impl warp::reject::Reject for ApiError {}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::BadRequest(msg) => write!(f, "Bad Request: {}", msg),
-            ApiError::NotFound(msg) => write!(f, "Not Found: {}", msg),
-            ApiError::InternalError(msg) => write!(f, "Internal Error: {}", msg),
-        }
-    }
-}
-
 /// Adaptive system load detection for background task throttling
 fn detect_system_load_multiplier() -> u64 {
     let mut load_signals = 0;
@@ -213,9 +193,11 @@ async fn main() -> Result<()> {
 
             // Optional warm-on-start: fault-in snapshot and RMI pages before serving
             if std::env::var("KYRODB_WARM_ON_START").ok().as_deref() == Some("1") {
-                println!("🔥 Warm-on-start enabled; warming data and index pages...");
-                log.warmup().await;
-                println!("🔥 Warm-on-start complete.");
+                println!("Warm-on-start enabled; warming data and index pages...");
+                if let Err(err) = log.warmup().await {
+                    eprintln!("Warmup failed: {err:?}");
+                }
+                println!("Warm-on-start complete.");
             }
 
             // Configure WAL rotation if requested
@@ -229,7 +211,7 @@ async fn main() -> Result<()> {
                 if maxb > 0 {
                     let log_for_size = log.clone();
                     tokio::spawn(async move {
-                        let mut base_check_interval = 2u64; 
+                        let base_check_interval = 2u64; 
                         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(base_check_interval));
                         let mut last_load_check = std::time::Instant::now();
                         let mut consecutive_failures = 0;
@@ -263,17 +245,17 @@ async fn main() -> Result<()> {
                                 
                                 match log_for_size.compact_keep_latest_and_snapshot().await {
                                     Ok(_) => {
-                                        println!("✅ Size-based compaction complete.");
+                                        println!("Size-based compaction complete.");
                                         consecutive_failures = 0;
                                     }
                                     Err(e) => {
                                         consecutive_failures += 1;
-                                        eprintln!("❌ Size-based compaction failed (attempt {}): {}", consecutive_failures, e);
+                                        eprintln!("Size-based compaction failed (attempt {}): {}", consecutive_failures, e);
                                         
                                         // Back off after repeated failures to prevent resource exhaustion
                                         if consecutive_failures > 2 {
                                             let backoff_duration = std::cmp::min(consecutive_failures * 10, 120); // Max 2 minutes
-                                            println!("🔄 Backing off size-based compaction for {} seconds", backoff_duration);
+                                            println!("Backing off size-based compaction for {} seconds", backoff_duration);
                                             tokio::time::sleep(tokio::time::Duration::from_secs(backoff_duration)).await;
                                         }
                                     }
@@ -288,7 +270,7 @@ async fn main() -> Result<()> {
             if compact_interval_secs > 0 {
                 let log_for_compact = log.clone();
                 tokio::spawn(async move {
-                    let mut base_interval = compact_interval_secs;
+                    let base_interval = compact_interval_secs;
                     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(base_interval));
                     let mut last_cpu_check = std::time::Instant::now();
                     let mut error_count = 0;
@@ -423,7 +405,9 @@ async fn main() -> Result<()> {
                             let new_index = engine_crate::index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
                             
                             // Swap to the new index
-                            rebuild_log.swap_primary_index(new_index).await;
+                            if let Err(err) = rebuild_log.swap_primary_index(new_index).await {
+                                eprintln!("Failed to swap primary index: {err:?}");
+                            }
                             
                             last_built = cur;
                             rebuild_timer.observe_duration();
@@ -500,10 +484,7 @@ fn create_unified_routes(
     // 🚀 ULTRA-FAST LOOKUP ENDPOINTS: Zero-allocation paths for maximum performance
     let ultra_fast_lookup_routes = create_ultra_fast_lookup_routes(log.clone());
     
-    // 📡 LEGACY ENDPOINTS: Existing functionality for compatibility
-    let legacy_routes = create_legacy_endpoints(log.clone());
-    
-    // 🔧 ADMIN ENDPOINTS: Management and monitoring
+    //  ADMIN ENDPOINTS: Management and monitoring
     let admin_routes = create_admin_endpoints(log.clone());
     
     // 💊 HEALTH ENDPOINTS: Health checks and diagnostics
@@ -512,7 +493,6 @@ fn create_unified_routes(
     // 🔗 COMBINE ALL ROUTES: Ultra-fast takes precedence for overlapping paths
     let all_routes = ultra_fast_write_routes
         .or(ultra_fast_lookup_routes)
-        .or(legacy_routes)
         .or(admin_routes)
         .or(health_routes);
 
@@ -698,176 +678,6 @@ fn create_ultra_fast_lookup_routes(
     get_fast.or(lookup_ultra).or(lookup_batch)
 }
 
-///  LEGACY ENDPOINTS: Existing functionality for compatibility
-fn create_legacy_endpoints(
-    log: Arc<engine_crate::PersistentEventLog>,
-) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    let v1 = warp::path("v1");
-
-    // PUT endpoint supporting multiple formats:
-    // POST /v1/put {"key": 123, "value": "data"} (JSON body)
-    // PUT /v1/put/123/456 (path parameters for numeric values)
-    let put_route = {
-        // JSON body version: POST /v1/put with JSON {"key": u64, "value": string}
-        let put_json = {
-            let log = log.clone();
-            v1.and(warp::path("put"))
-                .and(warp::path::end())
-                .and(warp::post())
-                .and(warp::body::json())
-                .and_then(move |body: serde_json::Value| {
-                    let log = log.clone();
-                    async move {
-                        let key = body.get("key")
-                            .and_then(|v| v.as_u64())
-                            .ok_or_else(|| warp::reject::custom(ApiError::BadRequest("Missing or invalid 'key' field".to_string())))?;
-                        
-                        let value_data = if let Some(value_str) = body.get("value").and_then(|v| v.as_str()) {
-                            value_str.as_bytes().to_vec()
-                        } else if let Some(value_num) = body.get("value").and_then(|v| v.as_u64()) {
-                            value_num.to_le_bytes().to_vec()
-                        } else {
-                            return Err(warp::reject::custom(ApiError::BadRequest("Missing or invalid 'value' field".to_string())));
-                        };
-                        
-                        let request_id = uuid::Uuid::new_v4();
-                        let record = kyrodb_engine::Record { key, value: value_data };
-                        let payload = bincode::serialize(&record)
-                            .map_err(|_| warp::reject::custom(ApiError::InternalError("Serialization failed".to_string())))?;
-                        
-                        let offset = log.append(request_id, payload).await
-                            .map_err(|_| warp::reject::custom(ApiError::InternalError("Append failed".to_string())))?;
-                        
-                        Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"offset": offset, "key": key})),
-                            warp::http::StatusCode::CREATED
-                        ))
-                    }
-                })
-        };
-            
-        // Path parameter version: PUT /v1/put/123/456 (numeric key/value)
-        let put_path = {
-            let log = log.clone();
-            v1.and(warp::path("put"))
-                .and(warp::path::param::<u64>())
-                .and(warp::path::param::<u64>())
-                .and(warp::path::end())
-                .and(warp::put())
-                .and_then(move |key: u64, value: u64| {
-                    let log = log.clone();
-                    async move {
-                        let request_id = uuid::Uuid::new_v4();
-                        let record = kyrodb_engine::Record { key, value: value.to_le_bytes().to_vec() };
-                        let payload = bincode::serialize(&record)
-                            .map_err(|_| warp::reject::custom(ApiError::InternalError("Serialization failed".to_string())))?;
-                        
-                        let offset = log.append(request_id, payload).await
-                            .map_err(|_| warp::reject::custom(ApiError::InternalError("Append failed".to_string())))?;
-                        
-                        Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({"offset": offset, "key": key, "value": value})),
-                            warp::http::StatusCode::CREATED
-                        ))
-                    }
-                })
-        };
-        
-        put_json.or(put_path)
-    };    // Legacy lookup endpoint supporting both patterns:
-    // GET /v1/lookup?key=123 (query parameter)  
-    // GET /v1/lookup/123 (path parameter)
-    let lookup_route = {
-        // Query parameter version: /v1/lookup?key=123
-        let lookup_query = {
-            let log = log.clone();
-            v1.and(warp::path("lookup"))
-                .and(warp::path::end())
-                .and(warp::query::<std::collections::HashMap<String, String>>())
-                .and(warp::get())
-                .and_then(move |params: std::collections::HashMap<String, String>| {
-                    let log = log.clone();
-                    async move {
-                        let key_str = params.get("key")
-                            .ok_or_else(|| warp::reject::custom(ApiError::BadRequest("Missing 'key' parameter".to_string())))?;
-                        let key: u64 = key_str.parse()
-                            .map_err(|_| warp::reject::custom(ApiError::BadRequest("Invalid key format".to_string())))?;
-                            
-                        match log.lookup_key(key).await {
-                            Some(offset) => {
-                                if let Some(payload) = log.get(offset).await {
-                                    Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                        payload,
-                                        warp::http::StatusCode::OK
-                                    ))
-                                } else {
-                                    Err(warp::reject::not_found())
-                                }
-                            }
-                            None => Err(warp::reject::not_found())
-                        }
-                    }
-                })
-        };
-            
-        // Path parameter version: /v1/lookup/123
-        let lookup_path = {
-            let log = log.clone();
-            v1.and(warp::path("lookup"))
-                .and(warp::path::param::<u64>())
-                .and(warp::path::end())
-                .and(warp::get())
-                .and_then(move |key: u64| {
-                    let log = log.clone();
-                    async move {
-                        match log.lookup_key(key).await {
-                            Some(offset) => {
-                                if let Some(payload) = log.get(offset).await {
-                                    Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                        payload,
-                                        warp::http::StatusCode::OK
-                                    ))
-                                } else {
-                                    Err(warp::reject::not_found())
-                                }
-                            }
-                            None => Err(warp::reject::not_found())
-                        }
-                    }
-                })
-        };
-        
-        lookup_query.or(lookup_path)
-    };
-
-    // Fast offset lookup: GET /v1/lookup_fast/123 (ultra-fast implementation)
-    let lookup_fast = {
-        let log = log.clone();
-        v1.and(warp::path("lookup_fast"))
-            .and(warp::path::param::<u64>())
-            .and(warp::path::end())
-            .and(warp::get())
-            .map(move |key: u64| {
-                if let Some(offset) = log.lookup_key_ultra_fast(key) {
-                    let response = offset.to_le_bytes().to_vec();
-                    warp::reply::with_header(
-                        response,
-                        "content-type",
-                        "application/octet-stream"
-                    )
-                } else {
-                    warp::reply::with_header(
-                        Vec::<u8>::new(),
-                        "content-type",
-                        "application/octet-stream"
-                    )
-                }
-            })
-    };
-
-    put_route.or(lookup_route).or(lookup_fast)
-}
-
 /// 🔧 ADMIN ENDPOINTS: Management and monitoring
 fn create_admin_endpoints(
     log: Arc<engine_crate::PersistentEventLog>,
@@ -902,8 +712,7 @@ fn create_admin_endpoints(
                 async move {
                     #[cfg(feature = "learned-index")]
                     {
-                        log.compact_keep_latest_and_snapshot().await
-                            .map_err(|_| warp::reject())?;
+                        log.build_rmi().await.map_err(|_| warp::reject())?;
                         Ok::<_, warp::Rejection>(warp::reply::json(
                             &serde_json::json!({ "rmi_build": "completed" }),
                         ))
@@ -914,6 +723,21 @@ fn create_admin_endpoints(
                             &serde_json::json!({ "rmi_build": "disabled" }),
                         ))
                     }
+                }
+            })
+    };
+
+    let warmup_route = {
+        let log = log.clone();
+        v1.and(warp::path("warmup"))
+            .and(warp::post())
+            .and_then(move || {
+                let log = log.clone();
+                async move {
+                    log.warmup().await.map_err(|_| warp::reject())?;
+                    Ok::<_, warp::Rejection>(warp::reply::json(
+                        &serde_json::json!({ "warmup": "initiated" }),
+                    ))
                 }
             })
     };
@@ -938,7 +762,7 @@ fn create_admin_endpoints(
             })
     };
 
-    snapshot_route.or(rmi_build).or(compact_route)
+    snapshot_route.or(rmi_build).or(warmup_route).or(compact_route)
 }
 
 /// 💊 HEALTH ENDPOINTS: Health checks and diagnostics

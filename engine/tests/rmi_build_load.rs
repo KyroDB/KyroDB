@@ -17,12 +17,8 @@ async fn rmi_build_and_load_lookup_works() {
     let o2 = log.append_kv(Uuid::new_v4(), 20, b"b".to_vec()).await.unwrap();
     log.snapshot().await.unwrap();
 
-    // build RMI file from pairs
-    let pairs = log.collect_key_offset_pairs().await;
-    let tmp = path.join("index-rmi.tmp");
-    let dst = path.join("index-rmi.bin");
-    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
-    std::fs::rename(&tmp, &dst).unwrap();
+    // rebuild adaptive index directly
+    log.build_rmi().await.unwrap();
 
     drop(log);
 

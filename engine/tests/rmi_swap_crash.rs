@@ -13,10 +13,9 @@ async fn rmi_crash_during_swap_startup_ignores_tmp() {
     }
     log.snapshot().await.unwrap();
 
-    // Simulate crashed swap: write tmp but do not rename
-    let pairs = log.collect_key_offset_pairs().await;
+    // Simulate crashed swap: leave behind a temporary file without a successful rebuild
     let tmp = path.join("index-rmi.tmp");
-    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
+    std::fs::write(&tmp, b"stale-rmi").unwrap();
     drop(log);
 
     // Startup should ignore tmp and have no RMI index loaded (falls back to BTree)

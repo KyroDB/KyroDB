@@ -1116,9 +1116,66 @@ impl PersistentEventLog {
         Ok(())
     }
     
-    /// Compact and keep latest snapshot
+    /// Compact the WAL by retaining only the latest segment on disk.
+    ///
+    /// This implementation persists a fresh snapshot, resets the WAL to a
+    /// single empty segment, and clears cached snapshot state so subsequent
+    /// reads operate on the new baseline.
     pub async fn compact_keep_latest_and_snapshot(&self) -> Result<()> {
-        // TODO: Implement compaction with snapshot retention
+        {
+            let mut wal_guard = self.wal.write().await;
+            wal_guard.flush().context("flushing WAL before compaction")?;
+        }
+
+        let events = {
+            let guard = self.inner.read().await;
+            guard.clone()
+        };
+
+        let snapshot_path = self.data_dir.join("snapshot.bin");
+        {
+            let file = File::create(&snapshot_path)
+                .context("creating snapshot during compaction")?;
+            let mut writer = BufWriter::new(file);
+            bincode::serialize_into(&mut writer, &events)
+                .context("serializing snapshot during compaction")?;
+            writer
+                .flush()
+                .context("flushing snapshot during compaction")?;
+        }
+
+        *self.snapshot_mmap.write().await = None;
+        *self.snapshot_payload_index.write().await = None;
+
+        let segments = Self::list_wal_segments(&self.data_dir);
+        for (_, path) in &segments {
+            if let Err(err) = std::fs::remove_file(path) {
+                eprintln!(
+                    "failed to remove WAL segment {} during compaction: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+
+        let new_path = Self::wal_segment_path(&self.data_dir, 0);
+        let new_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&new_path)
+            .context("creating new WAL segment during compaction")?;
+        {
+            let mut wal_guard = self.wal.write().await;
+            *wal_guard = BufWriter::new(new_file);
+        }
+        {
+            let mut idx_guard = self.wal_seg_index.write().await;
+            *idx_guard = 0;
+        }
+
+        fsync_dir(&self.data_dir).context("fsync data dir after compaction")?;
+
         Ok(())
     }
     
@@ -1130,13 +1187,25 @@ impl PersistentEventLog {
     
     /// Get WAL size in bytes
     pub async fn wal_size_bytes(&self) -> u64 {
-        // TODO: Calculate actual WAL size
-        0
+        Self::wal_total_bytes(&self.data_dir)
     }
     
     /// Build RMI index
+    #[cfg(feature = "learned-index")]
     pub async fn build_rmi(&self) -> Result<()> {
-        // TODO: Implement RMI building
+        let pairs = self.collect_key_offset_pairs().await;
+        let mut index_guard = self.index.write().await;
+        if pairs.is_empty() {
+            *index_guard = index::PrimaryIndex::new_adaptive_rmi();
+        } else {
+            *index_guard = index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
+        }
+        Ok(())
+    }
+
+    /// Build RMI index (no-op when adaptive index is disabled)
+    #[cfg(not(feature = "learned-index"))]
+    pub async fn build_rmi(&self) -> Result<()> {
         Ok(())
     }
     
@@ -1249,9 +1318,25 @@ impl PersistentEventLog {
     }
     
     /// Compact with statistics
-    pub async fn compact_keep_latest_and_snapshot_stats(&self) -> Result<String> {
-        // TODO: Implement compaction with stats
-        Ok("{}".to_string())
+    pub async fn compact_keep_latest_and_snapshot_stats(&self) -> Result<CompactionStats> {
+        let before_bytes = self.wal_size_bytes().await;
+        let before_segments = Self::list_wal_segments(&self.data_dir);
+
+        self.compact_keep_latest_and_snapshot().await?;
+
+        let after_segments = Self::list_wal_segments(&self.data_dir);
+        let after_bytes = self.wal_size_bytes().await;
+        let keys_retained = self.inner.read().await.len();
+
+        Ok(CompactionStats {
+            before_bytes,
+            after_bytes,
+            segments_removed: before_segments
+                .len()
+                .saturating_sub(after_segments.len()),
+            segments_active: after_segments.len(),
+            keys_retained,
+        })
     }
 }
 
@@ -1311,6 +1396,17 @@ impl PersistentEventLog {
         };
         let rx = self.tx.subscribe();
         (past, rx)
+    }
+
+    /// Return a snapshot of events between offsets `[from, to)`.
+    pub async fn replay(&self, from: u64, to: Option<u64>) -> Vec<Event> {
+        let upper = to.unwrap_or(u64::MAX);
+        let read = self.inner.read().await;
+        read
+            .iter()
+            .filter(|event| event.offset >= from && event.offset < upper)
+            .cloned()
+            .collect()
     }
 
     /// Collect latest (key, offset) pairs for all keys, suitable for RMI building.

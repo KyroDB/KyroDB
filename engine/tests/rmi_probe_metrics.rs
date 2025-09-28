@@ -19,18 +19,8 @@ async fn rmi_probe_histogram_and_mispredict_counter_increment() {
     }
     log.snapshot().await.unwrap();
 
-    // Build RMI and swap it in
-    let pairs = log.collect_key_offset_pairs().await;
-    let tmp = path.join("index-rmi.tmp");
-    let dst = path.join("index-rmi.bin");
-    kyrodb_engine::index::RmiIndex::write_from_pairs(&tmp, &pairs).unwrap();
-    std::fs::rename(&tmp, &dst).unwrap();
-    if let Some(rmi) = kyrodb_engine::index::RmiIndex::load_from_file(&dst) {
-        log.swap_primary_index(kyrodb_engine::index::PrimaryIndex::Rmi(rmi))
-            .await;
-    } else {
-        panic!("failed to load RMI");
-    }
+    // Build RMI via the engine helper
+    log.build_rmi().await.unwrap();
 
     // Gather baseline metrics
     let before = prometheus::gather();

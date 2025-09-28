@@ -232,9 +232,13 @@ mod crash_recovery_tests {
                         expected_offset);
                 }
 
-                // For now, just check that compaction completed successfully
-                // The detailed stats comparison is skipped since the return type is String
-                prop_assert!(!compact_stats.is_empty(), "Compaction should return stats");
+                // Compaction should report sensible byte counts
+                prop_assert!(
+                    compact_stats.before_bytes >= compact_stats.after_bytes,
+                    "Compaction should not grow the WAL (before={}, after={})",
+                    compact_stats.before_bytes,
+                    compact_stats.after_bytes
+                );
 
                 Ok(())
             });

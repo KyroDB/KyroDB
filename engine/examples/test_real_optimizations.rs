@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Insert data to have something to optimize
     for &key in &test_keys[..1000] {
-        adaptive_rmi.insert(key, key * 2);
+        let _ = adaptive_rmi.insert(key, key * 2);
     }
     
     // Get initial SIMD capabilities
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Generate memory pressure through large dataset
     let large_dataset: Vec<u64> = (10000..20000).collect();
     for &key in &large_dataset {
-        adaptive_rmi.insert(key, key * 3);
+        let _ = adaptive_rmi.insert(key, key * 3);
     }
     
     // Test memory-intensive operations
@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0 => { adaptive_rmi.lookup(key); }, // Sequential
             1 => { adaptive_rmi.lookup(key * 2); }, // Sparse
             2 => { adaptive_rmi.lookup_batch_simd(&[key, key + 1]); }, // Batch
-            _ => { adaptive_rmi.insert(key, key * 4); }, // Insert
+            _ => { let _ = adaptive_rmi.insert(key, key * 4); }, // Insert
         }
     }
     

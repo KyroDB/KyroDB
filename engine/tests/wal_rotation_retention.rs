@@ -40,14 +40,12 @@ async fn wal_rotation_and_retention_enforced() {
     assert!(seg_count <= 2, "expected <=2 segments, found {}", seg_count);
 
     // Compaction should reset to a single fresh segment and shrink total bytes
-    let before = log.wal_size_bytes();
+    let before = log.wal_size_bytes().await;
     let stats = log.compact_keep_latest_and_snapshot_stats().await.unwrap();
-    let after = log.wal_size_bytes();
-    assert!(
-        after <= stats.after_bytes
-            && stats.after_bytes < stats.before_bytes
-            && stats.before_bytes == before
-    );
+    let after = log.wal_size_bytes().await;
+    assert_eq!(stats.before_bytes, before, "stat before bytes should match measurement");
+    assert_eq!(stats.after_bytes, after, "stat after bytes should match measurement");
+    assert!(after <= before, "compaction should not increase WAL size");
 
     // After snapshot+reset, segments should be 1
     let mut seg_count_after = 0usize;

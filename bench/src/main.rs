@@ -436,11 +436,31 @@ async fn build_rmi_index(client: &mut BenchClient, args: &Args) -> Result<()> {
 }
 
 async fn warmup_server(client: &mut BenchClient, args: &Args) -> Result<()> {
-    let url = format!("{}/v1/warmup", args.base);
-    let response = client.http.post(&url).send().await?;
-    
-    if !response.status().is_success() {
-        println!("⚠️ Warmup endpoint not available, skipping...");
+    // Always trigger an RMI rebuild before warmup to align the read path with SIMD hot lanes.
+    let rmi_url = format!("{}/v1/rmi/build", args.base);
+    match client.http.post(&rmi_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            println!("🧠 RMI build command accepted before warmup");
+        }
+        Ok(resp) => {
+            println!("⚠️ RMI build endpoint returned status {}, continuing warmup", resp.status());
+        }
+        Err(err) => {
+            println!("⚠️ Failed to contact RMI build endpoint: {}", err);
+        }
+    }
+
+    let warmup_url = format!("{}/v1/warmup", args.base);
+    match client.http.post(&warmup_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            println!("🔥 Warmup endpoint acknowledged request");
+        }
+        Ok(resp) => {
+            println!("⚠️ Warmup endpoint returned status {}, falling back to manual warmup", resp.status());
+        }
+        Err(err) => {
+            println!("⚠️ Warmup endpoint not available ({}), performing manual warmup", err);
+        }
     }
     
     // Do some basic operations to warm up the server

@@ -164,3 +164,48 @@ impl PrimaryIndex {
         }
     }
 }
+
+#[cfg(feature = "learned-index")]
+#[derive(Clone)]
+pub struct RmiIndex {
+    inner: std::sync::Arc<crate::adaptive_rmi::AdaptiveRMI>,
+}
+
+#[cfg(feature = "learned-index")]
+impl RmiIndex {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(crate::adaptive_rmi::AdaptiveRMI::new()),
+        }
+    }
+
+    pub fn write_from_pairs<P: AsRef<std::path::Path>>(path: P, pairs: &[(u64, u64)]) -> std::io::Result<()> {
+        let mut dedup = std::collections::BTreeMap::new();
+        for &(key, offset) in pairs {
+            dedup.insert(key, offset);
+        }
+        let ordered: Vec<(u64, u64)> = dedup.into_iter().collect();
+
+        let mut file = std::fs::File::create(path)?;
+        bincode::serialize_into(&mut file, &ordered)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+    }
+
+    pub fn write_from_pairs_auto<P: AsRef<std::path::Path>>(path: P, pairs: &[(u64, u64)]) -> std::io::Result<()> {
+        Self::write_from_pairs(path, pairs)
+    }
+
+    pub fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> Option<Self> {
+        let file = std::fs::File::open(path).ok()?;
+        let reader = std::io::BufReader::new(file);
+        let pairs: Vec<(u64, u64)> = bincode::deserialize_from(reader).ok()?;
+        let adaptive = crate::adaptive_rmi::AdaptiveRMI::build_from_pairs(&pairs);
+        Some(Self {
+            inner: std::sync::Arc::new(adaptive),
+        })
+    }
+
+    pub fn predict_get(&self, key: &u64) -> Option<u64> {
+        self.inner.lookup(*key)
+    }
+}

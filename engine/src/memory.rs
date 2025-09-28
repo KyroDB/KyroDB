@@ -925,9 +925,7 @@ mod tests {
         };
         
         // Verify buffer came from fresh allocation
-        let stats_before_dealloc = mgr.stats();
-        mgr.deallocate(buffer);
-        let stats_after_dealloc = mgr.stats();
+    mgr.deallocate(buffer);
         
         // Buffer should be returned to pool (unless high pressure)
         let stats_before_realloc = mgr.stats();
@@ -981,9 +979,8 @@ mod tests {
         };
         
         // Deallocate small buffer - should be discarded due to pressure, not pooled
-        let stats_before = mgr.stats();
         mgr.deallocate(small_buffer);
-        let stats_after = mgr.stats();
+    let stats_after = mgr.stats();
         
         // The key behavior: under memory pressure, system should remain stable
         println!("   💡  Memory pressure: {:?}, bypass mode: {}", stats_after.pressure, stats_after.pool_bypass_mode);

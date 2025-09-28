@@ -77,37 +77,24 @@ impl BenchClient {
         });
         
         // Use high-performance binary endpoint for reads too
-        let url = format!("{}/v1/get_fast/{}", base_url, key_num);
+        let url = format!("{}/v1/lookup_ultra/{}", base_url, key_num);
         let response = self.http.get(&url)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("HTTP GET request failed: {}", e))?;
 
-        match response.status().as_u16() {
-            200 => Ok(Some(response.text().await?)),
-            404 => Ok(None),
-            _ => anyhow::bail!("GET failed with status: {} for key: {}", response.status(), key_num),
+        if !response.status().is_success() {
+            anyhow::bail!("GET failed with status: {} for key: {}", response.status(), key_num);
         }
-    }
 
-    pub async fn get_fast(&mut self, key: &str, _token: Option<&str>, base_url: &str) -> Result<Option<String>> {
-        // Parse key as number (KyroDB expects u64 keys)
-        let key_num: u64 = key.parse().unwrap_or_else(|_| {
-            // If not a number, hash the key to get a u64
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            key.hash(&mut hasher);
-            hasher.finish()
-        });
-        
-        let url = format!("{}/v1/lookup_fast/{}", base_url, key_num);
-        let response = self.http.get(&url).send().await?;
+        let payload = response.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&payload)
+            .map_err(|e| anyhow::anyhow!("Failed to parse lookup_ultra response: {}", e))?;
 
-        match response.status().as_u16() {
-            200 => Ok(Some(response.text().await?)),
-            404 => Ok(None),
-            _ => anyhow::bail!("GET failed with status: {}", response.status()),
+        if json.get("value").map(|v| v.is_null()).unwrap_or(true) {
+            Ok(None)
+        } else {
+            Ok(Some(json.get("value").map(|v| v.to_string()).unwrap_or_default()))
         }
     }
 

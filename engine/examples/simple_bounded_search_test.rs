@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔒 Bounded Search Validation Test");
-    println!("======================================");;
+    println!("======================================");
 
     // Create adaptive RMI with initial data to force segment creation
     println!("📝 Creating RMI with initial segment data...");
@@ -40,37 +40,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Show bounded search analytics
     println!("\n📊 Bounded Search Analytics");
-    println!("==========================");;
+    println!("==========================");
     
     let bounded_analytics = adaptive_rmi.get_bounded_search_analytics();
     println!("• Total segments: {}", bounded_analytics.total_segments);
-    println!("• Segments with bounded guarantee: {}/{} ({:.1}%)", 
-        bounded_analytics.segments_with_bounded_guarantee,
-        bounded_analytics.total_segments,
+    println!(
+        "• Bounded guarantee ratio: {:.1}%",
         bounded_analytics.bounded_guarantee_ratio * 100.0
     );
     println!("• Overall error rate: {:.3}%", bounded_analytics.overall_error_rate * 100.0);
     println!("• Total lookups: {}", bounded_analytics.total_lookups);
     println!("• Max search window: {} elements", bounded_analytics.max_search_window_observed);
-    println!("• Classification: {}", bounded_analytics.performance_classification);
     
     let system_validation = adaptive_rmi.validate_bounded_search_guarantees();
     println!("\n✅ System Validation:");
     println!("• Meets guarantees: {}", system_validation.system_meets_guarantees);
-    println!("• Worst-case complexity: {}", system_validation.worst_case_complexity);
+    println!(
+        "• Max observed search window: {}",
+        system_validation.max_search_window_observed
+    );
     println!("• Performance level: {}", system_validation.performance_level);
     println!("• Recommendation: {}", system_validation.recommendation);
 
     // Show per-segment details
-    if bounded_analytics.segment_details.len() > 0 {
+    if !bounded_analytics.per_segment_stats.is_empty() {
         println!("\n📋 Segment Details:");
-        for (i, (stats, validation)) in bounded_analytics.segment_details.iter().enumerate().take(5) {
-            println!("  Segment {}: {} lookups, {:.1}% errors, window: {}, {}",
+        for (i, stats) in bounded_analytics.per_segment_stats.iter().enumerate().take(5) {
+            println!(
+                "  Segment {}: {} lookups, {:.1}% errors, window: {}",
                 i,
                 stats.total_lookups,
                 stats.error_rate * 100.0,
-                stats.max_search_window,
-                validation.performance_class
+                stats.max_search_window
             );
         }
     }

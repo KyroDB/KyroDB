@@ -14,7 +14,7 @@ async fn compaction_triggers_by_appends_and_size() {
 
     // Snapshot to reset WAL
     log.snapshot().await.unwrap();
-    assert!(log.wal_size_bytes() < 1024);
+    assert!(log.wal_size_bytes().await < 1024);
 
     // Append enough to exceed ~2KB and trigger size-based decision (we'll call compaction directly)
     for i in 0..200u64 {
@@ -22,12 +22,12 @@ async fn compaction_triggers_by_appends_and_size() {
     }
 
     // Before compaction, wal should be non-trivial
-    let before = log.wal_size_bytes();
+    let before = log.wal_size_bytes().await;
     assert!(before > 1024);
 
     // Manual compaction keeps latest and snapshots
     log.compact_keep_latest_and_snapshot().await.unwrap();
-    let after = log.wal_size_bytes();
+    let after = log.wal_size_bytes().await;
     assert!(after < before, "wal did not shrink: before={}, after={}", before, after);
 
     // Verify lookups still work (latest writes retained)
