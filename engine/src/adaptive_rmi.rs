@@ -2822,17 +2822,6 @@ impl AdaptiveRMI {
         Ok(())
     }
 
-    /// Atomically update segments and router to prevent race conditions
-    /// This method ensures segment operations and router updates happen under single lock
-    async fn update_segments_and_router_atomically<F>(&self, segment_update_fn: F) -> Result<()>
-    where
-        F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
-    {
-        // Delegate to the new deadlock-free implementation
-        self.atomic_update_with_consistent_locking(segment_update_fn)
-            .await
-    }
-
     /// DEADLOCK-FREE ATOMIC UPDATE with GLOBAL LOCK ORDERING PROTOCOL
     /// CRITICAL: ALWAYS acquire locks in this exact order to prevent deadlock cycles:
     /// 1. segments (RwLock write)
@@ -2890,32 +2879,6 @@ impl AdaptiveRMI {
         "GLOBAL LOCK ORDER: hot_buffer → overflow_buffer → segments → router"
     }
 
-    /// DEADLOCK-FREE UPDATE with full protocol compliance
-    /// This is the ONLY safe way to perform updates that require multiple locks
-    async fn atomic_update_full_protocol<F>(&self, update_fn: F) -> Result<()>
-    where
-        F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
-    {
-        // Validate we're following the global protocol
-        let _protocol = Self::validate_lock_ordering_protocol();
-
-        // Note: hot_buffer and overflow_buffer are handled by callers before this method
-        // This method only handles segments → router ordering
-
-        // GLOBAL LOCK ORDER: segments first, then router
-        let mut segments_guard = self.segments.write();
-        let mut router_guard = self.global_router.write();
-
-        // Apply atomic updates
-        update_fn(&mut segments_guard, &mut router_guard)?;
-
-        // Maintain router consistency
-        self.update_router_boundaries_under_lock(&segments_guard, &mut router_guard)?;
-        router_guard.increment_generation();
-
-        Ok(())
-    }
-
     /// Determine if a segment should be split based on multiple criteria
     fn should_split_segment(
         &self,
@@ -2948,67 +2911,6 @@ impl AdaptiveRMI {
         let very_small_trigger = data_size < MIN_SEGMENT_SIZE / 2;
 
         cold_small_trigger || very_small_trigger
-    }
-
-    /// DEPRECATED
-    /// This method is kept for reference but should not be used in production
-    async fn split_segment_advanced(&self, _segment_id: usize) -> Result<()> {
-        // RACE CONDITION: This method has TOCTOU races between reading segments
-        // and operating on them. Use the new race-free implementation instead.
-        Err(anyhow::anyhow!(
-            "split_segment_advanced is deprecated due to race conditions"
-        ))
-    }
-
-    /// Calculate optimal split point based on access patterns
-    fn calculate_optimal_split_point(&self, data: &[(u64, u64)], _access_freq: u64) -> usize {
-        if data.len() < 4 {
-            return data.len() / 2;
-        }
-
-        // For now, use middle point - can be enhanced with access pattern analysis
-        // Future enhancement: track hot/cold regions within segments
-        let mid = data.len() / 2;
-
-        // Ensure we don't split too close to boundaries
-        let min_segment = data.len() / 4;
-        let max_segment = (data.len() * 3) / 4;
-        mid.clamp(min_segment, max_segment)
-    }
-
-    /// DEPRECATED
-    async fn find_merge_partner(
-        &self,
-        _segment_id: usize,
-        _candidates: &[usize],
-    ) -> Result<Option<usize>> {
-        // RACE CONDITION: This method has TOCTOU races
-        Err(anyhow::anyhow!(
-            "find_merge_partner is deprecated due to race conditions"
-        ))
-    }
-
-    /// Calculate merge score for two segments
-    fn calculate_merge_score(
-        &self,
-        seg1: &AdaptiveSegment,
-        seg2: &AdaptiveSegment,
-        combined_size: usize,
-    ) -> f64 {
-        let access_freq_1 = seg1.metrics.access_frequency();
-        let access_freq_2 = seg2.metrics.access_frequency();
-        let combined_access = access_freq_1 + access_freq_2;
-
-        let size_penalty = if combined_size > TARGET_SEGMENT_SIZE {
-            -(combined_size as f64 - TARGET_SEGMENT_SIZE as f64) / TARGET_SEGMENT_SIZE as f64
-        } else {
-            0.0
-        };
-
-        let access_score = -(combined_access as f64).ln(); // Lower access frequency = higher score
-        let size_score = -(combined_size as f64).ln() / 10.0; // Slightly favor smaller combined sizes
-
-        access_score + size_score + size_penalty
     }
 
     /// BOUNDED BACKGROUND MAINTENANCE - CPU Spin Prevention
@@ -4748,31 +4650,6 @@ impl AdaptiveRMI {
         }
     }
 
-    ///  SIMD PROCESS CHUNK 16 - ENTERPRISE IMPLEMENTATION
-    /// Enterprise-grade SIMD processing for 16-key chunks with segment conversion
-    fn simd_process_chunk_16(
-        &self,
-        chunk: &[u64],
-        _buffer: &CacheAlignedBuffer,
-    ) -> Result<[Option<u64>; 16], &'static str> {
-        if chunk.len() != 16 {
-            return Err("Chunk must contain exactly 16 keys");
-        }
-
-        // Convert chunk to fixed array for SIMD processing
-        let keys_array: [u64; 16] = chunk
-            .try_into()
-            .map_err(|_| "Failed to convert chunk to array")?;
-
-        //  SIMPLIFIED IMPLEMENTATION: Direct lookup for each key
-        let mut results = [None; 16];
-        for (i, &key) in keys_array.iter().enumerate() {
-            results[i] = self.lookup(key);
-        }
-
-        Ok(results)
-    }
-
     ///  CONVERT SEGMENTS TO CACHE OPTIMIZED - ENTERPRISE IMPLEMENTATION
     /// Convert AdaptiveRMI segments to cache-optimized format
     fn convert_segments_to_cache_optimized(&self) -> Vec<CacheOptimizedSegment> {
@@ -5445,22 +5322,6 @@ impl PredictivePrefetcher {
                 std::hint::black_box(&segment.values[0]);
             }
         }
-    }
-
-    ///  PREDICT NEXT KEYS
-    /// Predict likely next keys based on access patterns
-    fn predict_next_keys(&self, current_key: u64) -> Vec<u64> {
-        // Analyze sequential patterns
-        if self.detect_sequential_pattern() {
-            return vec![current_key + 1, current_key + 2];
-        }
-
-        // Analyze stride patterns
-        if let Some(stride) = self.detect_stride_pattern() {
-            return vec![current_key + stride];
-        }
-
-        vec![]
     }
 
     ///  DETECT SEQUENTIAL PATTERN
