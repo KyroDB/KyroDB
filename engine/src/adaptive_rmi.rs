@@ -2450,10 +2450,10 @@ impl AdaptiveRMI {
         }
 
         // 2. Extract current segment data safely under lock
-    let target_segment = &mut segments_guard[segment_id];
-    let current_model = target_segment.local_model.clone();
-    let current_epoch = target_segment.get_epoch();
-    let data = Arc::make_mut(&mut target_segment.data);
+        let target_segment = &mut segments_guard[segment_id];
+        let current_model = target_segment.local_model.clone();
+        let current_epoch = target_segment.get_epoch();
+        let data = Arc::make_mut(&mut target_segment.data);
         let update_count = updates.len();
 
         // 3. Process updates efficiently (quick in-memory operation)
@@ -2677,7 +2677,7 @@ impl AdaptiveRMI {
             return None;
         }
 
-    let mut merged_data = current_segment.data.as_ref().clone();
+        let mut merged_data = current_segment.data.as_ref().clone();
         merged_data.extend(next_segment.data.iter().copied());
         merged_data.sort_by_key(|(k, _)| *k);
 

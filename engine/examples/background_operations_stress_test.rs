@@ -101,11 +101,16 @@ async fn main() -> anyhow::Result<()> {
                 let reads = read_counter_clone.load(Ordering::Relaxed);
                 let errors = error_counter_clone.load(Ordering::Relaxed);
 
-                println!("Iter {}: Writes: {}, Reads: {}, Errors: {}, Segments: {}, Hot: {:.1}%, Merge: {}", 
-                        iteration + 1, writes, reads, errors, 
-                        stats.segment_count, 
-                        stats.hot_buffer_utilization * 100.0,
-                        stats.merge_in_progress);
+                println!(
+                    "Iter {}: Writes: {}, Reads: {}, Errors: {}, Segments: {}, Hot: {:.1}%, Merge: {}",
+                    iteration + 1,
+                    writes,
+                    reads,
+                    errors,
+                    stats.segment_count,
+                    stats.hot_buffer_utilization * 100.0,
+                    stats.merge_in_progress
+                );
 
                 // Test bounded search guarantees under load
                 let analytics = rmi_clone.get_bounded_search_analytics();

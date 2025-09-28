@@ -49,7 +49,7 @@ mod phase0_rmi_tests {
             );
         }
 
-        println!("✅ All lookups completed within performance bounds");
+        println!("All lookups completed within performance bounds");
     }
 
     #[test]
@@ -82,7 +82,7 @@ mod phase0_rmi_tests {
         ];
         test_rmi_performance(&extreme_pairs, "Extreme ranges");
 
-        println!("✅ All pathological key distribution tests passed");
+        println!("All pathological key distribution tests passed");
         println!(
             "    The RMI maintains bounded performance even under pathological key distributions"
         );
@@ -111,12 +111,16 @@ mod phase0_rmi_tests {
 
             // Verify performance bounds - for pathological distributions, we allow more time
             // but ensure the lookup doesn't degrade to O(n) behavior (>1ms would indicate problems)
-            assert!(duration.as_micros() < 1000, 
-                   "{}: Severely slow lookup for key {} took {:?} (exceeds 1ms bound - indicates O(n) behavior)", 
-                   test_name, key, duration);
+            assert!(
+                duration.as_micros() < 1000,
+                "{}: Severely slow lookup for key {} took {:?} (exceeds 1ms bound - indicates O(n) behavior)",
+                test_name,
+                key,
+                duration
+            );
 
             println!(
-                "✅ {}: Key {} -> offset {} ({:?})",
+                "{}: Key {} -> offset {} ({:?})",
                 test_name, key, expected_offset, duration
             );
         }
@@ -137,7 +141,7 @@ mod phase0_rmi_tests {
         assert!(rmi.predict_get(&99).is_none());
         assert!(rmi.predict_get(&101).is_none());
 
-        println!("✅ Edge cases handled correctly");
+        println!("Edge cases handled correctly");
     }
 
     #[test]
@@ -161,7 +165,7 @@ mod phase0_rmi_tests {
             let _result = rmi.predict_get(&key);
         }
 
-        println!("✅ Bounds checking prevents crashes");
+        println!("Bounds checking prevents crashes");
     }
 
     #[test]
@@ -193,7 +197,7 @@ mod phase0_rmi_tests {
         );
 
         println!(
-            "✅ Large dataset performance: {} lookups in {:?} (avg: {:?})",
+            "Large dataset performance: {} lookups in {:?} (avg: {:?})",
             sample_keys.len(),
             total_duration,
             avg_duration
