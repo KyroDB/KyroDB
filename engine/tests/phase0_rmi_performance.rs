@@ -22,25 +22,24 @@ mod phase0_rmi_tests {
     fn test_bounded_rmi_guarantees() {
         // Create test data that would trigger O(n) behavior in the old implementation
         let pairs: Vec<(u64, u64)> = (0..10000).map(|i| (i * 1000000, i)).collect(); // Large gaps
-        
-        let rmi = build_rmi_from_pairs(&pairs)
-            .expect("Failed to build RMI");
-        
+
+        let rmi = build_rmi_from_pairs(&pairs).expect("Failed to build RMI");
+
         // Test with various keys to ensure no O(n) behavior
         let test_keys = vec![
-            pairs[0].0,           // First key
-            pairs[5000].0,        // Middle key
-            pairs[9999].0,        // Last key
-            1000,                 // Key not in index (low)
-            5000000000,          // Key not in index (high)
-            pairs[1000].0 + 1,   // Key close to existing
+            pairs[0].0,        // First key
+            pairs[5000].0,     // Middle key
+            pairs[9999].0,     // Last key
+            1000,              // Key not in index (low)
+            5000000000,        // Key not in index (high)
+            pairs[1000].0 + 1, // Key close to existing
         ];
-        
+
         for &test_key in &test_keys {
             let start = Instant::now();
             let _result = rmi.predict_get(&test_key);
             let duration = start.elapsed();
-            
+
             // With our fixes, no lookup should take more than 100 microseconds
             assert!(
                 duration.as_micros() < 100,
@@ -49,31 +48,31 @@ mod phase0_rmi_tests {
                 duration
             );
         }
-        
+
         println!("✅ All lookups completed within performance bounds");
     }
-    
+
     #[test]
     fn test_pathological_key_distribution() {
         // The RMI implementation works correctly for pathological distributions
         // but has some edge case issues with specific dataset sizes.
         // This test focuses on demonstrating that pathological key distributions
         // don't break the performance guarantees when the RMI is functioning.
-        
+
         // Test 1: Dense sequential cluster (baseline case - demonstrates normal operation)
         println!("=== Test 1: Dense sequential cluster ===");
         let dense_pairs: Vec<(u64, u64)> = vec![(1, 0), (2, 1), (3, 2)];
         test_rmi_performance(&dense_pairs, "Dense cluster");
-        
+
         // Test 2: Large gaps in key space (pathological case - tests epsilon bounds)
         println!("=== Test 2: Large gaps in key space ===");
         let gap_pairs: Vec<(u64, u64)> = vec![
-            (1, 0),           // Start 
-            (1000000, 1),     // 1M gap
-            (2000000, 2),     // Another 1M gap
+            (1, 0),       // Start
+            (1000000, 1), // 1M gap
+            (2000000, 2), // Another 1M gap
         ];
         test_rmi_performance(&gap_pairs, "Large gaps");
-        
+
         // Test 3: Extreme key ranges (most pathological - tests worst-case behavior)
         println!("=== Test 3: Extreme key ranges ===");
         let extreme_pairs: Vec<(u64, u64)> = vec![
@@ -82,111 +81,117 @@ mod phase0_rmi_tests {
             (u64::MAX - 1000, 2), // Near maximum u64
         ];
         test_rmi_performance(&extreme_pairs, "Extreme ranges");
-        
+
         println!("✅ All pathological key distribution tests passed");
-        println!("    The RMI maintains bounded performance even under pathological key distributions");
+        println!(
+            "    The RMI maintains bounded performance even under pathological key distributions"
+        );
         println!("    that could cause epsilon calculation issues or degrade to O(n) behavior.");
     }
-    
+
     fn test_rmi_performance(pairs: &[(u64, u64)], test_name: &str) {
         let rmi = build_rmi_from_pairs(pairs)
             .unwrap_or_else(|e| panic!("{}: Failed to build RMI: {}", test_name, e));
-        
+
         println!("{}: Testing {} pairs", test_name, pairs.len());
-        
+
         for &(key, expected_offset) in pairs {
             let start = Instant::now();
             let result = rmi.predict_get(&key);
             let duration = start.elapsed();
-            
+
             assert!(result.is_some(), "{}: Should find key {}", test_name, key);
-            assert_eq!(result.unwrap(), expected_offset, 
-                      "{}: Offset mismatch for key {}", test_name, key);
-            
+            assert_eq!(
+                result.unwrap(),
+                expected_offset,
+                "{}: Offset mismatch for key {}",
+                test_name,
+                key
+            );
+
             // Verify performance bounds - for pathological distributions, we allow more time
             // but ensure the lookup doesn't degrade to O(n) behavior (>1ms would indicate problems)
             assert!(duration.as_micros() < 1000, 
                    "{}: Severely slow lookup for key {} took {:?} (exceeds 1ms bound - indicates O(n) behavior)", 
                    test_name, key, duration);
-            
-            println!("✅ {}: Key {} -> offset {} ({:?})", 
-                    test_name, key, expected_offset, duration);
+
+            println!(
+                "✅ {}: Key {} -> offset {} ({:?})",
+                test_name, key, expected_offset, duration
+            );
         }
     }
-    
+
     #[test]
     fn test_empty_and_edge_cases() {
         let rmi = RmiIndex::new();
-        
+
         // Test empty index
         assert!(rmi.predict_get(&42).is_none());
-        
+
         // Test single key
         let pairs = vec![(100, 1)];
-        let rmi = build_rmi_from_pairs(&pairs)
-            .expect("Failed to build single-key RMI");
-        
+        let rmi = build_rmi_from_pairs(&pairs).expect("Failed to build single-key RMI");
+
         assert_eq!(rmi.predict_get(&100), Some(1));
         assert!(rmi.predict_get(&99).is_none());
         assert!(rmi.predict_get(&101).is_none());
-        
+
         println!("✅ Edge cases handled correctly");
     }
-    
+
     #[test]
     fn test_bounds_checking() {
         // Create an RMI and verify bounds checking prevents crashes
         let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i, i)).collect();
-        
-        let rmi = build_rmi_from_pairs(&pairs)
-            .expect("Failed to build RMI");
-        
+
+        let rmi = build_rmi_from_pairs(&pairs).expect("Failed to build RMI");
+
         // Test various edge cases that could cause index out of bounds
         let test_cases = vec![
             0u64,
             999u64,
-            1000u64,     // Just past end
-            u64::MAX,    // Maximum value
-            500u64,      // Middle value
+            1000u64,  // Just past end
+            u64::MAX, // Maximum value
+            500u64,   // Middle value
         ];
-        
+
         for &key in &test_cases {
             // Should never panic, even with out-of-bounds keys
             let _result = rmi.predict_get(&key);
         }
-        
+
         println!("✅ Bounds checking prevents crashes");
     }
-    
+
     #[test]
     fn test_large_dataset_performance() {
         // Test with a larger dataset to ensure performance remains bounded
         let size = 100000;
         let pairs: Vec<(u64, u64)> = (0..size).map(|i| (i * 1000, i)).collect();
-        
-        let rmi = build_rmi_from_pairs(&pairs)
-            .expect("Failed to build large RMI");
-        
+
+        let rmi = build_rmi_from_pairs(&pairs).expect("Failed to build large RMI");
+
         // Sample lookups across the range
         let sample_keys: Vec<u64> = (0..100)
             .map(|i| pairs[i * (size as usize / 100)].0)
             .collect();
-        
+
         let start = Instant::now();
         for &key in &sample_keys {
             let _result = rmi.predict_get(&key);
         }
         let total_duration = start.elapsed();
-        
+
         let avg_duration = total_duration / sample_keys.len() as u32;
-        
+
         // Average lookup should be very fast
         assert!(
             avg_duration.as_micros() < 10,
             "Average lookup time {:?} exceeds 10μs threshold",
             avg_duration
         );
-        
+
         println!(
             "✅ Large dataset performance: {} lookups in {:?} (avg: {:?})",
             sample_keys.len(),

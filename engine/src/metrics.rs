@@ -72,15 +72,14 @@ mod shim {
 #[cfg(feature = "bench-no-metrics")]
 pub use shim::{
     inc_sse_lagged, render, rmi_rebuild_in_progress, APPENDS_TOTAL, APPEND_LATENCY_SECONDS,
-    BTREE_READS_TOTAL, COMPACTIONS_TOTAL, COMPACTION_DURATION_SECONDS, LOOKUP_FALLBACK_SCAN_TOTAL,
-    INDEX_FALLBACK_SCANS_TOTAL,
-    RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL, RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES,
-    RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS, RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL,
-    RMI_MISSES_TOTAL, RMI_PROBE_LEN, RMI_READS_TOTAL, RMI_REBUILDS_TOTAL,
-    RMI_REBUILD_DURATION_SECONDS, RMI_REBUILD_IN_PROGRESS, SNAPSHOTS_TOTAL,
-    SNAPSHOT_LATENCY_SECONDS, SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL,
-    WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL, GROUP_COMMIT_BATCH_SIZE,
-    GROUP_COMMIT_LATENCY_SECONDS, GROUP_COMMIT_BATCHES_TOTAL,
+    BTREE_READS_TOTAL, COMPACTIONS_TOTAL, COMPACTION_DURATION_SECONDS, GROUP_COMMIT_BATCHES_TOTAL,
+    GROUP_COMMIT_BATCH_SIZE, GROUP_COMMIT_LATENCY_SECONDS, INDEX_FALLBACK_SCANS_TOTAL,
+    LOOKUP_FALLBACK_SCAN_TOTAL, RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL,
+    RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES, RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS,
+    RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL, RMI_MISSES_TOTAL, RMI_PROBE_LEN,
+    RMI_READS_TOTAL, RMI_REBUILDS_TOTAL, RMI_REBUILD_DURATION_SECONDS, RMI_REBUILD_IN_PROGRESS,
+    SNAPSHOTS_TOTAL, SNAPSHOT_LATENCY_SECONDS, SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL,
+    WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL,
 };
 
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -372,7 +371,7 @@ pub fn rmi_rebuild_in_progress() -> bool {
 pub static GROUP_COMMIT_BATCH_SIZE: Lazy<Histogram> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "kyrodb_group_commit_batch_size",
-        "Number of writes per group commit batch"
+        "Number of writes per group commit batch",
     )
     .buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]);
     prometheus::register_histogram!(opts).expect("register kyrodb_group_commit_batch_size")
@@ -382,7 +381,7 @@ pub static GROUP_COMMIT_BATCH_SIZE: Lazy<Histogram> = Lazy::new(|| {
 pub static GROUP_COMMIT_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "kyrodb_group_commit_latency_seconds",
-        "Group commit batch processing latency"
+        "Group commit batch processing latency",
     )
     .buckets(prometheus::exponential_buckets(0.00001, 2.0, 20).unwrap());
     prometheus::register_histogram!(opts).expect("register kyrodb_group_commit_latency_seconds")
@@ -403,7 +402,7 @@ pub static GROUP_COMMIT_BATCHES_TOTAL: Lazy<Counter> = Lazy::new(|| {
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static BINARY_CONNECTIONS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     prometheus::register_counter!(
-        "kyrodb_binary_connections_total", 
+        "kyrodb_binary_connections_total",
         "Total binary protocol connections established"
     )
     .expect("register kyrodb_binary_connections_total")
@@ -433,10 +432,10 @@ pub static BINARY_COMMANDS_TOTAL: Lazy<prometheus::CounterVec> = Lazy::new(|| {
 pub static BINARY_COMMAND_LATENCY_SECONDS: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "kyrodb_binary_command_latency_seconds",
-        "Binary protocol command processing latency by type"
+        "Binary protocol command processing latency by type",
     )
     .buckets(prometheus::exponential_buckets(0.000001, 2.0, 20).unwrap()); // Microsecond precision
-    
+
     prometheus::register_histogram_vec!(opts, &["command"])
         .expect("register kyrodb_binary_command_latency_seconds")
 });
@@ -446,22 +445,23 @@ pub static BINARY_COMMAND_LATENCY_SECONDS: Lazy<prometheus::HistogramVec> = Lazy
 pub static BINARY_BATCH_SIZE: Lazy<Histogram> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "kyrodb_binary_batch_size",
-        "Binary protocol batch operation sizes"
+        "Binary protocol batch operation sizes",
     )
-    .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0]);
-    
-    prometheus::register_histogram!(opts)
-        .expect("register kyrodb_binary_batch_size")
+    .buckets(vec![
+        1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+    ]);
+
+    prometheus::register_histogram!(opts).expect("register kyrodb_binary_batch_size")
 });
 
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static BINARY_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "kyrodb_binary_batch_lookup_latency_seconds",
-        "Binary protocol batch lookup processing latency"
+        "Binary protocol batch lookup processing latency",
     )
     .buckets(prometheus::exponential_buckets(0.000001, 2.0, 20).unwrap()); // Microsecond precision
-    
+
     prometheus::register_histogram!(opts)
         .expect("register kyrodb_binary_batch_lookup_latency_seconds")
 });
@@ -489,12 +489,11 @@ pub static BINARY_FRAMES_INVALID_TOTAL: Lazy<Counter> = Lazy::new(|| {
 pub static BINARY_FRAME_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "kyrodb_binary_frame_size_bytes",
-        "Binary protocol frame sizes in bytes"
+        "Binary protocol frame sizes in bytes",
     )
     .buckets(prometheus::exponential_buckets(64.0, 2.0, 20).unwrap()); // 64B to 32MB
-    
-    prometheus::register_histogram!(opts)
-        .expect("register kyrodb_binary_frame_size_bytes")
+
+    prometheus::register_histogram!(opts).expect("register kyrodb_binary_frame_size_bytes")
 });
 
 // Binary Protocol Error Metrics
@@ -550,12 +549,11 @@ pub static BINARY_SIMD_BATCHES_TOTAL: Lazy<Counter> = Lazy::new(|| {
 pub static BINARY_SIMD_SPEEDUP_RATIO: Lazy<Histogram> = Lazy::new(|| {
     let opts = prometheus::HistogramOpts::new(
         "kyrodb_binary_simd_speedup_ratio",
-        "SIMD vs scalar performance speedup ratio"
+        "SIMD vs scalar performance speedup ratio",
     )
     .buckets(vec![1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]);
-    
-    prometheus::register_histogram!(opts)
-        .expect("register kyrodb_binary_simd_speedup_ratio")
+
+    prometheus::register_histogram!(opts).expect("register kyrodb_binary_simd_speedup_ratio")
 });
 
 // Enhanced RMI performance metrics
@@ -578,9 +576,18 @@ pub static RMI_SINGLE_LOOKUP_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
         "RMI single lookup latency in seconds",
     )
     .buckets(vec![
-        0.000_000_1, 0.000_000_5, 0.000_001, 0.000_005, 0.000_01, 0.000_05, 0.000_1, 0.000_5, 0.001,
+        0.000_000_1,
+        0.000_000_5,
+        0.000_001,
+        0.000_005,
+        0.000_01,
+        0.000_05,
+        0.000_1,
+        0.000_5,
+        0.001,
     ]);
-    prometheus::register_histogram!(opts).expect("register kyrodb_rmi_single_lookup_latency_seconds")
+    prometheus::register_histogram!(opts)
+        .expect("register kyrodb_rmi_single_lookup_latency_seconds")
 });
 
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -594,11 +601,8 @@ pub static RMI_SIMD_BATCH_SIZE: Lazy<Gauge> = Lazy::new(|| {
 
 #[cfg(not(feature = "bench-no-metrics"))]
 pub static RMI_CACHE_HIT_RATE: Lazy<Gauge> = Lazy::new(|| {
-    prometheus::register_gauge!(
-        "kyrodb_rmi_cache_hit_rate",
-        "RMI cache hit rate percentage"
-    )
-    .expect("register kyrodb_rmi_cache_hit_rate")
+    prometheus::register_gauge!("kyrodb_rmi_cache_hit_rate", "RMI cache hit rate percentage")
+        .expect("register kyrodb_rmi_cache_hit_rate")
 });
 
 #[cfg(not(feature = "bench-no-metrics"))]
@@ -700,7 +704,7 @@ pub fn inc_binary_protocol_error(_error_type: &str) {
 mod binary_protocol_shim {
     use super::shim::*;
     use once_cell::sync::Lazy;
-    
+
     pub static BINARY_CONNECTIONS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static BINARY_ACTIVE_CONNECTIONS: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
     pub static BINARY_FRAMES_PROCESSED_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
@@ -710,10 +714,11 @@ mod binary_protocol_shim {
     pub static BINARY_BYTES_SENT_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static BINARY_SIMD_BATCHES_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static BINARY_BATCH_SIZE: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
-    pub static BINARY_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
+    pub static BINARY_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> =
+        Lazy::new(|| NoopHistogram);
     pub static BINARY_FRAME_SIZE_BYTES: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static BINARY_SIMD_SPEEDUP_RATIO: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
-    
+
     // Enhanced RMI performance metrics
     pub static RMI_BATCH_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_SINGLE_LOOKUP_LATENCY_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
@@ -728,19 +733,19 @@ mod binary_protocol_shim {
 pub use binary_protocol_shim::*;
 
 /// Thread-safe metrics recording utilities
-/// 
+///
 /// Provides consistent and thread-safe metrics recording to prevent
 /// race conditions and inconsistent values
 pub mod metrics_utils {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
-    
+
     /// Thread-safe hit rate calculator
     pub struct HitRateCalculator {
         hits: Arc<AtomicU64>,
         total: Arc<AtomicU64>,
     }
-    
+
     impl HitRateCalculator {
         pub fn new() -> Self {
             Self {
@@ -748,24 +753,24 @@ pub mod metrics_utils {
                 total: Arc::new(AtomicU64::new(0)),
             }
         }
-        
+
         /// Record a hit
         pub fn record_hit(&self) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.total.fetch_add(1, Ordering::Relaxed);
         }
-        
+
         /// Record a miss
         pub fn record_miss(&self) {
             self.total.fetch_add(1, Ordering::Relaxed);
         }
-        
+
         /// Record batch results
         pub fn record_batch(&self, hits: u64, total: u64) {
             self.hits.fetch_add(hits, Ordering::Relaxed);
             self.total.fetch_add(total, Ordering::Relaxed);
         }
-        
+
         /// Get current hit rate (0.0 to 1.0)
         pub fn hit_rate(&self) -> f64 {
             let total = self.total.load(Ordering::Relaxed);
@@ -775,33 +780,33 @@ pub mod metrics_utils {
             let hits = self.hits.load(Ordering::Relaxed);
             hits as f64 / total as f64
         }
-        
+
         /// Get current statistics
         pub fn stats(&self) -> (u64, u64) {
             let hits = self.hits.load(Ordering::Relaxed);
             let total = self.total.load(Ordering::Relaxed);
             (hits, total)
         }
-        
+
         /// Reset counters
         pub fn reset(&self) {
             self.hits.store(0, Ordering::Relaxed);
             self.total.store(0, Ordering::Relaxed);
         }
     }
-    
+
     impl Default for HitRateCalculator {
         fn default() -> Self {
             Self::new()
         }
     }
-    
+
     /// Safely record metrics with proper error handling
     #[cfg(not(feature = "bench-no-metrics"))]
     pub fn record_rmi_lookup_result(result: &Option<u64>, latency_seconds: f64) {
         // Record latency
         crate::metrics::RMI_SINGLE_LOOKUP_LATENCY_SECONDS.observe(latency_seconds);
-        
+
         // Record hit/miss
         if result.is_some() {
             crate::metrics::RMI_HITS_TOTAL.inc();
@@ -809,25 +814,25 @@ pub mod metrics_utils {
             crate::metrics::RMI_MISSES_TOTAL.inc();
         }
     }
-    
+
     /// Safely record batch metrics
     #[cfg(not(feature = "bench-no-metrics"))]
     pub fn record_rmi_batch_results(results: &[Option<u64>], latency_seconds: f64) {
         // Record batch latency
         crate::metrics::RMI_BATCH_LOOKUP_LATENCY_SECONDS.observe(latency_seconds);
-        
+
         // Count hits and misses
         let hits = results.iter().filter(|r| r.is_some()).count();
         let misses = results.len() - hits;
-        
+
         // Record metrics atomically
         crate::metrics::RMI_HITS_TOTAL.inc_by(hits as f64);
         crate::metrics::RMI_MISSES_TOTAL.inc_by(misses as f64);
-        
+
         // Record batch size
         crate::metrics::BINARY_BATCH_SIZE.observe(results.len() as f64);
     }
-    
+
     /// Update performance gauges
     #[cfg(not(feature = "bench-no-metrics"))]
     pub fn update_performance_gauges(
@@ -841,19 +846,20 @@ pub mod metrics_utils {
         crate::metrics::RMI_MEMORY_POOL_USAGE.set(memory_pool_usage);
         crate::metrics::RMI_SIMD_BATCH_SIZE.set(current_batch_size as f64);
     }
-    
+
     // No-op implementations for bench-no-metrics
     #[cfg(feature = "bench-no-metrics")]
     pub fn record_rmi_lookup_result(_result: &Option<u64>, _latency_seconds: f64) {}
-    
+
     #[cfg(feature = "bench-no-metrics")]
     pub fn record_rmi_batch_results(_results: &[Option<u64>], _latency_seconds: f64) {}
-    
+
     #[cfg(feature = "bench-no-metrics")]
     pub fn update_performance_gauges(
         _cache_hit_rate: f64,
         _prefetch_effectiveness: f64,
         _memory_pool_usage: f64,
         _current_batch_size: usize,
-    ) {}
+    ) {
+    }
 }

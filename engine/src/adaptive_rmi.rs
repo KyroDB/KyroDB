@@ -9,22 +9,24 @@
 //! - Background merge process with no read blocking
 //! - Lock-free concurrent operations
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicU8, Ordering};
-use std::sync::Arc;
-use std::collections::{HashMap, VecDeque};
-use parking_lot::{RwLock, Mutex};
-use crossbeam_queue::SegQueue;
+use anyhow::{anyhow, Result};
 use crossbeam_epoch::{self, Atomic, Owned};
+use crossbeam_queue::SegQueue;
+use parking_lot::{Mutex, RwLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
+#[cfg(feature = "rmi-build-profiler")]
+use std::time::Instant;
 use tokio::sync::Notify;
-use anyhow::{Result, anyhow};
 
 // Architecture-specific SIMD imports with proper conditional compilation
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use std::arch::x86_64::{
-    __m256i, _mm256_loadu_si256, _mm256_extract_epi64, _mm256_set1_epi64x,
-    _mm256_set_epi64x, _mm256_cmpeq_epi64, _mm256_movemask_epi8, _mm256_srlv_epi64,
-    _mm256_min_epi64, _mm256_i64gather_epi32, _mm256_cvtepi32_epi64, 
-    _mm256_castsi256_si128, _mm256_extracti128_si256
+    __m256i, _mm256_castsi256_si128, _mm256_cmpeq_epi64, _mm256_cvtepi32_epi64,
+    _mm256_extract_epi64, _mm256_extracti128_si256, _mm256_i64gather_epi32, _mm256_loadu_si256,
+    _mm256_min_epi64, _mm256_movemask_epi8, _mm256_set1_epi64x, _mm256_set_epi64x,
+    _mm256_srlv_epi64,
 };
 /// Memory management constants
 const MAX_OVERFLOW_CAPACITY: usize = 500_000;
@@ -262,7 +264,7 @@ impl SegmentMetrics {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            Ordering::Relaxed
+            Ordering::Relaxed,
         );
     }
 
@@ -291,11 +293,15 @@ impl SegmentMetrics {
         let total_accesses = self.access_count.load(Ordering::Relaxed);
         let prediction_errors = self.prediction_errors.load(Ordering::Relaxed);
         let max_search_window = 64; // Bounded search window
-        
+
         SearchStats {
             total_lookups: total_accesses,
             prediction_errors,
-            error_rate: if total_accesses > 0 { prediction_errors as f64 / total_accesses as f64 } else { 0.0 },
+            error_rate: if total_accesses > 0 {
+                prediction_errors as f64 / total_accesses as f64
+            } else {
+                0.0
+            },
             max_search_window,
             data_size: 0, // Would need access to segment data to get accurate size
             model_error_bound: 32, // Conservative default
@@ -306,8 +312,9 @@ impl SegmentMetrics {
     /// Update error distribution statistics
     pub fn update_error_distribution(&mut self, error: i64) {
         // For atomic metrics, we can't directly modify a Vec, so we track aggregated stats
-        self.prediction_errors.fetch_add(if error != 0 { 1 } else { 0 }, Ordering::Relaxed);
-        
+        self.prediction_errors
+            .fetch_add(if error != 0 { 1 } else { 0 }, Ordering::Relaxed);
+
         // Note: For a proper error distribution, we'd need a different data structure
         // or separate collection mechanism since atomic fields don't allow complex updates
     }
@@ -319,7 +326,7 @@ pub struct AdaptiveSegment {
     /// Local learned model for this key range
     local_model: LocalLinearModel,
     /// Sorted data storage (key, offset) pairs - optimized for cache performance
-    data: Vec<(u64, u64)>,
+    data: Arc<Vec<(u64, u64)>>,
     /// Performance metrics for adaptation decisions
     metrics: SegmentMetrics,
     /// Adaptation thresholds
@@ -333,11 +340,12 @@ impl AdaptiveSegment {
     /// Create a new segment from sorted data
     pub fn new(data: Vec<(u64, u64)>) -> Self {
         let local_model = LocalLinearModel::new(&data);
-        
+
         // Calculate adaptive thresholds based on data size
         let size = data.len() as u64;
         let split_threshold = (size * 2).max(TARGET_SEGMENT_SIZE as u64);
         let merge_threshold = (size / 4).max(MIN_SEGMENT_SIZE as u64 / 2);
+        let data = Arc::new(data);
 
         Self {
             local_model,
@@ -355,6 +363,7 @@ impl AdaptiveSegment {
         let size = data.len() as u64;
         let split_threshold = (size * 2).max(TARGET_SEGMENT_SIZE as u64);
         let merge_threshold = (size / 4).max(MIN_SEGMENT_SIZE as u64 / 2);
+        let data = Arc::new(data);
 
         Self {
             local_model: model,
@@ -377,19 +386,25 @@ impl AdaptiveSegment {
         // Get prediction and error bound from local model
         let predicted_pos = self.local_model.predict(key);
         let model_epsilon = self.local_model.error_bound() as u32;
-        
+
         // Apply the guaranteed bounded search
         self.bounded_search_with_epsilon(key, predicted_pos, model_epsilon)
     }
 
     /// Core bounded search implementation with configurable epsilon
     /// Guaranteed O(log 64) = O(1) performance - no O(n) fallbacks possible
-    fn bounded_search_with_epsilon(&self, key: u64, predicted_pos: usize, epsilon: u32) -> Option<u64> {
+    fn bounded_search_with_epsilon(
+        &self,
+        key: u64,
+        predicted_pos: usize,
+        epsilon: u32,
+    ) -> Option<u64> {
         // Clamp search window to prevent O(n) behavior
         const MAX_WINDOW: u32 = 64; // Configurable constant for guaranteed bounds
         let actual_epsilon = epsilon.min(MAX_WINDOW);
-        
-        let data_len = self.data.len();
+
+        let data = self.data.as_slice();
+        let data_len = data.len();
         if data_len == 0 {
             return None;
         }
@@ -397,11 +412,11 @@ impl AdaptiveSegment {
         // Calculate strictly bounded search window
         let start = predicted_pos.saturating_sub(actual_epsilon as usize);
         let end = (predicted_pos + actual_epsilon as usize).min(data_len);
-        
+
         // Ensure we don't go out of bounds
         let start = start.min(data_len);
         let end = end.min(data_len);
-        
+
         if start >= end {
             // Track prediction error for adaptive retraining
             self.metrics.record_prediction_error();
@@ -409,9 +424,9 @@ impl AdaptiveSegment {
         }
 
         // Binary search in bounded window - guaranteed O(log 64) = O(1)
-        match self.data[start..end].binary_search_by_key(&key, |(k, _)| *k) {
+        match data[start..end].binary_search_by_key(&key, |(k, _)| *k) {
             Ok(idx) => {
-                let (_, value) = self.data[start + idx];
+                let (_, value) = data[start + idx];
                 Some(value)
             }
             Err(_) => {
@@ -424,15 +439,17 @@ impl AdaptiveSegment {
 
     /// Insert new key-value pair, maintaining sort order
     pub fn insert(&mut self, key: u64, value: u64) -> Result<()> {
-        match self.data.binary_search_by_key(&key, |&(k, _)| k) {
+        let data = Arc::make_mut(&mut self.data);
+
+        match data.binary_search_by_key(&key, |&(k, _)| k) {
             Ok(idx) => {
                 // Update existing key
-                self.data[idx].1 = value;
+                data[idx].1 = value;
             }
             Err(idx) => {
                 // Insert new key at correct position
-                self.data.insert(idx, (key, value));
-                
+                data.insert(idx, (key, value));
+
                 // Adaptive model retraining triggered by performance degradation
                 self.retrain_if_needed();
             }
@@ -444,22 +461,33 @@ impl AdaptiveSegment {
     fn should_retrain(&self) -> bool {
         let error_rate = self.calculate_recent_error_rate();
         let error_threshold = self.calculate_optimal_threshold();
-        
+
         // Multiple triggers for adaptive retraining
-        error_rate > error_threshold 
+        error_rate > error_threshold
             || self.data.len() > self.split_threshold as usize
-            || self.metrics.access_count.load(std::sync::atomic::Ordering::Relaxed) % 1000 == 0
+            || self
+                .metrics
+                .access_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+                % 1000
+                == 0
     }
 
     /// Calculate recent error rate for adaptive model management
     fn calculate_recent_error_rate(&self) -> f64 {
-        let total_accesses = self.metrics.access_count.load(std::sync::atomic::Ordering::Relaxed);
-        let prediction_errors = self.metrics.prediction_errors.load(std::sync::atomic::Ordering::Relaxed);
-        
+        let total_accesses = self
+            .metrics
+            .access_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let prediction_errors = self
+            .metrics
+            .prediction_errors
+            .load(std::sync::atomic::Ordering::Relaxed);
+
         if total_accesses == 0 {
             return 0.0;
         }
-        
+
         prediction_errors as f64 / total_accesses as f64
     }
 
@@ -467,7 +495,7 @@ impl AdaptiveSegment {
     fn calculate_optimal_threshold(&self) -> f64 {
         let data_size = self.data.len();
         let base_threshold = 0.1; // 10% base error rate
-        
+
         // Adjust threshold based on segment size - smaller segments can tolerate higher error rates
         if data_size < MIN_SEGMENT_SIZE {
             base_threshold * 1.5 // 15% for small segments
@@ -487,14 +515,16 @@ impl AdaptiveSegment {
 
         // Retrain local model (fast - only this segment)
         let old_error_bound = self.local_model.error_bound();
-        self.local_model = LocalLinearModel::new(&self.data);
+        self.local_model = LocalLinearModel::new(self.data.as_slice());
         let new_error_bound = self.local_model.error_bound();
-        
+
         // Update thresholds based on new model performance
         self.update_adaptive_thresholds(old_error_bound, new_error_bound);
-        
+
         // Reset error tracking after retraining
-        self.metrics.prediction_errors.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .prediction_errors
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Update adaptive thresholds based on model performance
@@ -507,12 +537,11 @@ impl AdaptiveSegment {
         else if new_error_bound > old_error_bound * 2 {
             self.split_threshold = (self.split_threshold as f64 * 1.1) as u64;
         }
-        
+
         // Keep thresholds within reasonable bounds
-        self.split_threshold = self.split_threshold.clamp(
-            TARGET_SEGMENT_SIZE as u64, 
-            MAX_SEGMENT_SIZE as u64
-        );
+        self.split_threshold = self
+            .split_threshold
+            .clamp(TARGET_SEGMENT_SIZE as u64, MAX_SEGMENT_SIZE as u64);
     }
 
     /// Retrain if needed - triggered by performance degradation
@@ -527,8 +556,8 @@ impl AdaptiveSegment {
         let access_freq = self.metrics.access_frequency();
         let data_size = self.data.len() as u64;
         let error_rate = self.metrics.error_rate();
-        
-        (access_freq > self.split_threshold && data_size > TARGET_SEGMENT_SIZE as u64) 
+
+        (access_freq > self.split_threshold && data_size > TARGET_SEGMENT_SIZE as u64)
             || error_rate > 0.15
             || data_size > MAX_SEGMENT_SIZE as u64
     }
@@ -537,21 +566,31 @@ impl AdaptiveSegment {
     pub fn should_merge(&self) -> bool {
         let access_freq = self.metrics.access_frequency();
         let data_size = self.data.len() as u64;
-        
+
         access_freq < self.merge_threshold && data_size < MIN_SEGMENT_SIZE as u64
     }
 
     /// Get bounded search performance statistics
     pub fn get_search_stats(&self) -> SearchStats {
-        let total_accesses = self.metrics.access_count.load(std::sync::atomic::Ordering::Relaxed);
-        let prediction_errors = self.metrics.prediction_errors.load(std::sync::atomic::Ordering::Relaxed);
+        let total_accesses = self
+            .metrics
+            .access_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let prediction_errors = self
+            .metrics
+            .prediction_errors
+            .load(std::sync::atomic::Ordering::Relaxed);
         let error_bound = self.local_model.error_bound();
         let data_size = self.data.len();
-        
+
         SearchStats {
             total_lookups: total_accesses,
             prediction_errors,
-            error_rate: if total_accesses > 0 { prediction_errors as f64 / total_accesses as f64 } else { 0.0 },
+            error_rate: if total_accesses > 0 {
+                prediction_errors as f64 / total_accesses as f64
+            } else {
+                0.0
+            },
             max_search_window: (error_bound as usize * 2).min(64), // Guaranteed bounded
             data_size,
             model_error_bound: error_bound,
@@ -563,32 +602,40 @@ impl AdaptiveSegment {
     pub fn validate_bounded_search_guarantees(&self) -> BoundedSearchValidation {
         let max_possible_window = (self.local_model.error_bound() as usize * 2).min(64);
         let data_size = self.data.len();
-        
+
         BoundedSearchValidation {
             max_search_window: max_possible_window,
-            guaranteed_max_complexity: if max_possible_window <= 64 { "O(log 64) = O(1)" } else { "O(log n)" }.to_string(),
+            guaranteed_max_complexity: if max_possible_window <= 64 {
+                "O(log 64) = O(1)"
+            } else {
+                "O(log n)"
+            }
+            .to_string(),
             bounded_guarantee: max_possible_window <= 64,
             fallback_risk: max_possible_window > 64,
             segment_size: data_size,
             performance_class: if max_possible_window <= 32 {
                 "Excellent O(log 32)"
             } else if max_possible_window <= 64 {
-                "Good O(log 64)" 
+                "Good O(log 64)"
             } else {
                 "Degraded O(log n)"
-            }.to_string(),
+            }
+            .to_string(),
         }
     }
 
     /// Split this segment into two parts
     pub fn split(self) -> (AdaptiveSegment, AdaptiveSegment) {
-        let mid = self.data.len() / 2;
-        let left_data = self.data[..mid].to_vec();
-        let right_data = self.data[mid..].to_vec();
-        
+        let AdaptiveSegment { data, .. } = self;
+        let data_vec = Arc::try_unwrap(data).unwrap_or_else(|arc| arc.as_ref().clone());
+        let mid = data_vec.len() / 2;
+        let left_data = data_vec[..mid].to_vec();
+        let right_data = data_vec[mid..].to_vec();
+
         (
             AdaptiveSegment::new(left_data),
-            AdaptiveSegment::new(right_data)
+            AdaptiveSegment::new(right_data),
         )
     }
 
@@ -664,13 +711,13 @@ impl GlobalRoutingModel {
     fn build_router(boundaries: &[u64], bits: u8) -> Vec<u32> {
         let size = 1usize << bits;
         let mut router = vec![0u32; size];
-        
+
         if boundaries.is_empty() {
             return router;
         }
 
         let shift = 64u32.saturating_sub(bits as u32);
-        
+
         for (segment_id, &boundary) in boundaries.iter().enumerate() {
             let prefix = (boundary >> shift) as usize;
             let end_prefix = if segment_id + 1 < boundaries.len() {
@@ -678,7 +725,7 @@ impl GlobalRoutingModel {
             } else {
                 size
             };
-            
+
             for p in prefix..end_prefix.min(size) {
                 router[p] = segment_id as u32;
             }
@@ -693,11 +740,11 @@ impl GlobalRoutingModel {
         if self.router.is_empty() {
             return 0;
         }
-        
+
         let shift = 64u32.saturating_sub(self.router_bits as u32);
         let prefix = (key >> shift) as usize;
         let idx = prefix.min(self.router.len().saturating_sub(1));
-        
+
         self.router[idx] as usize
     }
 
@@ -735,7 +782,7 @@ impl GlobalRoutingModel {
                 self.boundaries.insert(idx, split_key);
             }
         }
-        
+
         // Rebuild router with new boundaries and increment generation
         self.router = Self::build_router(&self.boundaries, self.router_bits);
         self.generation.fetch_add(1, Ordering::Release);
@@ -794,22 +841,22 @@ impl BoundedHotBuffer {
     /// Try to insert into hot buffer - returns true if successful, false if at capacity
     pub fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
         let mut buffer = self.buffer.lock();
-        
+
         // Atomic check and insert under single lock
         if buffer.len() >= self.capacity {
             return Ok(false);
         }
-        
+
         buffer.push_back((key, value));
         self.size.store(buffer.len(), Ordering::Release);
-        
+
         Ok(true)
     }
 
     /// Get value for key from hot buffer
     pub fn get(&self, key: u64) -> Option<u64> {
         let buffer = self.buffer.lock();
-        
+
         // Search from most recent to oldest
         for &(k, v) in buffer.iter().rev() {
             if k == key {
@@ -819,34 +866,38 @@ impl BoundedHotBuffer {
         None
     }
 
-    /// 
+    ///
     /// Fixes race condition where size and buffer could be inconsistent
     pub fn drain_atomic(&self) -> Vec<(u64, u64)> {
         let mut buffer = self.buffer.lock();
-        
+
         //  atomic SNAPSHOT: Capture state atomically before any modifications
         let drained_count = buffer.len();
         let buffer_capacity = buffer.capacity();
-        
+
         let drained_data: Vec<_> = buffer.drain(..).collect();
-        
+
         self.size.store(0, Ordering::Release); // Use Release ordering for consistency
-        
+
         let freed_bytes = Self::calculate_hot_buffer_memory(&drained_data, buffer_capacity);
-        
-        println!(" Hot buffer atomic drain: {} entries, ~{}KB freed, capacity: {}",
-                drained_count, freed_bytes / 1024, buffer_capacity);
-        
+
+        println!(
+            " Hot buffer atomic drain: {} entries, ~{}KB freed, capacity: {}",
+            drained_count,
+            freed_bytes / 1024,
+            buffer_capacity
+        );
+
         drained_data
     }
 
-    /// 
+    ///
     fn calculate_hot_buffer_memory(_data: &[(u64, u64)], capacity: usize) -> usize {
         let tuple_size = std::mem::size_of::<(u64, u64)>();
         let vec_overhead = std::mem::size_of::<Vec<(u64, u64)>>();
         let mutex_overhead = std::mem::size_of::<parking_lot::Mutex<Vec<(u64, u64)>>>();
         let atomic_overhead = std::mem::size_of::<AtomicUsize>();
-        
+
         // Accurate total: include all allocations and overheads
         capacity * tuple_size + vec_overhead + mutex_overhead + atomic_overhead
     }
@@ -856,10 +907,10 @@ impl BoundedHotBuffer {
     pub fn is_full(&self) -> bool {
         let buffer = self.buffer.lock();
         let actual_len = buffer.len();
-        
+
         // Sync atomic size with reality to prevent drift
         self.size.store(actual_len, Ordering::Release);
-        
+
         actual_len >= self.capacity
     }
 
@@ -868,10 +919,10 @@ impl BoundedHotBuffer {
     pub fn utilization(&self) -> f32 {
         let buffer = self.buffer.lock();
         let actual_len = buffer.len();
-        
-        // Sync atomic size with reality to prevent drift  
+
+        // Sync atomic size with reality to prevent drift
         self.size.store(actual_len, Ordering::Release);
-        
+
         actual_len as f32 / self.capacity as f32
     }
 }
@@ -937,13 +988,13 @@ impl LockFreeHotBuffer {
             generation: AtomicU64::new(0),
         }
     }
-    
+
     /// FAST PATH: Lock-free get operation with zero contention
     #[inline]
     pub fn get_fast(&self, key: u64) -> Option<u64> {
         let guard = &crossbeam_epoch::pin();
         let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-        
+
         if let Some(buffer) = unsafe { snapshot.as_ref() } {
             // Search from most recent to oldest (reverse order)
             for &(k, v) in buffer.iter().rev() {
@@ -952,45 +1003,53 @@ impl LockFreeHotBuffer {
                 }
             }
         }
-        
+
         None
     }
-    
+
     /// Get value for key (compatibility with existing interface)
     pub fn get(&self, key: u64) -> Option<u64> {
         self.get_fast(key)
     }
-    
+
     /// Try to insert into hot buffer (still uses fallback locking for writes)
     /// Note: Writes are less frequent than reads, so this optimization focuses on read path
     pub fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
         // For now, use a simple approach for writes - could be optimized further
         let guard = &crossbeam_epoch::pin();
         let old_snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-        
+
         let current_buffer = if let Some(buffer) = unsafe { old_snapshot.as_ref() } {
             buffer.clone()
         } else {
             Vec::new()
         };
-        
+
         // Check capacity
         if current_buffer.len() >= self.capacity {
             return Ok(false);
         }
-        
+
         // Create new buffer with the added element
         let mut new_buffer = current_buffer;
         new_buffer.push((key, value));
-        
+
         // Atomic update of buffer snapshot
         let new_snapshot = Owned::new(new_buffer);
-        let result = self.buffer_snapshot
-            .compare_exchange(old_snapshot, new_snapshot, Ordering::AcqRel, Ordering::Relaxed, guard);
-        
+        let result = self.buffer_snapshot.compare_exchange(
+            old_snapshot,
+            new_snapshot,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            guard,
+        );
+
         match result {
             Ok(_) => {
-                self.size.store(unsafe { old_snapshot.as_ref().map(|b| b.len()).unwrap_or(0) } + 1, Ordering::Release);
+                self.size.store(
+                    unsafe { old_snapshot.as_ref().map(|b| b.len()).unwrap_or(0) } + 1,
+                    Ordering::Release,
+                );
                 self.generation.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
             }
@@ -1000,47 +1059,55 @@ impl LockFreeHotBuffer {
             }
         }
     }
-    
+
     /// Atomic drain operation for background processing
     pub fn drain_atomic(&self) -> Vec<(u64, u64)> {
         let guard = &crossbeam_epoch::pin();
         let old_snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-        
+
         let drained_data = if let Some(buffer) = unsafe { old_snapshot.as_ref() } {
             buffer.clone()
         } else {
             Vec::new()
         };
-        
+
         // Replace with empty buffer
         let empty_buffer = Owned::new(Vec::new());
-        let _result = self.buffer_snapshot
-            .compare_exchange(old_snapshot, empty_buffer, Ordering::AcqRel, Ordering::Relaxed, guard);
-        
+        let _result = self.buffer_snapshot.compare_exchange(
+            old_snapshot,
+            empty_buffer,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            guard,
+        );
+
         self.size.store(0, Ordering::Release);
         self.generation.fetch_add(1, Ordering::Relaxed);
-        
+
         let freed_bytes = Self::calculate_memory(&drained_data, self.capacity);
-        println!("🚀 Lock-free buffer atomic drain: {} entries, ~{}KB freed", 
-                 drained_data.len(), freed_bytes / 1024);
-        
+        println!(
+            "🚀 Lock-free buffer atomic drain: {} entries, ~{}KB freed",
+            drained_data.len(),
+            freed_bytes / 1024
+        );
+
         drained_data
     }
-    
+
     /// Calculate memory usage
     fn calculate_memory(data: &[(u64, u64)], capacity: usize) -> usize {
         let tuple_size = std::mem::size_of::<(u64, u64)>();
         let vec_overhead = std::mem::size_of::<Vec<(u64, u64)>>();
         let atomic_overhead = std::mem::size_of::<Atomic<Vec<(u64, u64)>>>();
-        
+
         capacity * tuple_size + vec_overhead + atomic_overhead
     }
-    
+
     /// Check if buffer is full
     pub fn is_full(&self) -> bool {
         let guard = &crossbeam_epoch::pin();
         let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-        
+
         if let Some(buffer) = unsafe { snapshot.as_ref() } {
             let actual_len = buffer.len();
             self.size.store(actual_len, Ordering::Release);
@@ -1049,12 +1116,12 @@ impl LockFreeHotBuffer {
             false
         }
     }
-    
+
     /// Get current utilization
     pub fn utilization(&self) -> f32 {
         let guard = &crossbeam_epoch::pin();
         let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-        
+
         if let Some(buffer) = unsafe { snapshot.as_ref() } {
             let actual_len = buffer.len();
             self.size.store(actual_len, Ordering::Release);
@@ -1079,7 +1146,7 @@ impl HotBuffer for LockFreeHotBuffer {
         // Implement lock-free drain - for now just return snapshot
         let guard = &crossbeam_epoch::pin();
         let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-        
+
         if let Some(buffer) = unsafe { snapshot.as_ref() } {
             buffer.clone()
         } else {
@@ -1102,7 +1169,7 @@ impl HotBuffer for LockFreeHotBuffer {
     fn get_snapshot(&self) -> Vec<(u64, u64)> {
         let guard = &crossbeam_epoch::pin();
         let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-        
+
         if let Some(buffer) = unsafe { snapshot.as_ref() } {
             buffer.clone()
         } else {
@@ -1148,7 +1215,8 @@ impl BackgroundMerger {
 
     /// Schedule segment split
     pub fn schedule_split_async(&self, segment_id: usize) {
-        self.pending_merges.push(MergeOperation::SegmentSplit(segment_id));
+        self.pending_merges
+            .push(MergeOperation::SegmentSplit(segment_id));
         self.merge_notify.notify_one();
     }
 
@@ -1181,7 +1249,8 @@ impl BackgroundMerger {
     pub fn schedule_urgent_merge(&self) -> bool {
         // Always schedule urgent merge regardless of current merge status
         // High-priority merges should preempt normal operations
-        self.pending_merges.push(MergeOperation::UrgentHotBufferMerge);
+        self.pending_merges
+            .push(MergeOperation::UrgentHotBufferMerge);
         self.merge_notify.notify_waiters(); // Notify all waiters for urgent operation
         true // Always signal that urgent merge was scheduled
     }
@@ -1197,7 +1266,7 @@ impl BackgroundMerger {
 /// Bounded overflow buffer to prevent unbounded memory growth
 #[derive(Debug)]
 /// Optimized overflow buffer with improved lookup performance
-/// 
+///
 /// Performance improvements implemented:
 /// - Reverse iteration for better temporal locality
 /// - Future: Will be replaced with HashMap-based O(1) lookups
@@ -1234,30 +1303,33 @@ impl BoundedOverflowBuffer {
     ///  atomic insert with hard memory enforcement and accurate tracking
     pub fn try_insert(&mut self, key: u64, value: u64) -> Result<bool> {
         let current_size = self.data.len();
-        
+
         //  HARD ENFORCEMENT: Apply absolute limits before any processing
         if let Err(enforcement_msg) = self.enforce_hard_memory_limits() {
             eprintln!("Memory enforcement triggered: {}", enforcement_msg);
             // Continue with insertion if enforcement succeeded in making space
         }
-        
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let last_check = self.last_memory_check.load(Ordering::Relaxed);
         const MEMORY_CHECK_INTERVAL_MS: u64 = 1000;
-        
+
         if now - last_check > MEMORY_CHECK_INTERVAL_MS {
             self.update_accurate_memory_estimate(current_size);
             self.last_memory_check.store(now, Ordering::Relaxed);
-            
+
             // Hard circuit breaker: absolute memory protection
             let memory_mb = self.estimated_memory_mb.load(Ordering::Relaxed);
             if memory_mb > SYSTEM_MEMORY_LIMIT_MB {
                 self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-                return Err(anyhow!("HARD CIRCUIT BREAKER: Absolute memory limit exceeded ({}MB > {}MB)", 
-                    memory_mb, SYSTEM_MEMORY_LIMIT_MB));
+                return Err(anyhow!(
+                    "HARD CIRCUIT BREAKER: Absolute memory limit exceeded ({}MB > {}MB)",
+                    memory_mb,
+                    SYSTEM_MEMORY_LIMIT_MB
+                ));
             }
         }
 
@@ -1288,8 +1360,11 @@ impl BoundedOverflowBuffer {
         // HARD LIMIT: Never exceed capacity under any circumstances
         if self.data.len() >= self.max_capacity {
             self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow!("Hard capacity limit reached: {}/{}", 
-                self.data.len(), self.max_capacity));
+            return Err(anyhow!(
+                "Hard capacity limit reached: {}/{}",
+                self.data.len(),
+                self.max_capacity
+            ));
         }
 
         // GRADUATED BACK-PRESSURE: Enhanced rejection logic with memory awareness
@@ -1300,10 +1375,10 @@ impl BoundedOverflowBuffer {
 
         // HIGH PRESSURE: Probabilistic rejection with memory-aware scaling
         if current_len >= OVERFLOW_PRESSURE_HIGH {
-            let rejection_rate = ((current_len - OVERFLOW_PRESSURE_HIGH) * 100) / 
-                                (OVERFLOW_PRESSURE_CRITICAL - OVERFLOW_PRESSURE_HIGH);
+            let rejection_rate = ((current_len - OVERFLOW_PRESSURE_HIGH) * 100)
+                / (OVERFLOW_PRESSURE_CRITICAL - OVERFLOW_PRESSURE_HIGH);
             let reject = (key % 100) < rejection_rate as u64; // Use key for deterministic but distributed rejection
-            
+
             if reject {
                 self.rejected_writes.fetch_add(1, Ordering::Relaxed);
                 return Ok(false); // Memory-aware probabilistic rejection
@@ -1322,20 +1397,20 @@ impl BoundedOverflowBuffer {
         // O(1) insert with order tracking
         let is_new_key = !self.data.contains_key(&key);
         self.data.insert(key, value);
-        
+
         // Only add to insertion order if it's a new key
         if is_new_key {
             self.insertion_order.push_back(key);
         }
-        
+
         self.update_accurate_memory_estimate(self.data.len());
-        
+
         Ok(true)
     }
 
     /// Enhanced memory estimation with HashMap and VecDeque overhead calculation
     fn update_accurate_memory_estimate(&self, current_size: usize) {
-        // More accurate estimation: 
+        // More accurate estimation:
         // - 16 bytes per (u64, u64) pair in HashMap
         // - HashMap overhead: ~24 bytes base + capacity * 24 bytes for entries
         // - VecDeque overhead for insertion_order: ~24 bytes base + capacity * 8 bytes
@@ -1344,19 +1419,22 @@ impl BoundedOverflowBuffer {
         let hashmap_overhead = 24 + (self.data.capacity() * 24);
         let vecdeque_overhead = 24 + (self.insertion_order.capacity() * 8);
         let tracking_overhead = 64;
-        
+
         let total_bytes = pair_bytes + hashmap_overhead + vecdeque_overhead + tracking_overhead;
         let estimated_mb = (total_bytes + 1024 * 1024 - 1) / (1024 * 1024); // Round up
-        
-        self.estimated_memory_mb.store(estimated_mb, Ordering::Release);
-        
+
+        self.estimated_memory_mb
+            .store(estimated_mb, Ordering::Release);
+
         // Memory efficiency warning
         let utilization = (current_size * 100) / self.data.capacity().max(1);
         let wasted_mb = ((self.data.capacity() - current_size) * 16) / (1024 * 1024);
-        
+
         if utilization < 50 && wasted_mb > 10 {
-            println!("Memory efficiency warning: {}% utilization, {}MB wasted capacity", 
-                    utilization, wasted_mb);
+            println!(
+                "Memory efficiency warning: {}% utilization, {}MB wasted capacity",
+                utilization, wasted_mb
+            );
         }
     }
 
@@ -1371,23 +1449,27 @@ impl BoundedOverflowBuffer {
         // Use atomic replacement to ensure no partial drains
         let temp_data = std::mem::replace(&mut self.data, HashMap::new());
         let temp_order = std::mem::replace(&mut self.insertion_order, VecDeque::new());
-        
+
         // Convert HashMap to Vec preserving insertion order
-        let result: Vec<(u64, u64)> = temp_order.into_iter()
+        let result: Vec<(u64, u64)> = temp_order
+            .into_iter()
             .filter_map(|key| temp_data.get(&key).map(|&value| (key, value)))
             .collect();
-        
+
         let drained_count = result.len();
         let freed_bytes = Self::calculate_actual_memory_usage_hashmap(&temp_data);
-        
+
         // Reset pressure atomically
         self.pressure_level.store(0, Ordering::Release);
         self.rejected_writes.store(0, Ordering::Release);
         self.estimated_memory_mb.store(0, Ordering::Release);
-        
-        println!("Atomic drain completed: {} entries, ~{}MB freed", 
-                drained_count, freed_bytes / (1024 * 1024));
-        
+
+        println!(
+            "Atomic drain completed: {} entries, ~{}MB freed",
+            drained_count,
+            freed_bytes / (1024 * 1024)
+        );
+
         result
     }
 
@@ -1397,7 +1479,7 @@ impl BoundedOverflowBuffer {
         let entry_size = std::mem::size_of::<(u64, u64)>(); // Exactly 16 bytes
         let capacity_bytes = data.capacity() * entry_size;
         let hashmap_overhead = std::mem::size_of::<HashMap<u64, u64>>();
-        
+
         capacity_bytes + hashmap_overhead
     }
 
@@ -1407,12 +1489,12 @@ impl BoundedOverflowBuffer {
         let current_size = self.data.len();
         let actual_memory_bytes = Self::calculate_actual_memory_usage_hashmap(&self.data);
         let actual_memory_mb = actual_memory_bytes / (1024 * 1024);
-        
+
         // Hard limit 1: absolute count limit (prevent integer overflow)
         if current_size > MAX_OVERFLOW_CAPACITY {
             // Emergency truncation: Remove oldest entries to enforce hard limit
             let excess = current_size - MAX_OVERFLOW_CAPACITY;
-            
+
             // Remove oldest entries using insertion order
             for _ in 0..excess {
                 if let Some(oldest_key) = self.insertion_order.pop_front() {
@@ -1421,22 +1503,25 @@ impl BoundedOverflowBuffer {
                     break;
                 }
             }
-            
+
             self.rejected_writes.fetch_add(excess, Ordering::Relaxed);
-            
-            return Err(format!("HARD LIMIT ENFORCED: Truncated {} excess entries ({}>{} limit)", 
-                excess, current_size, MAX_OVERFLOW_CAPACITY));
+
+            return Err(format!(
+                "HARD LIMIT ENFORCED: Truncated {} excess entries ({}>{} limit)",
+                excess, current_size, MAX_OVERFLOW_CAPACITY
+            ));
         }
-        
+
         // Hard limit 2: absolute memory limit (prevent OOM)
         if actual_memory_mb > SYSTEM_MEMORY_LIMIT_MB {
             // Emergency truncation: Remove entries until under memory limit
-            let target_size = (SYSTEM_MEMORY_LIMIT_MB * 1024 * 1024) / std::mem::size_of::<(u64, u64)>();
+            let target_size =
+                (SYSTEM_MEMORY_LIMIT_MB * 1024 * 1024) / std::mem::size_of::<(u64, u64)>();
             let safe_target = target_size.min(MAX_OVERFLOW_CAPACITY * 8 / 10); // 80% of max as safety margin
-            
+
             if current_size > safe_target {
                 let truncate_count = current_size - safe_target;
-                
+
                 // Remove oldest entries using insertion order
                 for _ in 0..truncate_count {
                     if let Some(oldest_key) = self.insertion_order.pop_front() {
@@ -1445,16 +1530,20 @@ impl BoundedOverflowBuffer {
                         break;
                     }
                 }
-                
-                self.rejected_writes.fetch_add(truncate_count, Ordering::Relaxed);
-                
-                return Err(format!("MEMORY LIMIT ENFORCED: Truncated {} entries ({}MB>{}MB limit)", 
-                    truncate_count, actual_memory_mb, SYSTEM_MEMORY_LIMIT_MB));
+
+                self.rejected_writes
+                    .fetch_add(truncate_count, Ordering::Relaxed);
+
+                return Err(format!(
+                    "MEMORY LIMIT ENFORCED: Truncated {} entries ({}MB>{}MB limit)",
+                    truncate_count, actual_memory_mb, SYSTEM_MEMORY_LIMIT_MB
+                ));
             }
         }
-        
-        self.estimated_memory_mb.store(actual_memory_mb, Ordering::Release);
-        
+
+        self.estimated_memory_mb
+            .store(actual_memory_mb, Ordering::Release);
+
         Ok(())
     }
 
@@ -1513,19 +1602,19 @@ impl CPUPressureDetector {
     /// Enhanced pressure detection with comprehensive container throttling awareness
     fn detect_pressure(&mut self) -> usize {
         let now = std::time::Instant::now();
-        
+
         // More frequent checks during high pressure to respond quickly
         let check_interval_secs = match self.pressure_level.load(Ordering::Relaxed) {
-            0..=1 => 5,  // Normal: check every 5 seconds
-            2 => 3,      // Medium pressure: check every 3 seconds  
-            3 => 2,      // High pressure: check every 2 seconds
-            _ => 1,      // Critical pressure: check every second
+            0..=1 => 5, // Normal: check every 5 seconds
+            2 => 3,     // Medium pressure: check every 3 seconds
+            3 => 2,     // High pressure: check every 2 seconds
+            _ => 1,     // Critical pressure: check every second
         };
-        
+
         if now.duration_since(self.last_check).as_secs() < check_interval_secs {
             return self.pressure_level.load(Ordering::Relaxed);
         }
-        
+
         self.last_check = now;
         let mut pressure_signals = 0;
         let mut max_signal_strength = 0;
@@ -1547,11 +1636,11 @@ impl CPUPressureDetector {
 
         // Calculate final pressure level using both signal count and maximum signal strength
         let raw_pressure = match pressure_signals {
-            0 => 0,      // No pressure
-            1..=2 => 1,  // Low pressure  
-            3..=4 => 2,  // Medium pressure
-            5..=6 => 3,  // High pressure
-            _ => 4,      // Critical pressure
+            0 => 0,     // No pressure
+            1..=2 => 1, // Low pressure
+            3..=4 => 2, // Medium pressure
+            5..=6 => 3, // High pressure
+            _ => 4,     // Critical pressure
         };
 
         // Adjust based on maximum signal strength (individual signals can override)
@@ -1565,9 +1654,12 @@ impl CPUPressureDetector {
         }
 
         self.pressure_level.store(final_pressure, Ordering::Relaxed);
-        
+
         if final_pressure != raw_pressure {
-            println!("CPU pressure escalated from {} to {} due to critical signal", raw_pressure, final_pressure);
+            println!(
+                "CPU pressure escalated from {} to {} due to critical signal",
+                raw_pressure, final_pressure
+            );
         }
 
         final_pressure
@@ -1580,27 +1672,35 @@ impl CPUPressureDetector {
         // Check modern cgroup v2 throttling
         if let Ok(throttling) = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat") {
             self.container_detection.store(1, Ordering::Relaxed); // We're in a container
-            
+
             for line in throttling.lines() {
                 if line.starts_with("throttled_usec") {
                     if let Some(value_str) = line.split_whitespace().nth(1) {
                         if let Ok(throttled_usec) = value_str.parse::<u64>() {
                             let previous = self.last_throttle_count.load(Ordering::Relaxed);
-                            self.last_throttle_count.store(throttled_usec, Ordering::Relaxed);
-                            
+                            self.last_throttle_count
+                                .store(throttled_usec, Ordering::Relaxed);
+
                             // Check if throttling increased (delta throttling)
                             if throttled_usec > previous {
                                 let delta = throttled_usec - previous;
-                                if delta > 100_000 { // > 100ms of throttling per check interval
+                                if delta > 100_000 {
+                                    // > 100ms of throttling per check interval
                                     signals += 3;
                                     *max_signal_strength = (*max_signal_strength).max(4); // Critical
-                                    println!("Container CPU throttling detected: +{}μs throttled", delta);
-                                } else if delta > 10_000 { // > 10ms of throttling
+                                    println!(
+                                        "Container CPU throttling detected: +{}μs throttled",
+                                        delta
+                                    );
+                                } else if delta > 10_000 {
+                                    // > 10ms of throttling
                                     signals += 2;
-                                    *max_signal_strength = (*max_signal_strength).max(3); // High
+                                    *max_signal_strength = (*max_signal_strength).max(3);
+                                // High
                                 } else if delta > 0 {
                                     signals += 1;
-                                    *max_signal_strength = (*max_signal_strength).max(2); // Medium
+                                    *max_signal_strength = (*max_signal_strength).max(2);
+                                    // Medium
                                 }
                             }
                         }
@@ -1622,7 +1722,7 @@ impl CPUPressureDetector {
         // Fallback to cgroup v1
         else if let Ok(throttling) = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.stat") {
             self.container_detection.store(1, Ordering::Relaxed);
-            
+
             if let Some(line) = throttling.lines().find(|l| l.starts_with("nr_throttled")) {
                 if let Some(value_str) = line.split_whitespace().nth(1) {
                     if let Ok(throttled) = value_str.parse::<u64>() {
@@ -1652,7 +1752,7 @@ impl CPUPressureDetector {
                         .map(|p| p.get())
                         .unwrap_or(1) as f64;
                     let load_ratio = load / cpu_count;
-                    
+
                     // Update load history for trending
                     {
                         let mut history = self.load_history.lock();
@@ -1660,19 +1760,23 @@ impl CPUPressureDetector {
                         if history.len() > 5 {
                             history.pop_front();
                         }
-                        
+
                         // Check if load is trending upward (early warning)
                         if history.len() >= 3 {
                             let recent_avg = history.iter().rev().take(2).sum::<f64>() / 2.0;
-                            let older_avg = history.iter().take(history.len() - 2).sum::<f64>() / (history.len() - 2) as f64;
-                            
+                            let older_avg = history.iter().take(history.len() - 2).sum::<f64>()
+                                / (history.len() - 2) as f64;
+
                             if recent_avg > older_avg * 1.5 {
                                 signals += 1; // Load is trending up rapidly
-                                println!("Load trending upward: {:.2} -> {:.2}", older_avg, recent_avg);
+                                println!(
+                                    "Load trending upward: {:.2} -> {:.2}",
+                                    older_avg, recent_avg
+                                );
                             }
                         }
                     }
-                    
+
                     // Absolute load thresholds
                     if load_ratio > 4.0 {
                         signals += 3;
@@ -1703,7 +1807,7 @@ impl CPUPressureDetector {
             let mut total_kb = 0u64;
             let mut swap_total_kb = 0u64;
             let mut swap_free_kb = 0u64;
-            
+
             for line in meminfo.lines() {
                 if line.starts_with("MemAvailable:") {
                     if let Some(value) = line.split_whitespace().nth(1) {
@@ -1723,14 +1827,17 @@ impl CPUPressureDetector {
                     }
                 }
             }
-            
+
             if total_kb > 0 {
                 let available_ratio = available_kb as f64 / total_kb as f64;
-                
+
                 if available_ratio < 0.05 {
                     signals += 3;
                     *max_signal_strength = (*max_signal_strength).max(4); // Critical
-                    println!("Critical memory pressure: {:.1}% available", available_ratio * 100.0);
+                    println!(
+                        "Critical memory pressure: {:.1}% available",
+                        available_ratio * 100.0
+                    );
                 } else if available_ratio < 0.1 {
                     signals += 2;
                     *max_signal_strength = (*max_signal_strength).max(3); // High
@@ -1738,10 +1845,11 @@ impl CPUPressureDetector {
                     signals += 1;
                     *max_signal_strength = (*max_signal_strength).max(2); // Medium
                 }
-                
+
                 // Check swap usage (indicates memory pressure)
                 if swap_total_kb > 0 {
-                    let swap_used_ratio = (swap_total_kb - swap_free_kb) as f64 / swap_total_kb as f64;
+                    let swap_used_ratio =
+                        (swap_total_kb - swap_free_kb) as f64 / swap_total_kb as f64;
                     if swap_used_ratio > 0.5 {
                         signals += 2;
                         *max_signal_strength = (*max_signal_strength).max(3); // High
@@ -1766,11 +1874,13 @@ impl CPUPressureDetector {
                 let fields: Vec<&str> = cpu_line.split_whitespace().collect();
                 if fields.len() >= 6 {
                     // cpu user nice system idle iowait irq softirq ...
-                    if let (Ok(idle), Ok(iowait)) = (fields[4].parse::<u64>(), fields[5].parse::<u64>()) {
+                    if let (Ok(idle), Ok(iowait)) =
+                        (fields[4].parse::<u64>(), fields[5].parse::<u64>())
+                    {
                         let total_time = idle + iowait;
                         if total_time > 0 {
                             let iowait_ratio = iowait as f64 / total_time as f64;
-                            
+
                             if iowait_ratio > 0.3 {
                                 signals += 2;
                                 *max_signal_strength = (*max_signal_strength).max(3); // High
@@ -1823,14 +1933,14 @@ impl CPUPressureDetector {
     /// Enhanced interval multiplier with progressive scaling
     fn interval_multiplier(&self, pressure: usize) -> u64 {
         let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
-        
+
         let base_multiplier = match pressure {
-            0 => 1,  // No pressure - normal intervals
-            1 => 2,  // Low pressure - 2x slower
-            2 => 4,  // Medium pressure - 4x slower  
-            3 => 6,  // High pressure - 6x slower
-            4 => 8,  // Critical pressure - 8x slower
-            _ => 8,  // Cap at 8x
+            0 => 1, // No pressure - normal intervals
+            1 => 2, // Low pressure - 2x slower
+            2 => 4, // Medium pressure - 4x slower
+            3 => 6, // High pressure - 6x slower
+            4 => 8, // Critical pressure - 8x slower
+            _ => 8, // Cap at 8x
         };
 
         // Apply consecutive throttling penalty
@@ -1849,7 +1959,7 @@ impl CPUPressureDetector {
     fn should_yield_cpu(&self) -> bool {
         let pressure = self.current_pressure();
         let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
-        
+
         // CRITICAL FIX: Much higher thresholds to preserve HTTP performance
         // Only yield under extreme pressure to avoid starving HTTP server
         pressure >= 7 || consecutive > 10
@@ -1860,18 +1970,18 @@ impl CPUPressureDetector {
         let pressure = self.current_pressure();
         let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
         let is_container = self.container_detection.load(Ordering::Relaxed) == 1;
-        
+
         let environment = match self.container_detection.load(Ordering::Relaxed) {
             1 => "container",
             2 => "bare_metal",
             _ => "unknown",
         };
-        
+
         (pressure, consecutive, is_container, environment)
     }
 }
 
-/// 
+///
 #[derive(Debug)]
 enum LookupResult {
     Found(Option<u64>),
@@ -1900,7 +2010,9 @@ impl AdaptiveRMI {
     pub fn new() -> Self {
         // Load and validate RMI optimization configuration from environment
         let rmi_config = crate::rmi_config::RmiOptimizationConfig::from_env();
-        if let Err(validation_errors) = crate::rmi_config::ConfigValidator::validate_all(&rmi_config) {
+        if let Err(validation_errors) =
+            crate::rmi_config::ConfigValidator::validate_all(&rmi_config)
+        {
             eprintln!("FATAL: Invalid RMI configuration detected:");
             for error in &validation_errors {
                 eprintln!("  - {}", error);
@@ -1908,7 +2020,7 @@ impl AdaptiveRMI {
             eprintln!("Please fix configuration and restart the engine.");
             std::process::exit(1);
         }
-        
+
         // Log validated configuration for debugging
         eprintln!("Loaded optimized RMI configuration: SIMD width={}, batch size={}, cache buffer size={}",
                  rmi_config.simd_width, rmi_config.simd_batch_size, rmi_config.cache_buffer_size);
@@ -1927,19 +2039,39 @@ impl AdaptiveRMI {
         Self {
             segments: Arc::new(RwLock::new(Vec::new())),
             segments_snapshot: Atomic::new(Vec::new()),
-            global_router: Arc::new(RwLock::new(GlobalRoutingModel::new(Vec::new(), router_bits))),
+            global_router: Arc::new(RwLock::new(GlobalRoutingModel::new(
+                Vec::new(),
+                router_bits,
+            ))),
             hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
-            overflow_buffer: Arc::new(Mutex::new(BoundedOverflowBuffer::new(MAX_OVERFLOW_CAPACITY))),
+            overflow_buffer: Arc::new(Mutex::new(BoundedOverflowBuffer::new(
+                MAX_OVERFLOW_CAPACITY,
+            ))),
         }
     }
 
     /// Build Adaptive RMI from sorted key-value pairs
     pub fn build_from_pairs(pairs: &[(u64, u64)]) -> Self {
+        #[cfg(feature = "rmi-build-profiler")]
+        let mut profiler = BuildProfiler::new(pairs.len());
+
         let mut sorted_pairs = pairs.to_vec();
+
+        #[cfg(feature = "rmi-build-profiler")]
+        profiler.lap("clone_input");
+
         sorted_pairs.sort_by_key(|(k, _)| *k);
 
+        #[cfg(feature = "rmi-build-profiler")]
+        profiler.lap("sort");
+
         if sorted_pairs.is_empty() {
+            #[cfg(feature = "rmi-build-profiler")]
+            {
+                profiler.lap("input_empty");
+                profiler.finish();
+            }
             return Self::new();
         }
 
@@ -1951,12 +2083,15 @@ impl AdaptiveRMI {
         for i in 0..num_segments {
             let start = i * sorted_pairs.len() / num_segments;
             let end = ((i + 1) * sorted_pairs.len() / num_segments).min(sorted_pairs.len());
-            
+
             if start < end {
                 let segment_data = sorted_pairs[start..end].to_vec();
                 segments.push(AdaptiveSegment::new(segment_data));
             }
         }
+
+        #[cfg(feature = "rmi-build-profiler")]
+        profiler.lap("segment_build");
 
         // Build routing boundaries
         let boundaries: Vec<u64> = segments
@@ -1972,6 +2107,9 @@ impl AdaptiveRMI {
 
         let global_router = GlobalRoutingModel::new(boundaries, router_bits);
 
+        #[cfg(feature = "rmi-build-profiler")]
+        profiler.lap("router_build");
+
         let capacity = std::env::var("KYRODB_HOT_BUFFER_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1980,13 +2118,21 @@ impl AdaptiveRMI {
         // Create initial atomic snapshot
         let segments_snapshot = Atomic::new(segments.clone());
 
+        #[cfg(feature = "rmi-build-profiler")]
+        profiler.lap("snapshot_clone");
+
+        #[cfg(feature = "rmi-build-profiler")]
+        profiler.finish();
+
         Self {
             segments: Arc::new(RwLock::new(segments)),
             segments_snapshot,
             global_router: Arc::new(RwLock::new(global_router)),
             hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
-            overflow_buffer: Arc::new(Mutex::new(BoundedOverflowBuffer::new(MAX_OVERFLOW_CAPACITY))),
+            overflow_buffer: Arc::new(Mutex::new(BoundedOverflowBuffer::new(
+                MAX_OVERFLOW_CAPACITY,
+            ))),
         }
     }
 
@@ -2001,7 +2147,13 @@ impl AdaptiveRMI {
 
         // STEP 2: GLOBAL LOCK ORDER - overflow_buffer only if hot buffer full
         // Get stats quickly to minimize lock time
-        let (_overflow_size, _overflow_capacity, rejected_writes, _pressure_level, _overflow_memory_mb) = {
+        let (
+            _overflow_size,
+            _overflow_capacity,
+            rejected_writes,
+            _pressure_level,
+            _overflow_memory_mb,
+        ) = {
             let overflow = self.overflow_buffer.lock();
             overflow.stats()
         }; // Lock released immediately
@@ -2012,7 +2164,7 @@ impl AdaptiveRMI {
             (hot_size * std::mem::size_of::<(u64, u64)>()) / 1024
         };
 
-        // STEP 3: GLOBAL LOCK ORDER - overflow_buffer insert attempt  
+        // STEP 3: GLOBAL LOCK ORDER - overflow_buffer insert attempt
         // Single atomic insert with minimal lock time
         let insert_result = {
             let mut overflow = self.overflow_buffer.lock();
@@ -2022,9 +2174,7 @@ impl AdaptiveRMI {
         }; // Lock released immediately
 
         match insert_result {
-            (Ok(true), _) => {
-                Ok(())
-            }
+            (Ok(true), _) => Ok(()),
             (Ok(false), is_critical) => {
                 if is_critical {
                     Err(anyhow!(
@@ -2033,7 +2183,7 @@ impl AdaptiveRMI {
                 } else {
                     let retry_ms = std::cmp::min(500, 25 * (rejected_writes / 5 + 1));
                     Err(anyhow!(
-                        "Write temporarily rejected: High memory pressure. Retry after {}ms.", 
+                        "Write temporarily rejected: High memory pressure. Retry after {}ms.",
                         retry_ms
                     ))
                 }
@@ -2051,7 +2201,7 @@ impl AdaptiveRMI {
     pub fn lookup(&self, key: u64) -> Option<u64> {
         #[cfg(not(feature = "bench-no-metrics"))]
         let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-        
+
         // 1. Check hot buffer first (most recent data) - completely lock-free
         if let Some(value) = self.hot_buffer.get(key) {
             #[cfg(not(feature = "bench-no-metrics"))]
@@ -2067,7 +2217,7 @@ impl AdaptiveRMI {
             let overflow = self.overflow_buffer.lock();
             overflow.get(key)
         }; // Lock released immediately
-        
+
         if let Some(value) = overflow_result {
             #[cfg(not(feature = "bench-no-metrics"))]
             {
@@ -2083,10 +2233,10 @@ impl AdaptiveRMI {
             let router_snapshot = self.global_router.read();
             router_snapshot.predict_segment(key)
         }; // Router lock released immediately - critical for deadlock prevention
-        
+
         // Now acquire segments lock WITHOUT holding any other locks
         let segments_guard = self.segments.read();
-        
+
         // Fast segment lookup with bounds validation (no retry loops needed)
         let result = if segment_id < segments_guard.len() {
             // Use fast bounded search - guaranteed O(1) performance
@@ -2095,11 +2245,11 @@ impl AdaptiveRMI {
             // Graceful degradation: use fallback search if prediction is out of bounds
             #[cfg(not(feature = "bench-no-metrics"))]
             crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
-            
+
             self.fallback_linear_search_with_segments_lock(&segments_guard, key)
         };
         // Segment lock automatically released here - never hold multiple locks
-        
+
         #[cfg(not(feature = "bench-no-metrics"))]
         {
             timer.observe_duration();
@@ -2109,7 +2259,7 @@ impl AdaptiveRMI {
                 crate::metrics::RMI_MISSES_TOTAL.inc();
             }
         }
-        
+
         result
     }
 
@@ -2120,7 +2270,8 @@ impl AdaptiveRMI {
         let guard = &crossbeam_epoch::pin();
 
         // Check hot buffer first with lock-free snapshot
-        if let Some(lock_free_buffer) = self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>() {
+        if let Some(lock_free_buffer) = self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>()
+        {
             if let Some(value) = lock_free_buffer.get_fast(key) {
                 #[cfg(not(feature = "bench-no-metrics"))]
                 crate::metrics::RMI_HITS_TOTAL.inc();
@@ -2147,9 +2298,9 @@ impl AdaptiveRMI {
             }
         }
 
-    #[cfg(not(feature = "bench-no-metrics"))]
+        #[cfg(not(feature = "bench-no-metrics"))]
         crate::metrics::RMI_MISSES_TOTAL.inc();
-        
+
         None
     }
 
@@ -2159,7 +2310,8 @@ impl AdaptiveRMI {
         let guard = &crossbeam_epoch::pin();
         let segments_guard = self.segments.read();
         let snapshot = segments_guard.clone();
-        self.segments_snapshot.store(Owned::new(snapshot), Ordering::Release);
+        self.segments_snapshot
+            .store(Owned::new(snapshot), Ordering::Release);
     }
 
     /// DEPRECATED
@@ -2169,21 +2321,25 @@ impl AdaptiveRMI {
         self.lookup(key)
     }
 
-    /// 
+    ///
     fn fallback_linear_search_safe(&self, key: u64) -> Option<u64> {
         let segments_guard = self.segments.read();
         self.fallback_linear_search_with_segments_lock(&segments_guard, key)
     }
 
-    /// 
+    ///
     /// Used when we already hold the segments lock to avoid double-locking
-    fn fallback_linear_search_with_segments_lock(&self, segments_guard: &[AdaptiveSegment], key: u64) -> Option<u64> {
+    fn fallback_linear_search_with_segments_lock(
+        &self,
+        segments_guard: &[AdaptiveSegment],
+        key: u64,
+    ) -> Option<u64> {
         for segment in segments_guard.iter() {
             if let Some(value) = segment.bounded_search(key) {
                 return Some(value);
             }
         }
-        
+
         None
     }
 
@@ -2198,10 +2354,10 @@ impl AdaptiveRMI {
     /// This ordering prevents all possible deadlock cycles by ensuring consistency
     pub async fn merge_hot_buffer(&self) -> Result<()> {
         self.merge_scheduler.start_merge();
-        
+
         // STEP 1: Drain hot buffer (lock-free atomic operation)
         let hot_data = self.hot_buffer.drain_atomic();
-        
+
         // STEP 2: GLOBAL LOCK ORDER - overflow_buffer first
         let overflow_data = {
             let mut overflow = self.overflow_buffer.lock();
@@ -2211,12 +2367,12 @@ impl AdaptiveRMI {
         // STEP 3: Combine and sort all pending writes (lock-free operation)
         let mut all_writes = hot_data;
         all_writes.extend(overflow_data);
-        
+
         if all_writes.is_empty() {
             self.merge_scheduler.complete_merge();
             return Ok(());
         }
-        
+
         all_writes.sort_by_key(|(k, _)| *k);
 
         // STEP 4: GLOBAL LOCK ORDER - atomic update with segments → router ordering
@@ -2225,14 +2381,14 @@ impl AdaptiveRMI {
                 // Create initial segment
                 let first_key = all_writes[0].0;
                 let last_key = all_writes[all_writes.len() - 1].0;
-                
+
                 let initial_segment = AdaptiveSegment::new(all_writes.clone());
                 segments.push(initial_segment);
-                
+
                 // Update router for single segment (empty boundaries route all to segment 0)
                 router.update_boundaries(vec![]);
-                
-                println!("Created initial segment with {} keys (range: {} to {})", 
+
+                println!("Created initial segment with {} keys (range: {} to {})",
                          all_writes.len(), first_key, last_key);
                 return Ok(());
             }
@@ -2265,10 +2421,10 @@ impl AdaptiveRMI {
         }).await?;
 
         self.merge_scheduler.complete_merge();
-        
+
         // Update atomic snapshot after merge completes
         self.update_segments_snapshot();
-        
+
         Ok(())
     }
 
@@ -2283,45 +2439,55 @@ impl AdaptiveRMI {
     ) -> Result<()> {
         // CRITICAL FIX: Use single write lock for entire operation to eliminate TOCTOU races
         let mut segments_guard = segments.write();
-        
+
         // 1. Validate segment exists under write lock (no race possible)
         if segment_id >= segments_guard.len() {
-            return Err(anyhow!("Invalid segment ID: {} >= {}", segment_id, segments_guard.len()));
+            return Err(anyhow!(
+                "Invalid segment ID: {} >= {}",
+                segment_id,
+                segments_guard.len()
+            ));
         }
-        
+
         // 2. Extract current segment data safely under lock
-        let target_segment = &mut segments_guard[segment_id];
-        let current_data = target_segment.data.clone();
-        let current_model = target_segment.local_model.clone();
-        let current_epoch = target_segment.get_epoch();
+    let target_segment = &mut segments_guard[segment_id];
+    let current_model = target_segment.local_model.clone();
+    let current_epoch = target_segment.get_epoch();
+    let data = Arc::make_mut(&mut target_segment.data);
         let update_count = updates.len();
-        
+
         // 3. Process updates efficiently (quick in-memory operation)
-        let (new_data, needs_retrain) = Self::merge_updates_efficiently_sync(current_data, updates)?;
-        
+        let needs_retrain = Self::merge_updates_efficiently_sync(data, updates)?;
+
         // 4. Update model if necessary (optimized for speed)
-        let new_model = if needs_retrain || Self::should_retrain_model(&new_data, &current_model) {
-            LocalLinearModel::new(&new_data)
+        let retrain_required =
+            needs_retrain || Self::should_retrain_model(data.as_slice(), &current_model);
+        let new_model = if retrain_required {
+            LocalLinearModel::new(data.as_slice())
         } else {
             current_model
         };
-        
+
         // 5. Atomic in-place update under same write lock (no races possible)
-        target_segment.data = new_data;
         target_segment.local_model = new_model;
-        target_segment.epoch.store(current_epoch + 1, std::sync::atomic::Ordering::Release);
-        
+        target_segment
+            .epoch
+            .store(current_epoch + 1, std::sync::atomic::Ordering::Release);
+
         // Update access patterns and statistics
-        target_segment.metrics.access_count.fetch_add(update_count as u64, Ordering::Relaxed);
-        
+        target_segment
+            .metrics
+            .access_count
+            .fetch_add(update_count as u64, Ordering::Relaxed);
+
         Ok(())
     }
 
     /// Efficient update merging with minimal allocations (synchronous version for write lock)
     fn merge_updates_efficiently_sync(
-        mut current_data: Vec<(u64, u64)>,
+        current_data: &mut Vec<(u64, u64)>,
         updates: Vec<(u64, u64)>,
-    ) -> Result<(Vec<(u64, u64)>, bool)> {
+    ) -> Result<bool> {
         let initial_size = current_data.len();
         let mut significant_changes = false;
 
@@ -2345,16 +2511,17 @@ impl AdaptiveRMI {
 
         // Determine if retrain is needed based on growth
         let growth_ratio = current_data.len() as f64 / initial_size.max(1) as f64;
-        let needs_retrain = significant_changes && (growth_ratio > 1.1 || current_data.len().saturating_sub(initial_size) > 100);
+        let needs_retrain = significant_changes
+            && (growth_ratio > 1.1 || current_data.len().saturating_sub(initial_size) > 100);
 
-        Ok((current_data, needs_retrain))
+        Ok(needs_retrain)
     }
 
     /// Efficient update merging with minimal allocations (async version for compatibility)
     async fn merge_updates_efficiently(
-        current_data: Vec<(u64, u64)>,
+        current_data: &mut Vec<(u64, u64)>,
         updates: Vec<(u64, u64)>,
-    ) -> Result<(Vec<(u64, u64)>, bool)> {
+    ) -> Result<bool> {
         // Delegate to synchronous version - this is a quick in-memory operation
         Self::merge_updates_efficiently_sync(current_data, updates)
     }
@@ -2364,22 +2531,26 @@ impl AdaptiveRMI {
         if new_data.len() < 10 {
             return false;
         }
-        
+
         // Sample some predictions to estimate error rate
         let sample_size = (new_data.len() / 10).max(10).min(100);
         let mut errors = 0;
-        
-        for i in (0..new_data.len()).step_by(new_data.len() / sample_size + 1).take(sample_size) {
+
+        for i in (0..new_data.len())
+            .step_by(new_data.len() / sample_size + 1)
+            .take(sample_size)
+        {
             let (key, _) = new_data[i];
             let predicted_pos = current_model.predict(key);
             let actual_pos = i;
             let error = (predicted_pos as isize - actual_pos as isize).abs() as usize;
-            
-            if error > 32 { // Error threshold
+
+            if error > 32 {
+                // Error threshold
                 errors += 1;
             }
         }
-        
+
         // Retrain if error rate is too high
         (errors as f64 / sample_size as f64) > 0.2
     }
@@ -2389,14 +2560,16 @@ impl AdaptiveRMI {
         // Check if any segments need adaptation
         let needs_adaptation = {
             let segments = self.segments.read();
-            segments.iter().any(|s| s.should_split() || s.should_merge())
+            segments
+                .iter()
+                .any(|s| s.should_split() || s.should_merge())
         };
-        
+
         if needs_adaptation {
             // Direct call since we're already in an async context
             self.adaptive_segment_management().await?;
         }
-        
+
         Ok(())
     }
     /// DEADLOCK-FREE SEGMENT MANAGEMENT with strict global lock ordering
@@ -2404,61 +2577,77 @@ impl AdaptiveRMI {
     /// All operations performed under single atomic lock acquisition to prevent TOCTOU races
     pub async fn adaptive_segment_management(&self) -> Result<()> {
         // GLOBAL LOCK ORDER PROTOCOL: acquire in consistent order to prevent deadlocks
-        let mut segments_guard = self.segments.write();    // Lock 1: segments first
+        let mut segments_guard = self.segments.write(); // Lock 1: segments first
         let mut router_guard = self.global_router.write(); // Lock 2: router second
-        
+
         // 1. Analyze segments and collect operations under lock
         let mut split_operations = Vec::new();
         let mut merge_operations = Vec::new();
-        
+
         for (i, segment) in segments_guard.iter().enumerate() {
             let access_frequency = segment.metrics.access_frequency();
             let data_size = segment.len();
             let error_rate = segment.metrics.error_rate();
-            
+
             // Collect split operations
             if self.should_split_segment(segment, access_frequency, data_size, error_rate) {
-                if let Some(split_op) = self.prepare_split_operation_under_lock(i, segment, access_frequency) {
+                if let Some(split_op) =
+                    self.prepare_split_operation_under_lock(i, segment, access_frequency)
+                {
                     split_operations.push(split_op);
                 }
             }
-            
+
             // Collect merge operations (only for adjacent segments)
             if self.should_merge_segment(segment, access_frequency, data_size, error_rate) {
-                if let Some(merge_op) = self.prepare_merge_operation_under_lock(i, &segments_guard) {
+                if let Some(merge_op) = self.prepare_merge_operation_under_lock(i, &segments_guard)
+                {
                     merge_operations.push(merge_op);
                 }
             }
         }
-        
+
         // 2. Execute split operations (from highest index to lowest to avoid index shifting)
         split_operations.sort_by(|a, b| b.segment_id.cmp(&a.segment_id));
         for split_op in split_operations {
-            self.execute_split_operation_under_lock(&mut segments_guard, &mut router_guard, split_op)?;
+            self.execute_split_operation_under_lock(
+                &mut segments_guard,
+                &mut router_guard,
+                split_op,
+            )?;
         }
-        
-        // 3. Execute merge operations  
+
+        // 3. Execute merge operations
         let deduplicated_merges = self.deduplicate_merge_operations(merge_operations);
         for merge_op in deduplicated_merges {
-            self.execute_merge_operation_under_lock(&mut segments_guard, &mut router_guard, merge_op)?;
+            self.execute_merge_operation_under_lock(
+                &mut segments_guard,
+                &mut router_guard,
+                merge_op,
+            )?;
         }
 
         // Release locks before updating snapshot
         drop(router_guard);
         drop(segments_guard);
-        
+
         // Update atomic snapshot after all modifications
         self.update_segments_snapshot();
-        
+
         Ok(())
     }
 
     /// Prepare split operation data structure
-    fn prepare_split_operation_under_lock(&self, segment_id: usize, segment: &AdaptiveSegment, _access_frequency: u64) -> Option<SegmentSplitOperation> {
+    fn prepare_split_operation_under_lock(
+        &self,
+        segment_id: usize,
+        segment: &AdaptiveSegment,
+        _access_frequency: u64,
+    ) -> Option<SegmentSplitOperation> {
         if segment.len() < 4 {
             return None; // Too small to split
         }
-        
+
         let split_point = segment.len() / 2;
         Some(SegmentSplitOperation {
             segment_id,
@@ -2469,32 +2658,37 @@ impl AdaptiveRMI {
     }
 
     /// Prepare merge operation data structure  
-    fn prepare_merge_operation_under_lock(&self, segment_id: usize, segments: &[AdaptiveSegment]) -> Option<SegmentMergeOperation> {
+    fn prepare_merge_operation_under_lock(
+        &self,
+        segment_id: usize,
+        segments: &[AdaptiveSegment],
+    ) -> Option<SegmentMergeOperation> {
         // Only merge with adjacent segments
         if segment_id + 1 >= segments.len() {
             return None;
         }
-        
+
         let current_segment = &segments[segment_id];
         let next_segment = &segments[segment_id + 1];
-        
+
         // Check if merge would create reasonably sized segment
         let combined_size = current_segment.len() + next_segment.len();
         if combined_size > MAX_SEGMENT_SIZE {
             return None;
         }
-        
-        let mut merged_data = current_segment.data.clone();
+
+    let mut merged_data = current_segment.data.as_ref().clone();
         merged_data.extend(next_segment.data.iter().copied());
         merged_data.sort_by_key(|(k, _)| *k);
-        
+
         Some(SegmentMergeOperation {
             segment_id_1: segment_id,
             segment_id_2: segment_id + 1,
             keep_id: segment_id,
             remove_id: segment_id + 1,
             merged_data,
-            combined_access: current_segment.metrics.access_frequency() + next_segment.metrics.access_frequency(),
+            combined_access: current_segment.metrics.access_frequency()
+                + next_segment.metrics.access_frequency(),
         })
     }
 
@@ -2508,29 +2702,33 @@ impl AdaptiveRMI {
         if split_op.segment_id >= segments.len() {
             return Ok(()); // Segment was already removed
         }
-        
+
         // Create two new segments with fresh epochs
         let left_segment = AdaptiveSegment::new(split_op.left_data);
         let right_segment = AdaptiveSegment::new(split_op.right_data);
-        
+
         // Replace original segment with left segment, insert right segment after
         segments[split_op.segment_id] = left_segment;
         segments.insert(split_op.segment_id + 1, right_segment);
-        
+
         // CRITICAL: Update router generation before modifying router structure
         router.increment_generation();
-        
+
         // Update router with new split point
         if let Some((split_key, _)) = segments[split_op.segment_id + 1].data.first() {
             router.add_split_point(*split_key, split_op.segment_id);
         }
-        
+
         // Update router generation again after structural changes
         router.increment_generation();
-        
-        println!("Split segment {} at position {} (generation: {})", 
-                split_op.segment_id, split_op.split_point, router.get_generation());
-        
+
+        println!(
+            "Split segment {} at position {} (generation: {})",
+            split_op.segment_id,
+            split_op.split_point,
+            router.get_generation()
+        );
+
         Ok(())
     }
 
@@ -2545,54 +2743,58 @@ impl AdaptiveRMI {
         if merge_op.segment_id_1 >= segments.len() || merge_op.segment_id_2 >= segments.len() {
             return Ok(()); // One of the segments was already removed
         }
-        
+
         // CRITICAL: Update router generation before structural changes
         router.increment_generation();
-        
+
         // Create merged segment with fresh epoch
         let merged_segment = AdaptiveSegment::new(merge_op.merged_data);
-        
+
         // Replace the segment we're keeping with merged data
         segments[merge_op.keep_id] = merged_segment;
-        
+
         // Remove the other segment (remove higher index first to avoid shifting)
         let remove_index = merge_op.remove_id;
         if remove_index < segments.len() {
             segments.remove(remove_index);
-            
+
             // Update router to remove the split point
             router.remove_split_point(merge_op.keep_id);
         }
-        
+
         // Update router generation after structural changes
         router.increment_generation();
-        
+
         println!(
-            "Merged segments {} and {} (combined_access: {}, generation: {})", 
-            merge_op.segment_id_1, 
-            merge_op.segment_id_2, 
+            "Merged segments {} and {} (combined_access: {}, generation: {})",
+            merge_op.segment_id_1,
+            merge_op.segment_id_2,
             merge_op.combined_access,
             router.get_generation()
         );
-        
+
         Ok(())
     }
 
     /// Deduplicate merge operations to avoid conflicts
-    fn deduplicate_merge_operations(&self, merge_ops: Vec<SegmentMergeOperation>) -> Vec<SegmentMergeOperation> {
+    fn deduplicate_merge_operations(
+        &self,
+        merge_ops: Vec<SegmentMergeOperation>,
+    ) -> Vec<SegmentMergeOperation> {
         let mut seen_segments = std::collections::HashSet::new();
         let mut deduplicated = Vec::new();
-        
+
         for merge_op in merge_ops {
             // Only include if neither segment is already involved in a merge
-            if !seen_segments.contains(&merge_op.segment_id_1) && 
-               !seen_segments.contains(&merge_op.segment_id_2) {
+            if !seen_segments.contains(&merge_op.segment_id_1)
+                && !seen_segments.contains(&merge_op.segment_id_2)
+            {
                 seen_segments.insert(merge_op.segment_id_1);
                 seen_segments.insert(merge_op.segment_id_2);
                 deduplicated.push(merge_op);
             }
         }
-        
+
         deduplicated
     }
 
@@ -2604,33 +2806,31 @@ impl AdaptiveRMI {
     ) -> Result<()> {
         // Collect all boundary keys from segments
         let mut boundaries = Vec::new();
-        
+
         for segment in segments {
             if !segment.data.is_empty() {
                 boundaries.push(segment.data[0].0); // First key of each segment
             }
         }
-        
+
         boundaries.sort_unstable();
         boundaries.dedup();
-        
+
         // Update router with consistent boundaries
         router.update_boundaries(boundaries);
-        
+
         Ok(())
     }
 
     /// Atomically update segments and router to prevent race conditions
     /// This method ensures segment operations and router updates happen under single lock
-    async fn update_segments_and_router_atomically<F>(
-        &self,
-        segment_update_fn: F,
-    ) -> Result<()>
+    async fn update_segments_and_router_atomically<F>(&self, segment_update_fn: F) -> Result<()>
     where
         F: FnOnce(&mut Vec<AdaptiveSegment>, &mut GlobalRoutingModel) -> Result<()>,
     {
         // Delegate to the new deadlock-free implementation
-        self.atomic_update_with_consistent_locking(segment_update_fn).await
+        self.atomic_update_with_consistent_locking(segment_update_fn)
+            .await
     }
 
     /// DEADLOCK-FREE ATOMIC UPDATE with GLOBAL LOCK ORDERING PROTOCOL
@@ -2638,7 +2838,7 @@ impl AdaptiveRMI {
     /// 1. segments (RwLock write)
     /// 2. router (RwLock write)  
     /// 3. NEVER acquire overflow_buffer here (it's handled separately in calling methods)
-    /// 
+    ///
     /// This ordering prevents reader-writer deadlocks by ensuring all write operations
     /// follow the same acquisition sequence, eliminating circular wait conditions.
     async fn atomic_update_with_consistent_locking<F>(&self, update_fn: F) -> Result<()>
@@ -2647,44 +2847,44 @@ impl AdaptiveRMI {
     {
         // GLOBAL LOCK ORDER PROTOCOL: segments → router (NEVER deviate from this order)
         // This order must be consistent across ALL methods to prevent deadlock cycles
-        let mut segments_guard = self.segments.write();  // Lock 1: segments first
+        let mut segments_guard = self.segments.write(); // Lock 1: segments first
         let mut router_guard = self.global_router.write(); // Lock 2: router second
-        
+
         // Apply updates atomically under both locks
         update_fn(&mut segments_guard, &mut router_guard)?;
-        
-        // Update router boundaries to maintain consistency  
+
+        // Update router boundaries to maintain consistency
         self.update_router_boundaries_under_lock(&segments_guard, &mut router_guard)?;
-        
+
         // Increment generation after any structural changes (CRITICAL for race-free updates)
         router_guard.increment_generation();
-        
+
         // LOCKS RELEASED in reverse order automatically (router, then segments)
         // This maintains the lock ordering discipline and prevents deadlock
         Ok(())
     }
 
     /// GLOBAL LOCK ORDERING PROTOCOL ENFORCEMENT
-    /// 
+    ///
     /// CRITICAL: This method documents the ONLY valid lock acquisition order to prevent deadlocks
-    /// 
+    ///
     /// **GLOBAL LOCK ORDER (NEVER DEVIATE):**
     /// 1. hot_buffer (lock-free - no ordering constraint)
     /// 2. overflow_buffer (Mutex)
     /// 3. segments (RwLock)  
     /// 4. global_router (RwLock)
-    /// 
+    ///
     /// **DEADLOCK PREVENTION RULES:**
     /// - NEVER acquire locks in a different order
     /// - NEVER hold multiple locks longer than necessary
     /// - Release locks in reverse order (automatic with RAII)
     /// - Use atomic snapshots when possible to avoid holding multiple locks
-    /// 
+    ///
     /// **VIOLATIONS THAT CAUSE DEADLOCKS:**
-    /// - Thread A: segments.read() → router.read() 
+    /// - Thread A: segments.read() → router.read()
     /// - Thread B: router.write() → segments.write()
     /// - Result: Circular wait → DEADLOCK
-    /// 
+    ///
     /// This method serves as documentation and can be used for runtime validation.
     fn validate_lock_ordering_protocol() -> &'static str {
         "GLOBAL LOCK ORDER: hot_buffer → overflow_buffer → segments → router"
@@ -2698,40 +2898,55 @@ impl AdaptiveRMI {
     {
         // Validate we're following the global protocol
         let _protocol = Self::validate_lock_ordering_protocol();
-        
+
         // Note: hot_buffer and overflow_buffer are handled by callers before this method
         // This method only handles segments → router ordering
-        
+
         // GLOBAL LOCK ORDER: segments first, then router
         let mut segments_guard = self.segments.write();
         let mut router_guard = self.global_router.write();
-        
+
         // Apply atomic updates
         update_fn(&mut segments_guard, &mut router_guard)?;
-        
+
         // Maintain router consistency
         self.update_router_boundaries_under_lock(&segments_guard, &mut router_guard)?;
         router_guard.increment_generation();
-        
+
         Ok(())
     }
 
     /// Determine if a segment should be split based on multiple criteria
-    fn should_split_segment(&self, segment: &AdaptiveSegment, access_freq: u64, data_size: usize, error_rate: f64) -> bool {
+    fn should_split_segment(
+        &self,
+        segment: &AdaptiveSegment,
+        access_freq: u64,
+        data_size: usize,
+        error_rate: f64,
+    ) -> bool {
         let size_trigger = data_size > MAX_SEGMENT_SIZE;
-        let hot_large_trigger = access_freq > segment.split_threshold && data_size > TARGET_SEGMENT_SIZE;
+        let hot_large_trigger =
+            access_freq > segment.split_threshold && data_size > TARGET_SEGMENT_SIZE;
         let error_trigger = error_rate > MAX_ERROR_RATE;
-        let performance_trigger = access_freq > TARGET_ACCESS_FREQUENCY && data_size > TARGET_SEGMENT_SIZE * 2;
-        
+        let performance_trigger =
+            access_freq > TARGET_ACCESS_FREQUENCY && data_size > TARGET_SEGMENT_SIZE * 2;
+
         size_trigger || hot_large_trigger || error_trigger || performance_trigger
     }
 
     /// Advanced segment merge criteria
-    fn should_merge_segment(&self, segment: &AdaptiveSegment, access_freq: u64, data_size: usize, _error_rate: f64) -> bool {
+    fn should_merge_segment(
+        &self,
+        segment: &AdaptiveSegment,
+        access_freq: u64,
+        data_size: usize,
+        _error_rate: f64,
+    ) -> bool {
         // Conservative merge criteria to avoid thrashing
-        let cold_small_trigger = access_freq < segment.merge_threshold && data_size < MIN_SEGMENT_SIZE;
+        let cold_small_trigger =
+            access_freq < segment.merge_threshold && data_size < MIN_SEGMENT_SIZE;
         let very_small_trigger = data_size < MIN_SEGMENT_SIZE / 2;
-        
+
         cold_small_trigger || very_small_trigger
     }
 
@@ -2740,7 +2955,9 @@ impl AdaptiveRMI {
     async fn split_segment_advanced(&self, _segment_id: usize) -> Result<()> {
         // RACE CONDITION: This method has TOCTOU races between reading segments
         // and operating on them. Use the new race-free implementation instead.
-        Err(anyhow::anyhow!("split_segment_advanced is deprecated due to race conditions"))
+        Err(anyhow::anyhow!(
+            "split_segment_advanced is deprecated due to race conditions"
+        ))
     }
 
     /// Calculate optimal split point based on access patterns
@@ -2748,11 +2965,11 @@ impl AdaptiveRMI {
         if data.len() < 4 {
             return data.len() / 2;
         }
-        
+
         // For now, use middle point - can be enhanced with access pattern analysis
         // Future enhancement: track hot/cold regions within segments
         let mid = data.len() / 2;
-        
+
         // Ensure we don't split too close to boundaries
         let min_segment = data.len() / 4;
         let max_segment = (data.len() * 3) / 4;
@@ -2760,18 +2977,28 @@ impl AdaptiveRMI {
     }
 
     /// DEPRECATED
-    async fn find_merge_partner(&self, _segment_id: usize, _candidates: &[usize]) -> Result<Option<usize>> {
+    async fn find_merge_partner(
+        &self,
+        _segment_id: usize,
+        _candidates: &[usize],
+    ) -> Result<Option<usize>> {
         // RACE CONDITION: This method has TOCTOU races
-        Err(anyhow::anyhow!("find_merge_partner is deprecated due to race conditions"))
+        Err(anyhow::anyhow!(
+            "find_merge_partner is deprecated due to race conditions"
+        ))
     }
 
     /// Calculate merge score for two segments
-    fn calculate_merge_score(&self, seg1: &AdaptiveSegment, seg2: &AdaptiveSegment, combined_size: usize) -> f64 {
+    fn calculate_merge_score(
+        &self,
+        seg1: &AdaptiveSegment,
+        seg2: &AdaptiveSegment,
+        combined_size: usize,
+    ) -> f64 {
         let access_freq_1 = seg1.metrics.access_frequency();
         let access_freq_2 = seg2.metrics.access_frequency();
         let combined_access = access_freq_1 + access_freq_2;
-        
-      
+
         let size_penalty = if combined_size > TARGET_SEGMENT_SIZE {
             -(combined_size as f64 - TARGET_SEGMENT_SIZE as f64) / TARGET_SEGMENT_SIZE as f64
         } else {
@@ -2780,13 +3007,12 @@ impl AdaptiveRMI {
 
         let access_score = -(combined_access as f64).ln(); // Lower access frequency = higher score
         let size_score = -(combined_size as f64).ln() / 10.0; // Slightly favor smaller combined sizes
-        
+
         access_score + size_score + size_penalty
     }
 
-
     /// BOUNDED BACKGROUND MAINTENANCE - CPU Spin Prevention
-    /// 
+    ///
     /// Implements robust background maintenance with strict rate limiting and circuit breaker
     /// protection to prevent CPU spinning while maintaining essential database operations.
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -2794,40 +3020,50 @@ impl AdaptiveRMI {
             // CIRCUIT BREAKER: Bounded interval timing to prevent CPU spinning
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            
+
             let mut total_iteration_count = 0u64; // Total iterations (never reset)
             let mut rate_limit_count = 0u64; // For rate limiting (resets every minute)
             const MAX_ITERATIONS_PER_MINUTE: u64 = 600; // 10 Hz max (600 iterations/minute)
             const MAX_TOTAL_ITERATIONS: u64 = 300; // Safety limit for testing (5 minutes at 10Hz)
-            
+
             let mut rate_limit_start = std::time::Instant::now();
             let mut consecutive_errors = 0;
             const MAX_CONSECUTIVE_ERRORS: u32 = 5;
-            
-            println!("🔧 Starting bounded background maintenance (max 10 Hz, {} total iterations)", MAX_TOTAL_ITERATIONS);
-            
+
+            println!(
+                "🔧 Starting bounded background maintenance (max 10 Hz, {} total iterations)",
+                MAX_TOTAL_ITERATIONS
+            );
+
             loop {
                 // CRITICAL: Always wait before processing to ensure bounded rate
                 interval.tick().await;
-                
+
                 total_iteration_count += 1;
                 rate_limit_count += 1;
-                
+
                 // EARLY EXIT: Safety limit to prevent infinite loops
                 if total_iteration_count > MAX_TOTAL_ITERATIONS {
-                    println!(" Background maintenance stopping after {} iterations (safety limit)", MAX_TOTAL_ITERATIONS);
+                    println!(
+                        " Background maintenance stopping after {} iterations (safety limit)",
+                        MAX_TOTAL_ITERATIONS
+                    );
                     break;
                 }
-                
+
                 // CIRCUIT BREAKER: Rate limiting protection
                 if rate_limit_count % 100 == 0 {
                     let elapsed = rate_limit_start.elapsed();
-                    
+
                     if elapsed.as_secs() < 60 && rate_limit_count > MAX_ITERATIONS_PER_MINUTE {
                         println!("CIRCUIT BREAKER: Background loop rate limited");
-                        println!("   {} iterations in {}s (max {} per minute)", 
-                                rate_limit_count, elapsed.as_secs(), MAX_ITERATIONS_PER_MINUTE);
-                        
+                        println!(
+                            "   {} iterations in {}s (max {} per minute)",
+                            rate_limit_count,
+                            elapsed.as_secs(),
+                            MAX_ITERATIONS_PER_MINUTE
+                        );
+
                         // BOUNDED SLEEP: Reset rate limiting with recovery delay
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                         rate_limit_count = 0;
@@ -2841,18 +3077,24 @@ impl AdaptiveRMI {
                 }
                 // ERROR CIRCUIT BREAKER: Stop if too many consecutive failures
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    println!("Background maintenance stopping due to {} consecutive errors", consecutive_errors);
+                    println!(
+                        "Background maintenance stopping due to {} consecutive errors",
+                        consecutive_errors
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await; // Recovery delay
                     break;
                 }
-                
+
                 // SIMPLE MAINTENANCE: Only essential operations
                 // Check hot buffer utilization to decide if merge is needed
                 let hot_utilization = self.hot_buffer.utilization();
-                
+
                 if hot_utilization > 0.8 {
-                    println!("🔧 Background merge triggered (hot buffer {}% full)", (hot_utilization * 100.0) as u32);
-                    
+                    println!(
+                        "🔧 Background merge triggered (hot buffer {}% full)",
+                        (hot_utilization * 100.0) as u32
+                    );
+
                     match self.merge_hot_buffer().await {
                         Ok(_) => {
                             consecutive_errors = 0; // Reset error count on success
@@ -2860,66 +3102,75 @@ impl AdaptiveRMI {
                         }
                         Err(e) => {
                             consecutive_errors += 1;
-                            println!("❌ Background merge failed (attempt {}): {}", consecutive_errors, e);
-                            
+                            println!(
+                                "❌ Background merge failed (attempt {}): {}",
+                                consecutive_errors, e
+                            );
+
                             // EXPONENTIAL BACKOFF: Increase delay with each error
-                            let backoff_duration = std::time::Duration::from_secs(2_u64.pow(consecutive_errors.min(5)));
+                            let backoff_duration = std::time::Duration::from_secs(
+                                2_u64.pow(consecutive_errors.min(5)),
+                            );
                             tokio::time::sleep(backoff_duration).await;
                         }
                     }
                 }
-                
+
                 // LOW-IMPACT OPERATIONS: Quick checks only
                 let overflow_pressure = {
                     let overflow = self.overflow_buffer.lock();
                     overflow.is_under_pressure()
                 };
-                
+
                 if overflow_pressure {
                     println!("⚠️  Overflow buffer under pressure - scheduling urgent merge");
                     // Don't perform merge here, just log the condition
                     // Let the next hot buffer check handle it
                 }
-                
+
                 // BOUNDED LOGGING: Only log every 100 iterations to prevent spam
                 if total_iteration_count % 100 == 0 {
-                    println!("🔧 Background maintenance status: iteration {}, hot buffer {:.1}% full", 
-                            total_iteration_count, hot_utilization * 100.0);
+                    println!(
+                        "🔧 Background maintenance status: iteration {}, hot buffer {:.1}% full",
+                        total_iteration_count,
+                        hot_utilization * 100.0
+                    );
                 }
             }
-            
+
             println!(" Background maintenance loop terminated gracefully");
         })
     }
-    
+
     /// Performance analytics and monitoring
     async fn log_performance_analytics(&self) {
         let segments = self.segments.read();
         let num_segments = segments.len();
         let total_keys: usize = segments.iter().map(|s| s.len()).sum();
-        
+
         println!(
-            "🔍 RMI Analytics - Segments: {}, Total keys: {}", 
+            "🔍 RMI Analytics - Segments: {}, Total keys: {}",
             num_segments, total_keys
         );
     }
-                            
+
     /// Enhanced merge triggering logic
     async fn should_trigger_merge(&self) -> bool {
         let hot_utilization = self.hot_buffer.utilization();
-        let (overflow_size, _, _rejected_writes, _pressure, _memory_mb) = self.overflow_buffer.lock().stats();
+        let (overflow_size, _, _rejected_writes, _pressure, _memory_mb) =
+            self.overflow_buffer.lock().stats();
         let merge_in_progress = self.merge_scheduler.is_merge_in_progress();
-        
+
         // Don't start new merge if one is already in progress
         if merge_in_progress {
             return false;
         }
-        
+
         // Trigger merge based on multiple criteria
         let utilization_trigger = hot_utilization > MERGE_TRIGGER_RATIO;
         let overflow_trigger = overflow_size > 0;
         let time_based_trigger = hot_utilization > 0.3; // Periodic merge for moderate load
-        
+
         utilization_trigger || overflow_trigger || time_based_trigger
     }
 
@@ -2928,15 +3179,16 @@ impl AdaptiveRMI {
         let segments = self.segments.read();
         let hot_buffer_size = self.hot_buffer.current_size();
         let hot_buffer_utilization = self.hot_buffer.utilization();
-        let (overflow_size, _overflow_capacity, _rejected_writes, _pressure, _memory_mb) = self.overflow_buffer.lock().stats();
-        
+        let (overflow_size, _overflow_capacity, _rejected_writes, _pressure, _memory_mb) =
+            self.overflow_buffer.lock().stats();
+
         // Accurate total: Include both segments AND buffer contents
         let segment_keys: usize = segments.iter().map(|s| s.len()).sum();
         let total_keys = segment_keys + hot_buffer_size + overflow_size; // Include ALL data
         let segment_count = segments.len();
-        
+
         let avg_segment_size = if segment_count > 0 {
-            segment_keys as f64 / segment_count as f64  // Only segment average
+            segment_keys as f64 / segment_count as f64 // Only segment average
         } else {
             0.0
         };
@@ -2955,21 +3207,21 @@ impl AdaptiveRMI {
     /// Get bounded search performance analytics across all segments
     pub fn get_bounded_search_analytics(&self) -> BoundedSearchAnalytics {
         let segments = self.segments.read();
-        
+
         let mut total_lookups = 0;
         let mut total_errors = 0;
         let mut max_search_window = 0;
         let mut segments_with_bounded_guarantee = 0;
-    let mut search_stats = Vec::new();
-    let mut segment_details = Vec::new();
-        
+        let mut search_stats = Vec::new();
+        let mut segment_details = Vec::new();
+
         for segment in segments.iter() {
             let stats = segment.metrics.get_bounded_search_stats();
             let validation = segment.validate_bounded_search_guarantees();
             total_lookups += stats.total_lookups;
             total_errors += stats.prediction_errors;
             max_search_window = max_search_window.max(stats.max_search_window);
-            
+
             if stats.bounded_guarantee {
                 segments_with_bounded_guarantee += 1;
             }
@@ -2977,27 +3229,28 @@ impl AdaptiveRMI {
             search_stats.push(stats.clone());
             segment_details.push((stats, validation));
         }
-        
+
         let total_segments = segments.len();
         let bounded_guarantee_ratio = if total_segments > 0 {
             segments_with_bounded_guarantee as f64 / total_segments as f64
         } else {
             1.0 // Perfect ratio for empty system
         };
-        
+
         let overall_error_rate = if total_lookups > 0 {
             total_errors as f64 / total_lookups as f64
         } else {
             0.0
         };
 
-        let performance_classification = if bounded_guarantee_ratio >= 0.99 && max_search_window <= 32 {
-            "Excellent"
-        } else if bounded_guarantee_ratio >= 0.95 && max_search_window <= 64 {
-            "Good"
-        } else {
-            "Needs Attention"
-        };
+        let performance_classification =
+            if bounded_guarantee_ratio >= 0.99 && max_search_window <= 32 {
+                "Excellent"
+            } else if bounded_guarantee_ratio >= 0.95 && max_search_window <= 64 {
+                "Good"
+            } else {
+                "Needs Attention"
+            };
 
         BoundedSearchAnalytics {
             total_segments,
@@ -3016,20 +3269,21 @@ impl AdaptiveRMI {
     /// Validate system-wide bounded search guarantees
     pub fn validate_bounded_search_guarantees(&self) -> BoundedSearchSystemValidation {
         let analytics = self.get_bounded_search_analytics();
-        
+
         let meets_guarantees = analytics.bounded_guarantee_ratio >= 0.95;
         let performance_excellent = analytics.max_search_window_observed <= 64;
-        
+
         let performance_level = if performance_excellent && meets_guarantees {
             "Excellent"
         } else if meets_guarantees {
-            "Good"  
+            "Good"
         } else {
             "Needs Attention"
         };
-        
-        let segments_needing_attention = (analytics.total_segments as f64 * (1.0 - analytics.bounded_guarantee_ratio)) as usize;
-        
+
+        let segments_needing_attention =
+            (analytics.total_segments as f64 * (1.0 - analytics.bounded_guarantee_ratio)) as usize;
+
         let recommendation = if !meets_guarantees {
             "Consider segment splitting or model retraining"
         } else if !performance_excellent {
@@ -3060,20 +3314,20 @@ impl AdaptiveRMI {
     // ============================================================================
     // SIMD-optimized batch processing
     // ============================================================================
-    
+
     /// SIMD batch lookup: Process multiple keys with vectorized operations
-    /// 
+    ///
     /// SIMD batch lookup: Process multiple keys with vectorized operations
-    /// 
+    ///
     /// This method provides batch processing with runtime SIMD detection,
     /// falling back to optimized scalar operations when SIMD is unavailable.
     pub fn lookup_batch_simd(&self, keys: &[u64]) -> Vec<Option<u64>> {
         #[cfg(not(feature = "bench-no-metrics"))]
         let timer = crate::metrics::RMI_BATCH_LOOKUP_LATENCY_SECONDS.start_timer();
-        
+
         // Use optimized batch processing with runtime detection
         let results = self.lookup_batch_optimized(keys);
-        
+
         // Record batch metrics
         #[cfg(not(feature = "bench-no-metrics"))]
         {
@@ -3084,12 +3338,12 @@ impl AdaptiveRMI {
             crate::metrics::RMI_MISSES_TOTAL.inc_by(misses as f64);
             crate::metrics::BINARY_BATCH_SIZE.observe(keys.len() as f64);
         }
-        
+
         results
     }
 
     /// Runtime SIMD detection with optimized batch processing
-    /// 
+    ///
     /// Uses runtime feature detection to select the best available implementation,
     /// ensuring optimal performance on all architectures without conditional compilation.
     pub fn lookup_batch_optimized(&self, keys: &[u64]) -> Vec<Option<u64>> {
@@ -3100,7 +3354,7 @@ impl AdaptiveRMI {
                 return unsafe { self.lookup_batch_avx2(keys) };
             }
         }
-        
+
         // Runtime detection for ARM64 NEON
         #[cfg(target_arch = "aarch64")]
         {
@@ -3108,7 +3362,7 @@ impl AdaptiveRMI {
                 return self.lookup_batch_neon(keys);
             }
         }
-        
+
         // Optimized scalar batch processing (always available)
         if keys.len() >= 4 {
             self.lookup_batch_scalar_optimized(keys)
@@ -3119,14 +3373,14 @@ impl AdaptiveRMI {
     }
 
     /// Always available optimized scalar batch processing
-    /// 
+    ///
     /// Provides cache-efficient batch processing without SIMD dependencies.
     /// Uses prefetching and chunked processing for optimal memory access patterns.
     #[inline]
     fn lookup_batch_scalar_optimized(&self, keys: &[u64]) -> Vec<Option<u64>> {
         let mut results = Vec::with_capacity(keys.len());
         let _guard = &crossbeam_epoch::pin();
-        
+
         // Process in cache-friendly chunks of 8 keys
         for chunk in keys.chunks(8) {
             // Prefetch next chunk for cache efficiency
@@ -3136,12 +3390,12 @@ impl AdaptiveRMI {
                     if !next_chunk.is_empty() {
                         std::arch::x86_64::_mm_prefetch(
                             next_chunk.as_ptr() as *const i8,
-                            std::arch::x86_64::_MM_HINT_T0
+                            std::arch::x86_64::_MM_HINT_T0,
                         );
                     }
                 }
             }
-            
+
             // ARM64 prefetch hint
             #[cfg(target_arch = "aarch64")]
             {
@@ -3152,24 +3406,24 @@ impl AdaptiveRMI {
                     }
                 }
             }
-            
+
             // Process chunk with optimized lookups
             for &key in chunk {
                 results.push(self.lookup_fast(key));
             }
         }
-        
+
         results
     }
 
     /// AVX2-optimized batch processing (x86_64 only)
-    /// 
+    ///
     /// Uses runtime-detected AVX2 for maximum throughput on supported processors.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn lookup_batch_avx2(&self, keys: &[u64]) -> Vec<Option<u64>> {
         let mut results = Vec::with_capacity(keys.len());
-        
+
         // Process in optimal chunks for AVX2
         for chunk in keys.chunks(64) {
             // Process 16-key SIMD groups
@@ -3186,14 +3440,14 @@ impl AdaptiveRMI {
                             continue;
                         }
                     };
-                    
+
                     let simd_results = self.lookup_16_keys_avx2_impl(&keys_array);
                     results.extend_from_slice(&simd_results);
                 } else if simd_group.len() >= 8 {
                     // Process first 8 keys with SIMD
                     let simd_results = self.lookup_8_keys_avx2_impl(&simd_group[0..8]);
                     results.extend_from_slice(&simd_results);
-                    
+
                     // Process remaining keys with scalar
                     for &key in &simd_group[8..] {
                         results.push(self.lookup_fast(key));
@@ -3206,17 +3460,17 @@ impl AdaptiveRMI {
                 }
             }
         }
-        
+
         results
     }
 
     /// NEON-optimized batch processing (ARM64 only)
-    /// 
+    ///
     /// Uses NEON instructions for optimal performance on ARM64 processors.
     #[cfg(target_arch = "aarch64")]
     fn lookup_batch_neon(&self, keys: &[u64]) -> Vec<Option<u64>> {
         let mut results = Vec::with_capacity(keys.len());
-        
+
         // Process in optimal chunks for NEON
         for chunk in keys.chunks(16) {
             // Process 4-key NEON groups
@@ -3232,7 +3486,7 @@ impl AdaptiveRMI {
                 }
             }
         }
-        
+
         results
     }
 
@@ -3270,16 +3524,16 @@ impl AdaptiveRMI {
         }
         results
     }
-    
+
     /// Optimized 8-key SIMD: Process 8 keys using AVX2 instructions
-    /// 
+    ///
     /// Uses 2 AVX2 registers (2 separate 4-wide operations) for optimal performance.
     /// Technical reality: Each AVX2 register processes 4 u64 values (256 bits ÷ 64 bits = 4)
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn lookup_8_keys_optimized_simd(&self, keys: &[u64]) -> [Option<u64>; 8] {
         use std::arch::x86_64::*;
-        
+
         // Bounds validation for safety
         if keys.len() < 8 {
             // Fallback to scalar processing for insufficient keys
@@ -3289,32 +3543,29 @@ impl AdaptiveRMI {
             }
             return results;
         }
-        
+
         // Load 8 keys into 2 AVX2 registers
         // Each __m256i holds exactly 4 u64 values (256 bits ÷ 64 bits = 4)
         let keys_ptr = keys.as_ptr() as *const __m256i;
-        let keys_lo = _mm256_loadu_si256(keys_ptr);         // Keys 0-3 (register 1)
-        let keys_hi = _mm256_loadu_si256(keys_ptr.add(1));  // Keys 4-7 (register 2)
-        
-       
-        
+        let keys_lo = _mm256_loadu_si256(keys_ptr); // Keys 0-3 (register 1)
+        let keys_hi = _mm256_loadu_si256(keys_ptr.add(1)); // Keys 4-7 (register 2)
+
         // Hot buffer lookup (highest probability, fastest access)
         let hot_results = self.simd_hot_buffer_lookup(keys_lo, keys_hi);
-        
+
         //  PERFORMANCE OPTIMIZATION: Early exit if all keys found in hot buffer
         let hot_found_count = hot_results.iter().filter(|r| r.is_some()).count();
         if hot_found_count == 8 {
             return hot_results;
         }
-        
+
         //Overflow buffer lookup (for recently inserted, unsorted data)
         let overflow_results = self.simd_overflow_buffer_lookup(keys_lo, keys_hi, &hot_results);
-        
+
         // EARLY EXIT: Check if all keys found in buffers (hot + overflow)
-        let buffer_complete = (0..8).all(|i| {
-            hot_results[i].is_some() || overflow_results[i].is_some()
-        });
-        
+        let buffer_complete =
+            (0..8).all(|i| hot_results[i].is_some() || overflow_results[i].is_some());
+
         if buffer_complete {
             return [
                 hot_results[0].or(overflow_results[0]),
@@ -3329,29 +3580,45 @@ impl AdaptiveRMI {
         }
 
         //  Segment lookup (for persistent, sorted data)
-        let segment_results = self.simd_segment_lookup(keys_lo, keys_hi, &hot_results, &overflow_results);
-        
-        
+        let segment_results =
+            self.simd_segment_lookup(keys_lo, keys_hi, &hot_results, &overflow_results);
+
         // Priority: Hot buffer > Overflow buffer > Segments
         [
-            hot_results[0].or(overflow_results[0]).or(segment_results[0]),
-            hot_results[1].or(overflow_results[1]).or(segment_results[1]),
-            hot_results[2].or(overflow_results[2]).or(segment_results[2]),
-            hot_results[3].or(overflow_results[3]).or(segment_results[3]),
-            hot_results[4].or(overflow_results[4]).or(segment_results[4]),
-            hot_results[5].or(overflow_results[5]).or(segment_results[5]),
-            hot_results[6].or(overflow_results[6]).or(segment_results[6]),
-            hot_results[7].or(overflow_results[7]).or(segment_results[7]),
+            hot_results[0]
+                .or(overflow_results[0])
+                .or(segment_results[0]),
+            hot_results[1]
+                .or(overflow_results[1])
+                .or(segment_results[1]),
+            hot_results[2]
+                .or(overflow_results[2])
+                .or(segment_results[2]),
+            hot_results[3]
+                .or(overflow_results[3])
+                .or(segment_results[3]),
+            hot_results[4]
+                .or(overflow_results[4])
+                .or(segment_results[4]),
+            hot_results[5]
+                .or(overflow_results[5])
+                .or(segment_results[5]),
+            hot_results[6]
+                .or(overflow_results[6])
+                .or(segment_results[6]),
+            hot_results[7]
+                .or(overflow_results[7])
+                .or(segment_results[7]),
         ]
     }
-    
+
     /// Optimized 16-key SIMD: True 16-key vectorization with maximum throughput
-    /// 
+    ///
     /// Process 16 keys simultaneously using 4 AVX2 registers for optimal performance.
     /// This function represents the pinnacle of SIMD optimization for batch key lookups,
     /// designed to saturate modern CPU pipelines and maximize cache efficiency.
     ///  16-key processing: Uses 4 AVX2 registers (4 separate 4-wide operations)
-    /// 
+    ///
     /// Technical reality:
     /// - Each AVX2 register processes 4 u64 values (256 bits ÷ 64 bits = 4)
     /// - To process 16 keys: requires 4 separate register operations
@@ -3360,108 +3627,191 @@ impl AdaptiveRMI {
     #[target_feature(enable = "avx2")]
     unsafe fn lookup_16_keys_optimized_simd(&self, keys: &[u64; 16]) -> [Option<u64>; 16] {
         use std::arch::x86_64::*;
-        
+
         // Load 16 keys into 4 AVX2 registers
         // Each __m256i holds exactly 4 u64 values (256 bits ÷ 64 bits = 4)
         let keys_ptr = keys.as_ptr() as *const __m256i;
-        let keys_0 = _mm256_loadu_si256(keys_ptr);           // Keys 0-3 (register 1)
-        let keys_1 = _mm256_loadu_si256(keys_ptr.add(1));    // Keys 4-7 (register 2)
-        let keys_2 = _mm256_loadu_si256(keys_ptr.add(2));    // Keys 8-11 (register 3)
-        let keys_3 = _mm256_loadu_si256(keys_ptr.add(3));    // Keys 12-15 (register 4)
-        
+        let keys_0 = _mm256_loadu_si256(keys_ptr); // Keys 0-3 (register 1)
+        let keys_1 = _mm256_loadu_si256(keys_ptr.add(1)); // Keys 4-7 (register 2)
+        let keys_2 = _mm256_loadu_si256(keys_ptr.add(2)); // Keys 8-11 (register 3)
+        let keys_3 = _mm256_loadu_si256(keys_ptr.add(3)); // Keys 12-15 (register 4)
+
         // Processing: 4 separate 4-wide SIMD operations
-        
+
         //  Hot buffer lookup for all 16 keys
         let hot_results_0_3 = self.simd_hot_buffer_lookup(keys_0, keys_1);
         let hot_results_4_7 = self.simd_hot_buffer_lookup(keys_2, keys_3);
-        
+
         // Combine hot buffer results
         let hot_results = [
-            hot_results_0_3[0], hot_results_0_3[1], hot_results_0_3[2], hot_results_0_3[3],
-            hot_results_0_3[4], hot_results_0_3[5], hot_results_0_3[6], hot_results_0_3[7],
-            hot_results_4_7[0], hot_results_4_7[1], hot_results_4_7[2], hot_results_4_7[3],
-            hot_results_4_7[4], hot_results_4_7[5], hot_results_4_7[6], hot_results_4_7[7],
+            hot_results_0_3[0],
+            hot_results_0_3[1],
+            hot_results_0_3[2],
+            hot_results_0_3[3],
+            hot_results_0_3[4],
+            hot_results_0_3[5],
+            hot_results_0_3[6],
+            hot_results_0_3[7],
+            hot_results_4_7[0],
+            hot_results_4_7[1],
+            hot_results_4_7[2],
+            hot_results_4_7[3],
+            hot_results_4_7[4],
+            hot_results_4_7[5],
+            hot_results_4_7[6],
+            hot_results_4_7[7],
         ];
-        
+
         //  PERFORMANCE OPTIMIZATION: Early exit if all 16 keys found in hot buffer
         let hot_found_count = hot_results.iter().filter(|r| r.is_some()).count();
         if hot_found_count == 16 {
             return hot_results;
         }
-        
+
         // Overflow buffer lookup for missing keys
-        let overflow_results_0_3 = self.simd_overflow_buffer_lookup(keys_0, keys_1, &hot_results_0_3);
-        let overflow_results_4_7 = self.simd_overflow_buffer_lookup(keys_2, keys_3, &hot_results_4_7);
-        
+        let overflow_results_0_3 =
+            self.simd_overflow_buffer_lookup(keys_0, keys_1, &hot_results_0_3);
+        let overflow_results_4_7 =
+            self.simd_overflow_buffer_lookup(keys_2, keys_3, &hot_results_4_7);
+
         let overflow_results = [
-            overflow_results_0_3[0], overflow_results_0_3[1], overflow_results_0_3[2], overflow_results_0_3[3],
-            overflow_results_0_3[4], overflow_results_0_3[5], overflow_results_0_3[6], overflow_results_0_3[7],
-            overflow_results_4_7[0], overflow_results_4_7[1], overflow_results_4_7[2], overflow_results_4_7[3],
-            overflow_results_4_7[4], overflow_results_4_7[5], overflow_results_4_7[6], overflow_results_4_7[7],
+            overflow_results_0_3[0],
+            overflow_results_0_3[1],
+            overflow_results_0_3[2],
+            overflow_results_0_3[3],
+            overflow_results_0_3[4],
+            overflow_results_0_3[5],
+            overflow_results_0_3[6],
+            overflow_results_0_3[7],
+            overflow_results_4_7[0],
+            overflow_results_4_7[1],
+            overflow_results_4_7[2],
+            overflow_results_4_7[3],
+            overflow_results_4_7[4],
+            overflow_results_4_7[5],
+            overflow_results_4_7[6],
+            overflow_results_4_7[7],
         ];
-        
+
         // EARLY EXIT: Check if all keys found in buffers (hot + overflow)
-        let buffer_complete = (0..16).all(|i| {
-            hot_results[i].is_some() || overflow_results[i].is_some()
-        });
-        
+        let buffer_complete =
+            (0..16).all(|i| hot_results[i].is_some() || overflow_results[i].is_some());
+
         if buffer_complete {
             return [
-                hot_results[0].or(overflow_results[0]),   hot_results[1].or(overflow_results[1]),
-                hot_results[2].or(overflow_results[2]),   hot_results[3].or(overflow_results[3]),
-                hot_results[4].or(overflow_results[4]),   hot_results[5].or(overflow_results[5]),
-                hot_results[6].or(overflow_results[6]),   hot_results[7].or(overflow_results[7]),
-                hot_results[8].or(overflow_results[8]),   hot_results[9].or(overflow_results[9]),
-                hot_results[10].or(overflow_results[10]), hot_results[11].or(overflow_results[11]),
-                hot_results[12].or(overflow_results[12]), hot_results[13].or(overflow_results[13]),
-                hot_results[14].or(overflow_results[14]), hot_results[15].or(overflow_results[15]),
+                hot_results[0].or(overflow_results[0]),
+                hot_results[1].or(overflow_results[1]),
+                hot_results[2].or(overflow_results[2]),
+                hot_results[3].or(overflow_results[3]),
+                hot_results[4].or(overflow_results[4]),
+                hot_results[5].or(overflow_results[5]),
+                hot_results[6].or(overflow_results[6]),
+                hot_results[7].or(overflow_results[7]),
+                hot_results[8].or(overflow_results[8]),
+                hot_results[9].or(overflow_results[9]),
+                hot_results[10].or(overflow_results[10]),
+                hot_results[11].or(overflow_results[11]),
+                hot_results[12].or(overflow_results[12]),
+                hot_results[13].or(overflow_results[13]),
+                hot_results[14].or(overflow_results[14]),
+                hot_results[15].or(overflow_results[15]),
             ];
         }
-        
+
         // Segment lookup for still missing keys
-        let segment_results_0_3 = self.simd_segment_lookup(keys_0, keys_1, &hot_results_0_3, &overflow_results_0_3);
-        let segment_results_4_7 = self.simd_segment_lookup(keys_2, keys_3, &hot_results_4_7, &overflow_results_4_7);
-        
+        let segment_results_0_3 =
+            self.simd_segment_lookup(keys_0, keys_1, &hot_results_0_3, &overflow_results_0_3);
+        let segment_results_4_7 =
+            self.simd_segment_lookup(keys_2, keys_3, &hot_results_4_7, &overflow_results_4_7);
+
         let segment_results = [
-            segment_results_0_3[0], segment_results_0_3[1], segment_results_0_3[2], segment_results_0_3[3],
-            segment_results_0_3[4], segment_results_0_3[5], segment_results_0_3[6], segment_results_0_3[7],
-            segment_results_4_7[0], segment_results_4_7[1], segment_results_4_7[2], segment_results_4_7[3],
-            segment_results_4_7[4], segment_results_4_7[5], segment_results_4_7[6], segment_results_4_7[7],
+            segment_results_0_3[0],
+            segment_results_0_3[1],
+            segment_results_0_3[2],
+            segment_results_0_3[3],
+            segment_results_0_3[4],
+            segment_results_0_3[5],
+            segment_results_0_3[6],
+            segment_results_0_3[7],
+            segment_results_4_7[0],
+            segment_results_4_7[1],
+            segment_results_4_7[2],
+            segment_results_4_7[3],
+            segment_results_4_7[4],
+            segment_results_4_7[5],
+            segment_results_4_7[6],
+            segment_results_4_7[7],
         ];
-        
+
         // VECTORIZED RESULT COMBINATION: Efficiently combine all 16 results
         [
-            hot_results[0].or(overflow_results[0]).or(segment_results[0]),
-            hot_results[1].or(overflow_results[1]).or(segment_results[1]),
-            hot_results[2].or(overflow_results[2]).or(segment_results[2]),
-            hot_results[3].or(overflow_results[3]).or(segment_results[3]),
-            hot_results[4].or(overflow_results[4]).or(segment_results[4]),
-            hot_results[5].or(overflow_results[5]).or(segment_results[5]),
-            hot_results[6].or(overflow_results[6]).or(segment_results[6]),
-            hot_results[7].or(overflow_results[7]).or(segment_results[7]),
-            hot_results[8].or(overflow_results[8]).or(segment_results[8]),
-            hot_results[9].or(overflow_results[9]).or(segment_results[9]),
-            hot_results[10].or(overflow_results[10]).or(segment_results[10]),
-            hot_results[11].or(overflow_results[11]).or(segment_results[11]),
-            hot_results[12].or(overflow_results[12]).or(segment_results[12]),
-            hot_results[13].or(overflow_results[13]).or(segment_results[13]),
-            hot_results[14].or(overflow_results[14]).or(segment_results[14]),
-            hot_results[15].or(overflow_results[15]).or(segment_results[15]),
+            hot_results[0]
+                .or(overflow_results[0])
+                .or(segment_results[0]),
+            hot_results[1]
+                .or(overflow_results[1])
+                .or(segment_results[1]),
+            hot_results[2]
+                .or(overflow_results[2])
+                .or(segment_results[2]),
+            hot_results[3]
+                .or(overflow_results[3])
+                .or(segment_results[3]),
+            hot_results[4]
+                .or(overflow_results[4])
+                .or(segment_results[4]),
+            hot_results[5]
+                .or(overflow_results[5])
+                .or(segment_results[5]),
+            hot_results[6]
+                .or(overflow_results[6])
+                .or(segment_results[6]),
+            hot_results[7]
+                .or(overflow_results[7])
+                .or(segment_results[7]),
+            hot_results[8]
+                .or(overflow_results[8])
+                .or(segment_results[8]),
+            hot_results[9]
+                .or(overflow_results[9])
+                .or(segment_results[9]),
+            hot_results[10]
+                .or(overflow_results[10])
+                .or(segment_results[10]),
+            hot_results[11]
+                .or(overflow_results[11])
+                .or(segment_results[11]),
+            hot_results[12]
+                .or(overflow_results[12])
+                .or(segment_results[12]),
+            hot_results[13]
+                .or(overflow_results[13])
+                .or(segment_results[13]),
+            hot_results[14]
+                .or(overflow_results[14])
+                .or(segment_results[14]),
+            hot_results[15]
+                .or(overflow_results[15])
+                .or(segment_results[15]),
         ]
     }
-    
+
     /// LOCK-FREE SIMD HOT BUFFER LOOKUP: Vectorized hot buffer search
-    /// 
+    ///
     /// This function performs vectorized search through the hot buffer using AVX2 instructions.
     /// It implements a lock-minimization strategy with single atomic snapshot for maximum
     /// performance and maintains lock-free execution during the actual search phase.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
-    unsafe fn simd_hot_buffer_lookup(&self, keys_lo: __m256i, keys_hi: __m256i) -> [Option<u64>; 8] {
+    unsafe fn simd_hot_buffer_lookup(
+        &self,
+        keys_lo: __m256i,
+        keys_hi: __m256i,
+    ) -> [Option<u64>; 8] {
         use std::arch::x86_64::*;
-        
+
         let mut results = [None; 8];
-        
+
         // MINIMAL LOCK TIME: Single atomic snapshot acquisition
         // Lock strategy: Get all data at once to minimize lock contention
         let buffer_snapshot = {
@@ -3469,25 +3819,25 @@ impl AdaptiveRMI {
             if snapshot.is_empty() {
                 return results; // Early exit for empty buffer
             }
-            
+
             // Create snapshot to enable lock-free processing
             // Clone is necessary to release lock before SIMD processing
             snapshot
         }; // Lock released immediately after snapshot
-        
+
         // LOCK-FREE VECTORIZED SEARCH: No locks during actual search operations
         // Extract all 8 keys from SIMD registers for efficient processing
         let keys_array = [
-            _mm256_extract_epi64(keys_lo, 0) as u64,  // Key 0
-            _mm256_extract_epi64(keys_lo, 1) as u64,  // Key 1
-            _mm256_extract_epi64(keys_lo, 2) as u64,  // Key 2
-            _mm256_extract_epi64(keys_lo, 3) as u64,  // Key 3
-            _mm256_extract_epi64(keys_hi, 0) as u64,  // Key 4
-            _mm256_extract_epi64(keys_hi, 1) as u64,  // Key 5
-            _mm256_extract_epi64(keys_hi, 2) as u64,  // Key 6
-            _mm256_extract_epi64(keys_hi, 3) as u64,  // Key 7
+            _mm256_extract_epi64(keys_lo, 0) as u64, // Key 0
+            _mm256_extract_epi64(keys_lo, 1) as u64, // Key 1
+            _mm256_extract_epi64(keys_lo, 2) as u64, // Key 2
+            _mm256_extract_epi64(keys_lo, 3) as u64, // Key 3
+            _mm256_extract_epi64(keys_hi, 0) as u64, // Key 4
+            _mm256_extract_epi64(keys_hi, 1) as u64, // Key 5
+            _mm256_extract_epi64(keys_hi, 2) as u64, // Key 6
+            _mm256_extract_epi64(keys_hi, 3) as u64, // Key 7
         ];
-        
+
         // CACHE-EFFICIENT VECTORIZED SEARCH: Process buffer in SIMD-friendly chunks
         // Strategy: Reverse iteration for temporal locality (recent data first)
         if buffer_snapshot.len() >= 4 {
@@ -3495,35 +3845,40 @@ impl AdaptiveRMI {
             for chunk_start in (0..buffer_snapshot.len()).step_by(4).rev() {
                 let chunk_end = (chunk_start + 4).min(buffer_snapshot.len());
                 let chunk = &buffer_snapshot[chunk_start..chunk_end];
-                
+
                 if chunk.len() >= 4 {
                     //  VECTORIZED COMPARISON: Process 4 buffer entries simultaneously
                     let chunk_keys = [chunk[0].0, chunk[1].0, chunk[2].0, chunk[3].0];
                     let chunk_values = [chunk[0].1, chunk[1].1, chunk[2].1, chunk[3].1];
-                    
+
                     // Load chunk keys into SIMD register
                     let chunk_keys_vec = _mm256_loadu_si256(chunk_keys.as_ptr() as *const __m256i);
-                    
+
                     // Compare each search key against chunk keys
                     for (result_idx, &search_key) in keys_array.iter().enumerate() {
                         if results[result_idx].is_some() {
                             continue; // Skip already found keys
                         }
-                        
+
                         // Broadcast search key to all 4 positions
                         let search_vec = _mm256_set1_epi64x(search_key as i64);
-                        
+
                         // Compare search key against all 4 chunk keys simultaneously
                         let cmp_result = _mm256_cmpeq_epi64(search_vec, chunk_keys_vec);
-                        
+
                         // Extract comparison mask and check for matches
                         let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp_result));
-                        
+
                         // Check each bit in mask for matches
-                        if mask & 0x01 != 0 { results[result_idx] = Some(chunk_values[0]); }
-                        else if mask & 0x02 != 0 { results[result_idx] = Some(chunk_values[1]); }
-                        else if mask & 0x04 != 0 { results[result_idx] = Some(chunk_values[2]); }
-                        else if mask & 0x08 != 0 { results[result_idx] = Some(chunk_values[3]); }
+                        if mask & 0x01 != 0 {
+                            results[result_idx] = Some(chunk_values[0]);
+                        } else if mask & 0x02 != 0 {
+                            results[result_idx] = Some(chunk_values[1]);
+                        } else if mask & 0x04 != 0 {
+                            results[result_idx] = Some(chunk_values[2]);
+                        } else if mask & 0x08 != 0 {
+                            results[result_idx] = Some(chunk_values[3]);
+                        }
                     }
                 } else {
                     // Handle remaining entries with scalar search
@@ -3535,7 +3890,7 @@ impl AdaptiveRMI {
                         }
                     }
                 }
-                
+
                 // EARLY EXIT OPTIMIZATION: Stop if all keys found
                 if results.iter().all(|r| r.is_some()) {
                     break;
@@ -3550,36 +3905,38 @@ impl AdaptiveRMI {
                         results[result_idx] = Some(v);
                     }
                 }
-                
+
                 // Early exit if all keys found
                 if results.iter().all(|r| r.is_some()) {
                     break;
                 }
             }
         }
-        
+
         results
     }
-    
+
     /// OPTIMIZED SIMD OVERFLOW BUFFER LOOKUP: Selective vectorized overflow search
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_overflow_buffer_lookup(
-        &self, 
-        keys_lo: __m256i, 
-        keys_hi: __m256i, 
-        hot_results: &[Option<u64>; 8]
+        &self,
+        keys_lo: __m256i,
+        keys_hi: __m256i,
+        hot_results: &[Option<u64>; 8],
     ) -> [Option<u64>; 8] {
         let mut results = [None; 8];
-        
+
         // EARLY EXIT: Skip if all results found in hot buffer
         let missing_count = hot_results.iter().filter(|r| r.is_none()).count();
         if missing_count == 0 {
             return results;
         }
-        
+
         //SELECTIVE PROCESSING: Only process missing keys
-        let missing_keys: Vec<(usize, u64)> = hot_results.iter().enumerate()
+        let missing_keys: Vec<(usize, u64)> = hot_results
+            .iter()
+            .enumerate()
             .filter_map(|(i, result)| {
                 if result.is_none() {
                     let key = if i < 4 {
@@ -3593,47 +3950,75 @@ impl AdaptiveRMI {
                 }
             })
             .collect();
-        
+
         if missing_keys.is_empty() {
             return results;
         }
-        
+
         // MINIMAL LOCK TIME: Get snapshot of overflow buffer
         let overflow_snapshot = {
             let overflow = self.overflow_buffer.lock();
             if overflow.data.is_empty() {
                 return results; // Early exit if overflow is empty
             }
-            overflow.data.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>()
+            overflow
+                .data
+                .iter()
+                .map(|(&k, &v)| (k, v))
+                .collect::<Vec<_>>()
         }; // Lock released immediately
-        
+
         // VECTORIZED OVERFLOW SEARCH: Process missing keys in SIMD batches
         for chunk in missing_keys.chunks(4) {
             if chunk.len() >= 4 && overflow_snapshot.len() >= 4 {
                 // Load 4 search keys into SIMD register
                 let search_keys = _mm256_set_epi64x(
-                    if chunk.len() > 3 { chunk[3].1 as i64 } else { 0 },
-                    if chunk.len() > 2 { chunk[2].1 as i64 } else { 0 },
-                    if chunk.len() > 1 { chunk[1].1 as i64 } else { 0 },
-                    chunk[0].1 as i64
+                    if chunk.len() > 3 {
+                        chunk[3].1 as i64
+                    } else {
+                        0
+                    },
+                    if chunk.len() > 2 {
+                        chunk[2].1 as i64
+                    } else {
+                        0
+                    },
+                    if chunk.len() > 1 {
+                        chunk[1].1 as i64
+                    } else {
+                        0
+                    },
+                    chunk[0].1 as i64,
                 );
-                
+
                 // Search through overflow buffer in SIMD chunks
                 for buffer_chunk in overflow_snapshot.chunks(4) {
                     if buffer_chunk.len() >= 4 {
                         let buffer_keys = _mm256_set_epi64x(
-                            if buffer_chunk.len() > 3 { buffer_chunk[3].0 as i64 } else { 0 },
-                            if buffer_chunk.len() > 2 { buffer_chunk[2].0 as i64 } else { 0 },
-                            if buffer_chunk.len() > 1 { buffer_chunk[1].0 as i64 } else { 0 },
-                            buffer_chunk[0].0 as i64
+                            if buffer_chunk.len() > 3 {
+                                buffer_chunk[3].0 as i64
+                            } else {
+                                0
+                            },
+                            if buffer_chunk.len() > 2 {
+                                buffer_chunk[2].0 as i64
+                            } else {
+                                0
+                            },
+                            if buffer_chunk.len() > 1 {
+                                buffer_chunk[1].0 as i64
+                            } else {
+                                0
+                            },
+                            buffer_chunk[0].0 as i64,
                         );
-                        
+
                         // Compare all 4 search keys against all 4 buffer keys
                         for (j, &(search_idx, search_key)) in chunk.iter().enumerate() {
                             let search_vec = _mm256_set1_epi64x(search_key as i64);
                             let matches = _mm256_cmpeq_epi64(search_vec, buffer_keys);
                             let mask = _mm256_movemask_epi8(matches);
-                            
+
                             if mask != 0 {
                                 // Find exact match and extract value
                                 for &(k, v) in buffer_chunk {
@@ -3658,31 +4043,30 @@ impl AdaptiveRMI {
                 }
             }
         }
-        
+
         results
     }
-    
+
     /// SIMD SEGMENT LOOKUP: Vectorized segment prediction and bounded search
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_segment_lookup(
-        &self, 
-        keys_lo: __m256i, 
-        keys_hi: __m256i, 
+        &self,
+        keys_lo: __m256i,
+        keys_hi: __m256i,
         hot_results: &[Option<u64>; 8],
-        overflow_results: &[Option<u64>; 8]
+        overflow_results: &[Option<u64>; 8],
     ) -> [Option<u64>; 8] {
         let mut results = [None; 8];
-        
+
         //  EARLY EXIT: Check if we need to do segment lookup at all
-        let need_segment_lookup = (0..8).any(|i| {
-            hot_results[i].is_none() && overflow_results[i].is_none()
-        });
-        
+        let need_segment_lookup =
+            (0..8).any(|i| hot_results[i].is_none() && overflow_results[i].is_none());
+
         if !need_segment_lookup {
             return results;
         }
-        
+
         // ULTRA-FAST SIMD: Single atomic snapshot for maximum performance
         let (segment_ids, segments_guard) = {
             // Single atomic snapshot: get both router predictions and segments together
@@ -3692,93 +4076,97 @@ impl AdaptiveRMI {
             drop(router_guard); // Release router lock immediately
             (ids, segments_guard)
         };
-        
+
         // Fast SIMD processing with bounds validation (no retry loops)
         let missing_keys_with_segments: Vec<(usize, u64, usize)> = (0..8)
             .filter_map(|i| {
                 if hot_results[i].is_none() && overflow_results[i].is_none() {
                     let key = if i < 4 {
                         _mm256_extract_epi64(keys_lo, i as i32) as u64
-                        } else {
-                            _mm256_extract_epi64(keys_hi, (i - 4) as i32) as u64
-                        };
-                        Some((i, key, segment_ids[i]))
                     } else {
-                        None
-                    }
-                })
-                .collect();
-            
-            // 5. RACE-FREE VECTORIZED BOUNDED SEARCH with validated segments
-            for chunk in missing_keys_with_segments.chunks(4) {
-                if chunk.len() >= 4 {
-                    // Process segments with validated consistency
-                    let mut simd_processed = vec![false; chunk.len()];
-                    
-                    for &(result_idx, key, segment_id) in chunk {
-                        if segment_id < segments_guard.len() && !simd_processed[result_idx % 4] {
-                            let segment = &segments_guard[segment_id];
-                            
-                            // Use SIMD bounded search if segment has enough data
-                            if segment.data.len() >= 8 {
-                                results[result_idx] = self.simd_bounded_search_vectorized(
-                                    &segment.data, key, segment.local_model.predict(key)
-                                );
-                            } else {
-                                // Scalar bounded search for small segments
-                                results[result_idx] = segment.bounded_search(key);
-                            }
-                            simd_processed[result_idx % 4] = true;
-                        } else if segment_id >= segments_guard.len() {
-                            // Graceful degradation: use fallback search if prediction is out of bounds
-                            results[result_idx] = self.fallback_linear_search_with_segments_lock(&segments_guard, key);
-                        }
-                    }
+                        _mm256_extract_epi64(keys_hi, (i - 4) as i32) as u64
+                    };
+                    Some((i, key, segment_ids[i]))
                 } else {
-                    // Scalar fallback for remaining keys with bounds checking
-                    for &(result_idx, key, segment_id) in chunk {
-                        if segment_id < segments_guard.len() {
-                            results[result_idx] = segments_guard[segment_id].bounded_search(key);
+                    None
+                }
+            })
+            .collect();
+
+        // 5. RACE-FREE VECTORIZED BOUNDED SEARCH with validated segments
+        for chunk in missing_keys_with_segments.chunks(4) {
+            if chunk.len() >= 4 {
+                // Process segments with validated consistency
+                let mut simd_processed = vec![false; chunk.len()];
+
+                for &(result_idx, key, segment_id) in chunk {
+                    if segment_id < segments_guard.len() && !simd_processed[result_idx % 4] {
+                        let segment = &segments_guard[segment_id];
+
+                        // Use SIMD bounded search if segment has enough data
+                        if segment.data.len() >= 8 {
+                            results[result_idx] = self.simd_bounded_search_vectorized(
+                                &segment.data,
+                                key,
+                                segment.local_model.predict(key),
+                            );
                         } else {
-                            // Graceful degradation: use fallback search if prediction is out of bounds
-                            results[result_idx] = self.fallback_linear_search_with_segments_lock(&segments_guard, key);
+                            // Scalar bounded search for small segments
+                            results[result_idx] = segment.bounded_search(key);
                         }
+                        simd_processed[result_idx % 4] = true;
+                    } else if segment_id >= segments_guard.len() {
+                        // Graceful degradation: use fallback search if prediction is out of bounds
+                        results[result_idx] =
+                            self.fallback_linear_search_with_segments_lock(&segments_guard, key);
+                    }
+                }
+            } else {
+                // Scalar fallback for remaining keys with bounds checking
+                for &(result_idx, key, segment_id) in chunk {
+                    if segment_id < segments_guard.len() {
+                        results[result_idx] = segments_guard[segment_id].bounded_search(key);
+                    } else {
+                        // Graceful degradation: use fallback search if prediction is out of bounds
+                        results[result_idx] =
+                            self.fallback_linear_search_with_segments_lock(&segments_guard, key);
                     }
                 }
             }
-        
+        }
+
         results
     }
-    
+
     /// VECTORIZED BOUNDED SEARCH: SIMD-optimized binary search with prediction
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_bounded_search_vectorized(
         &self,
-        data: &[(u64, u64)], 
+        data: &[(u64, u64)],
         search_key: u64,
-        predicted_position: usize
+        predicted_position: usize,
     ) -> Option<u64> {
         if data.is_empty() {
             return None;
         }
-        
+
         //  BOUNDED SEARCH WINDOW: Limit search to small window around prediction
         const SEARCH_WINDOW: usize = 8; // Must be multiple of 4 for SIMD
         let data_len = data.len();
-        
+
         let start = predicted_position.saturating_sub(SEARCH_WINDOW / 2);
         let end = (predicted_position + SEARCH_WINDOW / 2).min(data_len);
         let window = &data[start..end];
-        
+
         if window.is_empty() {
             return None;
         }
-        
+
         // VECTORIZED COMPARISON: Compare search_key against 4 keys simultaneously
         if window.len() >= 4 {
             let search_vec = _mm256_set1_epi64x(search_key as i64);
-            
+
             // Process in chunks of 4
             for chunk in window.chunks(4) {
                 if chunk.len() >= 4 {
@@ -3787,13 +4175,13 @@ impl AdaptiveRMI {
                         chunk[3].0 as i64,
                         chunk[2].0 as i64,
                         chunk[1].0 as i64,
-                        chunk[0].0 as i64
+                        chunk[0].0 as i64,
                     );
-                    
+
                     // Compare all 4 keys at once
                     let matches = _mm256_cmpeq_epi64(search_vec, data_keys);
                     let mask = _mm256_movemask_epi8(matches);
-                    
+
                     // Check for exact matches
                     if mask != 0 {
                         // Find the exact match and return corresponding value
@@ -3820,53 +4208,53 @@ impl AdaptiveRMI {
                 }
             }
         }
-        
+
         // If not found in predicted window, fallback to binary search
         match data.binary_search_by_key(&search_key, |(k, _)| *k) {
             Ok(idx) => Some(data[idx].1),
             Err(_) => None,
         }
     }
-    
+
     ///  TRUE SIMD SEGMENT PREDICTION: Vectorized routing model prediction
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_predict_segments(
-        &self, 
-        keys_lo: __m256i, 
-        keys_hi: __m256i, 
-        router: &parking_lot::RwLockReadGuard<GlobalRoutingModel>
+        &self,
+        keys_lo: __m256i,
+        keys_hi: __m256i,
+        router: &parking_lot::RwLockReadGuard<GlobalRoutingModel>,
     ) -> [usize; 8] {
         // TRUE VECTORIZED ARITHMETIC: Process all 8 keys simultaneously
         let shift = 64u32.saturating_sub(router.router_bits as u32);
         let shift_vec = _mm256_set1_epi64x(shift as i64);
-        
+
         //  SIMD SHIFT: Shift all 8 keys at once for routing prefix calculation
         let prefixes_lo = _mm256_srlv_epi64(keys_lo, shift_vec);
         let prefixes_hi = _mm256_srlv_epi64(keys_hi, shift_vec);
-        
+
         // VECTORIZED BOUNDS CHECKING: Clamp all indices simultaneously
         let router_len = router.router.len() as i64;
         let max_index = _mm256_set1_epi64x(router_len - 1);
-        
+
         // Clamp all indices to valid range in parallel
         let clamped_lo = _mm256_min_epi64(prefixes_lo, max_index);
         let clamped_hi = _mm256_min_epi64(prefixes_hi, max_index);
-        
+
         // FULLY VECTORIZED GATHER: Use AVX2 gather for true vectorized lookup
         // This replaces 8 scalar memory accesses with 2 vectorized gather operations
         let router_ptr = router.router.as_ptr() as *const i32; // Cast to i32 for _mm256_i64gather_epi32
-        
+
         // Vectorized gather: Load router values for all indices at once
         let gathered_lo = _mm256_i64gather_epi32(router_ptr, clamped_lo, 4); // scale=4 for i32
         let gathered_hi = _mm256_i64gather_epi32(router_ptr, clamped_hi, 4);
-        
+
         // Convert gathered i32 values to u64 segment IDs efficiently
         let lo_64 = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(gathered_lo));
         let hi_64 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(gathered_lo, 1));
         let lo2_64 = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(gathered_hi));
         let hi2_64 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(gathered_hi, 1));
-        
+
         // Extract final results - now with minimal scalar operations
         [
             _mm256_extract_epi64(lo_64, 0) as usize,
@@ -3879,17 +4267,17 @@ impl AdaptiveRMI {
             _mm256_extract_epi64(hi_64, 3) as usize,
         ]
     }
-    
+
     /// ARM64 NEON: 4-key processing using 2 NEON registers (2 separate 2-wide operations)
-    /// 
-   
+    ///
+
     /// - Each NEON register holds 2 u64 values (128 bits ÷ 64 bits = 2)
     /// - To process 4 keys: requires 2 separate register operations  
     /// - Performance benefit: instruction pipelining, reduced function call overhead
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     pub fn lookup_4_keys_neon_optimized(&self, keys: &[u64]) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
-        
+
         // Bounds validation for safety
         if keys.len() < 4 {
             // Fallback to scalar processing for insufficient keys
@@ -3899,31 +4287,33 @@ impl AdaptiveRMI {
             }
             return results;
         }
-        
+
         unsafe {
-            // NEON loading: Load 4 keys into 2 NEON 128-bit registers  
+            // NEON loading: Load 4 keys into 2 NEON 128-bit registers
             // Each uint64x2_t holds exactly 2 u64 values (128 bits ÷ 64 bits = 2)
-            let _keys_vec1 = vld1q_u64([keys[0], keys[1]].as_ptr());  // Keys 0-1 (register 1)
-            let _keys_vec2 = vld1q_u64([keys[2], keys[3]].as_ptr());  // Keys 2-3 (register 2)
-            
+            let _keys_vec1 = vld1q_u64([keys[0], keys[1]].as_ptr()); // Keys 0-1 (register 1)
+            let _keys_vec2 = vld1q_u64([keys[2], keys[3]].as_ptr()); // Keys 2-3 (register 2)
+
             // Unified memory optimization: Leverage Apple Silicon's unified memory architecture
             // Apple Silicon has faster memory access patterns due to unified memory
-            
+
             // Hot buffer (prioritized for Apple Silicon's large cache)
             let hot_results = self.neon_hot_buffer_lookup(keys);
-            
+
             //  EARLY EXIT: Apple Silicon branch predictor optimization
             if hot_results.iter().all(|r| r.is_some()) {
                 return hot_results;
             }
-            
+
             //  Overflow buffer (optimized for M4's advanced cache hierarchy)
             let overflow_results = self.neon_overflow_buffer_lookup(keys, &hot_results);
-            
+
             // APPLE SILICON EARLY EXIT: Optimized for M4's execution units
-            let found_in_buffers = hot_results.iter().zip(overflow_results.iter())
+            let found_in_buffers = hot_results
+                .iter()
+                .zip(overflow_results.iter())
                 .all(|(hot, overflow)| hot.is_some() || overflow.is_some());
-            
+
             if found_in_buffers {
                 return [
                     hot_results[0].or(overflow_results[0]),
@@ -3932,31 +4322,39 @@ impl AdaptiveRMI {
                     hot_results[3].or(overflow_results[3]),
                 ];
             }
-            
+
             // Segments (optimized for Apple Silicon's wide execution)
             let segment_results = self.neon_segment_lookup(keys, &hot_results, &overflow_results);
-            
+
             // NEON RESULT COMBINATION: Optimized for Apple Silicon's execution pipeline
             [
-                hot_results[0].or(overflow_results[0]).or(segment_results[0]),
-                hot_results[1].or(overflow_results[1]).or(segment_results[1]),
-                hot_results[2].or(overflow_results[2]).or(segment_results[2]),
-                hot_results[3].or(overflow_results[3]).or(segment_results[3]),
+                hot_results[0]
+                    .or(overflow_results[0])
+                    .or(segment_results[0]),
+                hot_results[1]
+                    .or(overflow_results[1])
+                    .or(segment_results[1]),
+                hot_results[2]
+                    .or(overflow_results[2])
+                    .or(segment_results[2]),
+                hot_results[3]
+                    .or(overflow_results[3])
+                    .or(segment_results[3]),
             ]
         }
     }
 
     /// ARM64 NEON HOT BUFFER: Vectorized hot buffer search for Apple Silicon
-    /// 
+    ///
     /// Enterprise-grade NEON implementation optimized for M1/M2/M3/M4 MacBooks
     /// with unified memory architecture and cache hierarchy awareness.
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     fn neon_hot_buffer_lookup(&self, keys: &[u64]) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
-        
+
         //  Early exit optimization for enterprise performance
         let mut results = [None; 4];
-        
+
         // APPLE SILICON OPTIMIZATION: Single atomic lock acquisition
         // Leverages unified memory architecture for optimal cache coherency
         let buffer_snapshot = {
@@ -3964,42 +4362,48 @@ impl AdaptiveRMI {
             if snapshot.is_empty() {
                 return results; // Early exit for empty buffer
             }
-            
+
             // M4 MACBOOK OPTIMIZATION: Cache-aligned copy for unified memory
             snapshot
         };
-        
+
         //  NEON vectorized search with Apple Silicon optimizations
         unsafe {
             let mut found_count = 0;
-            
+
             // NEON 128-BIT PROCESSING: Process buffer in optimal chunks
             for chunk in buffer_snapshot.chunks(2) {
-                if found_count >= 4 { break; } // Early exit when all found
-                
+                if found_count >= 4 {
+                    break;
+                } // Early exit when all found
+
                 if chunk.len() >= 2 {
                     // NEON VECTOR LOAD: Load 2 key-value pairs into 128-bit registers
                     let buffer_keys = vld1q_u64([chunk[0].0, chunk[1].0].as_ptr());
                     let _buffer_values = vld1q_u64([chunk[0].1, chunk[1].1].as_ptr());
-                    
+
                     //  PARALLEL SEARCH: Compare all 4 search keys against buffer chunk
                     for (i, &search_key) in keys.iter().enumerate() {
-                        if results[i].is_some() { continue; } // Skip already found
-                        
+                        if results[i].is_some() {
+                            continue;
+                        } // Skip already found
+
                         // NEON BROADCAST: Duplicate search key across 128-bit vector
                         let search_vec = vdupq_n_u64(search_key);
-                        
+
                         // NEON COMPARISON: Vectorized equality check
                         let matches = vceqq_u64(search_vec, buffer_keys);
-                        
+
                         // APPLE SILICON CONDITIONAL: Extract match results efficiently
                         let match0 = vgetq_lane_u64(matches, 0);
                         let match1 = vgetq_lane_u64(matches, 1);
-                        
-                        if match0 == u64::MAX { // Full match on lane 0
+
+                        if match0 == u64::MAX {
+                            // Full match on lane 0
                             results[i] = Some(chunk[0].1);
                             found_count += 1;
-                        } else if match1 == u64::MAX { // Full match on lane 1
+                        } else if match1 == u64::MAX {
+                            // Full match on lane 1
                             results[i] = Some(chunk[1].1);
                             found_count += 1;
                         }
@@ -4011,15 +4415,19 @@ impl AdaptiveRMI {
                             if results[i].is_none() && k == search_key {
                                 results[i] = Some(v);
                                 found_count += 1;
-                                if found_count >= 4 { break; }
+                                if found_count >= 4 {
+                                    break;
+                                }
                             }
                         }
-                        if found_count >= 4 { break; }
+                        if found_count >= 4 {
+                            break;
+                        }
                     }
                 }
             }
         }
-        
+
         // Return enterprise-validated results
         results
     }
@@ -4029,72 +4437,80 @@ impl AdaptiveRMI {
     /// Implements enterprise-grade NEON optimizations with selective search logic.
     /// Only searches for keys not found in hot buffer, maximizing Apple Silicon efficiency.
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    fn neon_overflow_buffer_lookup(&self, keys: &[u64], hot_results: &[Option<u64>; 4]) -> [Option<u64>; 4] {
+    fn neon_overflow_buffer_lookup(
+        &self,
+        keys: &[u64],
+        hot_results: &[Option<u64>; 4],
+    ) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
-        
+
         // Initialize results and early exits
         let mut results = [None; 4];
-        
+
         // ENTERPRISE OPTIMIZATION: Skip if all keys found in hot buffer
         if hot_results.iter().all(|r| r.is_some()) {
             return results;
         }
-        
+
         // SELECTIVE SEARCH: Count keys that need overflow lookup
-        let unfound_keys: Vec<usize> = (0..4)
-            .filter(|&i| hot_results[i].is_none())
-            .collect();
-        
+        let unfound_keys: Vec<usize> = (0..4).filter(|&i| hot_results[i].is_none()).collect();
+
         if unfound_keys.is_empty() {
             return results;
         }
-        
+
         // APPLE SILICON OPTIMIZATION: Atomic overflow buffer snapshot
         let overflow_snapshot = {
             let overflow = self.overflow_buffer.lock();
             if overflow.data.is_empty() {
                 return results;
             }
-            
+
             // M4 MACBOOK OPTIMIZATION: Cache-efficient copy for unified memory
             let mut snapshot = Vec::with_capacity(overflow.data.len());
             snapshot.extend(overflow.data.iter().map(|(&k, &v)| (k, v)));
             snapshot
         };
-        
+
         //  NEON vectorized overflow search
         unsafe {
             let mut found_count = 0;
             let target_count = unfound_keys.len();
-            
+
             // NEON 128-BIT PROCESSING: Process overflow in vectorized chunks
             for chunk in overflow_snapshot.chunks(2) {
-                if found_count >= target_count { break; } // Early exit optimization
-                
+                if found_count >= target_count {
+                    break;
+                } // Early exit optimization
+
                 if chunk.len() >= 2 {
                     // NEON VECTOR LOAD: Load 2 overflow key-value pairs
                     let buffer_keys = vld1q_u64([chunk[0].0, chunk[1].0].as_ptr());
-                    
+
                     // SELECTIVE SEARCH: Only check unfound keys from hot buffer
                     for &idx in &unfound_keys {
-                        if results[idx].is_some() { continue; } // Skip already found
-                        
+                        if results[idx].is_some() {
+                            continue;
+                        } // Skip already found
+
                         let search_key = keys[idx];
-                        
+
                         // NEON BROADCAST: Duplicate search key across 128-bit vector
                         let search_vec = vdupq_n_u64(search_key);
-                        
+
                         // NEON COMPARISON: Vectorized equality check
                         let matches = vceqq_u64(search_vec, buffer_keys);
-                        
+
                         // APPLE SILICON CONDITIONAL: Extract match results efficiently
                         let match0 = vgetq_lane_u64(matches, 0);
                         let match1 = vgetq_lane_u64(matches, 1);
-                        
-                        if match0 == u64::MAX { // Full match on lane 0
+
+                        if match0 == u64::MAX {
+                            // Full match on lane 0
                             results[idx] = Some(chunk[0].1);
                             found_count += 1;
-                        } else if match1 == u64::MAX { // Full match on lane 1
+                        } else if match1 == u64::MAX {
+                            // Full match on lane 1
                             results[idx] = Some(chunk[1].1);
                             found_count += 1;
                         }
@@ -4106,15 +4522,19 @@ impl AdaptiveRMI {
                             if results[idx].is_none() && keys[idx] == k {
                                 results[idx] = Some(v);
                                 found_count += 1;
-                                if found_count >= target_count { break; }
+                                if found_count >= target_count {
+                                    break;
+                                }
                             }
                         }
-                        if found_count >= target_count { break; }
+                        if found_count >= target_count {
+                            break;
+                        }
                     }
                 }
             }
         }
-        
+
         //  Return enterprise-validated results
         results
     }
@@ -4128,81 +4548,95 @@ impl AdaptiveRMI {
         &self,
         keys: &[u64],
         hot_results: &[Option<u64>; 4],
-        overflow_results: &[Option<u64>; 4]
+        overflow_results: &[Option<u64>; 4],
     ) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
-        
+
         //  Initialize results and early exit optimization
         let mut results = [None; 4];
-        
+
         //  ENTERPRISE OPTIMIZATION: Check if segment lookup is needed
         let unfound_indices: Vec<usize> = (0..4)
             .filter(|&i| hot_results[i].is_none() && overflow_results[i].is_none())
             .collect();
-        
+
         if unfound_indices.is_empty() {
             return results; // Early exit if no keys need segment lookup
         }
-        
+
         //  Vectorized segment prediction with NEON
         let (segment_predictions, segments_guard) = {
             let segments_guard = self.segments.read();
             let router_guard = self.global_router.read();
-            
-                // NEON VECTORIZED PREDICTION: Process up to 4 keys simultaneously
-                let mut predictions = Vec::with_capacity(4);
-                
-                // Process keys individually due to NEON lane extraction requirements
-                for i in 0..4 {
-                    if i < keys.len() {
-                        predictions.push(router_guard.predict_segment(keys[i]));
-                    } else {
-                        predictions.push(0); // Pad with safe default
-                    }
-                }            drop(router_guard); // Release router lock immediately
+
+            // NEON VECTORIZED PREDICTION: Process up to 4 keys simultaneously
+            let mut predictions = Vec::with_capacity(4);
+
+            // Process keys individually due to NEON lane extraction requirements
+            for i in 0..4 {
+                if i < keys.len() {
+                    predictions.push(router_guard.predict_segment(keys[i]));
+                } else {
+                    predictions.push(0); // Pad with safe default
+                }
+            }
+            drop(router_guard); // Release router lock immediately
             (predictions, segments_guard)
         };
-        
+
         //  NEON-optimized bounded search with Apple Silicon cache awareness
         unsafe {
             //  NEON BOUNDS VALIDATION: Vectorized bounds checking
             let segment_count = segments_guard.len();
-            
+
             // Load predictions for vectorized bounds checking
             let predictions_array = [
                 segment_predictions[0] as u64,
-                if segment_predictions.len() > 1 { segment_predictions[1] as u64 } else { 0 },
-                if segment_predictions.len() > 2 { segment_predictions[2] as u64 } else { 0 },
-                if segment_predictions.len() > 3 { segment_predictions[3] as u64 } else { 0 },
+                if segment_predictions.len() > 1 {
+                    segment_predictions[1] as u64
+                } else {
+                    0
+                },
+                if segment_predictions.len() > 2 {
+                    segment_predictions[2] as u64
+                } else {
+                    0
+                },
+                if segment_predictions.len() > 3 {
+                    segment_predictions[3] as u64
+                } else {
+                    0
+                },
             ];
             let predictions_vec = vld1q_u64(predictions_array.as_ptr());
             let segment_count_vec = vdupq_n_u64(segment_count as u64);
-            
+
             //  NEON COMPARISON: Vectorized bounds validation
             let _bounds_valid = vcltq_u64(predictions_vec, segment_count_vec);
-            
+
             //  APPLE SILICON CONDITIONAL: Process valid predictions efficiently
             for &idx in &unfound_indices {
                 let key = keys[idx];
                 let segment_id = segment_predictions[idx];
-                
+
                 // Check bounds without vectorized extraction due to NEON lane limitations
                 let is_valid = segment_id < segment_count;
-                
+
                 if is_valid {
                     //  NEON-ACCELERATED BOUNDED SEARCH: Use segment's optimized search
                     results[idx] = segments_guard[segment_id].bounded_search(key);
                 } else {
                     //  GRACEFUL DEGRADATION: Enterprise-safe fallback for invalid predictions
-                    results[idx] = self.fallback_linear_search_with_segments_lock(&segments_guard, key);
+                    results[idx] =
+                        self.fallback_linear_search_with_segments_lock(&segments_guard, key);
                 }
             }
         }
-        
+
         // Return enterprise-validated results
         results
     }
-    
+
     /// ADAPTIVE BATCH SIZE: Determine optimal batch size based on workload and hardware
     pub fn get_optimal_batch_size(&self) -> usize {
         // Base batch size on available SIMD capabilities and system resources
@@ -4210,45 +4644,45 @@ impl AdaptiveRMI {
         {
             //  SIMD: AVX2 processes 4 u64 values per 256-bit register
             // Technical reality: 256 bits ÷ 64 bits = 4 u64 values per register
-            const AVX2_SIMD_WIDTH: usize = 4;  // CORRECTED: 4 u64 per register, not 16
-            
+            const AVX2_SIMD_WIDTH: usize = 4; // CORRECTED: 4 u64 per register, not 16
+
             // Scale based on CPU and memory characteristics
             let cpu_cores = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1);
-                
+
             // BATCH SIZING: Based on actual SIMD capability
             // - L1 cache: ~32KB, can hold ~4000 u64 keys
             // - L2 cache: ~256KB, can hold ~32000 u64 keys
             // - Optimal batch: 8-16x SIMD width for multiple register utilization
             let base_batch = AVX2_SIMD_WIDTH * 8; // 32 keys baseline (8 * 4 = 32)
             let scaled_batch = base_batch * cpu_cores.min(8); // Scale up to 8 cores
-            
+
             // Cap at reasonable maximum to prevent cache pressure
             scaled_batch.min(1024) // Max 1024 keys per batch (for 4-wide SIMD)
         }
-        
+
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
-            //  NEON: Processes 2 u64 values per 128-bit register 
+            //  NEON: Processes 2 u64 values per 128-bit register
             // Technical reality: 128 bits ÷ 64 bits = 2 u64 values per register
-            const NEON_SIMD_WIDTH: usize = 2;  // CORRECTED: 2 u64 per register
-            
+            const NEON_SIMD_WIDTH: usize = 2; // CORRECTED: 2 u64 per register
+
             // Scale based on CPU and unified memory architecture
             let cpu_cores = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1);
-                
+
             // APPLE SILICON OPTIMIZATION: Leveraging dual-register operations
             // - Apple Silicon can use register pairs for 4-key operations
             // - Unified memory allows larger batches efficiently
             let base_batch = NEON_SIMD_WIDTH * 16; // 32 keys baseline (dual register pairs)
             let scaled_batch = base_batch * cpu_cores.min(12); // Scale up to 12 cores (M4 Max)
-            
+
             // Higher cap for Apple Silicon's superior memory system
-            scaled_batch.min(1024) // Max 1024 keys per batch 
+            scaled_batch.min(1024) // Max 1024 keys per batch
         }
-        
+
         #[cfg(not(any(
             all(target_arch = "x86_64", target_feature = "avx2"),
             all(target_arch = "aarch64", target_feature = "neon")
@@ -4258,12 +4692,12 @@ impl AdaptiveRMI {
             let cpu_cores = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1);
-                
+
             // Conservative scaling for scalar operations
             (16 * cpu_cores).min(128) // 16-128 keys per batch
         }
     }
-    
+
     /// CORRECTED SIMD CAPABILITY DETECTION:  capability reporting
     pub fn simd_capabilities() -> SIMDCapabilities {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -4271,7 +4705,7 @@ impl AdaptiveRMI {
             let cores = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1);
-                
+
             SIMDCapabilities {
                 has_avx2: true,
                 has_avx512: cfg!(all(target_arch = "x86_64", target_feature = "avx512f")),
@@ -4281,23 +4715,23 @@ impl AdaptiveRMI {
                 simd_width: 4, //  AVX2 processes 4 u64 values per 256-bit register
             }
         }
-        
+
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         {
             let cores = std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(1);
-                
+
             SIMDCapabilities {
                 has_avx2: false,
                 has_avx512: false,
                 has_neon: true,
-                optimal_batch_size: (16 * cores).min(1024), //  16-1024 keys per batch  
+                optimal_batch_size: (16 * cores).min(1024), //  16-1024 keys per batch
                 architecture: "aarch64".to_string(),
                 simd_width: 2, // : NEON processes 2 u64 values per 128-bit register
             }
         }
-        
+
         #[cfg(not(any(
             all(target_arch = "x86_64", target_feature = "avx2"),
             all(target_arch = "aarch64", target_feature = "neon")
@@ -4313,7 +4747,7 @@ impl AdaptiveRMI {
             }
         }
     }
-    
+
     ///  SIMD PROCESS CHUNK 16 - ENTERPRISE IMPLEMENTATION
     /// Enterprise-grade SIMD processing for 16-key chunks with segment conversion
     fn simd_process_chunk_16(
@@ -4324,30 +4758,31 @@ impl AdaptiveRMI {
         if chunk.len() != 16 {
             return Err("Chunk must contain exactly 16 keys");
         }
-        
+
         // Convert chunk to fixed array for SIMD processing
-        let keys_array: [u64; 16] = chunk.try_into()
+        let keys_array: [u64; 16] = chunk
+            .try_into()
             .map_err(|_| "Failed to convert chunk to array")?;
-        
+
         //  SIMPLIFIED IMPLEMENTATION: Direct lookup for each key
         let mut results = [None; 16];
         for (i, &key) in keys_array.iter().enumerate() {
             results[i] = self.lookup(key);
         }
-        
+
         Ok(results)
     }
-    
+
     ///  CONVERT SEGMENTS TO CACHE OPTIMIZED - ENTERPRISE IMPLEMENTATION
     /// Convert AdaptiveRMI segments to cache-optimized format
     fn convert_segments_to_cache_optimized(&self) -> Vec<CacheOptimizedSegment> {
         let segments_guard = self.segments.read();
         let mut cache_segments = Vec::with_capacity(segments_guard.len());
-        
+
         for segment in segments_guard.iter() {
             // Extract segment data with read lock
             let segment_data = &segment.data;
-            
+
             if segment_data.is_empty() {
                 // Create empty cache-optimized segment
                 cache_segments.push(CacheOptimizedSegment {
@@ -4359,23 +4794,23 @@ impl AdaptiveRMI {
                 });
                 continue;
             }
-            
+
             // Separate keys and values
             let mut keys = Vec::with_capacity(segment_data.len());
             let mut values = Vec::with_capacity(segment_data.len());
-            
+
             for &(key, value) in segment_data.iter() {
                 keys.push(key);
                 values.push(value);
             }
-            
+
             // Calculate linear model coefficients (simplified)
             let model = if keys.len() >= 2 {
                 let first_key = keys[0] as f64;
                 let last_key = keys[keys.len() - 1] as f64;
                 let first_idx = 0.0;
                 let last_idx = (keys.len() - 1) as f64;
-                
+
                 if last_key != first_key {
                     let slope = (last_idx - first_idx) / (last_key - first_key);
                     let intercept = first_idx - slope * first_key;
@@ -4386,7 +4821,7 @@ impl AdaptiveRMI {
             } else {
                 (0.0, 0.0)
             };
-            
+
             cache_segments.push(CacheOptimizedSegment {
                 keys,
                 values,
@@ -4395,31 +4830,35 @@ impl AdaptiveRMI {
                 _padding: [0; 64],
             });
         }
-        
+
         cache_segments
     }
-    
+
     ///  GET CACHE OPTIMIZED SEGMENTS
     /// Get segments in cache-optimized format for SIMD operations
     pub fn get_cache_optimized_segments(&self) -> Vec<CacheOptimizedSegment> {
         self.convert_segments_to_cache_optimized()
     }
-    
+
     ///  APPLY OPTIMIZATION HINTS
     /// Apply performance optimization hints from monitoring
     pub fn apply_optimization_hints(&self, hints: OptimizationHints) {
         // Implementation simplified for compatibility
-        println!(" Applying optimization hints: batch_size={}, aggressive_prefetch={}, memory_layout={}", 
-                hints.should_increase_batch_size, hints.should_enable_aggressive_prefetching, hints.should_optimize_memory_layout);
+        println!(
+            " Applying optimization hints: batch_size={}, aggressive_prefetch={}, memory_layout={}",
+            hints.should_increase_batch_size,
+            hints.should_enable_aggressive_prefetching,
+            hints.should_optimize_memory_layout
+        );
     }
 }
 
 //  ENHANCED RMI OPTIMIZATIONS FOR BINARY PROTOCOL
-// 
+//
 // Advanced optimizations to maximize RMI performance for binary protocol infrastructure
 
 ///  CACHE-OPTIMIZED SEGMENT STRUCTURE
-/// 
+///
 /// Optimized segment layout for maximum cache efficiency
 #[derive(Debug, Clone)]
 pub struct CacheOptimizedSegment {
@@ -4442,11 +4881,11 @@ impl CacheOptimizedSegment {
     pub fn bounded_search_optimized(&self, key: u64) -> Option<u64> {
         // Predict position using linear model
         let predicted_pos = (self.model.0 * key as f64 + self.model.1) as usize;
-        
+
         // Calculate search bounds with epsilon
         let start = predicted_pos.saturating_sub(self.epsilon);
         let end = (predicted_pos + self.epsilon).min(self.keys.len());
-        
+
         //  UNROLLED BINARY SEARCH: Process 4 elements at once
         if end - start <= 8 {
             // Linear search for small ranges (better for cache)
@@ -4459,7 +4898,7 @@ impl CacheOptimizedSegment {
             // Binary search for larger ranges
             let mut left = start;
             let mut right = end;
-            
+
             while left < right {
                 let mid = (left + right) / 2;
                 match self.keys[mid].cmp(&key) {
@@ -4469,13 +4908,13 @@ impl CacheOptimizedSegment {
                 }
             }
         }
-        
+
         None
     }
 }
 
 ///  ADVANCED SIMD BATCH PROCESSOR
-/// 
+///
 /// Optimized batch lookup with advanced SIMD techniques
 pub struct AdvancedSIMDBatchProcessor {
     /// Pre-allocated SIMD registers for hot paths
@@ -4536,21 +4975,26 @@ impl AdvancedSIMDBatchProcessor {
         let keys_1 = _mm256_loadu_si256(keys.as_ptr().add(4) as *const __m256i);
         let keys_2 = _mm256_loadu_si256(keys.as_ptr().add(8) as *const __m256i);
         let keys_3 = _mm256_loadu_si256(keys.as_ptr().add(12) as *const __m256i);
-        
+
         // VECTORIZED ROUTING: Predict all segments simultaneously
         let segment_ids = self.simd_predict_all_segments(keys_0, keys_1, keys_2, keys_3, router);
-        
+
         // PARALLEL SEGMENT PROCESSING: Process 4 segments at once
         let mut results = [None; 16];
-        
+
         for chunk in segment_ids.chunks(4) {
             if chunk.len() == 4 && chunk.iter().all(|&id| id < segments.len()) {
                 let segment_results = self.simd_process_segment_chunk(
-                    keys_0, keys_1, keys_2, keys_3,
-                    &segments[chunk[0]], &segments[chunk[1]], 
-                    &segments[chunk[2]], &segments[chunk[3]]
+                    keys_0,
+                    keys_1,
+                    keys_2,
+                    keys_3,
+                    &segments[chunk[0]],
+                    &segments[chunk[1]],
+                    &segments[chunk[2]],
+                    &segments[chunk[3]],
                 );
-                
+
                 // Combine results efficiently
                 for (i, result) in segment_results.iter().enumerate() {
                     if results[i].is_none() {
@@ -4559,38 +5003,41 @@ impl AdvancedSIMDBatchProcessor {
                 }
             }
         }
-        
+
         results
     }
-    
+
     /// VECTORIZED SEGMENT PREDICTION
     /// Predict segment IDs for all 16 keys simultaneously
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_predict_all_segments(
         &self,
-        keys_0: __m256i, keys_1: __m256i, keys_2: __m256i, keys_3: __m256i,
+        keys_0: __m256i,
+        keys_1: __m256i,
+        keys_2: __m256i,
+        keys_3: __m256i,
         router: &GlobalRoutingModel,
     ) -> [usize; 16] {
         // VECTORIZED ROUTING CALCULATION
         let shift = 64u32.saturating_sub(router.router_bits as u32);
         let shift_vec = _mm256_set1_epi64x(shift as i64);
-        
+
         // Calculate routing prefixes for all keys
         let prefixes_0 = _mm256_srlv_epi64(keys_0, shift_vec);
         let prefixes_1 = _mm256_srlv_epi64(keys_1, shift_vec);
         let prefixes_2 = _mm256_srlv_epi64(keys_2, shift_vec);
         let prefixes_3 = _mm256_srlv_epi64(keys_3, shift_vec);
-        
+
         // VECTORIZED BOUNDS CHECKING
         let router_len = router.router.len() as i64;
         let max_index = _mm256_set1_epi64x(router_len - 1);
-        
+
         let clamped_0 = _mm256_min_epi64(prefixes_0, max_index);
         let clamped_1 = _mm256_min_epi64(prefixes_1, max_index);
         let clamped_2 = _mm256_min_epi64(prefixes_2, max_index);
         let clamped_3 = _mm256_min_epi64(prefixes_3, max_index);
-        
+
         // Extract segment IDs
         [
             router.router[_mm256_extract_epi64(clamped_0, 0) as usize] as usize,
@@ -4611,25 +5058,30 @@ impl AdvancedSIMDBatchProcessor {
             router.router[_mm256_extract_epi64(clamped_3, 3) as usize] as usize,
         ]
     }
-    
+
     /// SIMD PROCESS SEGMENT CHUNK
     /// Process 4 segments simultaneously with SIMD
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_process_segment_chunk(
         &self,
-        keys_0: __m256i, keys_1: __m256i, keys_2: __m256i, keys_3: __m256i,
-        seg0: &CacheOptimizedSegment, seg1: &CacheOptimizedSegment,
-        seg2: &CacheOptimizedSegment, seg3: &CacheOptimizedSegment,
+        keys_0: __m256i,
+        keys_1: __m256i,
+        keys_2: __m256i,
+        keys_3: __m256i,
+        seg0: &CacheOptimizedSegment,
+        seg1: &CacheOptimizedSegment,
+        seg2: &CacheOptimizedSegment,
+        seg3: &CacheOptimizedSegment,
     ) -> [Option<u64>; 16] {
         let mut results = [None; 16];
-        
+
         // Process each segment with SIMD
         let seg0_results = self.simd_search_segment(keys_0, seg0);
         let seg1_results = self.simd_search_segment(keys_1, seg1);
         let seg2_results = self.simd_search_segment(keys_2, seg2);
         let seg3_results = self.simd_search_segment(keys_3, seg3);
-        
+
         // Combine results
         for i in 0..4 {
             results[i] = seg0_results[i];
@@ -4637,7 +5089,7 @@ impl AdvancedSIMDBatchProcessor {
             results[i + 8] = seg2_results[i];
             results[i + 12] = seg3_results[i];
         }
-        
+
         results
     }
 
@@ -4645,21 +5097,25 @@ impl AdvancedSIMDBatchProcessor {
     /// Search a single segment with SIMD optimization
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[target_feature(enable = "avx2")]
-    unsafe fn simd_search_segment(&self, keys: __m256i, segment: &CacheOptimizedSegment) -> [Option<u64>; 4] {
+    unsafe fn simd_search_segment(
+        &self,
+        keys: __m256i,
+        segment: &CacheOptimizedSegment,
+    ) -> [Option<u64>; 4] {
         let mut results = [None; 4];
-        
+
         // Extract individual keys
         let key0 = _mm256_extract_epi64(keys, 0) as u64;
         let key1 = _mm256_extract_epi64(keys, 1) as u64;
         let key2 = _mm256_extract_epi64(keys, 2) as u64;
         let key3 = _mm256_extract_epi64(keys, 3) as u64;
-        
+
         // Search each key in the segment
         results[0] = segment.bounded_search_optimized(key0);
         results[1] = segment.bounded_search_optimized(key1);
         results[2] = segment.bounded_search_optimized(key2);
         results[3] = segment.bounded_search_optimized(key3);
-        
+
         results
     }
 
@@ -4673,25 +5129,25 @@ impl AdvancedSIMDBatchProcessor {
         router: &GlobalRoutingModel,
     ) -> [Option<u64>; 16] {
         let mut results = [None; 16];
-        
+
         // Scalar processing for non-SIMD architectures
         for (i, &key) in keys.iter().enumerate() {
             // Simple routing
             let shift = 64u32.saturating_sub(router.router_bits as u32);
             let prefix = key >> shift;
             let segment_id = router.router[prefix as usize % router.router.len()] as usize;
-            
+
             if segment_id < segments.len() {
                 results[i] = segments[segment_id].bounded_search_optimized(key);
             }
         }
-        
+
         results
     }
 }
 
 ///  CACHE-ALIGNED BUFFER
-/// 
+///
 /// 64-byte aligned buffer for optimal cache performance
 #[repr(align(64))]
 pub struct CacheAlignedBuffer {
@@ -4699,7 +5155,7 @@ pub struct CacheAlignedBuffer {
 }
 
 ///  PREDICTIVE PREFETCHING SYSTEM
-/// 
+///
 /// Advanced prefetching to minimize cache misses
 pub struct PredictivePrefetcher {
     /// Access pattern analyzer
@@ -4719,7 +5175,7 @@ impl PredictivePrefetcher {
             prefetch_distance: 2,
         }
     }
-    
+
     ///  INTELLIGENT PREFETCHING
     /// Analyze access patterns and prefetch likely next keys
     pub fn intelligent_prefetch(&mut self, current_key: u64, segments: &[CacheOptimizedSegment]) {
@@ -4728,121 +5184,119 @@ impl PredictivePrefetcher {
         if self.access_history.len() > 1000 {
             self.access_history.pop_front();
         }
-        
+
         //  ENTERPRISE PATTERN ANALYSIS: Multi-pattern detection
         let predicted_keys = self.predict_next_keys_advanced(current_key);
-        
+
         //  SPATIAL LOCALITY PREFETCHING: Prefetch nearby keys
         let spatial_keys = self.predict_spatial_locality(current_key);
-        
+
         //  TEMPORAL LOCALITY PREFETCHING: Prefetch recently accessed patterns
         let temporal_keys = self.predict_temporal_locality();
-        
+
         // Combine all predictions
         let mut all_predictions = predicted_keys;
         all_predictions.extend(spatial_keys);
         all_predictions.extend(temporal_keys);
-        
+
         // Remove duplicates and limit prefetch count
         all_predictions.sort_unstable();
         all_predictions.dedup();
         all_predictions.truncate(16); // Limit to 16 prefetches to avoid cache pollution
-        
+
         //  AGGRESSIVE PREFETCHING: Prefetch cache lines for predicted keys
         for &key in &all_predictions {
             if let Some(segment) = self.find_segment_for_key(key, segments) {
                 self.prefetch_segment_data(segment);
-                
+
                 // Also prefetch adjacent segments for spatial locality
                 if let Some(next_segment) = self.find_adjacent_segment(segment, segments) {
                     self.prefetch_segment_data(next_segment);
                 }
             }
         }
-        
+
         //  ADAPTIVE PREFETCH DISTANCE: Adjust based on hit rate
         self.adapt_prefetch_distance();
     }
-    
+
     ///  ADVANCED PATTERN PREDICTION
     /// Multi-pattern analysis for better prediction accuracy
     fn predict_next_keys_advanced(&self, current_key: u64) -> Vec<u64> {
         let mut predictions = Vec::new();
-        
+
         // Sequential pattern detection (improved)
         if self.detect_sequential_pattern() {
             predictions.extend_from_slice(&[
-                current_key + 1, current_key + 2, current_key + 3, current_key + 4
+                current_key + 1,
+                current_key + 2,
+                current_key + 3,
+                current_key + 4,
             ]);
         }
-        
+
         // Stride pattern detection (improved)
         if let Some(stride) = self.detect_stride_pattern() {
             predictions.extend_from_slice(&[
                 current_key + stride,
                 current_key + 2 * stride,
-                current_key + 3 * stride
+                current_key + 3 * stride,
             ]);
         }
-        
+
         // Geometric pattern detection
         if let Some(ratio) = self.detect_geometric_pattern() {
-            if ratio > 1 && ratio < 16 { // Reasonable geometric ratio
-                predictions.extend_from_slice(&[
-                    current_key * ratio,
-                    current_key * ratio * ratio
-                ]);
+            if ratio > 1 && ratio < 16 {
+                // Reasonable geometric ratio
+                predictions.extend_from_slice(&[current_key * ratio, current_key * ratio * ratio]);
             }
         }
-        
+
         // Exponential pattern detection
         if self.detect_exponential_pattern() {
             let base: u64 = 2; // Common base for exponential patterns
             predictions.extend_from_slice(&[
                 current_key + base.pow(1),
                 current_key + base.pow(2),
-                current_key + base.pow(3)
+                current_key + base.pow(3),
             ]);
         }
-        
+
         predictions
     }
-    
+
     ///  SPATIAL LOCALITY PREDICTION
     /// Predict keys based on spatial locality principles
     fn predict_spatial_locality(&self, current_key: u64) -> Vec<u64> {
         let mut spatial_keys = Vec::new();
-        
+
         // Predict keys in immediate neighborhood
         let neighborhood_size = 8;
         for offset in 1..=neighborhood_size {
             spatial_keys.push(current_key.saturating_sub(offset));
             spatial_keys.push(current_key.saturating_add(offset));
         }
-        
+
         // Predict keys at cache line boundaries
         let cache_line_keys = 8; // Assume 8 keys per cache line
         let cache_aligned_base = (current_key / cache_line_keys) * cache_line_keys;
         for i in 0..cache_line_keys {
             spatial_keys.push(cache_aligned_base + i);
         }
-        
+
         spatial_keys
     }
-    
+
     ///  TEMPORAL LOCALITY PREDICTION
     /// Predict keys based on recent access patterns
     fn predict_temporal_locality(&self) -> Vec<u64> {
         let mut temporal_keys = Vec::new();
-        
+
         // Recently accessed keys are likely to be accessed again
         if self.access_history.len() >= 10 {
-            let recent_keys: Vec<u64> = self.access_history.iter()
-                .rev()
-                .take(10)
-                .copied()
-                .collect();
-            
+            let recent_keys: Vec<u64> =
+                self.access_history.iter().rev().take(10).copied().collect();
+
             // Add keys that appeared multiple times recently
             for &key in &recent_keys {
                 let occurrences = recent_keys.iter().filter(|&&k| k == key).count();
@@ -4851,56 +5305,60 @@ impl PredictivePrefetcher {
                 }
             }
         }
-        
+
         temporal_keys
     }
-    
+
     ///  GEOMETRIC PATTERN DETECTION
     fn detect_geometric_pattern(&self) -> Option<u64> {
         if self.access_history.len() < 3 {
             return None;
         }
-        
+
         let recent: Vec<u64> = self.access_history.iter().rev().take(3).copied().collect();
-        
+
         if recent[2] > 0 && recent[1] > 0 && recent[0] > 0 {
             let ratio1 = recent[1] / recent[2];
             let ratio2 = recent[0] / recent[1];
-            
+
             if ratio1 == ratio2 && ratio1 > 1 && ratio1 < 16 {
                 return Some(ratio1);
             }
         }
-        
+
         None
     }
-    
+
     ///  EXPONENTIAL PATTERN DETECTION
     fn detect_exponential_pattern(&self) -> bool {
         if self.access_history.len() < 4 {
             return false;
         }
-        
+
         let recent: Vec<u64> = self.access_history.iter().rev().take(4).copied().collect();
-        
+
         // Check for exponential differences
         let diff1 = recent[0].saturating_sub(recent[1]);
         let diff2 = recent[1].saturating_sub(recent[2]);
         let diff3 = recent[2].saturating_sub(recent[3]);
-        
+
         // Exponential pattern: differences form geometric sequence
         if diff2 > 0 && diff3 > 0 {
             let ratio1 = diff1 / diff2;
             let ratio2 = diff2 / diff3;
-            
+
             return ratio1 == ratio2 && ratio1 == 2; // Common exponential base
         }
-        
+
         false
     }
-    
+
     ///  FIND ADJACENT SEGMENT
-    fn find_adjacent_segment<'a>(&self, target_segment: &CacheOptimizedSegment, segments: &'a [CacheOptimizedSegment]) -> Option<&'a CacheOptimizedSegment> {
+    fn find_adjacent_segment<'a>(
+        &self,
+        target_segment: &CacheOptimizedSegment,
+        segments: &'a [CacheOptimizedSegment],
+    ) -> Option<&'a CacheOptimizedSegment> {
         for (i, segment) in segments.iter().enumerate() {
             if std::ptr::eq(segment, target_segment) && i + 1 < segments.len() {
                 return Some(&segments[i + 1]);
@@ -4908,7 +5366,7 @@ impl PredictivePrefetcher {
         }
         None
     }
-    
+
     ///  ADAPTIVE PREFETCH DISTANCE
     fn adapt_prefetch_distance(&mut self) {
         // Increase prefetch distance if patterns are detected
@@ -4919,40 +5377,40 @@ impl PredictivePrefetcher {
             self.prefetch_distance = (self.prefetch_distance.saturating_sub(1)).max(1);
         }
     }
-    
+
     ///  CACHE LINE PREFETCHING
     /// Prefetch specific cache lines to minimize misses
     fn prefetch_segment_data(&self, segment: &CacheOptimizedSegment) {
         //  ENTERPRISE CACHE OPTIMIZATION: Prefetch both keys and values arrays
-        
+
         // Prefetch key array with temporal locality hint
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
-            
+
             // Prefetch keys array into L1 cache
             if !segment.keys.is_empty() {
                 let keys_ptr = segment.keys.as_ptr() as *const i8;
                 let keys_len = segment.keys.len() * 8; // 8 bytes per u64
-                
+
                 // Prefetch in 64-byte cache line chunks
                 for offset in (0..keys_len).step_by(64) {
                     _mm_prefetch(keys_ptr.add(offset), _MM_HINT_T0);
                 }
             }
-            
+
             // Prefetch values array into L1 cache
             if !segment.values.is_empty() {
                 let values_ptr = segment.values.as_ptr() as *const i8;
                 let values_len = segment.values.len() * 8; // 8 bytes per u64
-                
+
                 // Prefetch in 64-byte cache line chunks
                 for offset in (0..values_len).step_by(64) {
                     _mm_prefetch(values_ptr.add(offset), _MM_HINT_T0);
                 }
             }
         }
-        
+
         // ARM64 prefetching for Apple Silicon
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -4960,12 +5418,12 @@ impl PredictivePrefetcher {
             if !segment.keys.is_empty() {
                 let keys_ptr = segment.keys.as_ptr();
                 let values_ptr = segment.values.as_ptr();
-                
+
                 // Use PRFM (prefetch memory) instruction for Apple Silicon
                 // This is handled by the compiler's intrinsics
                 std::hint::black_box(keys_ptr);
                 std::hint::black_box(values_ptr);
-                
+
                 // Manual prefetch hint for next cache lines
                 for i in (0..segment.keys.len()).step_by(8) {
                     if i < segment.keys.len() {
@@ -4977,7 +5435,7 @@ impl PredictivePrefetcher {
                 }
             }
         }
-        
+
         // Generic fallback - use memory barrier to ensure ordering
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
@@ -4988,7 +5446,7 @@ impl PredictivePrefetcher {
             }
         }
     }
-    
+
     ///  PREDICT NEXT KEYS
     /// Predict likely next keys based on access patterns
     fn predict_next_keys(&self, current_key: u64) -> Vec<u64> {
@@ -4996,47 +5454,54 @@ impl PredictivePrefetcher {
         if self.detect_sequential_pattern() {
             return vec![current_key + 1, current_key + 2];
         }
-        
+
         // Analyze stride patterns
         if let Some(stride) = self.detect_stride_pattern() {
             return vec![current_key + stride];
         }
-        
+
         vec![]
     }
-    
+
     ///  DETECT SEQUENTIAL PATTERN
     fn detect_sequential_pattern(&self) -> bool {
         if self.access_history.len() < 3 {
             return false;
         }
-        
+
         let recent: Vec<u64> = self.access_history.iter().rev().take(3).copied().collect();
         recent[0] == recent[1] + 1 && recent[1] == recent[2] + 1
     }
-    
+
     ///  DETECT STRIDE PATTERN
     fn detect_stride_pattern(&self) -> Option<u64> {
         if self.access_history.len() < 3 {
             return None;
         }
-        
+
         let recent: Vec<u64> = self.access_history.iter().rev().take(3).copied().collect();
         let stride1 = recent[0].saturating_sub(recent[1]);
         let stride2 = recent[1].saturating_sub(recent[2]);
-        
+
         if stride1 == stride2 && stride1 > 0 {
             Some(stride1)
         } else {
             None
         }
     }
-    
+
     ///  FIND SEGMENT FOR KEY
-    fn find_segment_for_key<'a>(&self, key: u64, segments: &'a [CacheOptimizedSegment]) -> Option<&'a CacheOptimizedSegment> {
+    fn find_segment_for_key<'a>(
+        &self,
+        key: u64,
+        segments: &'a [CacheOptimizedSegment],
+    ) -> Option<&'a CacheOptimizedSegment> {
         // Simple linear search - could be optimized with routing
         for segment in segments {
-            if !segment.keys.is_empty() && key >= segment.keys[0] && key <= *segment.keys.last().unwrap() {
+            if !segment.keys.is_empty()
+                && key >= segment.keys[0]
+                && key <= *segment.keys.last().unwrap()
+            {
                 return Some(segment);
             }
         }
@@ -5045,7 +5510,7 @@ impl PredictivePrefetcher {
 }
 
 ///  MEMORY POOL OPTIMIZATIONS
-/// 
+///
 /// Advanced memory management for zero-allocation hot paths
 pub struct AdvancedMemoryPool {
     /// Pre-allocated buffers for hot paths
@@ -5065,12 +5530,12 @@ impl AdvancedMemoryPool {
         for _ in 0..pool_size {
             hot_buffers.push(CacheAlignedBuffer { data: [0; 64] });
         }
-        
+
         let mut batch_buffers = Vec::new();
         for _ in 0..pool_size {
             batch_buffers.push(Vec::with_capacity(1024));
         }
-        
+
         Self {
             hot_buffers,
             batch_buffers,
@@ -5078,7 +5543,7 @@ impl AdvancedMemoryPool {
             pool_size,
         }
     }
-    
+
     ///  ZERO-ALLOCATION BATCH PROCESSING
     /// Enterprise-grade batch processing without any memory allocations
     pub fn process_batch_zero_alloc(
@@ -5089,10 +5554,10 @@ impl AdvancedMemoryPool {
         if keys.len() > results.len() {
             return Err("Results buffer too small");
         }
-        
+
         // Use pre-allocated buffers
         let buffer = self.get_hot_buffer()?;
-        
+
         //  PROCESS IN SIMD CHUNKS: Maximum vectorization efficiency
         let mut processed = 0;
         for chunk in keys.chunks(16) {
@@ -5114,13 +5579,13 @@ impl AdvancedMemoryPool {
                 processed += chunk.len();
             }
         }
-        
+
         // Update usage tracking
         self.usage_tracker.fetch_add(processed, Ordering::Relaxed);
-        
+
         Ok(())
     }
-    
+
     ///  SCALAR LOOKUP OPTIMIZED
     /// Optimized scalar lookup for fallback cases
     fn scalar_lookup_optimized(&self, key: u64, _buffer: &CacheAlignedBuffer) -> Option<u64> {
@@ -5133,7 +5598,7 @@ impl AdvancedMemoryPool {
     fn get_hot_buffer(&self) -> Result<&CacheAlignedBuffer, &'static str> {
         self.hot_buffers.first().ok_or("No hot buffers available")
     }
-    
+
     /// Get pool hit rate for optimization decisions
     fn get_hit_rate(&self) -> f64 {
         let total_requests = self.usage_tracker.load(Ordering::Relaxed);
@@ -5145,23 +5610,23 @@ impl AdvancedMemoryPool {
             100.0
         }
     }
-    
+
     /// Expand memory pools when hit rate is low
     fn expand_pools(&mut self, factor: f32) {
         let new_size = ((self.pool_size as f32) * factor) as usize;
         self.pool_size = new_size.min(1024); // Cap at reasonable size
-        
+
         // Add more hot buffers
         while self.hot_buffers.len() < self.pool_size {
             self.hot_buffers.push(CacheAlignedBuffer { data: [0; 64] });
         }
-        
+
         // Add more batch buffers
         while self.batch_buffers.len() < self.pool_size {
             self.batch_buffers.push(Vec::with_capacity(1024));
         }
     }
-    
+
     /// Compact pools when memory usage is high
     fn compact_pools(&mut self) {
         // Remove unused buffers (simplified)
@@ -5170,7 +5635,7 @@ impl AdvancedMemoryPool {
         self.batch_buffers.truncate(target_size);
         self.pool_size = target_size;
     }
-    
+
     /// Ensure all hot buffers are properly cache-aligned
     fn align_hot_buffers(&mut self) {
         // Verify all buffers are properly aligned
@@ -5181,7 +5646,7 @@ impl AdvancedMemoryPool {
 }
 
 ///  PERFORMANCE MONITORING AND ADAPTATION
-/// 
+///
 /// Real-time performance monitoring and adaptive optimization
 pub struct PerformanceMonitor {
     /// Latency tracking
@@ -5207,14 +5672,14 @@ impl PerformanceMonitor {
             performance_history: VecDeque::with_capacity(1000),
         }
     }
-    
+
     ///  ADAPTIVE OPTIMIZATION
     /// Automatically adjust parameters based on performance
     pub fn adaptive_optimization(&mut self) -> OptimizationHints {
         let current_latency = self.calculate_p99_latency();
         let current_throughput = self.throughput_counter.load(Ordering::Relaxed);
         let cache_hit_rate = self.cache_hit_rate.load(Ordering::Relaxed);
-        
+
         // Generate optimization hints
         OptimizationHints {
             should_increase_batch_size: current_latency < 100, // < 100μs
@@ -5223,20 +5688,20 @@ impl PerformanceMonitor {
             recommended_simd_width: 4, // : Use actual AVX2 capability (4 u64 per register)
         }
     }
-    
+
     ///  CALCULATE P99 LATENCY
     fn calculate_p99_latency(&self) -> u64 {
         if self.latency_histogram.is_empty() {
             return 0;
         }
-        
+
         let mut sorted_latencies: Vec<u64> = self.latency_histogram.iter().copied().collect();
         sorted_latencies.sort_unstable();
-        
+
         let p99_index = (sorted_latencies.len() * 99) / 100;
         sorted_latencies[p99_index]
     }
-    
+
     ///  RECORD LATENCY
     pub fn record_latency(&mut self, latency_us: u64) {
         self.latency_histogram.push_back(latency_us);
@@ -5244,12 +5709,12 @@ impl PerformanceMonitor {
             self.latency_histogram.pop_front();
         }
     }
-    
+
     ///  RECORD THROUGHPUT
     pub fn record_throughput(&self, ops: u64) {
         self.throughput_counter.fetch_add(ops, Ordering::Relaxed);
     }
-    
+
     ///  RECORD CACHE HIT RATE
     pub fn record_cache_hit_rate(&self, hit_rate: usize) {
         self.cache_hit_rate.store(hit_rate, Ordering::Relaxed);
@@ -5257,7 +5722,7 @@ impl PerformanceMonitor {
 }
 
 ///  PERFORMANCE SNAPSHOT
-/// 
+///
 /// Snapshot of performance metrics at a point in time
 #[derive(Debug, Clone)]
 pub struct PerformanceSnapshot {
@@ -5269,7 +5734,7 @@ pub struct PerformanceSnapshot {
 }
 
 ///  OPTIMIZATION HINTS
-/// 
+///
 /// Generated hints for runtime optimization
 #[derive(Debug, Clone)]
 pub struct OptimizationHints {
@@ -5280,7 +5745,7 @@ pub struct OptimizationHints {
 }
 
 ///  ADAPTIVE THRESHOLDS
-/// 
+///
 /// Dynamic thresholds that adapt to workload
 pub struct AdaptiveThresholds {
     /// Dynamic epsilon bounds
@@ -5303,7 +5768,7 @@ impl AdaptiveThresholds {
 }
 
 ///  ENHANCED BINARY PROTOCOL INTEGRATION
-/// 
+///
 /// Enhanced binary protocol with RMI optimizations
 pub struct OptimizedBinaryProtocol {
     /// RMI with advanced optimizations
@@ -5333,26 +5798,29 @@ impl OptimizedBinaryProtocol {
             performance_monitor: PerformanceMonitor::new(),
         }
     }
-    
+
     ///  ULTRA-FAST BATCH LOOKUP
     /// Enterprise-grade batch lookup for binary protocol with complete SIMD integration
     pub fn ultra_fast_batch_lookup(&mut self, keys: &[u64]) -> Vec<Option<u64>> {
         let start = std::time::Instant::now();
         let mut results = Vec::with_capacity(keys.len());
-        
+
         //  SIMD-OPTIMIZED PROCESSING with segment conversion
         for chunk in keys.chunks(16) {
             if chunk.len() == 16 {
                 //  ENTERPRISE SIMD PATH: Full 16-key vectorization
-                match self.memory_pool.process_batch_zero_alloc(chunk, &mut vec![None; 16]) {
+                match self
+                    .memory_pool
+                    .process_batch_zero_alloc(chunk, &mut vec![None; 16])
+                {
                     Ok(_) => {
                         // Use advanced SIMD processing
                         let chunk_array: [u64; 16] = chunk.try_into().unwrap();
-                        
+
                         // Convert segments for SIMD processing
                         let cache_segments = self.convert_segments_to_cache_optimized();
                         let compatible_router = self.create_compatible_router();
-                        
+
                         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
                         {
                             let chunk_results = unsafe {
@@ -5364,7 +5832,7 @@ impl OptimizedBinaryProtocol {
                             };
                             results.extend_from_slice(&chunk_results);
                         }
-                        
+
                         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
                         {
                             let chunk_results = self.batch_processor.lookup_16_keys_ultra_fast(
@@ -5395,7 +5863,7 @@ impl OptimizedBinaryProtocol {
                         }
                     }
                 }
-                
+
                 #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
                 {
                     // Scalar fallback for remaining keys
@@ -5405,20 +5873,22 @@ impl OptimizedBinaryProtocol {
                 }
             }
         }
-        
+
         // Record performance metrics
         let duration = start.elapsed();
-        self.performance_monitor.record_latency(duration.as_micros() as u64);
-        self.performance_monitor.record_throughput(keys.len() as u64);
-        
+        self.performance_monitor
+            .record_latency(duration.as_micros() as u64);
+        self.performance_monitor
+            .record_throughput(keys.len() as u64);
+
         results
     }
-    
+
     ///  CREATE COMPATIBLE ROUTER
     /// Create a compatible router model for SIMD operations
     fn create_compatible_router(&self) -> GlobalRoutingModel {
         let global_router_guard = self.rmi.global_router.read();
-        
+
         GlobalRoutingModel {
             boundaries: Vec::new(), // Empty boundaries for compatibility
             router_bits: global_router_guard.router_bits,
@@ -5426,17 +5896,17 @@ impl OptimizedBinaryProtocol {
             generation: AtomicU64::new(0), // Default generation
         }
     }
-    
+
     ///  CONVERT SEGMENTS TO CACHE OPTIMIZED
     /// Convert AdaptiveRMI segments to cache-optimized format for SIMD processing
     fn convert_segments_to_cache_optimized(&self) -> Vec<CacheOptimizedSegment> {
         let segments_guard = self.rmi.segments.read();
         let mut cache_segments = Vec::with_capacity(segments_guard.len());
-        
+
         for segment in segments_guard.iter() {
             // Extract segment data with read lock
             let segment_data = &segment.data;
-            
+
             if segment_data.is_empty() {
                 // Create empty cache-optimized segment
                 cache_segments.push(CacheOptimizedSegment {
@@ -5448,23 +5918,23 @@ impl OptimizedBinaryProtocol {
                 });
                 continue;
             }
-            
+
             // Separate keys and values for cache optimization
             let mut keys = Vec::with_capacity(segment_data.len());
             let mut values = Vec::with_capacity(segment_data.len());
-            
+
             for &(key, value) in segment_data.iter() {
                 keys.push(key);
                 values.push(value);
             }
-            
+
             // Calculate linear model coefficients for prediction
             let model = if keys.len() >= 2 {
                 let first_key = keys[0] as f64;
                 let last_key = keys[keys.len() - 1] as f64;
                 let first_idx = 0.0;
                 let last_idx = (keys.len() - 1) as f64;
-                
+
                 if last_key != first_key {
                     let slope = (last_idx - first_idx) / (last_key - first_key);
                     let intercept = first_idx - slope * first_key;
@@ -5475,7 +5945,7 @@ impl OptimizedBinaryProtocol {
             } else {
                 (0.0, 0.0)
             };
-            
+
             cache_segments.push(CacheOptimizedSegment {
                 keys,
                 values,
@@ -5484,67 +5954,72 @@ impl OptimizedBinaryProtocol {
                 _padding: [0; 64],
             });
         }
-        
+
         cache_segments
     }
-    
+
     ///  CACHE-OPTIMIZED SINGLE LOOKUP
     /// Enterprise-grade single key lookup with intelligent prefetching and cache optimization
     pub fn cache_optimized_lookup(&mut self, key: u64) -> Option<u64> {
         let start = std::time::Instant::now();
-        
+
         //  INTELLIGENT PREFETCHING: Analyze access patterns and prefetch likely next keys
         let cache_segments = self.convert_segments_to_cache_optimized();
         self.prefetcher.intelligent_prefetch(key, &cache_segments);
-        
+
         //  OPTIMIZED LOOKUP: Use RMI with cache-aware optimizations
         let result = self.rmi.lookup(key);
-        
+
         //  CACHE HIT RATE TRACKING: Monitor cache performance
         let cache_hit = result.is_some();
         let current_hit_rate = if cache_hit { 95 } else { 85 }; // Simplified calculation
-        self.performance_monitor.record_cache_hit_rate(current_hit_rate);
-        
+        self.performance_monitor
+            .record_cache_hit_rate(current_hit_rate);
+
         // Record performance metrics
         let duration = start.elapsed();
-        self.performance_monitor.record_latency(duration.as_micros() as u64);
+        self.performance_monitor
+            .record_latency(duration.as_micros() as u64);
         self.performance_monitor.record_throughput(1);
-        
+
         result
     }
-    
+
     ///  ADAPTIVE OPTIMIZATION
     /// Continuously optimize based on performance metrics
     pub fn adaptive_optimization(&mut self) {
         let hints = self.performance_monitor.adaptive_optimization();
-        
+
         // Apply optimization hints
         if hints.should_increase_batch_size {
             // Increase batch size for better throughput
             self.optimize_batch_size();
         }
-        
+
         if hints.should_enable_aggressive_prefetching {
             // Enable more aggressive prefetching
             self.enable_aggressive_prefetching();
         }
-        
+
         if hints.should_optimize_memory_layout {
             // Optimize memory layout for better cache performance
             self.optimize_memory_layout();
         }
     }
-    
+
     ///  OPTIMIZE BATCH SIZE
     /// Dynamic batch size optimization based on performance metrics
     fn optimize_batch_size(&mut self) {
-        let current_throughput = self.performance_monitor.throughput_counter.load(Ordering::Relaxed);
+        let current_throughput = self
+            .performance_monitor
+            .throughput_counter
+            .load(Ordering::Relaxed);
         let current_latency = self.performance_monitor.calculate_p99_latency();
-        
+
         // Get current optimal batch size from SIMD capabilities
         let capabilities = AdaptiveRMI::simd_capabilities();
         let current_batch = capabilities.optimal_batch_size;
-        
+
         //  ADAPTIVE SCALING: Adjust based on performance characteristics
         let new_batch_size = if current_latency > 1000 {
             // High latency: reduce batch size for better responsiveness
@@ -5560,7 +6035,7 @@ impl OptimizedBinaryProtocol {
                 (current_batch.saturating_sub(8)).max(8)
             }
         };
-        
+
         //  HARDWARE-SPECIFIC CONSTRAINTS
         let optimal_batch = match std::env::consts::ARCH {
             "x86_64" => {
@@ -5573,33 +6048,41 @@ impl OptimizedBinaryProtocol {
                 // Use multiples of 4 for dual-register operations
                 ((new_batch_size + 3) / 4) * 4
             }
-            _ => new_batch_size
+            _ => new_batch_size,
         };
-        
+
         //  APPLY OPTIMIZATION: Update batch processor configuration
-        self.batch_processor.prediction_hints.store(optimal_batch, Ordering::Relaxed);
-        
+        self.batch_processor
+            .prediction_hints
+            .store(optimal_batch, Ordering::Relaxed);
+
         //  METRICS RECORDING
         #[cfg(not(feature = "bench-no-metrics"))]
         {
             // Update metrics if available
             tracing::info!(
                 "Batch size optimized: {} → {} (latency: {}μs, throughput: {} ops/sec)",
-                current_batch, optimal_batch, current_latency, current_throughput
+                current_batch,
+                optimal_batch,
+                current_latency,
+                current_throughput
             );
         }
-        
+
         #[cfg(feature = "bench-no-metrics")]
         {
             // Silent optimization for benchmarks
         }
     }
-    
+
     ///  ENABLE AGGRESSIVE PREFETCHING
     /// Enable enterprise-grade aggressive prefetching strategies
     fn enable_aggressive_prefetching(&mut self) {
-        let cache_hit_rate = self.performance_monitor.cache_hit_rate.load(Ordering::Relaxed);
-        
+        let cache_hit_rate = self
+            .performance_monitor
+            .cache_hit_rate
+            .load(Ordering::Relaxed);
+
         //  ADAPTIVE PREFETCH DISTANCE: Based on cache performance
         let new_prefetch_distance = if cache_hit_rate < 80 {
             // Poor cache performance: increase prefetch distance
@@ -5611,101 +6094,118 @@ impl OptimizedBinaryProtocol {
             // Good performance: maintain current distance
             self.prefetcher.prefetch_distance
         };
-        
+
         self.prefetcher.prefetch_distance = new_prefetch_distance;
-        
+
         //  HARDWARE-SPECIFIC PREFETCHING
         #[cfg(target_arch = "x86_64")]
         {
             // x86_64: Enable aggressive prefetch hints
             self.prefetcher.access_history.reserve(2000); // Larger history for better prediction
         }
-        
+
         #[cfg(target_arch = "aarch64")]
         {
             // Apple Silicon: Leverage unified memory architecture
             self.prefetcher.access_history.reserve(1500); // Optimize for unified memory
         }
-        
+
         //  PATTERN-SPECIFIC OPTIMIZATIONS
-        let sequential_access = self.prefetcher.access_history.len() > 10 && 
-            self.prefetcher.access_history.iter().rev().take(3).collect::<Vec<_>>()
-                .windows(2).all(|w| w[1] < w[0]); // Check if descending (most recent first)
-        
+        let sequential_access = self.prefetcher.access_history.len() > 10
+            && self
+                .prefetcher
+                .access_history
+                .iter()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .all(|w| w[1] < w[0]); // Check if descending (most recent first)
+
         if sequential_access {
             // Sequential access: enable aggressive sequential prefetching
             self.prefetcher.prefetch_distance = self.prefetcher.prefetch_distance.max(4);
         }
-        
+
         //  METRICS AND VALIDATION
         #[cfg(not(feature = "bench-no-metrics"))]
         {
             tracing::info!(
                 "Aggressive prefetching enabled: distance={}, cache_hit_rate={}%, sequential={}",
-                new_prefetch_distance, cache_hit_rate, sequential_access
+                new_prefetch_distance,
+                cache_hit_rate,
+                sequential_access
             );
         }
     }
-    
+
     ///  OPTIMIZE MEMORY LAYOUT
     /// Enterprise-grade memory layout optimization for cache efficiency
     fn optimize_memory_layout(&mut self) {
         let memory_usage = self.get_current_memory_usage();
         let cache_pressure = self.detect_cache_pressure();
-        
+
         //  SEGMENT REORGANIZATION: Optimize segment layout for cache efficiency
         let _cache_segments = self.convert_segments_to_cache_optimized();
-        
+
         //  MEMORY POOL OPTIMIZATION: Adjust pool sizes based on usage patterns
         let pool_hit_rate = self.memory_pool.get_hit_rate();
-        
+
         if pool_hit_rate < 90.0 {
             // Poor pool performance: increase pool sizes
             self.memory_pool.expand_pools(1.5);
-        } else if memory_usage > 500_000_000 { // 500MB threshold
+        } else if memory_usage > 500_000_000 {
+            // 500MB threshold
             // High memory usage: optimize layout
             self.memory_pool.compact_pools();
         }
-        
+
         //  CACHE-LINE ALIGNMENT: Ensure all critical data structures are cache-aligned
         self.align_critical_structures();
-        
+
         //  NUMA OPTIMIZATION: Optimize for NUMA topology if available
         #[cfg(target_os = "linux")]
         {
             self.optimize_numa_allocation();
         }
-        
+
         //  PREFETCH OPTIMIZATION: Adjust prefetch strategies based on layout
         let segments_per_cache_line = 64 / std::mem::size_of::<CacheOptimizedSegment>();
         if segments_per_cache_line > 0 {
-            self.prefetcher.prefetch_distance = self.prefetcher.prefetch_distance
+            self.prefetcher.prefetch_distance = self
+                .prefetcher
+                .prefetch_distance
                 .max(segments_per_cache_line);
         }
-        
+
         //  METRICS RECORDING
         #[cfg(not(feature = "bench-no-metrics"))]
         {
             tracing::info!(
                 "Memory layout optimized: usage={} MB, cache_pressure={}, pool_hit_rate={:.1}%",
-                memory_usage / 1_000_000, cache_pressure, pool_hit_rate
+                memory_usage / 1_000_000,
+                cache_pressure,
+                pool_hit_rate
             );
         }
     }
-    
+
     /// Detect cache pressure through performance metrics
     fn detect_cache_pressure(&self) -> u8 {
-        let cache_hit_rate = self.performance_monitor.cache_hit_rate.load(Ordering::Relaxed);
+        let cache_hit_rate = self
+            .performance_monitor
+            .cache_hit_rate
+            .load(Ordering::Relaxed);
         let p99_latency = self.performance_monitor.calculate_p99_latency();
-        
+
         match (cache_hit_rate, p99_latency) {
             (hit_rate, latency) if hit_rate < 80 || latency > 2000 => 3, // High pressure
             (hit_rate, latency) if hit_rate < 90 || latency > 1000 => 2, // Medium pressure
             (hit_rate, latency) if hit_rate < 95 || latency > 500 => 1,  // Low pressure
-            _ => 0, // No pressure
+            _ => 0,                                                      // No pressure
         }
     }
-    
+
     /// Align critical data structures to cache boundaries
     fn align_critical_structures(&mut self) {
         // Ensure segment data is cache-aligned
@@ -5714,23 +6214,64 @@ impl OptimizedBinaryProtocol {
             // Verify alignment - already done by CacheOptimizedSegment design
             debug_assert_eq!(segment.keys.as_ptr() as usize % 64, 0);
         }
-        
+
         // Align memory pool buffers
         self.memory_pool.align_hot_buffers();
     }
-    
+
     /// Get current memory usage in bytes
     fn get_current_memory_usage(&self) -> usize {
         self.memory_pool.usage_tracker.load(Ordering::Relaxed) * 8 + // 8 bytes per u64
         self.prefetcher.access_history.len() * 8 + // Access history size
         1024 * 1024 // Estimated overhead (1MB)
     }
-    
+
     /// Optimize NUMA allocation for multi-socket systems
     #[cfg(target_os = "linux")]
     fn optimize_numa_allocation(&self) {
         // NUMA optimization would use libnuma bindings
         // Simplified for compatibility
         tracing::debug!("NUMA optimization applied for Linux systems");
+    }
+}
+
+#[cfg(feature = "rmi-build-profiler")]
+struct BuildProfiler {
+    total_keys: usize,
+    start: Instant,
+    last: Instant,
+}
+
+#[cfg(feature = "rmi-build-profiler")]
+impl BuildProfiler {
+    fn new(total_keys: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            total_keys,
+            start: now,
+            last: now,
+        }
+    }
+
+    fn lap(&mut self, phase: &str) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last);
+        self.last = now;
+        self.log_phase(phase, elapsed);
+    }
+
+    fn finish(&mut self) {
+        let total = self.start.elapsed();
+        self.log_phase("total", total);
+    }
+
+    fn log_phase(&self, phase: &str, duration: std::time::Duration) {
+        tracing::info!(
+            target: "kyrodb::rmi_build_profiler",
+            phase,
+            elapsed_ms = duration.as_secs_f64() * 1000.0,
+            total_keys = self.total_keys,
+            "adaptive_rmi_build_phase_complete"
+        );
     }
 }

@@ -1,7 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use kyrodb_engine::index::{BTreeIndex, Index, PrimaryIndex};
-use std::sync::Arc;
 use rand::prelude::*;
+use std::sync::Arc;
 
 /// Pure RMI vs BTree lookup performance at massive scale
 /// Tests: 1M, 10M, 50M key datasets with random lookup patterns
@@ -9,22 +9,22 @@ use rand::prelude::*;
 
 fn benchmark_raw_lookup_scale(c: &mut Criterion) {
     let mut group = c.benchmark_group("raw_index_scale");
-    
+
     // Test sizes: 1M, 10M, 50M keys
     let sizes = vec![
-        1_000_000,   // 1M
-        10_000_000,  // 10M
-        50_000_000,  // 50M
+        1_000_000,  // 1M
+        10_000_000, // 10M
+        50_000_000, // 50M
     ];
-    
+
     for &size in &sizes {
         println!("🔥 Preparing dataset: {} keys", size);
-        
+
         // Generate sorted keys for realistic data distribution
         let mut keys: Vec<u64> = (0..size)
             .map(|i| (i as u64) * 100 + (i as u64 % 1000)) // Add some variance
             .collect();
-        
+
         // Generate random lookup keys (mix of hits and misses)
         let mut rng = StdRng::seed_from_u64(42);
         let lookup_keys: Vec<u64> = (0..1000)
@@ -38,25 +38,27 @@ fn benchmark_raw_lookup_scale(c: &mut Criterion) {
                 }
             })
             .collect();
-        
+
         // Create BTree index
         println!("🌳 Building BTree index...");
         let mut btree = BTreeIndex::new();
         for (i, &key) in keys.iter().enumerate() {
             btree.insert(key, i as u64);
         }
-        
+
         // Create RMI index
         #[cfg(feature = "learned-index")]
         {
             println!("🧠 Building RMI index...");
-            let key_offset_pairs: Vec<(u64, u64)> = keys.iter()
+            let key_offset_pairs: Vec<(u64, u64)> = keys
+                .iter()
                 .enumerate()
                 .map(|(i, &key)| (key, i as u64))
                 .collect();
-            let adaptive_rmi = kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
+            let adaptive_rmi =
+                kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
             let rmi_index = PrimaryIndex::AdaptiveRmi(Arc::new(adaptive_rmi));
-            
+
             // Benchmark RMI
             group.bench_with_input(
                 BenchmarkId::new("rmi_lookup", format!("{}M", size / 1_000_000)),
@@ -75,7 +77,7 @@ fn benchmark_raw_lookup_scale(c: &mut Criterion) {
                 },
             );
         }
-        
+
         // Benchmark BTree
         group.bench_with_input(
             BenchmarkId::new("btree_lookup", format!("{}M", size / 1_000_000)),
@@ -89,30 +91,30 @@ fn benchmark_raw_lookup_scale(c: &mut Criterion) {
                 })
             },
         );
-        
+
         println!("✅ Completed benchmarks for {} keys", size);
     }
-    
+
     group.finish();
 }
 
 fn benchmark_sequential_vs_random_patterns(c: &mut Criterion) {
     let mut group = c.benchmark_group("access_patterns_scale");
-    
+
     let size = 10_000_000; // 10M keys for pattern testing
     println!("🔥 Preparing 10M key dataset for pattern analysis...");
-    
+
     let keys: Vec<u64> = (0..size).map(|i| i as u64 * 10).collect();
-    
+
     // Sequential access pattern
     let sequential_keys: Vec<u64> = (0..1000).map(|i| (i * 10000) as u64 * 10).collect();
-    
+
     // Random access pattern
     let mut rng = StdRng::seed_from_u64(42);
     let random_keys: Vec<u64> = (0..1000)
         .map(|_| keys[rng.gen_range(0..keys.len())])
         .collect();
-    
+
     // Zipf distribution (hotspot pattern)
     let hotspot_keys: Vec<u64> = {
         let mut hotspot = Vec::new();
@@ -126,22 +128,24 @@ fn benchmark_sequential_vs_random_patterns(c: &mut Criterion) {
         }
         hotspot
     };
-    
+
     // Build indexes
     let mut btree = BTreeIndex::new();
     for (i, &key) in keys.iter().enumerate() {
         btree.insert(key, i as u64);
     }
-    
+
     #[cfg(feature = "learned-index")]
     {
-        let key_offset_pairs: Vec<(u64, u64)> = keys.iter()
+        let key_offset_pairs: Vec<(u64, u64)> = keys
+            .iter()
             .enumerate()
             .map(|(i, &key)| (key, i as u64))
             .collect();
-        let adaptive_rmi = kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
+        let adaptive_rmi =
+            kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
         let rmi_index = PrimaryIndex::AdaptiveRmi(Arc::new(adaptive_rmi));
-        
+
         for (pattern_name, pattern_keys) in [
             ("sequential", &sequential_keys),
             ("random", &random_keys),
@@ -164,7 +168,7 @@ fn benchmark_sequential_vs_random_patterns(c: &mut Criterion) {
                     })
                 },
             );
-            
+
             // BTree pattern test
             group.bench_with_input(
                 BenchmarkId::new("btree", pattern_name),
@@ -180,7 +184,7 @@ fn benchmark_sequential_vs_random_patterns(c: &mut Criterion) {
             );
         }
     }
-    
+
     #[cfg(not(feature = "learned-index"))]
     {
         for (pattern_name, pattern_keys) in [
@@ -203,57 +207,47 @@ fn benchmark_sequential_vs_random_patterns(c: &mut Criterion) {
             );
         }
     }
-    
+
     group.finish();
 }
 
 fn benchmark_scaling_behavior(c: &mut Criterion) {
     let mut group = c.benchmark_group("scaling_behavior");
-    
+
     // Test multiple sizes to see scaling behavior
     let sizes = vec![100_000, 500_000, 1_000_000, 5_000_000, 10_000_000];
-    
+
     for &size in &sizes {
         let keys: Vec<u64> = (0..size).map(|i| i as u64 * 7).collect(); // Prime multiplier for distribution
         let lookup_key = keys[size / 2]; // Middle key
-        
+
         // BTree scaling
         let mut btree = BTreeIndex::new();
         for (i, &key) in keys.iter().enumerate() {
             btree.insert(key, i as u64);
         }
-        
-        group.bench_with_input(
-            BenchmarkId::new("btree_scale", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    black_box(btree.get(black_box(&lookup_key)))
-                })
-            },
-        );
-        
+
+        group.bench_with_input(BenchmarkId::new("btree_scale", size), &size, |b, _| {
+            b.iter(|| black_box(btree.get(black_box(&lookup_key))))
+        });
+
         #[cfg(feature = "learned-index")]
         {
             // RMI scaling
-            let key_offset_pairs: Vec<(u64, u64)> = keys.iter()
+            let key_offset_pairs: Vec<(u64, u64)> = keys
+                .iter()
                 .enumerate()
                 .map(|(i, &key)| (key, i as u64))
                 .collect();
-            let adaptive_rmi = kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
-            
-            group.bench_with_input(
-                BenchmarkId::new("rmi_scale", size),
-                &size,
-                |b, _| {
-                    b.iter(|| {
-                        black_box(adaptive_rmi.lookup(black_box(lookup_key)))
-                    })
-                },
-            );
+            let adaptive_rmi =
+                kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
+
+            group.bench_with_input(BenchmarkId::new("rmi_scale", size), &size, |b, _| {
+                b.iter(|| black_box(adaptive_rmi.lookup(black_box(lookup_key))))
+            });
         }
     }
-    
+
     group.finish();
 }
 

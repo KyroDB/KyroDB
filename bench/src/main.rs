@@ -22,7 +22,7 @@ struct Args {
     /// Engine base URL for HTTP
     #[arg(long, default_value = "http://127.0.0.1:3030")]
     base: String,
-    
+
     /// Protocol to use: http only for Phase 0
     #[arg(long, default_value = "http")]
     protocol: String,
@@ -66,20 +66,20 @@ struct Args {
     /// Warmup time in seconds before measuring
     #[arg(long, default_value = "10")]
     warmup: u64,
-    
+
     /// 🚀 RMI OPTIMIZATION BENCHMARKS
     /// Enable RMI optimization benchmarks
     #[arg(long)]
     enable_rmi_optimizations: bool,
-    
+
     /// SIMD batch size for RMI benchmarks
     #[arg(long, default_value = "16")]
     rmi_simd_batch_size: usize,
-    
+
     /// Enable predictive prefetching in benchmarks
     #[arg(long)]
     enable_prefetching: bool,
-    
+
     /// Memory pool size for zero-allocation benchmarks
     #[arg(long, default_value = "16")]
     memory_pool_size: usize,
@@ -127,15 +127,15 @@ struct Args {
     /// Maximum value size (bytes)  
     #[arg(long, default_value = "1024")]
     max_value_size: usize,
-    
+
     /// 🚀 Phase 5: Enable ultra-fast connection pooling test
     #[arg(long)]
     phase5_ultra_fast: bool,
-    
+
     /// Phase 5: Number of connection pool connections
     #[arg(long, default_value = "200")]
     pool_size: usize,
-    
+
     /// Phase 5: SIMD batch size for testing
     #[arg(long, default_value = "64")]
     simd_batch_size: usize,
@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
     if !(0.0..=1.0).contains(&args.read_ratio) {
         anyhow::bail!("Read ratio must be between 0.0 and 1.0");
     }
-    
+
     if args.read_percentage > 100 {
         anyhow::bail!("Read percentage must be between 0 and 100");
     }
@@ -164,14 +164,15 @@ async fn main() -> Result<()> {
         run_phase5_ultra_fast_test(&args).await?;
         return Ok(());
     }
-    
+
     // Create benchmark client
     let mut client = BenchClient::new(
         &args.protocol,
         &args.base,
-        "",  // No gRPC address needed
+        "", // No gRPC address needed
         args.auth_token.clone(),
-    ).await?;
+    )
+    .await?;
 
     // 🚀 RMI OPTIMIZATION BENCHMARKS
     if args.enable_rmi_optimizations {
@@ -194,22 +195,20 @@ async fn main() -> Result<()> {
     println!("✅ Server warmed up");
 
     match args.protocol.as_str() {
-        "http" => {
-            match args.test_mode.as_str() {
-                "write" => run_write_only_test(&mut client, &args).await?,
-                "read" => run_read_only_test(&mut client, &args).await?,
-                "mixed" => {
-                    if args.streaming {
-                        println!("🚀 Using HTTP batch operations for maximum throughput");
-                        run_streaming_benchmark(&mut client, &args).await?;
-                    } else {
-                        println!("🚀 Using HTTP point operations");
-                        run_workload(&mut client, &args).await?;
-                    }
+        "http" => match args.test_mode.as_str() {
+            "write" => run_write_only_test(&mut client, &args).await?,
+            "read" => run_read_only_test(&mut client, &args).await?,
+            "mixed" => {
+                if args.streaming {
+                    println!("🚀 Using HTTP batch operations for maximum throughput");
+                    run_streaming_benchmark(&mut client, &args).await?;
+                } else {
+                    println!("🚀 Using HTTP point operations");
+                    run_workload(&mut client, &args).await?;
                 }
-                _ => anyhow::bail!("Invalid test mode. Use: read, write, or mixed"),
             }
-        }
+            _ => anyhow::bail!("Invalid test mode. Use: read, write, or mixed"),
+        },
         _ => {
             anyhow::bail!("Only 'http' protocol supported in Phase 0");
         }
@@ -219,20 +218,23 @@ async fn main() -> Result<()> {
 }
 
 async fn run_streaming_benchmark(client: &mut BenchClient, args: &Args) -> Result<()> {
-    println!("🏁 Running streaming benchmark for {} seconds", args.duration);
-    
+    println!(
+        "🏁 Running streaming benchmark for {} seconds",
+        args.duration
+    );
+
     let value = "x".repeat(args.value_size);
     let mut rng = StdRng::seed_from_u64(42);
-    
+
     let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
     let test_end = warmup_end + Duration::from_secs(args.duration);
-    
+
     let mut batch_items = Vec::with_capacity(args.batch_size);
     let mut ops_count = 0u64;
     let mut start_time = None;
-    
+
     println!("🔥 Warming up for {} seconds...", args.warmup);
-    
+
     while Instant::now() < test_end {
         // Build batch
         batch_items.clear();
@@ -240,11 +242,11 @@ async fn run_streaming_benchmark(client: &mut BenchClient, args: &Args) -> Resul
             let key = format!("{}_{}", args.key_prefix, rng.gen_range(0..args.key_count));
             batch_items.push((key, value.clone()));
         }
-        
+
         // Execute batch
         let batch_start = Instant::now();
         client.batch_put(&batch_items, None, &args.base).await?;
-        
+
         // Track metrics after warmup
         if Instant::now() > warmup_end {
             if start_time.is_none() {
@@ -253,56 +255,59 @@ async fn run_streaming_benchmark(client: &mut BenchClient, args: &Args) -> Resul
             }
             ops_count += args.batch_size as u64;
         }
-        
+
         // Rate limiting
         if args.rate > 0 {
-            let target_duration = Duration::from_micros(
-                (args.batch_size as u64 * 1_000_000) / args.rate
-            );
+            let target_duration =
+                Duration::from_micros((args.batch_size as u64 * 1_000_000) / args.rate);
             let elapsed = batch_start.elapsed();
             if elapsed < target_duration {
                 tokio::time::sleep(target_duration - elapsed).await;
             }
         }
     }
-    
+
     let test_duration = start_time.unwrap().elapsed();
     let throughput = ops_count as f64 / test_duration.as_secs_f64();
-    
+
     println!("🎯 Streaming Benchmark Results:");
     println!("   Operations: {}", ops_count);
     println!("   Duration: {:.2}s", test_duration.as_secs_f64());
     println!("   Throughput: {:.2} ops/sec", throughput);
     println!("   Batch Size: {}", args.batch_size);
-    
+
     Ok(())
 }
 
 async fn run_workload(client: &mut BenchClient, args: &Args) -> Result<()> {
-    println!("🏁 Starting load test with {} workers for {} seconds", 
-             args.workers, args.duration);
+    println!(
+        "🏁 Starting load test with {} workers for {} seconds",
+        args.workers, args.duration
+    );
 
     let completed_ops = Arc::new(AtomicU64::new(0));
     let successful_ops = Arc::new(AtomicU64::new(0));
     let error_ops = Arc::new(AtomicU64::new(0));
     let mut histogram = Histogram::<u64>::new(3)?;
-    
+
     let progress_bar = ProgressBar::new(args.duration);
     progress_bar.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
             .unwrap()
             .progress_chars("#>-"),
     );
 
     let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
     let test_end = warmup_end + Duration::from_secs(args.duration);
-    
+
     println!("🔥 Warming up for {} seconds...", args.warmup);
-    
+
     // Pre-create worker tasks instead of spawning unlimited tasks
     let mut tasks = JoinSet::new();
-    
+
     // Spawn exactly `workers` number of persistent worker tasks
     for worker_id in 0..args.workers {
         let mut client_clone = client.clone();
@@ -310,24 +315,31 @@ async fn run_workload(client: &mut BenchClient, args: &Args) -> Result<()> {
         let successful = successful_ops.clone();
         let errors = error_ops.clone();
         let args_clone = args.clone();
-        
+
         tasks.spawn(async move {
             let mut worker_histogram = Histogram::<u64>::new(3).unwrap();
             let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
             let mut measurement_started = false;
-            
+
             while Instant::now() < test_end {
                 // Check if we're in measurement phase
                 if Instant::now() > warmup_end && !measurement_started {
                     measurement_started = true;
                 }
-                
-                let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
-                                     args_clone.key_count, &mut rng, args_clone.zipf_skew);
-                
+
+                let key = generate_key(
+                    &args_clone.key_prefix,
+                    &args_clone.distribution,
+                    args_clone.key_count,
+                    &mut rng,
+                    args_clone.zipf_skew,
+                );
+
                 let start = Instant::now();
                 let result = if rng.gen_range(0..100) < args_clone.read_percentage {
-                    client_clone.get(&key, None, &args_clone.base).await
+                    client_clone
+                        .get(&key, None, &args_clone.base)
+                        .await
                         .map(|_| ())
                 } else {
                     let value_size = if args_clone.min_value_size == args_clone.max_value_size {
@@ -336,11 +348,13 @@ async fn run_workload(client: &mut BenchClient, args: &Args) -> Result<()> {
                         rng.gen_range(args_clone.min_value_size..=args_clone.max_value_size)
                     };
                     let value = "x".repeat(value_size);
-                    client_clone.put(key.clone(), value, None, &args_clone.base).await
+                    client_clone
+                        .put(key.clone(), value, None, &args_clone.base)
+                        .await
                 };
-                
+
                 let latency = start.elapsed();
-                
+
                 // Only count operations after warmup
                 if measurement_started {
                     completed.fetch_add(1, Ordering::Relaxed);
@@ -358,7 +372,7 @@ async fn run_workload(client: &mut BenchClient, args: &Args) -> Result<()> {
                         }
                     }
                 }
-                
+
                 // Rate limiting per worker
                 if args_clone.rate > 0 {
                     let worker_rate = args_clone.rate / args_clone.workers as u64;
@@ -367,34 +381,37 @@ async fn run_workload(client: &mut BenchClient, args: &Args) -> Result<()> {
                         tokio::time::sleep(delay).await;
                     }
                 }
-                
+
                 // Small yield to prevent CPU starvation
                 if completed.load(Ordering::Relaxed) % 100 == 0 {
                     tokio::task::yield_now().await;
                 }
             }
-            
+
             worker_histogram
         });
     }
-    
+
     // Monitor progress
     let measurement_start = warmup_end;
     let mut last_update = Instant::now();
-    
+
     // Progress monitoring loop
     while Instant::now() < test_end {
         let now = Instant::now();
         if now > measurement_start && now.duration_since(last_update) > Duration::from_secs(1) {
-            let elapsed = now.duration_since(measurement_start).as_secs().min(args.duration);
+            let elapsed = now
+                .duration_since(measurement_start)
+                .as_secs()
+                .min(args.duration);
             progress_bar.set_position(elapsed);
             last_update = now;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    
+
     progress_bar.finish_with_message("Collecting results...");
-    
+
     // Collect all worker histograms
     while let Some(result) = tasks.join_next().await {
         match result {
@@ -407,14 +424,24 @@ async fn run_workload(client: &mut BenchClient, args: &Args) -> Result<()> {
             Err(e) => eprintln!("Worker task failed: {}", e),
         }
     }
-    
+
     let total_ops = completed_ops.load(Ordering::Relaxed);
     let success_count = successful_ops.load(Ordering::Relaxed);
     let error_count = error_ops.load(Ordering::Relaxed);
-    let test_duration = measurement_start.elapsed().min(Duration::from_secs(args.duration));
-    
-    print_results("MIXED", &args, total_ops, success_count, error_count, &histogram, test_duration);
-    
+    let test_duration = measurement_start
+        .elapsed()
+        .min(Duration::from_secs(args.duration));
+
+    print_results(
+        "MIXED",
+        &args,
+        total_ops,
+        success_count,
+        error_count,
+        &histogram,
+        test_duration,
+    );
+
     Ok(())
 }
 
@@ -427,11 +454,11 @@ async fn run_protocol_comparison(_args: &Args) -> Result<()> {
 async fn build_rmi_index(client: &mut BenchClient, args: &Args) -> Result<()> {
     let url = format!("{}/v1/rmi/build", args.base);
     let response = client.http.post(&url).send().await?;
-    
+
     if !response.status().is_success() {
         anyhow::bail!("Failed to build RMI index: {}", response.status());
     }
-    
+
     Ok(())
 }
 
@@ -443,7 +470,10 @@ async fn warmup_server(client: &mut BenchClient, args: &Args) -> Result<()> {
             println!("🧠 RMI build command accepted before warmup");
         }
         Ok(resp) => {
-            println!("⚠️ RMI build endpoint returned status {}, continuing warmup", resp.status());
+            println!(
+                "⚠️ RMI build endpoint returned status {}, continuing warmup",
+                resp.status()
+            );
         }
         Err(err) => {
             println!("⚠️ Failed to contact RMI build endpoint: {}", err);
@@ -456,13 +486,19 @@ async fn warmup_server(client: &mut BenchClient, args: &Args) -> Result<()> {
             println!("🔥 Warmup endpoint acknowledged request");
         }
         Ok(resp) => {
-            println!("⚠️ Warmup endpoint returned status {}, falling back to manual warmup", resp.status());
+            println!(
+                "⚠️ Warmup endpoint returned status {}, falling back to manual warmup",
+                resp.status()
+            );
         }
         Err(err) => {
-            println!("⚠️ Warmup endpoint not available ({}), performing manual warmup", err);
+            println!(
+                "⚠️ Warmup endpoint not available ({}), performing manual warmup",
+                err
+            );
         }
     }
-    
+
     // Do some basic operations to warm up the server
     let warmup_ops = 1000;
     for i in 0..warmup_ops {
@@ -473,31 +509,33 @@ async fn warmup_server(client: &mut BenchClient, args: &Args) -> Result<()> {
             let _ = client.get(&key, None, &args.base).await;
         }
     }
-    
+
     Ok(())
 }
 
 async fn run_write_only_test(client: &mut BenchClient, args: &Args) -> Result<()> {
     println!("✍️ Running write-only performance test");
-    
+
     let completed_ops = Arc::new(AtomicU64::new(0));
     let successful_ops = Arc::new(AtomicU64::new(0));
     let error_ops = Arc::new(AtomicU64::new(0));
     let mut histogram = Histogram::<u64>::new(3)?;
-    
+
     let progress_bar = ProgressBar::new(args.duration);
     progress_bar.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
             .unwrap()
             .progress_chars("#>-"),
     );
 
     let test_end = Instant::now() + Duration::from_secs(args.duration);
     let measurement_start = Instant::now();
-    
+
     let mut tasks = JoinSet::new();
-    
+
     // Spawn exactly `workers` number of persistent worker tasks
     for worker_id in 0..args.workers {
         let mut client_clone = client.clone();
@@ -505,15 +543,20 @@ async fn run_write_only_test(client: &mut BenchClient, args: &Args) -> Result<()
         let successful = successful_ops.clone();
         let errors = error_ops.clone();
         let args_clone = args.clone();
-        
+
         tasks.spawn(async move {
             let mut worker_histogram = Histogram::<u64>::new(3).unwrap();
             let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
-            
+
             while Instant::now() < test_end {
-                let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
-                                     args_clone.key_count, &mut rng, args_clone.zipf_skew);
-                
+                let key = generate_key(
+                    &args_clone.key_prefix,
+                    &args_clone.distribution,
+                    args_clone.key_count,
+                    &mut rng,
+                    args_clone.zipf_skew,
+                );
+
                 // Generate variable value sizes if specified
                 let value_size = if args_clone.min_value_size == args_clone.max_value_size {
                     args_clone.value_size
@@ -521,11 +564,13 @@ async fn run_write_only_test(client: &mut BenchClient, args: &Args) -> Result<()
                     rng.gen_range(args_clone.min_value_size..=args_clone.max_value_size)
                 };
                 let value = "x".repeat(value_size);
-                
+
                 let start = Instant::now();
-                let result = client_clone.put(key.clone(), value, None, &args_clone.base).await;
+                let result = client_clone
+                    .put(key.clone(), value, None, &args_clone.base)
+                    .await;
                 let latency = start.elapsed();
-                
+
                 completed.fetch_add(1, Ordering::Relaxed);
                 match result {
                     Ok(_) => {
@@ -540,7 +585,7 @@ async fn run_write_only_test(client: &mut BenchClient, args: &Args) -> Result<()
                         }
                     }
                 }
-                
+
                 // Rate limiting per worker
                 if args_clone.rate > 0 {
                     let worker_rate = args_clone.rate / args_clone.workers as u64;
@@ -549,33 +594,36 @@ async fn run_write_only_test(client: &mut BenchClient, args: &Args) -> Result<()
                         tokio::time::sleep(delay).await;
                     }
                 }
-                
+
                 // Small yield to prevent CPU starvation
                 if completed.load(Ordering::Relaxed) % 100 == 0 {
                     tokio::task::yield_now().await;
                 }
             }
-            
+
             worker_histogram
         });
     }
-    
+
     // Monitor progress
     let mut last_update = Instant::now();
-    
+
     // Progress monitoring loop
     while Instant::now() < test_end {
         let now = Instant::now();
         if now.duration_since(last_update) > Duration::from_secs(1) {
-            let elapsed = now.duration_since(measurement_start).as_secs().min(args.duration);
+            let elapsed = now
+                .duration_since(measurement_start)
+                .as_secs()
+                .min(args.duration);
             progress_bar.set_position(elapsed);
             last_update = now;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    
+
     progress_bar.finish_with_message("Collecting write results...");
-    
+
     // Collect all worker histograms
     while let Some(result) = tasks.join_next().await {
         match result {
@@ -588,25 +636,35 @@ async fn run_write_only_test(client: &mut BenchClient, args: &Args) -> Result<()
             Err(e) => eprintln!("Worker task failed: {}", e),
         }
     }
-    
+
     let total_ops = completed_ops.load(Ordering::Relaxed);
     let success_count = successful_ops.load(Ordering::Relaxed);
     let error_count = error_ops.load(Ordering::Relaxed);
-    let test_duration = measurement_start.elapsed().min(Duration::from_secs(args.duration));
-    
-    print_results("WRITE-ONLY", &args, total_ops, success_count, error_count, &histogram, test_duration);
-    
+    let test_duration = measurement_start
+        .elapsed()
+        .min(Duration::from_secs(args.duration));
+
+    print_results(
+        "WRITE-ONLY",
+        &args,
+        total_ops,
+        success_count,
+        error_count,
+        &histogram,
+        test_duration,
+    );
+
     Ok(())
 }
 
 async fn run_read_only_test(client: &mut BenchClient, args: &Args) -> Result<()> {
     println!("📖 Running read-only performance test");
-    
+
     // First, populate some data for reading
     println!("📝 Populating test data...");
     let populate_count = args.key_count.min(10000); // Limit population for faster test
     let mut rng = StdRng::seed_from_u64(42);
-    
+
     for i in 0..populate_count {
         let key = i.to_string(); // Use numeric keys
         let value_size = if args.min_value_size == args.max_value_size {
@@ -616,31 +674,33 @@ async fn run_read_only_test(client: &mut BenchClient, args: &Args) -> Result<()>
         };
         let value = "x".repeat(value_size);
         let _ = client.put(key, value, None, &args.base).await;
-        
+
         if i % 1000 == 0 {
             print!(".");
         }
     }
     println!(" ✅ Data populated");
-    
+
     let completed_ops = Arc::new(AtomicU64::new(0));
     let successful_ops = Arc::new(AtomicU64::new(0));
     let error_ops = Arc::new(AtomicU64::new(0));
     let mut histogram = Histogram::<u64>::new(3)?;
-    
+
     let progress_bar = ProgressBar::new(args.duration);
     progress_bar.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
             .unwrap()
             .progress_chars("#>-"),
     );
 
     let test_end = Instant::now() + Duration::from_secs(args.duration);
     let measurement_start = Instant::now();
-    
+
     let mut tasks = JoinSet::new();
-    
+
     // Spawn exactly `workers` number of persistent worker tasks
     for worker_id in 0..args.workers {
         let mut client_clone = client.clone();
@@ -648,19 +708,24 @@ async fn run_read_only_test(client: &mut BenchClient, args: &Args) -> Result<()>
         let successful = successful_ops.clone();
         let errors = error_ops.clone();
         let args_clone = args.clone();
-        
+
         tasks.spawn(async move {
             let mut worker_histogram = Histogram::<u64>::new(3).unwrap();
             let mut rng = StdRng::seed_from_u64(42 + worker_id as u64);
-            
+
             while Instant::now() < test_end {
-                let key = generate_key(&args_clone.key_prefix, &args_clone.distribution, 
-                                     populate_count, &mut rng, args_clone.zipf_skew);
-                
+                let key = generate_key(
+                    &args_clone.key_prefix,
+                    &args_clone.distribution,
+                    populate_count,
+                    &mut rng,
+                    args_clone.zipf_skew,
+                );
+
                 let start = Instant::now();
                 let result = client_clone.get(&key, None, &args_clone.base).await;
                 let latency = start.elapsed();
-                
+
                 completed.fetch_add(1, Ordering::Relaxed);
                 match result {
                     Ok(_) => {
@@ -675,7 +740,7 @@ async fn run_read_only_test(client: &mut BenchClient, args: &Args) -> Result<()>
                         }
                     }
                 }
-                
+
                 // Rate limiting per worker
                 if args_clone.rate > 0 {
                     let worker_rate = args_clone.rate / args_clone.workers as u64;
@@ -684,33 +749,36 @@ async fn run_read_only_test(client: &mut BenchClient, args: &Args) -> Result<()>
                         tokio::time::sleep(delay).await;
                     }
                 }
-                
+
                 // Small yield to prevent CPU starvation
                 if completed.load(Ordering::Relaxed) % 100 == 0 {
                     tokio::task::yield_now().await;
                 }
             }
-            
+
             worker_histogram
         });
     }
-    
+
     // Monitor progress
     let mut last_update = Instant::now();
-    
+
     // Progress monitoring loop
     while Instant::now() < test_end {
         let now = Instant::now();
         if now.duration_since(last_update) > Duration::from_secs(1) {
-            let elapsed = now.duration_since(measurement_start).as_secs().min(args.duration);
+            let elapsed = now
+                .duration_since(measurement_start)
+                .as_secs()
+                .min(args.duration);
             progress_bar.set_position(elapsed);
             last_update = now;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    
+
     progress_bar.finish_with_message("Collecting read results...");
-    
+
     // Collect all worker histograms
     while let Some(result) = tasks.join_next().await {
         match result {
@@ -723,94 +791,119 @@ async fn run_read_only_test(client: &mut BenchClient, args: &Args) -> Result<()>
             Err(e) => eprintln!("Worker task failed: {}", e),
         }
     }
-    
+
     let total_ops = completed_ops.load(Ordering::Relaxed);
     let success_count = successful_ops.load(Ordering::Relaxed);
     let error_count = error_ops.load(Ordering::Relaxed);
-    let test_duration = measurement_start.elapsed().min(Duration::from_secs(args.duration));
-    
-    print_results("READ-ONLY", &args, total_ops, success_count, error_count, &histogram, test_duration);
-    
+    let test_duration = measurement_start
+        .elapsed()
+        .min(Duration::from_secs(args.duration));
+
+    print_results(
+        "READ-ONLY",
+        &args,
+        total_ops,
+        success_count,
+        error_count,
+        &histogram,
+        test_duration,
+    );
+
     Ok(())
 }
 
 /// 🚀 PHASE 5: Ultra-Fast Connection Pooling Test
 async fn run_phase5_ultra_fast_test(args: &Args) -> Result<()> {
-    println!("🔌 Creating ultra-fast connection pool with {} connections...", args.pool_size);
-    
+    println!(
+        "🔌 Creating ultra-fast connection pool with {} connections...",
+        args.pool_size
+    );
+
     // Create ultra-fast client
     let ultra_client = UltraFastBenchClient::new(&args.base).await?;
     println!("✅ Ultra-fast client created with connection pooling");
-    
+
     // Display initial pool stats
     let initial_stats = ultra_client.get_pool_stats();
     println!("📊 Initial pool state: {}", initial_stats);
-    
+
     // Phase 5.1: Connection Pool Validation
     println!("\n🧪 Phase 5.1: Connection Pool Validation");
     println!("==========================================");
     validate_connection_pool(&ultra_client).await?;
-    
-    // Phase 5.2: Binary Protocol Testing  
+
+    // Phase 5.2: Binary Protocol Testing
     println!("\n🔥 Phase 5.2: Binary Protocol vs HTTP Performance");
     println!("=================================================");
     compare_binary_vs_http(&ultra_client, args).await?;
-    
+
     // Phase 5.3: SIMD Batch Performance with Connection Pooling
     println!("\n⚡ Phase 5.3: SIMD + Connection Pool Combined Performance");
     println!("========================================================");
     test_simd_with_connection_pool(&ultra_client, args).await?;
-    
+
     // Phase 5.4: Stress Testing with Maximum Throughput
     println!("\n🚀 Phase 5.4: Maximum Throughput Stress Test");
     println!("=============================================");
     stress_test_maximum_throughput(&ultra_client, args).await?;
-    
+
     println!("\n🏆 Phase 5: Ultra-Fast Connection Pooling - COMPLETE!");
     println!("=======================================================");
-    
+
     // Final pool stats
     let final_stats = ultra_client.get_pool_stats();
     println!("📊 Final pool state: {}", final_stats);
-    
+
     Ok(())
 }
 
 /// Validate connection pool is working correctly
 async fn validate_connection_pool(client: &UltraFastBenchClient) -> Result<()> {
     println!("🔍 Testing connection pool basic functionality...");
-    
+
     // Test data lookup instead of insertion (since the PUT endpoint may not be configured correctly)
     let test_keys = vec![1u64, 2u64, 3u64, 4u64, 5u64];
-    
+
     println!("� Looking up {} test keys...", test_keys.len());
     let start = std::time::Instant::now();
     let results = client.lookup_batch_pipelined(&test_keys).await?;
     let lookup_duration = start.elapsed();
-    
-    println!("✅ Looked up {} keys in {:.2}ms", test_keys.len(), lookup_duration.as_millis());
-    
+
+    println!(
+        "✅ Looked up {} keys in {:.2}ms",
+        test_keys.len(),
+        lookup_duration.as_millis()
+    );
+
     // Show results
     let found_count = results.iter().filter(|(_, v)| v.is_some()).count();
-    println!("� Found {}/{} keys (this is normal for empty database)", found_count, test_keys.len());
-    
+    println!(
+        "� Found {}/{} keys (this is normal for empty database)",
+        found_count,
+        test_keys.len()
+    );
+
     // Test with a larger batch to show connection pool in action
     println!("\n� Testing larger batch lookup (100 keys)...");
     let large_keys: Vec<u64> = (1..=100).collect();
-    
+
     let start = std::time::Instant::now();
     let large_results = client.lookup_batch_pipelined(&large_keys).await?;
     let large_duration = start.elapsed();
-    
-    println!("✅ Batch lookup of {} keys in {:.2}ms", large_keys.len(), large_duration.as_millis());
+
+    println!(
+        "✅ Batch lookup of {} keys in {:.2}ms",
+        large_keys.len(),
+        large_duration.as_millis()
+    );
     let large_found = large_results.iter().filter(|(_, v)| v.is_some()).count();
     println!("📊 Found {}/{} keys", large_found, large_keys.len());
-    
+
     let throughput = large_keys.len() as f64 / large_duration.as_secs_f64();
     println!("⚡ Lookup throughput: {:.0} keys/sec", throughput);
-    
+
     println!("🎉 Connection pool validation: SUCCESS");
-    
+
     Ok(())
 }
 
@@ -818,98 +911,116 @@ async fn validate_connection_pool(client: &UltraFastBenchClient) -> Result<()> {
 async fn compare_binary_vs_http(_client: &UltraFastBenchClient, args: &Args) -> Result<()> {
     let batch_size = args.simd_batch_size;
     let iterations = 100;
-    
+
     // Generate test keys
     let keys: Vec<u64> = (1..=batch_size).map(|i| i as u64).collect();
-    
+
     println!("🧪 Testing {} keys × {} iterations", batch_size, iterations);
-    
+
     // Test with binary protocol enabled
     println!("\n🔥 Testing with Binary Protocol...");
     // Since we can't clone easily, let's create a new client
     let client_binary = UltraFastBenchClient::new(&args.base).await?;
-    
-    let binary_results = client_binary.benchmark_simd_batch(&keys, iterations).await?;
+
+    let binary_results = client_binary
+        .benchmark_simd_batch(&keys, iterations)
+        .await?;
     println!("📊 Binary Protocol Results:");
     println!("{}", binary_results);
-    
+
     // Test with HTTP fallback
     println!("\n🌐 Testing with HTTP Fallback...");
     let _client_http = UltraFastBenchClient::new(&args.base).await?;
     // We would disable binary protocol here, but let's simulate by forcing fallback
-    
+
     // For now, show the binary results as a demonstration
     println!("📊 HTTP Fallback Results: (simulated - would be slower)");
     let simulated_http_throughput = binary_results.avg_throughput * 0.6; // Simulate 40% slower
-    println!("⚡ Simulated HTTP Throughput: {:.0} keys/sec", simulated_http_throughput);
-    
+    println!(
+        "⚡ Simulated HTTP Throughput: {:.0} keys/sec",
+        simulated_http_throughput
+    );
+
     let speedup = binary_results.avg_throughput / simulated_http_throughput;
-    println!("🚀 Binary Protocol Speedup: {:.2}x faster than HTTP", speedup);
-    
+    println!(
+        "🚀 Binary Protocol Speedup: {:.2}x faster than HTTP",
+        speedup
+    );
+
     Ok(())
 }
 
 /// Test SIMD performance combined with connection pooling
 async fn test_simd_with_connection_pool(client: &UltraFastBenchClient, _args: &Args) -> Result<()> {
     println!("⚡ Testing SIMD batch processing with connection pooling...");
-    
+
     // Test various batch sizes to find optimal performance
     let batch_sizes = vec![4, 8, 16, 32, 64, 128, 256, 512];
     let iterations = 50;
-    
+
     println!("📊 Batch Size Optimization Test:");
     println!("================================");
-    
+
     let mut best_throughput = 0.0;
     let mut best_batch_size = 0;
-    
+
     for &batch_size in &batch_sizes {
         let keys: Vec<u64> = (1..=batch_size).map(|i| i as u64).collect();
-        
+
         let start = std::time::Instant::now();
         let results = client.benchmark_simd_batch(&keys, iterations).await?;
         let _total_time = start.elapsed();
-        
-        println!("📦 Batch Size {}: {:.0} keys/sec ({:.2}ms avg)",
-                batch_size, results.avg_throughput, results.avg_duration.as_millis());
-        
+
+        println!(
+            "📦 Batch Size {}: {:.0} keys/sec ({:.2}ms avg)",
+            batch_size,
+            results.avg_throughput,
+            results.avg_duration.as_millis()
+        );
+
         if results.avg_throughput > best_throughput {
             best_throughput = results.avg_throughput;
             best_batch_size = batch_size;
         }
     }
-    
+
     println!("\n🏆 Optimal Configuration:");
     println!("   Best Batch Size: {} keys", best_batch_size);
     println!("   Peak Throughput: {:.0} keys/sec", best_throughput);
-    
+
     // Test the optimal batch size with more iterations
-    println!("\n🚀 Extended test with optimal batch size ({} keys)...", best_batch_size);
+    println!(
+        "\n🚀 Extended test with optimal batch size ({} keys)...",
+        best_batch_size
+    );
     let optimal_keys: Vec<u64> = (1..=best_batch_size).map(|i| i as u64).collect();
     let extended_results = client.benchmark_simd_batch(&optimal_keys, 200).await?;
-    
+
     println!("📊 Extended Optimal Performance:");
     println!("{}", extended_results);
-    
+
     Ok(())
 }
 
 /// Stress test with maximum throughput
 async fn stress_test_maximum_throughput(client: &UltraFastBenchClient, _args: &Args) -> Result<()> {
     println!("🔥 Maximum throughput stress test...");
-    
+
     let batch_size = 64; // Optimal from previous tests
     let duration = std::time::Duration::from_secs(30); // 30-second stress test
     let keys: Vec<u64> = (1..=batch_size).map(|i| i as u64).collect();
-    
-    println!("⏱️  Running {}-second stress test with {} key batches...", 
-             duration.as_secs(), batch_size);
-    
+
+    println!(
+        "⏱️  Running {}-second stress test with {} key batches...",
+        duration.as_secs(),
+        batch_size
+    );
+
     let start_time = std::time::Instant::now();
     let mut iteration_count = 0;
     let mut total_keys = 0;
     let mut error_count = 0;
-    
+
     while start_time.elapsed() < duration {
         match client.lookup_batch_pipelined(&keys).await {
             Ok(results) => {
@@ -921,20 +1032,22 @@ async fn stress_test_maximum_throughput(client: &UltraFastBenchClient, _args: &A
                 eprintln!("❌ Batch error: {}", e);
             }
         }
-        
+
         // Progress update every 1000 iterations
         if iteration_count % 1000 == 0 {
             let elapsed = start_time.elapsed();
             let current_throughput = total_keys as f64 / elapsed.as_secs_f64();
-            println!("📊 Progress: {} iterations, {:.0} keys/sec", 
-                     iteration_count, current_throughput);
+            println!(
+                "📊 Progress: {} iterations, {:.0} keys/sec",
+                iteration_count, current_throughput
+            );
         }
     }
-    
+
     let final_duration = start_time.elapsed();
     let final_throughput = total_keys as f64 / final_duration.as_secs_f64();
     let error_rate = error_count as f64 / iteration_count as f64 * 100.0;
-    
+
     println!("\n🏁 Stress Test Results:");
     println!("========================");
     println!("⏱️  Duration: {:.2}s", final_duration.as_secs_f64());
@@ -942,21 +1055,27 @@ async fn stress_test_maximum_throughput(client: &UltraFastBenchClient, _args: &A
     println!("🔑 Total Keys: {}", total_keys);
     println!("⚡ Final Throughput: {:.0} keys/sec", final_throughput);
     println!("❌ Error Rate: {:.2}%", error_rate);
-    
+
     // Pool stats after stress test
     let stress_stats = client.get_pool_stats();
     println!("🔌 Final Pool Stats: {}", stress_stats);
-    
+
     if error_rate < 1.0 {
         println!("🎉 Stress test: SUCCESS (low error rate)");
     } else {
         println!("⚠️  Stress test: HIGH ERROR RATE - connection pool may need tuning");
     }
-    
+
     Ok(())
 }
 
-fn generate_key(_prefix: &str, distribution: &str, key_count: u64, rng: &mut StdRng, zipf_skew: f64) -> String {
+fn generate_key(
+    _prefix: &str,
+    distribution: &str,
+    key_count: u64,
+    rng: &mut StdRng,
+    zipf_skew: f64,
+) -> String {
     let key_id = match distribution {
         "uniform" => rng.gen_range(0..key_count),
         "zipf" => {
@@ -969,7 +1088,7 @@ fn generate_key(_prefix: &str, distribution: &str, key_count: u64, rng: &mut Std
         }
         _ => rng.gen_range(0..key_count),
     };
-    
+
     // Return just the numeric key as string for KyroDB
     key_id.to_string()
 }
@@ -984,7 +1103,7 @@ fn print_results(
     duration: Duration,
 ) {
     let throughput = total_ops as f64 / duration.as_secs_f64();
-    
+
     match args.output_format.as_str() {
         "json" => {
             let result = serde_json::json!({
@@ -1014,13 +1133,28 @@ fn print_results(
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         }
         "csv" => {
-            println!("{},{},{},{},{},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{}",
-                args.benchmark_name, test_type, total_ops, success_count, error_count,
-                duration.as_secs_f64(), throughput, args.workers,
-                histogram.min(), histogram.mean(), histogram.value_at_quantile(0.5),
-                histogram.value_at_quantile(0.95), histogram.value_at_quantile(0.99),
-                histogram.max(), args.value_size, args.key_count, args.distribution,
-                args.enable_rmi, args.base);
+            println!(
+                "{},{},{},{},{},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{}",
+                args.benchmark_name,
+                test_type,
+                total_ops,
+                success_count,
+                error_count,
+                duration.as_secs_f64(),
+                throughput,
+                args.workers,
+                histogram.min(),
+                histogram.mean(),
+                histogram.value_at_quantile(0.5),
+                histogram.value_at_quantile(0.95),
+                histogram.value_at_quantile(0.99),
+                histogram.max(),
+                args.value_size,
+                args.key_count,
+                args.distribution,
+                args.enable_rmi,
+                args.base
+            );
         }
         _ => {
             println!("\n🎯 {} Benchmark Results:", test_type);
@@ -1030,7 +1164,7 @@ fn print_results(
             println!("   Duration: {:.2}s", duration.as_secs_f64());
             println!("   Throughput: {:.2} ops/sec", throughput);
             println!("   Workers: {}", args.workers);
-            
+
             if histogram.len() > 0 {
                 println!("\n📊 Latency Distribution (μs):");
                 println!("   Min: {}", histogram.min());
@@ -1045,84 +1179,93 @@ fn print_results(
 }
 
 /// 🧪 Comprehensive Binary Protocol Validation
-/// 
+///
 /// This function validates the complete binary protocol implementation
 /// including single operations, batch operations, and performance characteristics.
 async fn validate_binary_protocol(client: &UltraFastBenchClient) -> Result<()> {
     println!("🧪 Validating binary protocol implementation...");
-    
+
     // Test 1: Single key operations
     println!("🔍 Test 1: Single key operations");
     let test_key = 12345u64;
     let test_value = b"binary_test_value_for_comprehensive_validation";
-    
+
     let put_start = std::time::Instant::now();
     let offset = client.put_ultra_fast(test_key, test_value).await?;
     let put_time = put_start.elapsed();
-    println!("✅ PUT: key={}, offset={}, time={:.2}ms", test_key, offset, put_time.as_millis());
-    
+    println!(
+        "✅ PUT: key={}, offset={}, time={:.2}ms",
+        test_key,
+        offset,
+        put_time.as_millis()
+    );
+
     let lookup_start = std::time::Instant::now();
     let results = client.lookup_batch_pipelined(&[test_key]).await?;
     let lookup_time = lookup_start.elapsed();
-    
+
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, test_key);
     if let Some(found_offset) = results[0].1 {
-        println!("✅ LOOKUP: found key with offset={}, time={:.2}ms", found_offset, lookup_time.as_millis());
+        println!(
+            "✅ LOOKUP: found key with offset={}, time={:.2}ms",
+            found_offset,
+            lookup_time.as_millis()
+        );
     } else {
         println!("⚠️  LOOKUP: key not found (this is expected with fresh RMI index)");
     }
-    
+
     // Test 2: Large batch operations
     println!("🔍 Test 2: Large batch operations");
     let large_batch: Vec<u64> = (1..=1000).collect();
-    
+
     let batch_start = std::time::Instant::now();
     let batch_results = client.lookup_batch_pipelined(&large_batch).await?;
     let batch_time = batch_start.elapsed();
-    
+
     assert_eq!(batch_results.len(), 1000);
-    println!("✅ BATCH: processed 1000 keys in {:.2}ms ({:.0} ops/sec)", 
-        batch_time.as_millis(), 
+    println!(
+        "✅ BATCH: processed 1000 keys in {:.2}ms ({:.0} ops/sec)",
+        batch_time.as_millis(),
         1000.0 / batch_time.as_secs_f64()
     );
-    
+
     // Test 3: Performance stress test
     println!("🔍 Test 3: Performance stress test");
     let stress_keys: Vec<u64> = (1..=100).collect();
     let stress_iterations = 100;
-    
+
     let stress_start = std::time::Instant::now();
     for _ in 0..stress_iterations {
         let _ = client.lookup_batch_pipelined(&stress_keys).await?;
     }
     let stress_time = stress_start.elapsed();
-    
+
     let total_ops = stress_iterations * stress_keys.len();
     let ops_per_sec = total_ops as f64 / stress_time.as_secs_f64();
-    
-    println!("✅ STRESS: {} operations in {:.2}ms ({:.0} ops/sec)", 
-        total_ops, 
-        stress_time.as_millis(), 
+
+    println!(
+        "✅ STRESS: {} operations in {:.2}ms ({:.0} ops/sec)",
+        total_ops,
+        stress_time.as_millis(),
         ops_per_sec
     );
-    
+
     // Test 4: Connection pool validation
     println!("🔍 Test 4: Connection pool validation");
     let concurrent_lookups = 10;
     let mut handles = Vec::new();
-    
+
     let pool_test_start = std::time::Instant::now();
     for i in 0..concurrent_lookups {
         let client_clone = client.clone();
         let keys = vec![test_key + i as u64];
-        
-        let handle = tokio::spawn(async move {
-            client_clone.lookup_batch_pipelined(&keys).await
-        });
+
+        let handle = tokio::spawn(async move { client_clone.lookup_batch_pipelined(&keys).await });
         handles.push(handle);
     }
-    
+
     let mut successful_lookups = 0;
     for handle in handles {
         if handle.await?.is_ok() {
@@ -1130,24 +1273,25 @@ async fn validate_binary_protocol(client: &UltraFastBenchClient) -> Result<()> {
         }
     }
     let pool_test_time = pool_test_start.elapsed();
-    
-    println!("✅ POOL: {}/{} concurrent lookups successful in {:.2}ms", 
-        successful_lookups, 
-        concurrent_lookups, 
+
+    println!(
+        "✅ POOL: {}/{} concurrent lookups successful in {:.2}ms",
+        successful_lookups,
+        concurrent_lookups,
         pool_test_time.as_millis()
     );
-    
+
     // Test 5: Binary protocol capabilities
     println!("🔍 Test 5: Protocol capabilities check");
-    
+
     // Check if client is using binary protocol
     if client.is_binary_protocol_enabled() {
         println!("✅ PROTOCOL: Binary protocol enabled and functional");
-        
+
         // Get optimal batch size
         let optimal_batch = client.get_optimal_batch_size();
         println!("✅ BATCH_SIZE: Optimal batch size = {}", optimal_batch);
-        
+
         // Test SIMD capabilities if available
         if let Some(simd_info) = client.get_simd_capabilities() {
             println!("✅ SIMD: {} capabilities detected", simd_info);
@@ -1157,176 +1301,235 @@ async fn validate_binary_protocol(client: &UltraFastBenchClient) -> Result<()> {
     } else {
         println!("⚠️  PROTOCOL: Binary protocol not enabled, using HTTP fallback");
     }
-    
+
     println!("🎉 Binary protocol validation completed successfully!");
     println!("📊 Performance Summary:");
     println!("   • Single PUT latency: {:.2}ms", put_time.as_millis());
-    println!("   • Single LOOKUP latency: {:.2}ms", lookup_time.as_millis());
-    println!("   • Batch throughput: {:.0} ops/sec", 1000.0 / batch_time.as_secs_f64());
+    println!(
+        "   • Single LOOKUP latency: {:.2}ms",
+        lookup_time.as_millis()
+    );
+    println!(
+        "   • Batch throughput: {:.0} ops/sec",
+        1000.0 / batch_time.as_secs_f64()
+    );
     println!("   • Stress test throughput: {:.0} ops/sec", ops_per_sec);
-    println!("   • Connection pool efficiency: {}/{} concurrent operations", successful_lookups, concurrent_lookups);
-    
+    println!(
+        "   • Connection pool efficiency: {}/{} concurrent operations",
+        successful_lookups, concurrent_lookups
+    );
+
     // Performance thresholds validation
     let put_latency_ms = put_time.as_millis();
     let lookup_latency_ms = lookup_time.as_millis();
     let batch_ops_per_sec = 1000.0 / batch_time.as_secs_f64();
-    
+
     if put_latency_ms > 50 {
-        println!("⚠️  WARNING: PUT latency {}ms exceeds 50ms threshold", put_latency_ms);
+        println!(
+            "⚠️  WARNING: PUT latency {}ms exceeds 50ms threshold",
+            put_latency_ms
+        );
     }
-    
+
     if lookup_latency_ms > 10 {
-        println!("⚠️  WARNING: LOOKUP latency {}ms exceeds 10ms threshold", lookup_latency_ms);
+        println!(
+            "⚠️  WARNING: LOOKUP latency {}ms exceeds 10ms threshold",
+            lookup_latency_ms
+        );
     }
-    
+
     if batch_ops_per_sec < 50000.0 {
-        println!("⚠️  WARNING: Batch throughput {:.0} ops/sec below 50K ops/sec threshold", batch_ops_per_sec);
+        println!(
+            "⚠️  WARNING: Batch throughput {:.0} ops/sec below 50K ops/sec threshold",
+            batch_ops_per_sec
+        );
     }
-    
+
     if stress_time.as_millis() > 1000 {
-        println!("⚠️  WARNING: Stress test duration {}ms exceeds 1000ms threshold", stress_time.as_millis());
+        println!(
+            "⚠️  WARNING: Stress test duration {}ms exceeds 1000ms threshold",
+            stress_time.as_millis()
+        );
     }
-    
+
     Ok(())
 }
 
 /// 🚀 ENHANCED RMI OPTIMIZATION BENCHMARKS
-/// 
+///
 /// Comprehensive benchmarks for RMI performance optimizations
-async fn run_rmi_optimization_benchmarks(
-    client: &mut BenchClient,
-    args: &Args,
-) -> Result<()> {
+async fn run_rmi_optimization_benchmarks(client: &mut BenchClient, args: &Args) -> Result<()> {
     println!("🚀 Starting RMI Optimization Benchmarks...");
-    
+
     // Benchmark 1: SIMD Batch Processing Performance
     println!("🔍 Benchmark 1: SIMD Batch Processing Performance");
     let simd_batch_sizes = vec![8, 16, 32, 64];
     let mut simd_results = Vec::new();
-    
+
     for batch_size in simd_batch_sizes {
         let keys: Vec<u64> = (0..batch_size).map(|i| i as u64).collect();
         let start = Instant::now();
-        
+
         // Perform batch lookup
         let results = client.batch_lookup(&keys, &args.base).await?;
         let duration = start.elapsed();
-        
+
         let ops_per_sec = (batch_size as f64) / duration.as_secs_f64();
         simd_results.push((batch_size, ops_per_sec, duration));
-        
-        println!("   • Batch size {}: {:.0} ops/sec ({:.2}ms)", 
-            batch_size, ops_per_sec, duration.as_millis());
+
+        println!(
+            "   • Batch size {}: {:.0} ops/sec ({:.2}ms)",
+            batch_size,
+            ops_per_sec,
+            duration.as_millis()
+        );
     }
-    
+
     // Benchmark 2: Cache Optimization Performance
     println!("🔍 Benchmark 2: Cache Optimization Performance");
     let cache_test_keys: Vec<u64> = (0..1000).map(|i| i as u64).collect();
     let mut cache_latencies = Vec::new();
-    
+
     for _ in 0..100 {
         let start = Instant::now();
-        let _results = client.batch_lookup(&cache_test_keys[..100], &args.base).await?;
+        let _results = client
+            .batch_lookup(&cache_test_keys[..100], &args.base)
+            .await?;
         let duration = start.elapsed();
         cache_latencies.push(duration.as_micros() as u64);
     }
-    
+
     cache_latencies.sort();
     let p50_latency = cache_latencies[cache_latencies.len() / 2];
     let p99_latency = cache_latencies[(cache_latencies.len() * 99) / 100];
-    
+
     println!("   • P50 latency: {}μs", p50_latency);
     println!("   • P99 latency: {}μs", p99_latency);
-    
+
     // Benchmark 3: Memory Pool Performance
     println!("🔍 Benchmark 3: Memory Pool Performance");
     let memory_pool_sizes = vec![8, 16, 32, 64];
     let mut memory_results = Vec::new();
-    
+
     for pool_size in memory_pool_sizes {
         let keys: Vec<u64> = (0..pool_size * 10).map(|i| i as u64).collect();
         let start = Instant::now();
-        
+
         // Simulate memory pool operations
         for chunk in keys.chunks(pool_size) {
             let _results = client.batch_lookup(chunk, &args.base).await?;
         }
         let duration = start.elapsed();
-        
+
         let ops_per_sec = (keys.len() as f64) / duration.as_secs_f64();
         memory_results.push((pool_size, ops_per_sec, duration));
-        
-        println!("   • Pool size {}: {:.0} ops/sec ({:.2}ms)", 
-            pool_size, ops_per_sec, duration.as_millis());
+
+        println!(
+            "   • Pool size {}: {:.0} ops/sec ({:.2}ms)",
+            pool_size,
+            ops_per_sec,
+            duration.as_millis()
+        );
     }
-    
+
     // Benchmark 4: Predictive Prefetching Performance
     println!("🔍 Benchmark 4: Predictive Prefetching Performance");
     let sequential_keys: Vec<u64> = (0..1000).map(|i| i as u64).collect();
     let random_keys: Vec<u64> = (0..1000).map(|i| (i * 7 + 13) % 1000).collect();
-    
+
     // Test sequential access pattern
     let start = Instant::now();
-    let _sequential_results = client.batch_lookup(&sequential_keys[..100], &args.base).await?;
+    let _sequential_results = client
+        .batch_lookup(&sequential_keys[..100], &args.base)
+        .await?;
     let sequential_duration = start.elapsed();
-    
+
     // Test random access pattern
     let start = Instant::now();
     let _random_results = client.batch_lookup(&random_keys[..100], &args.base).await?;
     let random_duration = start.elapsed();
-    
-    let prefetch_speedup = random_duration.as_micros() as f64 / sequential_duration.as_micros() as f64;
-    
-    println!("   • Sequential access: {:.2}ms", sequential_duration.as_millis());
+
+    let prefetch_speedup =
+        random_duration.as_micros() as f64 / sequential_duration.as_micros() as f64;
+
+    println!(
+        "   • Sequential access: {:.2}ms",
+        sequential_duration.as_millis()
+    );
     println!("   • Random access: {:.2}ms", random_duration.as_millis());
     println!("   • Prefetch speedup: {:.2}x", prefetch_speedup);
-    
+
     // Benchmark 5: Adaptive Optimization Performance
     println!("🔍 Benchmark 5: Adaptive Optimization Performance");
     let mut adaptive_results = Vec::new();
-    
+
     for workload_size in vec![100, 1000, 10000] {
         let keys: Vec<u64> = (0..workload_size).map(|i| i as u64).collect();
         let start = Instant::now();
-        
+
         let _results = client.batch_lookup(&keys, &args.base).await?;
         let duration = start.elapsed();
-        
+
         let ops_per_sec = (workload_size as f64) / duration.as_secs_f64();
         adaptive_results.push((workload_size, ops_per_sec, duration));
-        
-        println!("   • Workload size {}: {:.0} ops/sec ({:.2}ms)", 
-            workload_size, ops_per_sec, duration.as_millis());
+
+        println!(
+            "   • Workload size {}: {:.0} ops/sec ({:.2}ms)",
+            workload_size,
+            ops_per_sec,
+            duration.as_millis()
+        );
     }
-    
+
     // Performance Summary
     println!("🎉 RMI Optimization Benchmarks Completed!");
     println!("📊 Performance Summary:");
-    
+
     // Find best SIMD batch size
-    let best_simd = simd_results.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
-    println!("   • Best SIMD batch size: {} ({:.0} ops/sec)", best_simd.0, best_simd.1);
-    
+    let best_simd = simd_results
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .unwrap();
+    println!(
+        "   • Best SIMD batch size: {} ({:.0} ops/sec)",
+        best_simd.0, best_simd.1
+    );
+
     // Find best memory pool size
-    let best_memory = memory_results.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
-    println!("   • Best memory pool size: {} ({:.0} ops/sec)", best_memory.0, best_memory.1);
-    
+    let best_memory = memory_results
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .unwrap();
+    println!(
+        "   • Best memory pool size: {} ({:.0} ops/sec)",
+        best_memory.0, best_memory.1
+    );
+
     println!("   • Cache P50 latency: {}μs", p50_latency);
     println!("   • Cache P99 latency: {}μs", p99_latency);
     println!("   • Prefetch speedup: {:.2}x", prefetch_speedup);
-    
+
     // Performance thresholds validation
     if p50_latency > 100 {
-        println!("⚠️  WARNING: P50 latency {}μs exceeds 100μs threshold", p50_latency);
+        println!(
+            "⚠️  WARNING: P50 latency {}μs exceeds 100μs threshold",
+            p50_latency
+        );
     }
-    
+
     if p99_latency > 1000 {
-        println!("⚠️  WARNING: P99 latency {}μs exceeds 1000μs threshold", p99_latency);
+        println!(
+            "⚠️  WARNING: P99 latency {}μs exceeds 1000μs threshold",
+            p99_latency
+        );
     }
-    
+
     if prefetch_speedup < 1.5 {
-        println!("⚠️  WARNING: Prefetch speedup {:.2}x below 1.5x threshold", prefetch_speedup);
+        println!(
+            "⚠️  WARNING: Prefetch speedup {:.2}x below 1.5x threshold",
+            prefetch_speedup
+        );
     }
-    
+
     Ok(())
 }

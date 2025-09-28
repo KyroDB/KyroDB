@@ -43,8 +43,14 @@ async fn wal_rotation_and_retention_enforced() {
     let before = log.wal_size_bytes().await;
     let stats = log.compact_keep_latest_and_snapshot_stats().await.unwrap();
     let after = log.wal_size_bytes().await;
-    assert_eq!(stats.before_bytes, before, "stat before bytes should match measurement");
-    assert_eq!(stats.after_bytes, after, "stat after bytes should match measurement");
+    assert_eq!(
+        stats.before_bytes, before,
+        "stat before bytes should match measurement"
+    );
+    assert_eq!(
+        stats.after_bytes, after,
+        "stat after bytes should match measurement"
+    );
     assert!(after <= before, "compaction should not increase WAL size");
 
     // After snapshot+reset, segments should be 1

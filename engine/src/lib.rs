@@ -1,31 +1,33 @@
 //! KyroDB: High-performance, durable key-value database engine with learned indexes (RMI)
-//! 
+//!
 //! This is a production-ready database engine focusing on:
-//! - Predictable tail latency through bounded RMI performance 
+//! - Predictable tail latency through bounded RMI performance
 //! - Lock-free concurrency to eliminate deadlocks
 //! - Enterprise-grade durability with group commit
 //! - Memory management with allocation tracking and limits
 
 // Binary protocol module for maximum performance
 pub mod binary_protocol;
-pub use binary_protocol::{binary_protocol_server, MAGIC, CMD_BATCH_LOOKUP, CMD_PUT, CMD_BATCH_PUT, CMD_PING};
+pub use binary_protocol::{
+    binary_protocol_server, CMD_BATCH_LOOKUP, CMD_BATCH_PUT, CMD_PING, CMD_PUT, MAGIC,
+};
 
 use anyhow::{Context, Result};
 use bincode::Options;
+use bytes::{BufMut, Bytes, BytesMut};
 use chrono::Utc;
 use lru::LruCache;
+use parking_lot::Mutex;
+use parking_lot::Mutex as FastMutex;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
-use tokio::sync::{broadcast, RwLock, Notify, oneshot};
-use parking_lot::Mutex;
-use uuid::Uuid;
-use std::time::{Duration, Instant};
-use std::collections::VecDeque;
-use bytes::{Bytes, BytesMut, BufMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use parking_lot::Mutex as FastMutex;
+use std::time::{Duration, Instant};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
+use tokio::sync::{broadcast, oneshot, Notify, RwLock};
+use uuid::Uuid;
 
 // Core modules
 pub mod index;
@@ -34,16 +36,15 @@ pub mod metrics;
 
 // Foundation modules
 #[cfg(feature = "learned-index")]
-
+pub mod adaptive_rmi;
+#[cfg(feature = "learned-index")]
 #[cfg(feature = "learned-index")]
 pub mod memory;
-#[cfg(feature = "learned-index")]
-pub mod adaptive_rmi;
 #[cfg(feature = "learned-index")]
 pub mod rmi_config;
 
 // Export main types for public API
-pub use PersistentEventLog as KyroDb;  // Alias for backward compatibility with tests
+pub use PersistentEventLog as KyroDb; // Alias for backward compatibility with tests
 
 // Convenient alias to reduce type complexity for the mmap payload index
 type SnapshotIndex = std::collections::HashMap<u64, (usize, usize)>;
@@ -77,7 +78,7 @@ impl BufferPool {
                 buffers.push(buf);
             }
         }
-        
+
         self.miss_count.fetch_add(1, Ordering::Relaxed);
         BytesMut::with_capacity(min_capacity.max(4096))
     }
@@ -100,35 +101,35 @@ fn try_deserialize_record_fast(payload: &[u8]) -> Option<Record> {
     if payload.len() < 16 {
         return None; // Not enough bytes for key + value_len
     }
-    
+
     let mut cursor = std::io::Cursor::new(payload);
     use std::io::Read;
-    
+
     // Read key (8 bytes)
     let mut key_bytes = [0u8; 8];
     if cursor.read_exact(&mut key_bytes).is_err() {
         return None;
     }
     let key = u64::from_le_bytes(key_bytes);
-    
+
     // Read value length (8 bytes)
     let mut len_bytes = [0u8; 8];
     if cursor.read_exact(&mut len_bytes).is_err() {
         return None;
     }
     let value_len = u64::from_le_bytes(len_bytes) as usize;
-    
+
     // Check if we have enough bytes for the value
     if cursor.position() as usize + value_len != payload.len() {
         return None;
     }
-    
+
     // Read value
     let mut value = vec![0u8; value_len];
     if cursor.read_exact(&mut value).is_err() {
         return None;
     }
-    
+
     Some(Record { key, value })
 }
 
@@ -138,7 +139,7 @@ pub fn deserialize_record_compat(payload: &[u8]) -> Option<Record> {
     if let Some(record) = try_deserialize_record_fast(payload) {
         return Some(record);
     }
-    
+
     // Fallback to bincode for backwards compatibility
     bincode::deserialize::<Record>(payload).ok()
 }
@@ -218,31 +219,31 @@ pub struct GroupCommitConfig {
 impl Default for GroupCommitConfig {
     fn default() -> Self {
         let durability_level = DurabilityLevel::from_env();
-        
+
         // Optimized defaults for microsecond-level performance
         let (default_batch_size, default_delay_micros) = match durability_level {
-            DurabilityLevel::EnterpriseSafe => (500, 200),     // 500 items, 200µs max delay
-            DurabilityLevel::EnterpriseAsync => (1000, 100),   // 1000 items, 100µs max delay
-            DurabilityLevel::Unsafe => (2000, 50),            // 2000 items, 50µs max delay
+            DurabilityLevel::EnterpriseSafe => (500, 200), // 500 items, 200µs max delay
+            DurabilityLevel::EnterpriseAsync => (1000, 100), // 1000 items, 100µs max delay
+            DurabilityLevel::Unsafe => (2000, 50),         // 2000 items, 50µs max delay
         };
-        
+
         Self {
             max_batch_delay_micros: std::env::var("KYRODB_GROUP_COMMIT_DELAY_MICROS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(default_delay_micros),
-                
+
             max_batch_size: std::env::var("KYRODB_GROUP_COMMIT_BATCH_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(default_batch_size),
-                
+
             enabled: std::env::var("KYRODB_GROUP_COMMIT_ENABLED")
                 .map(|s| s != "0" && s.to_lowercase() != "false")
                 .unwrap_or(true),
-                
+
             durability_level,
-            
+
             background_fsync_interval_ms: std::env::var("KYRODB_BACKGROUND_FSYNC_INTERVAL_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -517,7 +518,7 @@ impl PersistentEventLog {
                         pairs.push((rec.key, ev.offset));
                     }
                 }
-                
+
                 if pairs.is_empty() {
                     index::PrimaryIndex::new_adaptive_rmi()
                 } else {
@@ -535,7 +536,7 @@ impl PersistentEventLog {
         };
 
         let mut max_off = 0u64;
-        
+
         // For non-adaptive indexes, insert events normally
         if !use_adaptive_rmi || !cfg!(feature = "learned-index") {
             for ev in &events {
@@ -630,12 +631,24 @@ impl PersistentEventLog {
     }
 
     /// Create a new log with custom group commit configuration (for testing)
-    pub async fn with_group_commit(data_dir: impl Into<PathBuf>, config: GroupCommitConfig) -> Result<Self> {
+    pub async fn with_group_commit(
+        data_dir: impl Into<PathBuf>,
+        config: GroupCommitConfig,
+    ) -> Result<Self> {
         // Set environment variables to override defaults
-        std::env::set_var("KYRODB_GROUP_COMMIT_DELAY_MICROS", config.max_batch_delay_micros.to_string());
-        std::env::set_var("KYRODB_GROUP_COMMIT_BATCH_SIZE", config.max_batch_size.to_string());
-        std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", if config.enabled { "1" } else { "0" });
-        
+        std::env::set_var(
+            "KYRODB_GROUP_COMMIT_DELAY_MICROS",
+            config.max_batch_delay_micros.to_string(),
+        );
+        std::env::set_var(
+            "KYRODB_GROUP_COMMIT_BATCH_SIZE",
+            config.max_batch_size.to_string(),
+        );
+        std::env::set_var(
+            "KYRODB_GROUP_COMMIT_ENABLED",
+            if config.enabled { "1" } else { "0" },
+        );
+
         // Use the regular open method which will pick up the env vars
         Self::open(data_dir).await
     }
@@ -701,7 +714,7 @@ impl PersistentEventLog {
     /// Append (durably) and return its offset.
     pub async fn append(&self, request_id: Uuid, payload: Vec<u8>) -> Result<u64> {
         let timer = metrics::APPEND_LATENCY_SECONDS.start_timer();
-        
+
         // Idempotency check
         {
             let read = self.inner.read().await;
@@ -734,7 +747,7 @@ impl PersistentEventLog {
         if group_commit_enabled {
             // Use group commit for high throughput
             let (response_tx, response_rx) = oneshot::channel();
-            
+
             // Add to batch
             {
                 let mut state = self.group_commit_state.lock();
@@ -742,20 +755,20 @@ impl PersistentEventLog {
                     event: event.clone(),
                     response_tx,
                 });
-                
+
                 // Start batch timer if this is the first item
                 if state.batch.len() == 1 {
                     state.batch_start_time = Some(Instant::now());
                 }
-                
+
                 // Check if we should trigger immediate flush
                 let should_flush = state.batch.len() >= state.config.max_batch_size;
-                
+
                 if should_flush {
                     state.fsync_notify.notify_one();
                 }
             }
-            
+
             // Wait for group commit to complete
             match response_rx.await {
                 Ok(result) => {
@@ -775,14 +788,12 @@ impl PersistentEventLog {
                         // Broadcast to subscribers
                         let _ = self.tx.send(event);
                     }
-                    
+
                     metrics::APPENDS_TOTAL.inc();
                     timer.observe_duration();
                     result
                 }
-                Err(_) => {
-                    Err(anyhow::anyhow!("Group commit channel closed"))
-                }
+                Err(_) => Err(anyhow::anyhow!("Group commit channel closed")),
             }
         } else {
             // Legacy per-write fsync path (for compatibility)
@@ -791,9 +802,13 @@ impl PersistentEventLog {
     }
 
     /// Legacy append path with immediate fsync (used when group commit disabled)
-    async fn append_with_immediate_fsync(&self, event: Event, timer: prometheus::HistogramTimer) -> Result<u64> {
+    async fn append_with_immediate_fsync(
+        &self,
+        event: Event,
+        timer: prometheus::HistogramTimer,
+    ) -> Result<u64> {
         let bopt = bincode::options().with_limit(16 * 1024 * 1024);
-        
+
         // Write to WAL current segment (flush + fsync based on policy)
         {
             let mut w = self.wal.write().await;
@@ -838,12 +853,12 @@ impl PersistentEventLog {
         // Optimized serialization: avoid intermediate Record struct allocation
         let pool = BUFFER_POOL.get_or_init(|| BufferPool::new());
         let mut buf = pool.get_buffer(16 + value.len());
-        
+
         // Manual serialization: [key u64][value_len u64][value bytes]
         buf.put_u64_le(key);
         buf.put_u64_le(value.len() as u64);
         buf.put_slice(&value);
-        
+
         let bytes = buf.freeze();
         self.append(request_id, bytes.to_vec()).await
     }
@@ -858,7 +873,7 @@ impl PersistentEventLog {
                 if let Some(offset) = b.get(&key) {
                     return Some(offset);
                 }
-                
+
                 // BTree miss - try fallback scan
                 drop(idx); // Release the index lock
                 crate::metrics::LOOKUP_FALLBACK_SCAN_TOTAL.inc();
@@ -873,14 +888,14 @@ impl PersistentEventLog {
                 let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
                 let result = adaptive.lookup(key);
                 timer.observe_duration();
-                
+
                 if result.is_some() {
                     crate::metrics::RMI_HITS_TOTAL.inc();
                     crate::metrics::RMI_READS_TOTAL.inc();
                 } else {
                     crate::metrics::RMI_MISSES_TOTAL.inc();
                 }
-                
+
                 // Return immediately - no O(n) fallback scans
                 // The AdaptiveRMI is kept up-to-date on every insert, so we can trust it
                 result
@@ -898,28 +913,26 @@ impl PersistentEventLog {
                     let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
                     let result = adaptive.lookup(key);
                     timer.observe_duration();
-                    
+
                     if result.is_some() {
                         crate::metrics::RMI_HITS_TOTAL.inc();
                         crate::metrics::RMI_READS_TOTAL.inc();
                     } else {
                         crate::metrics::RMI_MISSES_TOTAL.inc();
                     }
-                    
+
                     result
                 }
-                index::PrimaryIndex::BTree(btree) => {
-                    btree.get(&key)
-                }
+                index::PrimaryIndex::BTree(btree) => btree.get(&key),
             },
             Err(_) => None, // Lock contention - return None for ultra-fast path
         }
     }
-    
+
     /// Batch lookup: process multiple keys efficiently with single lock acquisition
     pub fn lookup_keys_batch(&self, keys: &[u64]) -> Vec<(u64, Option<u64>)> {
         let mut results = Vec::with_capacity(keys.len());
-        
+
         // Single lock acquisition for entire batch
         match self.index.try_read() {
             Ok(idx) => match &*idx {
@@ -928,7 +941,7 @@ impl PersistentEventLog {
                     for &key in keys {
                         let value = adaptive.lookup(key);
                         results.push((key, value));
-                        
+
                         if value.is_some() {
                             crate::metrics::RMI_HITS_TOTAL.inc();
                         } else {
@@ -952,10 +965,10 @@ impl PersistentEventLog {
                 }
             }
         }
-        
+
         results
     }
-    
+
     /// Ultra-fast lock-free lookup with minimal metrics
     /// This is the absolute fastest path - use for high-frequency operations
     pub fn lookup_key_ultra_fast(&self, key: u64) -> Option<u64> {
@@ -966,7 +979,7 @@ impl PersistentEventLog {
                 index::PrimaryIndex::AdaptiveRmi(adaptive) => {
                     // Direct call: pure synchronous lookup with minimal overhead
                     let result = adaptive.lookup(key);
-                    
+
                     // Minimal metrics: only increment counters, no timers for maximum speed
                     #[cfg(not(feature = "bench-no-metrics"))]
                     {
@@ -977,21 +990,19 @@ impl PersistentEventLog {
                         }
                         crate::metrics::RMI_READS_TOTAL.inc();
                     }
-                    
+
                     result
                 }
-                index::PrimaryIndex::BTree(btree) => {
-                    btree.get(&key)
-                }
+                index::PrimaryIndex::BTree(btree) => btree.get(&key),
             },
             Err(_) => None, // Lock contention - fail fast for ultra-fast path
         }
     }
-    
+
     /// Ultra-fast batch lookup optimized for high-throughput scenarios with SIMD
     pub fn lookup_keys_ultra_batch(&self, keys: &[u64]) -> Vec<(u64, Option<u64>)> {
         let mut results = Vec::with_capacity(keys.len());
-        
+
         // Single lock acquisition for entire batch - fail fast if contention
         match self.index.try_read() {
             Ok(idx) => match &*idx {
@@ -999,13 +1010,13 @@ impl PersistentEventLog {
                 index::PrimaryIndex::AdaptiveRmi(adaptive) => {
                     // Use SIMD batch processing when available
                     let simd_results = adaptive.lookup_batch_simd(keys);
-                    
+
                     // Convert to expected format
                     for (i, &key) in keys.iter().enumerate() {
                         let value = simd_results.get(i).copied().unwrap_or(None);
                         results.push((key, value));
                     }
-                    
+
                     // Minimal metrics: batch increment for efficiency
                     #[cfg(not(feature = "bench-no-metrics"))]
                     {
@@ -1029,41 +1040,45 @@ impl PersistentEventLog {
                 }
             }
         }
-        
+
         results
     }
-    
+
     /// Lock-free index access for specialized high-performance scenarios
     /// Returns the current index snapshot without any locking overhead
     pub fn get_index_snapshot(&self) -> Option<std::sync::Arc<index::PrimaryIndex>> {
         // Future optimization: Could use ArcSwap here for truly atomic reads
-        self.index.try_read().ok().map(|guard| {
-            // Clone the Arc to get a snapshot
-            match &*guard {
-                #[cfg(feature = "learned-index")]
-                index::PrimaryIndex::AdaptiveRmi(_) => {
-                    // For now, we can't easily clone the RMI, so return None
-                    // This could be improved with ArcSwap in the future
-                    None
+        self.index
+            .try_read()
+            .ok()
+            .map(|guard| {
+                // Clone the Arc to get a snapshot
+                match &*guard {
+                    #[cfg(feature = "learned-index")]
+                    index::PrimaryIndex::AdaptiveRmi(_) => {
+                        // For now, we can't easily clone the RMI, so return None
+                        // This could be improved with ArcSwap in the future
+                        None
+                    }
+                    index::PrimaryIndex::BTree(_) => {
+                        // Similarly for BTree
+                        None
+                    }
                 }
-                index::PrimaryIndex::BTree(_) => {
-                    // Similarly for BTree
-                    None
-                }
-            }
-        }).flatten()
+            })
+            .flatten()
     }
-    
+
     /// SIMD-optimized batch lookup
-    /// 
+    ///
     /// Enterprise-grade batch processing with automatic SIMD optimization.
     /// Processes multiple keys simultaneously using vectorized operations when available.
-    /// 
+    ///
     /// # Performance Characteristics:
     /// - AVX2: Processes 8 keys simultaneously
     /// - Scalar fallback: Individual key processing
     /// - Adaptive batch sizing based on CPU capabilities
-    /// 
+    ///
     /// # Usage:
     /// ```rust
     /// let keys = vec![1, 2, 3, 4, 5, 6, 7, 8];
@@ -1074,25 +1089,23 @@ impl PersistentEventLog {
         let optimal_batch_size = match self.index.try_read() {
             Ok(idx) => match &*idx {
                 #[cfg(feature = "learned-index")]
-                index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                    adaptive.get_optimal_batch_size()
-                }
+                index::PrimaryIndex::AdaptiveRmi(adaptive) => adaptive.get_optimal_batch_size(),
                 index::PrimaryIndex::BTree(_) => 32, // BTree optimal batch size
             },
             Err(_) => 32, // Default batch size on contention
         };
-        
+
         let mut results = Vec::with_capacity(keys.len());
-        
+
         // Process keys in optimally-sized batches
         for chunk in keys.chunks(optimal_batch_size) {
             let chunk_results = self.lookup_keys_ultra_batch(chunk);
             results.extend(chunk_results);
         }
-        
+
         results
     }
-    
+
     /// Get SIMD capabilities of the current system
     pub fn get_simd_capabilities(&self) -> Option<crate::adaptive_rmi::SIMDCapabilities> {
         match self.index.try_read() {
@@ -1109,13 +1122,13 @@ impl PersistentEventLog {
 
     // ===== MISSING METHOD STUBS FOR SERVER BINARY =====
     // These methods are required by main.rs but not core functionality
-    
+
     /// Create a database snapshot
     pub async fn snapshot(&self) -> Result<()> {
         // TODO: Implement snapshot creation
         Ok(())
     }
-    
+
     /// Compact the WAL by retaining only the latest segment on disk.
     ///
     /// This implementation persists a fresh snapshot, resets the WAL to a
@@ -1124,7 +1137,9 @@ impl PersistentEventLog {
     pub async fn compact_keep_latest_and_snapshot(&self) -> Result<()> {
         {
             let mut wal_guard = self.wal.write().await;
-            wal_guard.flush().context("flushing WAL before compaction")?;
+            wal_guard
+                .flush()
+                .context("flushing WAL before compaction")?;
         }
 
         let events = {
@@ -1134,8 +1149,8 @@ impl PersistentEventLog {
 
         let snapshot_path = self.data_dir.join("snapshot.bin");
         {
-            let file = File::create(&snapshot_path)
-                .context("creating snapshot during compaction")?;
+            let file =
+                File::create(&snapshot_path).context("creating snapshot during compaction")?;
             let mut writer = BufWriter::new(file);
             bincode::serialize_into(&mut writer, &events)
                 .context("serializing snapshot during compaction")?;
@@ -1178,18 +1193,18 @@ impl PersistentEventLog {
 
         Ok(())
     }
-    
+
     /// Warm up the database
     pub async fn warmup(&self) -> Result<()> {
         // TODO: Implement database warmup
         Ok(())
     }
-    
+
     /// Get WAL size in bytes
     pub async fn wal_size_bytes(&self) -> u64 {
         Self::wal_total_bytes(&self.data_dir)
     }
-    
+
     /// Build RMI index
     #[cfg(feature = "learned-index")]
     pub async fn build_rmi(&self) -> Result<()> {
@@ -1208,115 +1223,115 @@ impl PersistentEventLog {
     pub async fn build_rmi(&self) -> Result<()> {
         Ok(())
     }
-    
+
     /// Get memory usage statistics
     pub async fn memory_usage_bytes(&self) -> u64 {
         // TODO: Calculate actual memory usage
         0
     }
-    
+
     /// Get total records count
     pub async fn total_records(&self) -> u64 {
         // TODO: Calculate actual record count
         0
     }
-    
+
     /// Get database configuration
     pub async fn config(&self) -> String {
         // TODO: Return actual configuration
         "{}".to_string()
     }
-    
+
     /// Check if database is ready
     pub async fn ready(&self) -> bool {
         // TODO: Implement readiness check
         true
     }
-    
+
     /// Get database health status
     pub async fn health(&self) -> String {
         // TODO: Implement health check
         "healthy".to_string()
     }
-    
+
     /// Get database metrics
     pub async fn metrics(&self) -> String {
         // TODO: Return actual metrics
         "{}".to_string()
     }
-    
+
     /// Enable/disable debug mode
     pub async fn debug(&self, _enabled: bool) -> Result<()> {
         // TODO: Implement debug mode toggle
         Ok(())
     }
-    
+
     /// Trigger database compaction
     pub async fn compact(&self) -> Result<()> {
         // TODO: Implement compaction
         Ok(())
     }
-    
+
     /// Set checkpoint interval
     pub async fn set_checkpoint_interval_seconds(&self, _interval: u64) -> Result<()> {
         // TODO: Implement checkpoint interval setting
         Ok(())
     }
-    
+
     /// Set maintenance window
     pub async fn set_maintenance_window(&self, _start: String, _end: String) -> Result<()> {
         // TODO: Implement maintenance window setting
         Ok(())
     }
-    
+
     /// Set log level
     pub async fn set_log_level(&self, _level: String) -> Result<()> {
         // TODO: Implement log level setting
         Ok(())
     }
-    
+
     /// Enable/disable background compaction
     pub async fn set_background_compaction(&self, _enabled: bool) -> Result<()> {
         // TODO: Implement background compaction toggle
         Ok(())
     }
-    
+
     /// Set memory pool size
     pub async fn set_memory_pool_size_mb(&self, _size: u64) -> Result<()> {
         // TODO: Implement memory pool size setting
         Ok(())
     }
-    
+
     /// Set CPU throttling protection
     pub async fn set_cpu_throttling_protection(&self, _enabled: bool) -> Result<()> {
         // TODO: Implement CPU throttling protection toggle
         Ok(())
     }
-    
+
     /// Live tail WAL entries
     pub async fn tail(&self) -> Result<()> {
         // TODO: Implement WAL tailing
         Ok(())
     }
-    
+
     /// Get current offset in the log
     pub async fn get_offset(&self) -> u64 {
         // TODO: Implement offset tracking
         0
     }
-    
+
     /// Swap the primary index (for RMI rebuilding)
     pub async fn swap_primary_index(&self, _new_index: index::PrimaryIndex) -> Result<()> {
         // TODO: Implement index swapping
         Ok(())
     }
-    
+
     /// Write manifest file
     pub async fn write_manifest(&self) -> Result<()> {
         // TODO: Implement manifest writing
         Ok(())
     }
-    
+
     /// Compact with statistics
     pub async fn compact_keep_latest_and_snapshot_stats(&self) -> Result<CompactionStats> {
         let before_bytes = self.wal_size_bytes().await;
@@ -1331,9 +1346,7 @@ impl PersistentEventLog {
         Ok(CompactionStats {
             before_bytes,
             after_bytes,
-            segments_removed: before_segments
-                .len()
-                .saturating_sub(after_segments.len()),
+            segments_removed: before_segments.len().saturating_sub(after_segments.len()),
             segments_active: after_segments.len(),
             keys_retained,
         })
@@ -1402,8 +1415,7 @@ impl PersistentEventLog {
     pub async fn replay(&self, from: u64, to: Option<u64>) -> Vec<Event> {
         let upper = to.unwrap_or(u64::MAX);
         let read = self.inner.read().await;
-        read
-            .iter()
+        read.iter()
             .filter(|event| event.offset >= from && event.offset < upper)
             .cloned()
             .collect()
@@ -1502,7 +1514,7 @@ impl PersistentEventLog {
     async fn group_commit_background_task(&self) {
         let mut interval = tokio::time::interval(Duration::from_micros(5)); // Check every 5µs for ultra-fast responsiveness
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        
+
         loop {
             // Wait for either interval or flush notification
             tokio::select! {
@@ -1527,27 +1539,28 @@ impl PersistentEventLog {
         let mut batch_to_flush = Vec::new();
         let should_flush = {
             let mut state = self.group_commit_state.lock();
-            
+
             if state.batch.is_empty() {
                 return;
             }
-            
+
             let batch_size = state.batch.len();
-            let batch_age = state.batch_start_time
+            let batch_age = state
+                .batch_start_time
                 .map(|start| start.elapsed())
                 .unwrap_or(Duration::ZERO);
-                
+
             // Flush if batch is large enough or old enough
             let size_trigger = batch_size >= state.config.max_batch_size;
             let time_trigger = batch_age.as_micros() >= state.config.max_batch_delay_micros as u128;
-            
+
             // More aggressive flushing for low latency - flush smaller batches faster
             let aggressive_trigger = match state.config.durability_level {
                 DurabilityLevel::Unsafe => batch_size >= 10 && batch_age.as_micros() >= 25, // Very aggressive
                 DurabilityLevel::EnterpriseAsync => batch_size >= 25 && batch_age.as_micros() >= 50, // Aggressive
                 DurabilityLevel::EnterpriseSafe => batch_size >= 50 && batch_age.as_micros() >= 100, // Moderate
             };
-            
+
             if size_trigger || time_trigger || aggressive_trigger {
                 // Take all items from batch
                 batch_to_flush = state.batch.drain(..).collect();
@@ -1557,7 +1570,7 @@ impl PersistentEventLog {
                 false
             }
         };
-        
+
         if should_flush && !batch_to_flush.is_empty() {
             self.flush_batch(batch_to_flush).await;
         }
@@ -1569,7 +1582,7 @@ impl PersistentEventLog {
             let state = self.group_commit_state.lock();
             state.config
         };
-        
+
         match config.durability_level {
             DurabilityLevel::EnterpriseSafe => {
                 self.flush_batch_enterprise_safe(batch).await;
@@ -1586,26 +1599,28 @@ impl PersistentEventLog {
     /// Enterprise-safe batch flush: Zero-copy serialization + immediate fsync
     async fn flush_batch_enterprise_safe(&self, batch: Vec<BatchItem>) {
         let start = Instant::now();
-        
+
         // 1. Zero-copy serialization: serialize entire batch to single buffer
         let write_buffer = match self.serialize_batch_zero_copy(&batch) {
             Ok(buffer) => buffer,
             Err(e) => {
                 // Serialization failed - notify all waiters
                 for item in batch {
-                    let _ = item.response_tx.send(Err(anyhow::anyhow!("Serialization failed: {}", e)));
+                    let _ = item
+                        .response_tx
+                        .send(Err(anyhow::anyhow!("Serialization failed: {}", e)));
                 }
                 return;
             }
         };
-        
+
         // 2. Single write + immediate fsync for enterprise durability
         let write_result = {
             let mut w = self.wal.write().await;
-            
+
             // Write entire batch in one operation
             let write_success = w.write_all(&write_buffer).is_ok() && w.flush().is_ok();
-            
+
             if write_success {
                 // Enterprise requirement: IMMEDIATE fsync for zero data loss
                 match self.fsync_policy.sync_file(w.get_ref()) {
@@ -1619,23 +1634,23 @@ impl PersistentEventLog {
                 false
             }
         };
-        
+
         // 3. Check if WAL rotation is needed after successful write
         if write_result {
             self.rotate_wal_if_needed().await;
         }
-        
+
         // 4. Update metrics
         let batch_size = batch.len();
         let duration = start.elapsed();
-        
+
         if write_result {
             metrics::APPENDS_TOTAL.inc_by(batch_size as f64);
             metrics::GROUP_COMMIT_BATCH_SIZE.observe(batch_size as f64);
             metrics::GROUP_COMMIT_LATENCY_SECONDS.observe(duration.as_secs_f64());
             metrics::GROUP_COMMIT_BATCHES_TOTAL.inc();
         }
-        
+
         // 5. Send results to all waiters
         for item in batch {
             let result = if write_result {
@@ -1643,7 +1658,7 @@ impl PersistentEventLog {
             } else {
                 Err(anyhow::anyhow!("Enterprise-safe batch write failed"))
             };
-            
+
             // Send result back to waiter (ignore if receiver dropped)
             let _ = item.response_tx.send(result);
         }
@@ -1653,9 +1668,10 @@ impl PersistentEventLog {
     fn serialize_batch_zero_copy(&self, batch: &[BatchItem]) -> Result<Bytes> {
         // Get buffer pool (initialize on first use)
         let pool = BUFFER_POOL.get_or_init(|| BufferPool::new());
-        
+
         // Pre-calculate total buffer size to avoid reallocations
-        let estimated_size: usize = batch.iter()
+        let estimated_size: usize = batch
+            .iter()
             .map(|item| {
                 // More accurate estimate: 8 (header) + payload + 8 (uuid) + 16 (timestamp) + 4 (crc) + padding
                 let payload_size = item.event.payload.len();
@@ -1663,42 +1679,42 @@ impl PersistentEventLog {
             })
             .sum::<usize>()
             .max(4096); // Minimum 4KB buffer
-            
+
         let mut buf = pool.get_buffer(estimated_size);
-        
+
         // Use MessagePack for more efficient serialization than bincode
         let batch_len = batch.len() as u32;
         buf.put_u32_le(batch_len); // Batch header
-        
+
         // Serialize each event directly into the buffer with minimal overhead
         for item in batch {
             let event = &item.event;
-            
+
             // Manual serialization for maximum performance
             // Format: [offset u64][timestamp u64][request_id 16 bytes][payload_len u32][payload][crc32c u32]
             buf.put_u64_le(event.offset);
             buf.put_u64_le(event.timestamp);
             buf.put_slice(event.request_id.as_bytes());
-            
+
             let payload_len = event.payload.len() as u32;
             buf.put_u32_le(payload_len);
             buf.put_slice(&event.payload);
-            
+
             // Calculate CRC over the entire event frame (not just payload)
             let frame_start = buf.len() - 32 - payload_len as usize; // Start of this event
             let crc = crc32c::crc32c(&buf[frame_start..]);
             buf.put_u32_le(crc);
         }
-        
+
         let result = buf.freeze();
-        
+
         // Return the buffer to pool for reuse (done via Drop trait in practice)
         // Note: We can't return the BytesMut here since we've frozen it,
         // but the pool will allocate new ones efficiently
-        
+
         Ok(result)
     }
-    
+
     /// Enterprise async: Write immediately, fsync in background
     async fn flush_batch_enterprise_async(&self, batch: Vec<BatchItem>) {
         // Write to WAL buffer immediately
@@ -1706,23 +1722,25 @@ impl PersistentEventLog {
             Ok(buffer) => buffer,
             Err(e) => {
                 for item in batch {
-                    let _ = item.response_tx.send(Err(anyhow::anyhow!("Serialization failed: {}", e)));
+                    let _ = item
+                        .response_tx
+                        .send(Err(anyhow::anyhow!("Serialization failed: {}", e)));
                 }
                 return;
             }
         };
-        
+
         let write_result = {
             let mut w = self.wal.write().await;
             w.write_all(&write_buffer).is_ok() && w.flush().is_ok()
         };
-        
+
         if write_result {
             // Mark for background fsync (maintains durability with bounded recovery window)
             self.mark_for_background_fsync().await;
             self.rotate_wal_if_needed().await;
         }
-        
+
         // Notify waiters immediately (data is in OS buffer)
         for item in batch {
             let result = if write_result {
@@ -1733,7 +1751,7 @@ impl PersistentEventLog {
             let _ = item.response_tx.send(result);
         }
     }
-    
+
     /// Unsafe mode: Skip fsync entirely (for benchmarking only)
     async fn flush_batch_unsafe(&self, batch: Vec<BatchItem>) {
         // Write to WAL buffer only
@@ -1741,17 +1759,19 @@ impl PersistentEventLog {
             Ok(buffer) => buffer,
             Err(e) => {
                 for item in batch {
-                    let _ = item.response_tx.send(Err(anyhow::anyhow!("Serialization failed: {}", e)));
+                    let _ = item
+                        .response_tx
+                        .send(Err(anyhow::anyhow!("Serialization failed: {}", e)));
                 }
                 return;
             }
         };
-        
+
         let write_result = {
             let mut w = self.wal.write().await;
             w.write_all(&write_buffer).is_ok() && w.flush().is_ok()
         };
-        
+
         // No fsync - just notify waiters
         for item in batch {
             let result = if write_result {
@@ -1762,7 +1782,7 @@ impl PersistentEventLog {
             let _ = item.response_tx.send(result);
         }
     }
-    
+
     /// Mark data for background fsync (enterprise async mode)
     async fn mark_for_background_fsync(&self) {
         // Implementation would track pending fsync operations
@@ -1773,9 +1793,9 @@ impl PersistentEventLog {
 /// Buffer size categories for optimized allocation strategies
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferSize {
-    Small,   // 256B JSON, 64B binary - 80% of requests
-    Medium,  // 1KB JSON, 512B binary - 18% of requests  
-    Large,   // 4KB JSON, 2KB binary - 2% of requests
+    Small,  // 256B JSON, 64B binary - 80% of requests
+    Medium, // 1KB JSON, 512B binary - 18% of requests
+    Large,  // 4KB JSON, 2KB binary - 2% of requests
 }
 
 /// Pool statistics for comprehensive performance metrics
@@ -1800,27 +1820,27 @@ pub enum PoolHealth {
 }
 
 /// Ultra-fast buffer pool for zero-allocation responses
-/// 
+///
 /// Advanced memory pool with multiple buffer sizes,
 /// pressure-based adaptation, and enterprise-grade statistics tracking.
 pub struct UltraFastBufferPool {
     /// Pre-allocated JSON response buffers (small, medium, large)
-    json_buffers_small: crossbeam_queue::SegQueue<String>,      // 256 bytes
-    json_buffers_medium: crossbeam_queue::SegQueue<String>,     // 1KB
-    json_buffers_large: crossbeam_queue::SegQueue<String>,      // 4KB
-    
+    json_buffers_small: crossbeam_queue::SegQueue<String>, // 256 bytes
+    json_buffers_medium: crossbeam_queue::SegQueue<String>, // 1KB
+    json_buffers_large: crossbeam_queue::SegQueue<String>,  // 4KB
+
     /// Pre-allocated binary response buffers (small, medium, large)  
-    binary_buffers_small: crossbeam_queue::SegQueue<Vec<u8>>,   // 64 bytes
-    binary_buffers_medium: crossbeam_queue::SegQueue<Vec<u8>>,  // 512 bytes
-    binary_buffers_large: crossbeam_queue::SegQueue<Vec<u8>>,   // 2KB
-    
+    binary_buffers_small: crossbeam_queue::SegQueue<Vec<u8>>, // 64 bytes
+    binary_buffers_medium: crossbeam_queue::SegQueue<Vec<u8>>, // 512 bytes
+    binary_buffers_large: crossbeam_queue::SegQueue<Vec<u8>>,  // 2KB
+
     /// Advanced statistics for performance monitoring
     allocations: std::sync::atomic::AtomicU64,
     reuses: std::sync::atomic::AtomicU64,
     cache_hits: std::sync::atomic::AtomicU64,
     cache_misses: std::sync::atomic::AtomicU64,
     memory_pressure_drops: std::sync::atomic::AtomicU64,
-    
+
     /// Memory pressure thresholds
     max_pool_size_per_type: AtomicUsize,
     current_memory_usage: AtomicUsize,
@@ -1844,48 +1864,48 @@ impl UltraFastBufferPool {
             max_pool_size_per_type: AtomicUsize::new(1000),
             current_memory_usage: AtomicUsize::new(0),
         };
-        
+
         // Enterprise pre-allocation: multiple buffer sizes for zero-allocation responses
         // Small buffers: 80% of requests (optimized for lookup responses)
         for _ in 0..800 {
             pool.json_buffers_small.push(String::with_capacity(256));
             pool.binary_buffers_small.push(Vec::with_capacity(64));
         }
-        
+
         // Medium buffers: 18% of requests (batch responses, metadata)
         for _ in 0..180 {
             pool.json_buffers_medium.push(String::with_capacity(1024));
             pool.binary_buffers_medium.push(Vec::with_capacity(512));
         }
-        
+
         // Large buffers: 2% of requests (complex queries, large payloads)
         for _ in 0..20 {
             pool.json_buffers_large.push(String::with_capacity(4096));
             pool.binary_buffers_large.push(Vec::with_capacity(2048));
         }
-        
+
         // Track initial memory usage
-        let initial_memory = 
-            (800 * 256) + (180 * 1024) + (20 * 4096) +  // JSON buffers
-            (800 * 64) + (180 * 512) + (20 * 2048);     // Binary buffers
-        pool.current_memory_usage.store(initial_memory, Ordering::Relaxed);
-        
+        let initial_memory = (800 * 256) + (180 * 1024) + (20 * 4096) +  // JSON buffers
+            (800 * 64) + (180 * 512) + (20 * 2048); // Binary buffers
+        pool.current_memory_usage
+            .store(initial_memory, Ordering::Relaxed);
+
         pool
     }
-    
+
     /// Smart buffer selection: get optimally-sized JSON buffer
     pub fn get_json_buffer(&self) -> String {
         self.get_json_buffer_sized(BufferSize::Small)
     }
-    
+
     /// Size-aware JSON buffer: get buffer based on expected size
     pub fn get_json_buffer_sized(&self, size: BufferSize) -> String {
         let (queue, capacity) = match size {
             BufferSize::Small => (&self.json_buffers_small, 256),
-            BufferSize::Medium => (&self.json_buffers_medium, 1024), 
+            BufferSize::Medium => (&self.json_buffers_medium, 1024),
             BufferSize::Large => (&self.json_buffers_large, 4096),
         };
-        
+
         match queue.pop() {
             Some(mut buf) => {
                 buf.clear();
@@ -1900,12 +1920,12 @@ impl UltraFastBufferPool {
             }
         }
     }
-    
+
     /// Enterprise buffer return: intelligent reuse with memory pressure handling
     pub fn return_json_buffer(&self, buf: String) {
         self.return_json_buffer_sized(buf, BufferSize::Small)
     }
-    
+
     /// Smart buffer return: return to appropriate size pool
     pub fn return_json_buffer_sized(&self, buf: String, _expected_size: BufferSize) {
         // Determine actual buffer size category based on capacity
@@ -1920,7 +1940,7 @@ impl UltraFastBufferPool {
             self.memory_pressure_drops.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        
+
         // Check memory pressure before returning to pool
         if buf.capacity() <= max_capacity && self.should_accept_buffer() {
             queue.push(buf);
@@ -1928,12 +1948,12 @@ impl UltraFastBufferPool {
             self.memory_pressure_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
-    
+
     /// Smart binary buffer: zero allocation for binary responses
     pub fn get_binary_buffer(&self) -> Vec<u8> {
         self.get_binary_buffer_sized(BufferSize::Small)
     }
-    
+
     /// Size-aware binary buffer: get buffer based on expected size
     pub fn get_binary_buffer_sized(&self, size: BufferSize) -> Vec<u8> {
         let (queue, capacity) = match size {
@@ -1941,7 +1961,7 @@ impl UltraFastBufferPool {
             BufferSize::Medium => (&self.binary_buffers_medium, 512),
             BufferSize::Large => (&self.binary_buffers_large, 2048),
         };
-        
+
         match queue.pop() {
             Some(mut buf) => {
                 buf.clear();
@@ -1956,12 +1976,12 @@ impl UltraFastBufferPool {
             }
         }
     }
-    
+
     /// Intelligent binary return: return to appropriate size pool
     pub fn return_binary_buffer(&self, buf: Vec<u8>) {
         self.return_binary_buffer_sized(buf, BufferSize::Small)
     }
-    
+
     /// Smart binary return: return to appropriate size pool
     pub fn return_binary_buffer_sized(&self, buf: Vec<u8>, _expected_size: BufferSize) {
         // Determine actual buffer size category based on capacity
@@ -1976,7 +1996,7 @@ impl UltraFastBufferPool {
             self.memory_pressure_drops.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        
+
         // Check memory pressure before returning to pool
         if buf.capacity() <= max_capacity && self.should_accept_buffer() {
             queue.push(buf);
@@ -1984,16 +2004,16 @@ impl UltraFastBufferPool {
             self.memory_pressure_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
-    
+
     /// Memory pressure detection: prevent unlimited memory growth
     fn should_accept_buffer(&self) -> bool {
         // Simple heuristic: check current queue lengths vs limits
         let current_usage = self.current_memory_usage.load(Ordering::Relaxed);
         let max_usage = self.max_pool_size_per_type.load(Ordering::Relaxed) * 6 * 1024; // 6 pools * 1KB avg
-        
+
         current_usage < max_usage
     }
-    
+
     /// Enterprise statistics: comprehensive pool performance metrics
     pub fn stats(&self) -> PoolStats {
         PoolStats {
@@ -2005,16 +2025,20 @@ impl UltraFastBufferPool {
             cache_hit_rate: {
                 let hits = self.cache_hits.load(Ordering::Relaxed);
                 let total = hits + self.cache_misses.load(Ordering::Relaxed);
-                if total > 0 { (hits as f64 / total as f64) * 100.0 } else { 0.0 }
+                if total > 0 {
+                    (hits as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                }
             },
             current_memory_usage: self.current_memory_usage.load(Ordering::Relaxed),
         }
     }
-    
+
     /// Pool health check: monitor pool performance
     pub fn health_check(&self) -> PoolHealth {
         let stats = self.stats();
-    
+
         let health = if stats.cache_hit_rate > 95.0 {
             PoolHealth::Excellent
         } else if stats.cache_hit_rate > 90.0 {
@@ -2024,7 +2048,7 @@ impl UltraFastBufferPool {
         } else {
             PoolHealth::Poor
         };
-        
+
         health
     }
 }

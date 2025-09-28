@@ -1,6 +1,6 @@
 use kyrodb_engine::PersistentEventLog;
-use tempfile::tempdir;
 use std::io::Write;
+use tempfile::tempdir;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -18,7 +18,10 @@ async fn wal_tail_corruption_ignored() {
 
     // Corrupt WAL tail by appending incomplete bytes
     let wal_path = path.join("wal.bin");
-    let mut f = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal_path)
+        .unwrap();
     let _ = f.write_all(&[0xFF, 0xFF]);
     let _ = f.flush();
 

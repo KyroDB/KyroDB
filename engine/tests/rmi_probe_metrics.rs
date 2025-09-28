@@ -63,13 +63,15 @@ async fn rmi_probe_histogram_and_mispredict_counter_increment() {
 
     let mis_before = get_counter(&before, "kyrodb_rmi_mispredicts_total");
     let mis_after = get_counter(&after, "kyrodb_rmi_mispredicts_total");
-    
-    // Note: mispredicts are only triggered when the RMI has poor epsilon bounds (window > 64) 
+
+    // Note: mispredicts are only triggered when the RMI has poor epsilon bounds (window > 64)
     // or when binary search times out. For well-behaved data and reasonable missing keys,
     // the RMI may not trigger mispredicts. This is actually good behavior.
     // We'll check that mispredicts either stay the same or increase, but don't require an increase.
     assert!(
         mis_after >= mis_before,
-        "mispredicts counter should not decrease (before: {}, after: {})", mis_before, mis_after
+        "mispredicts counter should not decrease (before: {}, after: {})",
+        mis_before,
+        mis_after
     );
 }

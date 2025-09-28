@@ -38,7 +38,10 @@ async fn main() -> Result<()> {
         "Bounded guarantee ratio: {:.1}%",
         analytics.bounded_guarantee_ratio * 100.0
     );
-    println!("Overall error rate: {:.3}%", analytics.overall_error_rate * 100.0);
+    println!(
+        "Overall error rate: {:.3}%",
+        analytics.overall_error_rate * 100.0
+    );
     println!(
         "Maximum search window observed: {}",
         analytics.max_search_window_observed
@@ -49,10 +52,7 @@ async fn main() -> Result<()> {
         "System meets guarantees: {}",
         validation.system_meets_guarantees
     );
-    println!(
-        "Performance level: {}",
-        validation.performance_level
-    );
+    println!("Performance level: {}", validation.performance_level);
     println!(
         "Segments needing attention: {}",
         validation.segments_needing_attention

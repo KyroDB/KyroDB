@@ -1,5 +1,5 @@
 //! KyroDB Engine - High-performance CLI and HTTP server
-//! 
+//!
 //! Raw performance mode: No authentication, no rate limiting.
 //! Pure database engine focused on maximum throughput and minimal latency.
 
@@ -38,7 +38,7 @@ fn detect_system_load_multiplier() -> u64 {
                     .map(|p| p.get())
                     .unwrap_or(1) as f64;
                 let load_ratio = load / cpu_count;
-                
+
                 if load_ratio > 2.0 {
                     load_signals += 2; // Very high load
                 } else if load_ratio > 1.0 {
@@ -52,7 +52,7 @@ fn detect_system_load_multiplier() -> u64 {
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
         let mut available_kb = 0u64;
         let mut total_kb = 0u64;
-        
+
         for line in meminfo.lines() {
             if line.starts_with("MemAvailable:") {
                 if let Some(value) = line.split_whitespace().nth(1) {
@@ -64,7 +64,7 @@ fn detect_system_load_multiplier() -> u64 {
                 }
             }
         }
-        
+
         if total_kb > 0 {
             let available_ratio = available_kb as f64 / total_kb as f64;
             if available_ratio < 0.1 {
@@ -77,15 +77,18 @@ fn detect_system_load_multiplier() -> u64 {
 
     // Calculate interval multiplier based on load signals
     match load_signals {
-        0 => 1,      // No pressure - normal intervals
-        1 => 2,      // Low pressure - 2x slower
-        2..=3 => 4,  // Medium pressure - 4x slower  
-        _ => 8,      // High pressure - 8x slower
+        0 => 1,     // No pressure - normal intervals
+        1 => 2,     // Low pressure - 2x slower
+        2..=3 => 4, // Medium pressure - 4x slower
+        _ => 8,     // High pressure - 8x slower
     }
 }
 
 #[derive(Parser)]
-#[command(name = "kyrodb-engine", about = "KyroDB Engine - High-performance KV Database")]
+#[command(
+    name = "kyrodb-engine",
+    about = "KyroDB Engine - High-performance KV Database"
+)]
 struct Cli {
     /// Directory for data files (snapshots + WAL)
     #[arg(short, long, default_value = "./data")]
@@ -104,7 +107,7 @@ enum Commands {
         /// Enable binary protocol server (default: enabled for maximum performance)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         enable_binary: bool,
-        
+
         /// Binary protocol port offset from HTTP port (default: +1)
         #[arg(long, default_value = "1")]
         binary_port_offset: u16,
@@ -112,35 +115,35 @@ enum Commands {
         /// Automatically trigger snapshot every N seconds
         #[arg(long)]
         auto_snapshot_secs: Option<u64>,
-        
+
         /// Trigger snapshot when N new events have been appended since last snapshot
         #[arg(long)]
         snapshot_every_n_appends: Option<u64>,
-        
+
         /// Rotate/compact when WAL reaches this many bytes
         #[arg(long)]
         wal_max_bytes: Option<u64>,
-        
+
         /// Rebuild RMI when N appends since last build
         #[arg(long)]
         rmi_rebuild_appends: Option<u64>,
-        
+
         /// Rebuild RMI when delta/total ratio exceeds R (0.0-1.0)
         #[arg(long)]
         rmi_rebuild_ratio: Option<f64>,
-        
+
         /// WAL rotation: per-segment max bytes
         #[arg(long)]
         wal_segment_bytes: Option<u64>,
-        
+
         /// WAL retention: max segments to keep
         #[arg(long, default_value_t = 8)]
         wal_max_segments: usize,
-        
+
         /// Background compaction every N seconds (0 to disable)
         #[arg(long, default_value_t = 0)]
         compact_interval_secs: u64,
-        
+
         /// Compact when WAL bytes exceed this threshold (0 to disable)
         #[arg(long, default_value_t = 0)]
         compact_when_wal_bytes: u64,
@@ -211,38 +214,45 @@ async fn main() -> Result<()> {
                 if maxb > 0 {
                     let log_for_size = log.clone();
                     tokio::spawn(async move {
-                        let base_check_interval = 2u64; 
-                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(base_check_interval));
+                        let base_check_interval = 2u64;
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+                            base_check_interval,
+                        ));
                         let mut last_load_check = std::time::Instant::now();
                         let mut consecutive_failures = 0;
-                        
+
                         loop {
                             interval.tick().await;
-                            
+
                             // Adapt check frequency based on system load every 60 seconds
                             let now = std::time::Instant::now();
                             if now.duration_since(last_load_check).as_secs() >= 60 {
                                 last_load_check = now;
                                 let load_multiplier = detect_system_load_multiplier();
                                 let new_interval = base_check_interval * load_multiplier;
-                                
+
                                 if new_interval != interval.period().as_secs() {
-                                    println!("🔧 Adapting WAL size check interval: {}s -> {}s", 
-                                        interval.period().as_secs(), new_interval);
-                                    interval = tokio::time::interval(tokio::time::Duration::from_secs(new_interval));
+                                    println!(
+                                        "🔧 Adapting WAL size check interval: {}s -> {}s",
+                                        interval.period().as_secs(),
+                                        new_interval
+                                    );
+                                    interval = tokio::time::interval(
+                                        tokio::time::Duration::from_secs(new_interval),
+                                    );
                                 }
                             }
-                            
+
                             let size = log_for_size.wal_size_bytes().await;
                             if size >= maxb {
                                 println!(
                                     "📦 Size-based compaction: wal={} bytes >= {}",
                                     size, maxb
                                 );
-                                
+
                                 // Yield to foreground operations before heavy compaction
                                 tokio::task::yield_now().await;
-                                
+
                                 match log_for_size.compact_keep_latest_and_snapshot().await {
                                     Ok(_) => {
                                         println!("Size-based compaction complete.");
@@ -250,13 +260,23 @@ async fn main() -> Result<()> {
                                     }
                                     Err(e) => {
                                         consecutive_failures += 1;
-                                        eprintln!("Size-based compaction failed (attempt {}): {}", consecutive_failures, e);
-                                        
+                                        eprintln!(
+                                            "Size-based compaction failed (attempt {}): {}",
+                                            consecutive_failures, e
+                                        );
+
                                         // Back off after repeated failures to prevent resource exhaustion
                                         if consecutive_failures > 2 {
-                                            let backoff_duration = std::cmp::min(consecutive_failures * 10, 120); // Max 2 minutes
-                                            println!("Backing off size-based compaction for {} seconds", backoff_duration);
-                                            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_duration)).await;
+                                            let backoff_duration =
+                                                std::cmp::min(consecutive_failures * 10, 120); // Max 2 minutes
+                                            println!(
+                                                "Backing off size-based compaction for {} seconds",
+                                                backoff_duration
+                                            );
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                                backoff_duration,
+                                            ))
+                                            .await;
                                         }
                                     }
                                 }
@@ -271,40 +291,43 @@ async fn main() -> Result<()> {
                 let log_for_compact = log.clone();
                 tokio::spawn(async move {
                     let base_interval = compact_interval_secs;
-                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(base_interval));
+                    let mut interval =
+                        tokio::time::interval(tokio::time::Duration::from_secs(base_interval));
                     let mut last_cpu_check = std::time::Instant::now();
                     let mut error_count = 0;
-                    
+
                     loop {
                         interval.tick().await;
-                        
+
                         // Adaptive interval adjustment based on system load every 30 seconds
                         let now = std::time::Instant::now();
                         if now.duration_since(last_cpu_check).as_secs() >= 30 {
                             last_cpu_check = now;
-                            
+
                             // Check system load and adapt interval
                             let load_multiplier = detect_system_load_multiplier();
                             let new_interval = base_interval * load_multiplier;
-                            
+
                             if new_interval != interval.period().as_secs() {
                                 println!("🔧 Adapting compaction interval: {}s -> {}s (load factor: {}x)", 
                                     interval.period().as_secs(), new_interval, load_multiplier);
-                                interval = tokio::time::interval(tokio::time::Duration::from_secs(new_interval));
+                                interval = tokio::time::interval(tokio::time::Duration::from_secs(
+                                    new_interval,
+                                ));
                             }
                         }
-                        
+
                         // Check if compaction should run based on conditions
                         let should_compact = if compact_when_wal_bytes == 0 {
                             true
                         } else {
                             log_for_compact.wal_size_bytes().await >= compact_when_wal_bytes
                         };
-                        
+
                         if should_compact {
                             // Yield to other tasks before heavy operation
                             tokio::task::yield_now().await;
-                            
+
                             match log_for_compact.compact_keep_latest_and_snapshot().await {
                                 Ok(_) => {
                                     println!("✅ Interval compaction complete.");
@@ -312,13 +335,19 @@ async fn main() -> Result<()> {
                                 }
                                 Err(e) => {
                                     error_count += 1;
-                                    eprintln!("❌ Interval compaction failed (attempt {}): {}", error_count, e);
-                                    
+                                    eprintln!(
+                                        "❌ Interval compaction failed (attempt {}): {}",
+                                        error_count, e
+                                    );
+
                                     // Implement exponential backoff for repeated failures
                                     if error_count > 3 {
                                         let backoff_secs = std::cmp::min(error_count * 30, 300); // Max 5 minutes
                                         println!("🔄 Backing off compaction for {} seconds due to repeated failures", backoff_secs);
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(
+                                            backoff_secs,
+                                        ))
+                                        .await;
                                         error_count = 0; // Reset after backoff
                                     }
                                 }
@@ -347,7 +376,7 @@ async fn main() -> Result<()> {
                     });
                 }
             }
-            
+
             if let Some(n) = snapshot_every_n_appends {
                 if n > 0 {
                     let snap_log = log.clone();
@@ -400,20 +429,26 @@ async fn main() -> Result<()> {
                                 engine_crate::metrics::RMI_REBUILD_DURATION_SECONDS.start_timer();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(1.0);
                             engine_crate::metrics::RMI_REBUILDS_TOTAL.inc();
-                            
+
                             // Build new AdaptiveRMI from current data
-                            let new_index = engine_crate::index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
-                            
+                            let new_index =
+                                engine_crate::index::PrimaryIndex::new_adaptive_rmi_from_pairs(
+                                    &pairs,
+                                );
+
                             // Swap to the new index
                             if let Err(err) = rebuild_log.swap_primary_index(new_index).await {
                                 eprintln!("Failed to swap primary index: {err:?}");
                             }
-                            
+
                             last_built = cur;
                             rebuild_timer.observe_duration();
                             engine_crate::metrics::RMI_REBUILD_IN_PROGRESS.set(0.0);
                             let _ = rebuild_log.write_manifest().await;
-                            println!("✅ AdaptiveRMI rebuilt successfully (appended={}, ratio={:.3})", appended, ratio);
+                            println!(
+                                "✅ AdaptiveRMI rebuilt successfully (appended={}, ratio={:.3})",
+                                appended, ratio
+                            );
                         }
                     }
                 });
@@ -426,7 +461,7 @@ async fn main() -> Result<()> {
             // Parse address for unified server
             let addr = (host.parse::<std::net::IpAddr>()?, port);
             let binary_port = port + binary_port_offset; // Configurable port offset
-            
+
             tracing::info!(
                 "Starting kyrodb-engine DUAL-PROTOCOL SERVERS: HTTP on {}:{}, Binary TCP on {}:{} (commit={}, features={})",
                 host,
@@ -459,8 +494,10 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     if let Err(e) = kyrodb_engine::binary_protocol::binary_protocol_server(
                         binary_log,
-                        binary_addr
-                    ).await {
+                        binary_addr,
+                    )
+                    .await
+                    {
                         eprintln!("❌ Binary TCP server error: {}", e);
                     }
                 });
@@ -483,10 +520,10 @@ fn create_unified_routes(
 
     // 🚀 ULTRA-FAST LOOKUP ENDPOINTS: Zero-allocation paths for maximum performance
     let ultra_fast_lookup_routes = create_ultra_fast_lookup_routes(log.clone());
-    
+
     //  ADMIN ENDPOINTS: Management and monitoring
     let admin_routes = create_admin_endpoints(log.clone());
-    
+
     // 💊 HEALTH ENDPOINTS: Health checks and diagnostics
     let health_routes = create_health_endpoints();
 
@@ -547,22 +584,24 @@ fn create_ultra_fast_write_routes(
                         Ok::<_, warp::Rejection>(warp::reply::with_status(
                             warp::reply::with_header(
                                 response,
-                                "Content-Type", "application/octet-stream"
+                                "Content-Type",
+                                "application/octet-stream",
                             ),
                             StatusCode::OK,
                         ))
-                    },
-                    Err(_) => Ok::<_ ,warp::Rejection>(warp::reply::with_status(
+                    }
+                    Err(_) => Ok::<_, warp::Rejection>(warp::reply::with_status(
                         warp::reply::with_header(
                             "error".as_bytes().to_vec(),
-                            "Content-Type", "application/octet-stream"
+                            "Content-Type",
+                            "application/octet-stream",
                         ),
                         StatusCode::INTERNAL_SERVER_ERROR,
                     )),
                 }
             }
         });
-    
+
     put_fast_route
 }
 
@@ -611,11 +650,11 @@ fn create_ultra_fast_lookup_routes(
             .and(warp::get())
             .map(move |key: u64| {
                 let value = log.lookup_key_ultra_fast(key);
-                
+
                 // 🚀 ZERO-ALLOCATION RESPONSE
                 let pool = engine_crate::get_ultra_fast_pool();
                 let mut response = pool.get_json_buffer();
-                
+
                 match value {
                     Some(v) => {
                         use std::fmt::Write;
@@ -626,15 +665,11 @@ fn create_ultra_fast_lookup_routes(
                         write!(&mut response, "{{\"key\":{},\"value\":null}}", key).unwrap();
                     }
                 }
-                
+
                 let reply_data = response.clone();
                 pool.return_json_buffer(response);
-                
-                warp::reply::with_header(
-                    reply_data,
-                    "content-type", 
-                    "application/json"
-                )
+
+                warp::reply::with_header(reply_data, "content-type", "application/json")
             })
     };
 
@@ -655,22 +690,20 @@ fn create_ultra_fast_lookup_routes(
                         .collect()
                 } else if let Some(keys_array) = body.get("keys").and_then(|k| k.as_array()) {
                     // Object format: {"keys": [1,2,3]}
-                    keys_array
-                        .iter()
-                        .filter_map(|v| v.as_u64())
-                        .collect()
+                    keys_array.iter().filter_map(|v| v.as_u64()).collect()
                 } else {
                     vec![]
                 };
-                
+
                 let raw_results = log.lookup_keys_ultra_batch(&keys);
                 // Convert to format expected by ultra-fast client: [{"value": "123"}, {"value": null}, ...]
-                let json_results: Vec<serde_json::Value> = raw_results.into_iter().map(|(key, maybe_value)| {
-                    match maybe_value {
+                let json_results: Vec<serde_json::Value> = raw_results
+                    .into_iter()
+                    .map(|(key, maybe_value)| match maybe_value {
                         Some(value) => serde_json::json!({"key": key, "value": value.to_string()}),
                         None => serde_json::json!({"key": key, "value": null}),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 warp::reply::json(&json_results)
             })
     };
@@ -692,8 +725,7 @@ fn create_admin_endpoints(
             .and_then(move || {
                 let log = log.clone();
                 async move {
-                    log.snapshot().await
-                        .map_err(|_| warp::reject())?;
+                    log.snapshot().await.map_err(|_| warp::reject())?;
                     Ok::<_, warp::Rejection>(warp::reply::json(
                         &serde_json::json!({ "snapshot": "ok" }),
                     ))
@@ -762,50 +794,49 @@ fn create_admin_endpoints(
             })
     };
 
-    snapshot_route.or(rmi_build).or(warmup_route).or(compact_route)
+    snapshot_route
+        .or(rmi_build)
+        .or(warmup_route)
+        .or(compact_route)
 }
 
 /// 💊 HEALTH ENDPOINTS: Health checks and diagnostics
-fn create_health_endpoints() -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+fn create_health_endpoints(
+) -> impl warp::Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     let v1 = warp::path("v1");
-    
+
     // Health check endpoint: GET /v1/health
-    let health_route = v1.and(warp::path("health"))
+    let health_route = v1
+        .and(warp::path("health"))
         .and(warp::get())
-        .map(|| {
-            warp::reply::json(&serde_json::json!({ "status": "ok" }))
-        });
+        .map(|| warp::reply::json(&serde_json::json!({ "status": "ok" })));
 
     // Metrics endpoint: GET /metrics (no v1 prefix for Prometheus compatibility)
-    let metrics_route = warp::path("metrics")
-        .and(warp::get())
-        .map(|| {
-            #[cfg(not(feature = "bench-no-metrics"))]
-            {
-                let encoder = prometheus::TextEncoder::new();
-                let metric_families = prometheus::gather();
-                match encoder.encode_to_string(&metric_families) {
-                    Ok(output) => warp::reply::with_header(
-                        output,
-                        "Content-Type",
-                        "text/plain; version=0.0.4",
-                    ),
-                    Err(_) => warp::reply::with_header(
-                        "# Metrics encoding failed".to_string(),
-                        "Content-Type",
-                        "text/plain",
-                    ),
+    let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
+        #[cfg(not(feature = "bench-no-metrics"))]
+        {
+            let encoder = prometheus::TextEncoder::new();
+            let metric_families = prometheus::gather();
+            match encoder.encode_to_string(&metric_families) {
+                Ok(output) => {
+                    warp::reply::with_header(output, "Content-Type", "text/plain; version=0.0.4")
                 }
-            }
-            #[cfg(feature = "bench-no-metrics")]
-            {
-                warp::reply::with_header(
-                    "# Metrics disabled for benchmarking".to_string(),
+                Err(_) => warp::reply::with_header(
+                    "# Metrics encoding failed".to_string(),
                     "Content-Type",
                     "text/plain",
-                )
+                ),
             }
-        });
+        }
+        #[cfg(feature = "bench-no-metrics")]
+        {
+            warp::reply::with_header(
+                "# Metrics disabled for benchmarking".to_string(),
+                "Content-Type",
+                "text/plain",
+            )
+        }
+    });
 
     health_route.or(metrics_route)
 }

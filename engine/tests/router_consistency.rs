@@ -7,20 +7,20 @@ use tokio;
 #[tokio::test]
 async fn test_router_consistency_during_concurrent_operations() {
     let rmi = Arc::new(AdaptiveRMI::new());
-    
+
     // Insert initial data to create segments
     for i in 0..1000 {
         let key = i * 100;
         let value = key + 1;
         rmi.insert(key, value).expect("Insert should succeed");
     }
-    
+
     // Force merge to create segments
     rmi.merge_hot_buffer().await.expect("Merge should succeed");
-    
+
     // Wait a bit for any background operations to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    
+
     // Verify initial lookups work
     for i in 0..10 {
         let key = i * 100;
@@ -28,12 +28,20 @@ async fn test_router_consistency_during_concurrent_operations() {
         let result = rmi.lookup(key);
         if result.is_none() {
             // Data might still be in hot buffer, check there too
-            println!("Warning: Key {} not found in segments, checking if data was actually stored", key);
+            println!(
+                "Warning: Key {} not found in segments, checking if data was actually stored",
+                key
+            );
             continue;
         }
-        assert_eq!(result, Some(expected_value), "Initial lookup should work for key {}", key);
+        assert_eq!(
+            result,
+            Some(expected_value),
+            "Initial lookup should work for key {}",
+            key
+        );
     }
-    
+
     println!("✅ Router consistency tests need segments with actual data - test framework needs improvement");
 }
 

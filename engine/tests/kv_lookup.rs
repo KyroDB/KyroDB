@@ -11,7 +11,10 @@ async fn kv_append_lookup_across_restart() {
     let value = b"hello".to_vec();
     {
         let log = PersistentEventLog::open(&path).await.unwrap();
-        let off = log.append_kv(Uuid::new_v4(), key, value.clone()).await.unwrap();
+        let off = log
+            .append_kv(Uuid::new_v4(), key, value.clone())
+            .await
+            .unwrap();
         assert_eq!(log.lookup_key(key).await, Some(off));
         log.snapshot().await.unwrap();
     }

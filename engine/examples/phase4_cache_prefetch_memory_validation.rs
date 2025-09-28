@@ -10,4 +10,3 @@ mod legacy_phase4_validation {
 fn main() {
     println!("Phase 4 cache prefetch memory validation demo placeholder");
 }
-

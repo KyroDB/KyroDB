@@ -10,8 +10,14 @@ async fn monotonic_offset_across_compaction() {
     let log = PersistentEventLog::open(&path).await.unwrap();
 
     // Write two versions for the same key
-    let o1 = log.append_kv(Uuid::new_v4(), 42, b"v1".to_vec()).await.unwrap();
-    let o2 = log.append_kv(Uuid::new_v4(), 42, b"v2".to_vec()).await.unwrap();
+    let o1 = log
+        .append_kv(Uuid::new_v4(), 42, b"v1".to_vec())
+        .await
+        .unwrap();
+    let o2 = log
+        .append_kv(Uuid::new_v4(), 42, b"v2".to_vec())
+        .await
+        .unwrap();
     assert!(o2 > o1);
 
     // Compact and snapshot

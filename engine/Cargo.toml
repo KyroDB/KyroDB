@@ -31,6 +31,8 @@ bench-no-metrics = []
 simd-avx2 = ["dep:wide"]
 simd-avx512 = ["dep:wide"]
 cpu-native = []
+# Internal debugging helpers
+rmi-build-profiler = []
 # Failure injection for tests only
 failpoints = ["dep:fail"]
 # Optional rate limiting (disabled by default for max performance)

@@ -56,8 +56,8 @@ mod http_integration_tests {
             return;
         }
         let client = reqwest::Client::new();
-    let test_key = 42u64;
-    let test_value: u64 = 4242;
+        let test_key = 42u64;
+        let test_value: u64 = 4242;
 
         let put_resp = timeout(
             TEST_TIMEOUT,

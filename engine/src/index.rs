@@ -66,7 +66,7 @@ impl PrimaryIndex {
     #[cfg(feature = "learned-index")]
     pub fn new_adaptive_rmi_from_pairs(pairs: &[(u64, u64)]) -> Self {
         PrimaryIndex::AdaptiveRmi(std::sync::Arc::new(
-            crate::adaptive_rmi::AdaptiveRMI::build_from_pairs(pairs)
+            crate::adaptive_rmi::AdaptiveRMI::build_from_pairs(pairs),
         ))
     }
 
@@ -107,7 +107,6 @@ impl PrimaryIndex {
         }
     }
 
- 
     #[cfg(feature = "learned-index")]
     pub fn is_adaptive_rmi(&self) -> bool {
         matches!(self, PrimaryIndex::AdaptiveRmi(_))
@@ -119,14 +118,18 @@ impl PrimaryIndex {
         match self {
             PrimaryIndex::AdaptiveRmi(ar) => {
                 // Only start if not already running - prevent multiple background tasks
-                static MAINTENANCE_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                
-                if MAINTENANCE_STARTED.compare_exchange(
-                    false, 
-                    true, 
-                    std::sync::atomic::Ordering::SeqCst, 
-                    std::sync::atomic::Ordering::SeqCst
-                ).is_ok() {
+                static MAINTENANCE_STARTED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+
+                if MAINTENANCE_STARTED
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
                     Some(ar.clone().start_background_maintenance())
                 } else {
                     None
@@ -145,10 +148,8 @@ impl PrimaryIndex {
         }
     }
 
-  
     #[cfg(feature = "learned-index")]
     pub fn migrate_to_adaptive(&mut self) -> anyhow::Result<()> {
-       
         match self {
             PrimaryIndex::AdaptiveRmi(_) => Ok(()),
             _ => Err(anyhow::anyhow!("Cannot migrate non-adaptive index")),
@@ -179,7 +180,10 @@ impl RmiIndex {
         }
     }
 
-    pub fn write_from_pairs<P: AsRef<std::path::Path>>(path: P, pairs: &[(u64, u64)]) -> std::io::Result<()> {
+    pub fn write_from_pairs<P: AsRef<std::path::Path>>(
+        path: P,
+        pairs: &[(u64, u64)],
+    ) -> std::io::Result<()> {
         let mut dedup = std::collections::BTreeMap::new();
         for &(key, offset) in pairs {
             dedup.insert(key, offset);
@@ -191,7 +195,10 @@ impl RmiIndex {
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
     }
 
-    pub fn write_from_pairs_auto<P: AsRef<std::path::Path>>(path: P, pairs: &[(u64, u64)]) -> std::io::Result<()> {
+    pub fn write_from_pairs_auto<P: AsRef<std::path::Path>>(
+        path: P,
+        pairs: &[(u64, u64)],
+    ) -> std::io::Result<()> {
         Self::write_from_pairs(path, pairs)
     }
 

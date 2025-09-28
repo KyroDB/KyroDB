@@ -26,7 +26,7 @@ async fn background_compaction_shrinks_wal_and_preserves_reads() {
         .expect("compaction should succeed");
 
     let after = log.wal_size_bytes().await;
-    
+
     assert!(
         after < before,
         "wal did not shrink, before={} after={}",
