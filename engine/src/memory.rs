@@ -7,7 +7,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Maximum memory usage before triggering aggressive cleanup (512 MB)
 const MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -336,18 +336,11 @@ impl MemoryManager {
         let mut pool = self.buffer_pool.lock();
 
         // Under high memory pressure, bypass pool to force immediate deallocation
-        if pressure == MemoryPressure::High && !pool.bypass_mode {
-            pool.bypass_mode = true;
-            // Clear pool under high pressure to free memory immediately
-            pool.small_buffers.clear();
-            pool.medium_buffers.clear();
-            pool.large_buffers.clear();
-            pool.total_pooled = 0;
-        }
-
-        // Re-enable pool when pressure subsides
-        if pressure == MemoryPressure::None && pool.bypass_mode {
-            pool.bypass_mode = false;
+        if pressure == MemoryPressure::High {
+            pool.enter_bypass_mode();
+        } else if pressure == MemoryPressure::None {
+            // Re-enable pool when pressure subsides
+            pool.exit_bypass_mode();
         }
 
         // If in bypass mode, don't use pool
@@ -356,22 +349,12 @@ impl MemoryManager {
             return Err(MemoryError::PoolExhausted);
         }
 
-        let buffer = match size {
-            0..=4096 => pool.small_buffers.pop_front().map(|tb| tb.buffer),
-            4097..=65536 => pool.medium_buffers.pop_front().map(|tb| tb.buffer),
-            _ => pool.large_buffers.pop_front().map(|tb| tb.buffer),
-        };
-
-        if let Some(mut buf) = buffer {
-            buf.clear();
-            buf.resize(size, 0);
-            pool.total_pooled = pool.total_pooled.saturating_sub(buf.capacity());
-            pool.pool_hits += 1;
-            Ok(buf)
-        } else {
-            pool.pool_misses += 1;
-            Err(MemoryError::PoolExhausted)
+        if let Some(mut buffer) = pool.try_buffer_from_size(size) {
+            buffer.resize(size, 0);
+            return Ok(buffer);
         }
+
+        Err(MemoryError::PoolExhausted)
     }
 
     /// Track allocation and update pressure
@@ -484,8 +467,6 @@ impl MemoryManager {
     /// Try to return buffer to pool with robust pressure handling
     fn try_return_to_pool_robust(&self, buffer: Vec<u8>) -> Result<PoolReturnResult, MemoryError> {
         let mut pool = self.buffer_pool.lock();
-        let size = buffer.capacity();
-
         // If in bypass mode, discard buffer immediately to prevent memory buildup
         if pool.bypass_mode {
             return Ok(PoolReturnResult::Discarded);
@@ -496,32 +477,10 @@ impl MemoryManager {
             return Ok(PoolReturnResult::Discarded);
         }
 
-        match size {
-            0..=4096 if pool.small_buffers.len() < 64 => {
-                pool.small_buffers.push_back(TimestampedBuffer {
-                    buffer,
-                    last_used: std::time::Instant::now(),
-                });
-                pool.total_pooled += size;
-                Ok(PoolReturnResult::Returned)
-            }
-            4097..=65536 if pool.medium_buffers.len() < 32 => {
-                pool.medium_buffers.push_back(TimestampedBuffer {
-                    buffer,
-                    last_used: std::time::Instant::now(),
-                });
-                pool.total_pooled += size;
-                Ok(PoolReturnResult::Returned)
-            }
-            _ if pool.large_buffers.len() < 8 => {
-                pool.large_buffers.push_back(TimestampedBuffer {
-                    buffer,
-                    last_used: std::time::Instant::now(),
-                });
-                pool.total_pooled += size;
-                Ok(PoolReturnResult::Returned)
-            }
-            _ => Ok(PoolReturnResult::Discarded),
+        if pool.return_buffer(buffer) {
+            Ok(PoolReturnResult::Returned)
+        } else {
+            Ok(PoolReturnResult::Discarded)
         }
     }
 
@@ -624,6 +583,8 @@ impl MemoryManager {
     pub fn stats(&self) -> MemoryStats {
         let cache = self.index_cache.read();
         let pool = self.buffer_pool.lock();
+        let (_small, _medium, _large, bypass_mode, pool_hits, pool_misses, pool_evictions) =
+            pool.get_stats();
 
         MemoryStats {
             total_allocated: self.total_allocated.load(Ordering::Relaxed),
@@ -634,9 +595,10 @@ impl MemoryManager {
             cache_entries: cache.snapshots.len(),
             pool_size: pool.total_pooled,
             pressure: self.memory_pressure(),
-            pool_hits: pool.pool_hits,
-            pool_misses: pool.pool_misses,
-            pool_bypass_mode: pool.bypass_mode,
+            pool_hits,
+            pool_misses,
+            pool_bypass_mode: bypass_mode,
+            pool_evictions,
         }
     }
 
@@ -672,6 +634,7 @@ pub struct MemoryStats {
     pub pool_hits: usize,
     pub pool_misses: usize,
     pub pool_bypass_mode: bool,
+    pub pool_evictions: usize,
 }
 
 impl IndexCache {
@@ -728,6 +691,23 @@ impl BufferPool {
             &mut self.large_buffers
         };
 
+        // Remove stale buffers that have not been used recently
+        let stale_threshold = Duration::from_secs(120);
+        while let Some(front) = pool.front() {
+            if now.duration_since(front.last_used) > stale_threshold {
+                if let Some(evicted) = pool.pop_front() {
+                    self.total_pooled = self
+                        .total_pooled
+                        .saturating_sub(evicted.buffer.capacity());
+                    self.eviction_count = self.eviction_count.saturating_add(1);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
         // Look for a suitable buffer in the pool (LRU order - oldest first)
         let mut found_index = None;
         for (i, timestamped_buffer) in pool.iter().enumerate() {
@@ -757,12 +737,12 @@ impl BufferPool {
     }
 
     /// Return a buffer to the appropriate pool with LRU management
-    fn return_buffer(&mut self, buffer: Vec<u8>) {
+    fn return_buffer(&mut self, buffer: Vec<u8>) -> bool {
         let now = std::time::Instant::now();
         let capacity = buffer.capacity();
 
         if capacity == 0 || self.bypass_mode {
-            return; // Don't pool zero-capacity or when bypassing
+            return false; // Don't pool zero-capacity or when bypassing
         }
 
         // Determine which pool to use based on capacity
@@ -791,8 +771,12 @@ impl BufferPool {
                 buffer,
                 last_used: now,
             });
+            true
         }
         // If pool is still full after eviction, drop the buffer
+        else {
+            false
+        }
     }
 
     /// Enter bypass mode when pool performance degrades
@@ -832,17 +816,6 @@ impl BufferPool {
         self.try_get_buffer(size)
     }
 
-    /// Apply graduated pressure response
-    fn apply_graduated_pressure_response(&mut self) {
-        // Under medium pressure, proactively evict some buffers
-        let evict_count = std::cmp::min(5, self.small_buffers.len() / 4);
-        for _ in 0..evict_count {
-            if self.small_buffers.pop_front().is_none() {
-                break;
-            }
-        }
-        self.eviction_count += evict_count;
-    }
 }
 
 impl Default for MemoryManager {

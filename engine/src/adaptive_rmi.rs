@@ -14,7 +14,7 @@ use crossbeam_epoch::{self, Atomic, Owned};
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "rmi-build-profiler")]
 use std::time::Instant;
@@ -35,7 +35,6 @@ const OVERFLOW_PRESSURE_MEDIUM: usize = (MAX_OVERFLOW_CAPACITY * 8) / 10;
 const OVERFLOW_PRESSURE_HIGH: usize = (MAX_OVERFLOW_CAPACITY * 9) / 10;
 const OVERFLOW_PRESSURE_CRITICAL: usize = (MAX_OVERFLOW_CAPACITY * 19) / 20;
 const SYSTEM_MEMORY_LIMIT_MB: usize = 64 * 1024; // 64 GB safety ceiling for overflow buffer enforcement
-const MAX_INTERVAL_MULTIPLIER: u64 = 16;
 
 /// Maximum search window size - strict bound to prevent O(n) behavior
 const MAX_SEARCH_WINDOW: usize = 64;
@@ -46,7 +45,6 @@ const DEFAULT_HOT_BUFFER_SIZE: usize = 4096;
 const MIN_SEGMENT_SIZE: usize = 100;
 const MAX_SEGMENT_SIZE: usize = 8192;
 const TARGET_SEGMENT_SIZE: usize = 1024;
-const MERGE_TRIGGER_RATIO: f32 = 0.75;
 const MAX_ERROR_RATE: f64 = 0.15;
 const TARGET_ACCESS_FREQUENCY: u64 = 1000;
 
@@ -243,10 +241,6 @@ impl LocalLinearModel {
 pub struct SegmentMetrics {
     access_count: AtomicU64,
     last_access: AtomicU64,
-    /// Number of times this segment was split
-    split_count: AtomicU64,
-    /// Number of times this segment was merged
-    merge_count: AtomicU64,
     /// Total prediction errors
     prediction_errors: AtomicU64,
 }
@@ -663,10 +657,6 @@ impl AdaptiveSegment {
         self.epoch.load(Ordering::Acquire)
     }
 
-    /// Increment epoch version when segment is modified
-    fn increment_epoch(&self) {
-        self.epoch.fetch_add(1, Ordering::Release);
-    }
 }
 
 impl Clone for AdaptiveSegment {
@@ -939,7 +929,6 @@ impl HotBuffer for BoundedHotBuffer {
     fn drain_atomic(&self) -> Vec<(u64, u64)> {
         // Call the actual method on BoundedHotBuffer
         let mut buffer = self.buffer.lock();
-        let drained_count = buffer.len();
         let drained_data: Vec<_> = buffer.drain(..).collect();
         self.size.store(0, Ordering::Release);
         drained_data
@@ -1100,7 +1089,10 @@ impl LockFreeHotBuffer {
         let vec_overhead = std::mem::size_of::<Vec<(u64, u64)>>();
         let atomic_overhead = std::mem::size_of::<Atomic<Vec<(u64, u64)>>>();
 
-        capacity * tuple_size + vec_overhead + atomic_overhead
+        let reserved_bytes = capacity * tuple_size;
+        let active_bytes = data.len() * tuple_size;
+
+        reserved_bytes.max(active_bytes) + vec_overhead + atomic_overhead
     }
 
     /// Check if buffer is full
@@ -1133,7 +1125,7 @@ impl LockFreeHotBuffer {
 }
 
 impl HotBuffer for LockFreeHotBuffer {
-    fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
+    fn try_insert(&self, _key: u64, _value: u64) -> Result<bool, anyhow::Error> {
         // For now, delegate to bounded search - could be enhanced with lock-free insertion
         Ok(false) // Lock-free insertion is complex, for now return false to use overflow
     }
@@ -1574,420 +1566,6 @@ impl BoundedOverflowBuffer {
     }
 }
 
-/// Enhanced CPU pressure detection for container environments with comprehensive throttling awareness
-#[derive(Debug)]
-struct CPUPressureDetector {
-    last_check: std::time::Instant,
-    pressure_level: AtomicUsize, // 0=none, 1=low, 2=medium, 3=high, 4=critical
-    throttle_history: Mutex<VecDeque<u64>>, // Track throttling events over time
-    load_history: Mutex<VecDeque<f64>>, // Track load average trend
-    consecutive_throttles: AtomicUsize, // Consecutive throttling detections
-    last_throttle_count: AtomicU64, // Previous throttle count for delta calculation
-    container_detection: AtomicU8, // 0=unknown, 1=container, 2=bare_metal
-}
-
-impl CPUPressureDetector {
-    fn new() -> Self {
-        Self {
-            last_check: std::time::Instant::now(),
-            pressure_level: AtomicUsize::new(0),
-            throttle_history: Mutex::new(VecDeque::with_capacity(10)),
-            load_history: Mutex::new(VecDeque::with_capacity(5)),
-            consecutive_throttles: AtomicUsize::new(0),
-            last_throttle_count: AtomicU64::new(0),
-            container_detection: AtomicU8::new(0),
-        }
-    }
-
-    /// Enhanced pressure detection with comprehensive container throttling awareness
-    fn detect_pressure(&mut self) -> usize {
-        let now = std::time::Instant::now();
-
-        // More frequent checks during high pressure to respond quickly
-        let check_interval_secs = match self.pressure_level.load(Ordering::Relaxed) {
-            0..=1 => 5, // Normal: check every 5 seconds
-            2 => 3,     // Medium pressure: check every 3 seconds
-            3 => 2,     // High pressure: check every 2 seconds
-            _ => 1,     // Critical pressure: check every second
-        };
-
-        if now.duration_since(self.last_check).as_secs() < check_interval_secs {
-            return self.pressure_level.load(Ordering::Relaxed);
-        }
-
-        self.last_check = now;
-        let mut pressure_signals = 0;
-        let mut max_signal_strength = 0;
-
-        // Signal 1: Enhanced container CPU throttling detection
-        pressure_signals += self.detect_container_throttling(&mut max_signal_strength);
-
-        // Signal 2: Enhanced system load analysis with trending
-        pressure_signals += self.detect_load_pressure(&mut max_signal_strength);
-
-        // Signal 3: Enhanced memory pressure with swap detection
-        pressure_signals += self.detect_memory_pressure(&mut max_signal_strength);
-
-        // Signal 4: New - I/O wait and context switching pressure
-        pressure_signals += self.detect_io_pressure(&mut max_signal_strength);
-
-        // Signal 5: New - Container-specific cgroup pressure indicators
-        pressure_signals += self.detect_cgroup_pressure(&mut max_signal_strength);
-
-        // Calculate final pressure level using both signal count and maximum signal strength
-        let raw_pressure = match pressure_signals {
-            0 => 0,     // No pressure
-            1..=2 => 1, // Low pressure
-            3..=4 => 2, // Medium pressure
-            5..=6 => 3, // High pressure
-            _ => 4,     // Critical pressure
-        };
-
-        // Adjust based on maximum signal strength (individual signals can override)
-        let final_pressure = raw_pressure.max(max_signal_strength);
-
-        // Update consecutive throttling tracking
-        if final_pressure >= 3 {
-            self.consecutive_throttles.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.consecutive_throttles.store(0, Ordering::Relaxed);
-        }
-
-        self.pressure_level.store(final_pressure, Ordering::Relaxed);
-
-        if final_pressure != raw_pressure {
-            println!(
-                "CPU pressure escalated from {} to {} due to critical signal",
-                raw_pressure, final_pressure
-            );
-        }
-
-        final_pressure
-    }
-
-    /// Detect container CPU throttling with delta tracking
-    fn detect_container_throttling(&self, max_signal_strength: &mut usize) -> usize {
-        let mut signals = 0;
-
-        // Check modern cgroup v2 throttling
-        if let Ok(throttling) = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat") {
-            self.container_detection.store(1, Ordering::Relaxed); // We're in a container
-
-            for line in throttling.lines() {
-                if line.starts_with("throttled_usec") {
-                    if let Some(value_str) = line.split_whitespace().nth(1) {
-                        if let Ok(throttled_usec) = value_str.parse::<u64>() {
-                            let previous = self.last_throttle_count.load(Ordering::Relaxed);
-                            self.last_throttle_count
-                                .store(throttled_usec, Ordering::Relaxed);
-
-                            // Check if throttling increased (delta throttling)
-                            if throttled_usec > previous {
-                                let delta = throttled_usec - previous;
-                                if delta > 100_000 {
-                                    // > 100ms of throttling per check interval
-                                    signals += 3;
-                                    *max_signal_strength = (*max_signal_strength).max(4); // Critical
-                                    println!(
-                                        "Container CPU throttling detected: +{}μs throttled",
-                                        delta
-                                    );
-                                } else if delta > 10_000 {
-                                    // > 10ms of throttling
-                                    signals += 2;
-                                    *max_signal_strength = (*max_signal_strength).max(3);
-                                // High
-                                } else if delta > 0 {
-                                    signals += 1;
-                                    *max_signal_strength = (*max_signal_strength).max(2);
-                                    // Medium
-                                }
-                            }
-                        }
-                    }
-                }
-                // Also check nr_periods and nr_throttled for additional context
-                else if line.starts_with("nr_throttled") {
-                    if let Some(value_str) = line.split_whitespace().nth(1) {
-                        if let Ok(nr_throttled) = value_str.parse::<u64>() {
-                            if nr_throttled > 0 {
-                                signals += 1;
-                                println!("Container throttle count: {}", nr_throttled);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Fallback to cgroup v1
-        else if let Ok(throttling) = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.stat") {
-            self.container_detection.store(1, Ordering::Relaxed);
-
-            if let Some(line) = throttling.lines().find(|l| l.starts_with("nr_throttled")) {
-                if let Some(value_str) = line.split_whitespace().nth(1) {
-                    if let Ok(throttled) = value_str.parse::<u64>() {
-                        if throttled > 0 {
-                            signals += 1;
-                            println!("Legacy container throttling detected: {}", throttled);
-                        }
-                    }
-                }
-            }
-        } else {
-            // Not in a container - check bare metal indicators
-            self.container_detection.store(2, Ordering::Relaxed);
-        }
-
-        signals
-    }
-
-    /// Enhanced load pressure detection with trending analysis
-    fn detect_load_pressure(&self, max_signal_strength: &mut usize) -> usize {
-        let mut signals = 0;
-
-        if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
-            if let Some(load_str) = loadavg.split_whitespace().next() {
-                if let Ok(load) = load_str.parse::<f64>() {
-                    let cpu_count = std::thread::available_parallelism()
-                        .map(|p| p.get())
-                        .unwrap_or(1) as f64;
-                    let load_ratio = load / cpu_count;
-
-                    // Update load history for trending
-                    {
-                        let mut history = self.load_history.lock();
-                        history.push_back(load_ratio);
-                        if history.len() > 5 {
-                            history.pop_front();
-                        }
-
-                        // Check if load is trending upward (early warning)
-                        if history.len() >= 3 {
-                            let recent_avg = history.iter().rev().take(2).sum::<f64>() / 2.0;
-                            let older_avg = history.iter().take(history.len() - 2).sum::<f64>()
-                                / (history.len() - 2) as f64;
-
-                            if recent_avg > older_avg * 1.5 {
-                                signals += 1; // Load is trending up rapidly
-                                println!(
-                                    "Load trending upward: {:.2} -> {:.2}",
-                                    older_avg, recent_avg
-                                );
-                            }
-                        }
-                    }
-
-                    // Absolute load thresholds
-                    if load_ratio > 4.0 {
-                        signals += 3;
-                        *max_signal_strength = (*max_signal_strength).max(4); // Critical
-                        println!("Critical system load: {:.2}x CPU count", load_ratio);
-                    } else if load_ratio > 2.5 {
-                        signals += 2;
-                        *max_signal_strength = (*max_signal_strength).max(3); // High
-                    } else if load_ratio > 1.8 {
-                        signals += 1;
-                        *max_signal_strength = (*max_signal_strength).max(2); // Medium
-                    } else if load_ratio > 1.2 {
-                        signals += 1;
-                    }
-                }
-            }
-        }
-
-        signals
-    }
-
-    /// Enhanced memory pressure detection including swap usage
-    fn detect_memory_pressure(&self, max_signal_strength: &mut usize) -> usize {
-        let mut signals = 0;
-
-        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-            let mut available_kb = 0u64;
-            let mut total_kb = 0u64;
-            let mut swap_total_kb = 0u64;
-            let mut swap_free_kb = 0u64;
-
-            for line in meminfo.lines() {
-                if line.starts_with("MemAvailable:") {
-                    if let Some(value) = line.split_whitespace().nth(1) {
-                        available_kb = value.parse().unwrap_or(0);
-                    }
-                } else if line.starts_with("MemTotal:") {
-                    if let Some(value) = line.split_whitespace().nth(1) {
-                        total_kb = value.parse().unwrap_or(0);
-                    }
-                } else if line.starts_with("SwapTotal:") {
-                    if let Some(value) = line.split_whitespace().nth(1) {
-                        swap_total_kb = value.parse().unwrap_or(0);
-                    }
-                } else if line.starts_with("SwapFree:") {
-                    if let Some(value) = line.split_whitespace().nth(1) {
-                        swap_free_kb = value.parse().unwrap_or(0);
-                    }
-                }
-            }
-
-            if total_kb > 0 {
-                let available_ratio = available_kb as f64 / total_kb as f64;
-
-                if available_ratio < 0.05 {
-                    signals += 3;
-                    *max_signal_strength = (*max_signal_strength).max(4); // Critical
-                    println!(
-                        "Critical memory pressure: {:.1}% available",
-                        available_ratio * 100.0
-                    );
-                } else if available_ratio < 0.1 {
-                    signals += 2;
-                    *max_signal_strength = (*max_signal_strength).max(3); // High
-                } else if available_ratio < 0.2 {
-                    signals += 1;
-                    *max_signal_strength = (*max_signal_strength).max(2); // Medium
-                }
-
-                // Check swap usage (indicates memory pressure)
-                if swap_total_kb > 0 {
-                    let swap_used_ratio =
-                        (swap_total_kb - swap_free_kb) as f64 / swap_total_kb as f64;
-                    if swap_used_ratio > 0.5 {
-                        signals += 2;
-                        *max_signal_strength = (*max_signal_strength).max(3); // High
-                        println!("🔄 High swap usage: {:.1}%", swap_used_ratio * 100.0);
-                    } else if swap_used_ratio > 0.2 {
-                        signals += 1;
-                    }
-                }
-            }
-        }
-
-        signals
-    }
-
-    /// Detect I/O wait and context switching pressure
-    fn detect_io_pressure(&self, max_signal_strength: &mut usize) -> usize {
-        let mut signals = 0;
-
-        // Check I/O wait from /proc/stat
-        if let Ok(stat) = std::fs::read_to_string("/proc/stat") {
-            if let Some(cpu_line) = stat.lines().find(|l| l.starts_with("cpu ")) {
-                let fields: Vec<&str> = cpu_line.split_whitespace().collect();
-                if fields.len() >= 6 {
-                    // cpu user nice system idle iowait irq softirq ...
-                    if let (Ok(idle), Ok(iowait)) =
-                        (fields[4].parse::<u64>(), fields[5].parse::<u64>())
-                    {
-                        let total_time = idle + iowait;
-                        if total_time > 0 {
-                            let iowait_ratio = iowait as f64 / total_time as f64;
-
-                            if iowait_ratio > 0.3 {
-                                signals += 2;
-                                *max_signal_strength = (*max_signal_strength).max(3); // High
-                                println!("💾 High I/O wait: {:.1}%", iowait_ratio * 100.0);
-                            } else if iowait_ratio > 0.15 {
-                                signals += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        signals
-    }
-
-    /// Detect container-specific cgroup pressure indicators
-    fn detect_cgroup_pressure(&self, max_signal_strength: &mut usize) -> usize {
-        let mut signals = 0;
-
-        // Check cgroup v2 pressure stall information
-        if let Ok(pressure) = std::fs::read_to_string("/sys/fs/cgroup/cpu.pressure") {
-            for line in pressure.lines() {
-                if line.starts_with("some avg10=") {
-                    if let Some(avg_str) = line.strip_prefix("some avg10=") {
-                        if let Some(avg_val_str) = avg_str.split_whitespace().next() {
-                            if let Ok(avg_pressure) = avg_val_str.parse::<f64>() {
-                                if avg_pressure > 50.0 {
-                                    signals += 2;
-                                    *max_signal_strength = (*max_signal_strength).max(3); // High
-                                    println!("CPU pressure stall: {:.1}%", avg_pressure);
-                                } else if avg_pressure > 20.0 {
-                                    signals += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        signals
-    }
-
-    /// Get current pressure level without detection (fast path)
-    fn current_pressure(&self) -> usize {
-        self.pressure_level.load(Ordering::Relaxed)
-    }
-
-    /// Enhanced interval multiplier with progressive scaling
-    fn interval_multiplier(&self, pressure: usize) -> u64 {
-        let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
-
-        let base_multiplier = match pressure {
-            0 => 1, // No pressure - normal intervals
-            1 => 2, // Low pressure - 2x slower
-            2 => 4, // Medium pressure - 4x slower
-            3 => 6, // High pressure - 6x slower
-            4 => 8, // Critical pressure - 8x slower
-            _ => 8, // Cap at 8x
-        };
-
-        // Apply consecutive throttling penalty
-        let penalty_multiplier = if consecutive > 10 {
-            2 // Double the interval if we've been throttled many times
-        } else if consecutive > 5 {
-            1.5 as u64 // 50% penalty for persistent throttling
-        } else {
-            1
-        };
-
-        (base_multiplier * penalty_multiplier).min(MAX_INTERVAL_MULTIPLIER)
-    }
-
-    /// Check if we should yield CPU to other processes (HTTP-optimized thresholds)
-    fn should_yield_cpu(&self) -> bool {
-        let pressure = self.current_pressure();
-        let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
-
-        // CRITICAL FIX: Much higher thresholds to preserve HTTP performance
-        // Only yield under extreme pressure to avoid starving HTTP server
-        pressure >= 7 || consecutive > 10
-    }
-
-    /// Get comprehensive pressure statistics for monitoring
-    fn get_pressure_stats(&self) -> (usize, usize, bool, &'static str) {
-        let pressure = self.current_pressure();
-        let consecutive = self.consecutive_throttles.load(Ordering::Relaxed);
-        let is_container = self.container_detection.load(Ordering::Relaxed) == 1;
-
-        let environment = match self.container_detection.load(Ordering::Relaxed) {
-            1 => "container",
-            2 => "bare_metal",
-            _ => "unknown",
-        };
-
-        (pressure, consecutive, is_container, environment)
-    }
-}
-
-///
-#[derive(Debug)]
-enum LookupResult {
-    Found(Option<u64>),
-    Inconsistent,
-}
-
 /// Main Adaptive RMI structure
 #[derive(Debug, Clone)]
 pub struct AdaptiveRMI {
@@ -2246,7 +1824,7 @@ impl AdaptiveRMI {
             #[cfg(not(feature = "bench-no-metrics"))]
             crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
 
-            self.fallback_linear_search_with_segments_lock(&segments_guard, key)
+            Self::linear_probe_segments(&segments_guard, key)
         };
         // Segment lock automatically released here - never hold multiple locks
 
@@ -2307,46 +1885,17 @@ impl AdaptiveRMI {
     /// Update atomic snapshot when segments change
     /// Called after any modification to maintain consistency
     fn update_segments_snapshot(&self) {
-        let guard = &crossbeam_epoch::pin();
         let segments_guard = self.segments.read();
         let snapshot = segments_guard.clone();
         self.segments_snapshot
             .store(Owned::new(snapshot), Ordering::Release);
     }
 
-    /// DEPRECATED
-    /// All retry logic is now integrated into the main lookup() method for atomicity
-    fn lookup_with_retry(&self, key: u64, retry_count: usize) -> Option<u64> {
-        let _ = retry_count; // Suppress unused parameter warning
-        self.lookup(key)
-    }
-
-    ///
-    fn fallback_linear_search_safe(&self, key: u64) -> Option<u64> {
-        let segments_guard = self.segments.read();
-        self.fallback_linear_search_with_segments_lock(&segments_guard, key)
-    }
-
-    ///
-    /// Used when we already hold the segments lock to avoid double-locking
-    fn fallback_linear_search_with_segments_lock(
-        &self,
-        segments_guard: &[AdaptiveSegment],
-        key: u64,
-    ) -> Option<u64> {
-        for segment in segments_guard.iter() {
-            if let Some(value) = segment.bounded_search(key) {
-                return Some(value);
-            }
-        }
-
-        None
-    }
-
-    /// DEPRECATED
-    fn fallback_linear_search(&self, key: u64) -> Option<u64> {
-        // Delegate to the new safe implementation
-        self.fallback_linear_search_safe(key)
+    #[inline]
+    fn linear_probe_segments(segments: &[AdaptiveSegment], key: u64) -> Option<u64> {
+        segments
+            .iter()
+            .find_map(|segment| segment.bounded_search(key))
     }
 
     /// DEADLOCK-FREE MERGE with strict global lock ordering protocol  
@@ -2428,150 +1977,6 @@ impl AdaptiveRMI {
         Ok(())
     }
 
-    /// DEPRECATED
-    /// This method had potential deadlock risks with separate lock acquisition
-    /// Updates are now grouped inline within atomic_update_with_consistent_locking
-    /// race-free segment updates using single write lock for entire operation
-    async fn merge_segment_updates_parallel(
-        segments: Arc<RwLock<Vec<AdaptiveSegment>>>,
-        segment_id: usize,
-        updates: Vec<(u64, u64)>,
-    ) -> Result<()> {
-        // CRITICAL FIX: Use single write lock for entire operation to eliminate TOCTOU races
-        let mut segments_guard = segments.write();
-
-        // 1. Validate segment exists under write lock (no race possible)
-        if segment_id >= segments_guard.len() {
-            return Err(anyhow!(
-                "Invalid segment ID: {} >= {}",
-                segment_id,
-                segments_guard.len()
-            ));
-        }
-
-        // 2. Extract current segment data safely under lock
-        let target_segment = &mut segments_guard[segment_id];
-        let current_model = target_segment.local_model.clone();
-        let current_epoch = target_segment.get_epoch();
-        let data = Arc::make_mut(&mut target_segment.data);
-        let update_count = updates.len();
-
-        // 3. Process updates efficiently (quick in-memory operation)
-        let needs_retrain = Self::merge_updates_efficiently_sync(data, updates)?;
-
-        // 4. Update model if necessary (optimized for speed)
-        let retrain_required =
-            needs_retrain || Self::should_retrain_model(data.as_slice(), &current_model);
-        let new_model = if retrain_required {
-            LocalLinearModel::new(data.as_slice())
-        } else {
-            current_model
-        };
-
-        // 5. Atomic in-place update under same write lock (no races possible)
-        target_segment.local_model = new_model;
-        target_segment
-            .epoch
-            .store(current_epoch + 1, std::sync::atomic::Ordering::Release);
-
-        // Update access patterns and statistics
-        target_segment
-            .metrics
-            .access_count
-            .fetch_add(update_count as u64, Ordering::Relaxed);
-
-        Ok(())
-    }
-
-    /// Efficient update merging with minimal allocations (synchronous version for write lock)
-    fn merge_updates_efficiently_sync(
-        current_data: &mut Vec<(u64, u64)>,
-        updates: Vec<(u64, u64)>,
-    ) -> Result<bool> {
-        let initial_size = current_data.len();
-        let mut significant_changes = false;
-
-        // Merge updates efficiently - maintaining sort order
-        for (key, value) in updates {
-            match current_data.binary_search_by_key(&key, |(k, _)| *k) {
-                Ok(idx) => {
-                    // Update existing key
-                    if current_data[idx].1 != value {
-                        current_data[idx].1 = value;
-                        significant_changes = true;
-                    }
-                }
-                Err(idx) => {
-                    // Insert new key at correct position
-                    current_data.insert(idx, (key, value));
-                    significant_changes = true;
-                }
-            }
-        }
-
-        // Determine if retrain is needed based on growth
-        let growth_ratio = current_data.len() as f64 / initial_size.max(1) as f64;
-        let needs_retrain = significant_changes
-            && (growth_ratio > 1.1 || current_data.len().saturating_sub(initial_size) > 100);
-
-        Ok(needs_retrain)
-    }
-
-    /// Efficient update merging with minimal allocations (async version for compatibility)
-    async fn merge_updates_efficiently(
-        current_data: &mut Vec<(u64, u64)>,
-        updates: Vec<(u64, u64)>,
-    ) -> Result<bool> {
-        // Delegate to synchronous version - this is a quick in-memory operation
-        Self::merge_updates_efficiently_sync(current_data, updates)
-    }
-
-    /// Determine if model retraining is needed
-    fn should_retrain_model(new_data: &[(u64, u64)], current_model: &LocalLinearModel) -> bool {
-        if new_data.len() < 10 {
-            return false;
-        }
-
-        // Sample some predictions to estimate error rate
-        let sample_size = (new_data.len() / 10).max(10).min(100);
-        let mut errors = 0;
-
-        for i in (0..new_data.len())
-            .step_by(new_data.len() / sample_size + 1)
-            .take(sample_size)
-        {
-            let (key, _) = new_data[i];
-            let predicted_pos = current_model.predict(key);
-            let actual_pos = i;
-            let error = (predicted_pos as isize - actual_pos as isize).abs() as usize;
-
-            if error > 32 {
-                // Error threshold
-                errors += 1;
-            }
-        }
-
-        // Retrain if error rate is too high
-        (errors as f64 / sample_size as f64) > 0.2
-    }
-
-    /// Check for segment adaptation needs after merge
-    async fn check_segment_adaptation_after_merge(&self) -> Result<()> {
-        // Check if any segments need adaptation
-        let needs_adaptation = {
-            let segments = self.segments.read();
-            segments
-                .iter()
-                .any(|s| s.should_split() || s.should_merge())
-        };
-
-        if needs_adaptation {
-            // Direct call since we're already in an async context
-            self.adaptive_segment_management().await?;
-        }
-
-        Ok(())
-    }
     /// DEADLOCK-FREE SEGMENT MANAGEMENT with strict global lock ordering
     /// GLOBAL LOCK ORDER: segments → router (consistent with all other operations)
     /// All operations performed under single atomic lock acquisition to prevent TOCTOU races
@@ -2853,32 +2258,6 @@ impl AdaptiveRMI {
         Ok(())
     }
 
-    /// GLOBAL LOCK ORDERING PROTOCOL ENFORCEMENT
-    ///
-    /// CRITICAL: This method documents the ONLY valid lock acquisition order to prevent deadlocks
-    ///
-    /// **GLOBAL LOCK ORDER (NEVER DEVIATE):**
-    /// 1. hot_buffer (lock-free - no ordering constraint)
-    /// 2. overflow_buffer (Mutex)
-    /// 3. segments (RwLock)  
-    /// 4. global_router (RwLock)
-    ///
-    /// **DEADLOCK PREVENTION RULES:**
-    /// - NEVER acquire locks in a different order
-    /// - NEVER hold multiple locks longer than necessary
-    /// - Release locks in reverse order (automatic with RAII)
-    /// - Use atomic snapshots when possible to avoid holding multiple locks
-    ///
-    /// **VIOLATIONS THAT CAUSE DEADLOCKS:**
-    /// - Thread A: segments.read() → router.read()
-    /// - Thread B: router.write() → segments.write()
-    /// - Result: Circular wait → DEADLOCK
-    ///
-    /// This method serves as documentation and can be used for runtime validation.
-    fn validate_lock_ordering_protocol() -> &'static str {
-        "GLOBAL LOCK ORDER: hot_buffer → overflow_buffer → segments → router"
-    }
-
     /// Determine if a segment should be split based on multiple criteria
     fn should_split_segment(
         &self,
@@ -3042,38 +2421,6 @@ impl AdaptiveRMI {
 
             println!(" Background maintenance loop terminated gracefully");
         })
-    }
-
-    /// Performance analytics and monitoring
-    async fn log_performance_analytics(&self) {
-        let segments = self.segments.read();
-        let num_segments = segments.len();
-        let total_keys: usize = segments.iter().map(|s| s.len()).sum();
-
-        println!(
-            "🔍 RMI Analytics - Segments: {}, Total keys: {}",
-            num_segments, total_keys
-        );
-    }
-
-    /// Enhanced merge triggering logic
-    async fn should_trigger_merge(&self) -> bool {
-        let hot_utilization = self.hot_buffer.utilization();
-        let (overflow_size, _, _rejected_writes, _pressure, _memory_mb) =
-            self.overflow_buffer.lock().stats();
-        let merge_in_progress = self.merge_scheduler.is_merge_in_progress();
-
-        // Don't start new merge if one is already in progress
-        if merge_in_progress {
-            return false;
-        }
-
-        // Trigger merge based on multiple criteria
-        let utilization_trigger = hot_utilization > MERGE_TRIGGER_RATIO;
-        let overflow_trigger = overflow_size > 0;
-        let time_based_trigger = hot_utilization > 0.3; // Periodic merge for moderate load
-
-        utilization_trigger || overflow_trigger || time_based_trigger
     }
 
     /// Get performance statistics
@@ -4529,8 +3876,7 @@ impl AdaptiveRMI {
                     results[idx] = segments_guard[segment_id].bounded_search(key);
                 } else {
                     //  GRACEFUL DEGRADATION: Enterprise-safe fallback for invalid predictions
-                    results[idx] =
-                        self.fallback_linear_search_with_segments_lock(&segments_guard, key);
+                    results[idx] = Self::linear_probe_segments(&segments_guard, key);
                 }
             }
         }
@@ -4794,13 +4140,6 @@ impl CacheOptimizedSegment {
 ///
 /// Optimized batch lookup with advanced SIMD techniques
 pub struct AdvancedSIMDBatchProcessor {
-    /// Pre-allocated SIMD registers for hot paths
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    simd_registers: Vec<__m256i>,
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    simd_registers: Vec<u64>, // Fallback for non-AVX2
-    /// Cache-aligned memory pools
-    memory_pools: Vec<CacheAlignedBuffer>,
     /// Branch prediction hints
     prediction_hints: AtomicUsize,
 }
@@ -4808,11 +4147,6 @@ pub struct AdvancedSIMDBatchProcessor {
 impl Default for AdvancedSIMDBatchProcessor {
     fn default() -> Self {
         Self {
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            simd_registers: Vec::new(),
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            simd_registers: Vec::new(),
-            memory_pools: Vec::new(),
             prediction_hints: AtomicUsize::new(0),
         }
     }
@@ -5037,8 +4371,6 @@ pub struct CacheAlignedBuffer {
 pub struct PredictivePrefetcher {
     /// Access pattern analyzer
     access_history: VecDeque<u64>,
-    /// Cache line size (typically 64 bytes)
-    cache_line_size: usize,
     /// Prefetch distance
     prefetch_distance: usize,
 }
@@ -5048,7 +4380,6 @@ impl PredictivePrefetcher {
     pub fn new() -> Self {
         Self {
             access_history: VecDeque::with_capacity(1000),
-            cache_line_size: 64,
             prefetch_distance: 2,
         }
     }
@@ -5290,7 +4621,7 @@ impl PredictivePrefetcher {
 
         // ARM64 prefetching for Apple Silicon
         #[cfg(target_arch = "aarch64")]
-        unsafe {
+        {
             // Apple Silicon unified memory prefetching
             if !segment.keys.is_empty() {
                 let keys_ptr = segment.keys.as_ptr();
@@ -5424,7 +4755,7 @@ impl AdvancedMemoryPool {
         for chunk in keys.chunks(16) {
             if chunk.len() == 16 && processed + 16 <= results.len() {
                 //  SIMPLIFIED PROCESSING: Use scalar fallback
-                for (i, &key) in chunk.iter().enumerate() {
+                for (i, _) in chunk.iter().enumerate() {
                     if processed + i < results.len() {
                         results[processed + i] = None; // Simplified for now
                     }
@@ -5449,7 +4780,7 @@ impl AdvancedMemoryPool {
 
     ///  SCALAR LOOKUP OPTIMIZED
     /// Optimized scalar lookup for fallback cases
-    fn scalar_lookup_optimized(&self, key: u64, _buffer: &CacheAlignedBuffer) -> Option<u64> {
+    fn scalar_lookup_optimized(&self, _key: u64, _buffer: &CacheAlignedBuffer) -> Option<u64> {
         // Simplified scalar lookup (in real implementation, this would use the buffer for caching)
         // For now, return None as placeholder - this would integrate with the actual RMI
         None
@@ -5516,10 +4847,6 @@ pub struct PerformanceMonitor {
     throughput_counter: AtomicU64,
     /// Cache hit rate
     cache_hit_rate: AtomicUsize,
-    /// Adaptive thresholds
-    adaptive_thresholds: AdaptiveThresholds,
-    /// Performance history
-    performance_history: VecDeque<PerformanceSnapshot>,
 }
 
 impl PerformanceMonitor {
@@ -5529,8 +4856,6 @@ impl PerformanceMonitor {
             latency_histogram: VecDeque::with_capacity(10000),
             throughput_counter: AtomicU64::new(0),
             cache_hit_rate: AtomicUsize::new(0),
-            adaptive_thresholds: AdaptiveThresholds::new(),
-            performance_history: VecDeque::with_capacity(1000),
         }
     }
 
@@ -5582,18 +4907,6 @@ impl PerformanceMonitor {
     }
 }
 
-///  PERFORMANCE SNAPSHOT
-///
-/// Snapshot of performance metrics at a point in time
-#[derive(Debug, Clone)]
-pub struct PerformanceSnapshot {
-    pub timestamp: std::time::Instant,
-    pub latency_p99: u64,
-    pub throughput: u64,
-    pub cache_hit_rate: usize,
-    pub memory_usage: usize,
-}
-
 ///  OPTIMIZATION HINTS
 ///
 /// Generated hints for runtime optimization
@@ -5603,29 +4916,6 @@ pub struct OptimizationHints {
     pub should_enable_aggressive_prefetching: bool,
     pub should_optimize_memory_layout: bool,
     pub recommended_simd_width: usize,
-}
-
-///  ADAPTIVE THRESHOLDS
-///
-/// Dynamic thresholds that adapt to workload
-pub struct AdaptiveThresholds {
-    /// Dynamic epsilon bounds
-    pub epsilon_bounds: Vec<usize>,
-    /// Dynamic batch sizes
-    pub batch_sizes: Vec<usize>,
-    /// Dynamic prefetch distances
-    pub prefetch_distances: Vec<usize>,
-}
-
-impl AdaptiveThresholds {
-    /// Create new adaptive thresholds
-    pub fn new() -> Self {
-        Self {
-            epsilon_bounds: vec![32, 64, 128, 256],
-            batch_sizes: vec![8, 16, 32, 64],
-            prefetch_distances: vec![1, 2, 4, 8],
-        }
-    }
 }
 
 ///  ENHANCED BINARY PROTOCOL INTEGRATION
@@ -5649,11 +4939,7 @@ impl OptimizedBinaryProtocol {
     pub fn new(rmi: Arc<AdaptiveRMI>) -> Self {
         Self {
             rmi: rmi.clone(),
-            batch_processor: AdvancedSIMDBatchProcessor {
-                simd_registers: Vec::new(),
-                memory_pools: Vec::new(),
-                prediction_hints: AtomicUsize::new(0),
-            },
+            batch_processor: AdvancedSIMDBatchProcessor::default(),
             memory_pool: AdvancedMemoryPool::new(16),
             prefetcher: PredictivePrefetcher::new(),
             performance_monitor: PerformanceMonitor::new(),
