@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, oneshot, Notify, RwLock};
 use uuid::Uuid;
+use arc_swap::ArcSwap;
 
 // Core modules
 pub mod index;
@@ -360,7 +361,8 @@ pub struct PersistentEventLog {
     wal: Arc<RwLock<BufWriter<File>>>,
     data_dir: PathBuf,
     tx: broadcast::Sender<Event>,
-    index: Arc<RwLock<index::PrimaryIndex>>, // primary key → offset
+    index: Arc<RwLock<index::PrimaryIndex>>, // primary key → offset (legacy)
+    index_atomic: Arc<ArcSwap<index::PrimaryIndex>>, // Lock-free atomic access
     // Replace with epoch-guarded shared pointer for linearizable swaps
     next_offset: Arc<RwLock<u64>>, // monotonic sequence (not tied to vec length)
     // current WAL segment index for rotation
@@ -591,7 +593,8 @@ impl PersistentEventLog {
             wal,
             data_dir: data_dir.clone(),
             tx,
-            index: Arc::new(RwLock::new(idx)),
+            index: Arc::new(RwLock::new(idx.clone())), // Keep legacy for compatibility
+            index_atomic: Arc::new(ArcSwap::from_pointee(idx)), // Lock-free atomic access
             // TODO: migrate to ArcSwap for better concurrency
             next_offset: Arc::new(RwLock::new(next)),
             wal_seg_index: Arc::new(RwLock::new(seg_to_open)),
@@ -969,74 +972,67 @@ impl PersistentEventLog {
         results
     }
 
-    /// Ultra-fast lock-free lookup with minimal metrics
+    /// Ultra-fast lock-free lookup with minimal metrics - OPTIMIZED VERSION
     /// This is the absolute fastest path - use for high-frequency operations
     pub fn lookup_key_ultra_fast(&self, key: u64) -> Option<u64> {
-        // Completely lock-free: no contention possible
-        match self.index.try_read() {
-            Ok(idx) => match &*idx {
-                #[cfg(feature = "learned-index")]
-                index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                    // Direct call: pure synchronous lookup with minimal overhead
-                    let result = adaptive.lookup(key);
+        // ZERO-CONTENTION: Direct atomic load - never fails, never blocks
+        let index = self.index_atomic.load();
+        
+        match &**index {
+            #[cfg(feature = "learned-index")]
+            index::PrimaryIndex::AdaptiveRmi(adaptive) => {
+                // Direct call: pure synchronous lookup with minimal overhead
+                let result = adaptive.lookup(key);
 
-                    // Minimal metrics: only increment counters, no timers for maximum speed
-                    #[cfg(not(feature = "bench-no-metrics"))]
-                    {
-                        if result.is_some() {
-                            crate::metrics::RMI_HITS_TOTAL.inc();
-                        } else {
-                            crate::metrics::RMI_MISSES_TOTAL.inc();
-                        }
-                        crate::metrics::RMI_READS_TOTAL.inc();
+                // Minimal metrics: only increment counters, no timers for maximum speed
+                #[cfg(not(feature = "bench-no-metrics"))]
+                {
+                    if result.is_some() {
+                        crate::metrics::RMI_HITS_TOTAL.inc();
+                    } else {
+                        crate::metrics::RMI_MISSES_TOTAL.inc();
                     }
-
-                    result
+                    crate::metrics::RMI_READS_TOTAL.inc();
                 }
-                index::PrimaryIndex::BTree(btree) => btree.get(&key),
-            },
-            Err(_) => None, // Lock contention - fail fast for ultra-fast path
+
+                result
+            }
+            index::PrimaryIndex::BTree(btree) => btree.get(&key),
         }
     }
 
-    /// Ultra-fast batch lookup optimized for high-throughput scenarios with SIMD
+    /// Ultra-fast batch lookup optimized for high-throughput scenarios with SIMD - OPTIMIZED VERSION
     pub fn lookup_keys_ultra_batch(&self, keys: &[u64]) -> Vec<(u64, Option<u64>)> {
         let mut results = Vec::with_capacity(keys.len());
 
-        // Single lock acquisition for entire batch - fail fast if contention
-        match self.index.try_read() {
-            Ok(idx) => match &*idx {
-                #[cfg(feature = "learned-index")]
-                index::PrimaryIndex::AdaptiveRmi(adaptive) => {
-                    // Use SIMD batch processing when available
-                    let simd_results = adaptive.lookup_batch_simd(keys);
+        // ZERO-CONTENTION: Direct atomic load - never fails, never blocks
+        let index = self.index_atomic.load();
+        
+        match &**index {
+            #[cfg(feature = "learned-index")]
+            index::PrimaryIndex::AdaptiveRmi(adaptive) => {
+                // Use SIMD batch processing when available
+                let simd_results = adaptive.lookup_batch_simd(keys);
 
-                    // Convert to expected format
-                    for (i, &key) in keys.iter().enumerate() {
-                        let value = simd_results.get(i).copied().unwrap_or(None);
-                        results.push((key, value));
-                    }
+                // Convert to expected format
+                for (i, &key) in keys.iter().enumerate() {
+                    let value = simd_results.get(i).copied().unwrap_or(None);
+                    results.push((key, value));
+                }
 
-                    // Minimal metrics: batch increment for efficiency
-                    #[cfg(not(feature = "bench-no-metrics"))]
-                    {
-                        let hits = results.iter().filter(|(_, v)| v.is_some()).count();
-                        crate::metrics::RMI_HITS_TOTAL.inc_by(hits as f64);
-                        crate::metrics::RMI_MISSES_TOTAL.inc_by((keys.len() - hits) as f64);
-                        crate::metrics::RMI_READS_TOTAL.inc_by(keys.len() as f64);
-                    }
+                // Minimal metrics: batch increment for efficiency
+                #[cfg(not(feature = "bench-no-metrics"))]
+                {
+                    let hits = results.iter().filter(|(_, v)| v.is_some()).count();
+                    crate::metrics::RMI_HITS_TOTAL.inc_by(hits as f64);
+                    crate::metrics::RMI_MISSES_TOTAL.inc_by((keys.len() - hits) as f64);
+                    crate::metrics::RMI_READS_TOTAL.inc_by(keys.len() as f64);
                 }
-                index::PrimaryIndex::BTree(btree) => {
-                    for &key in keys {
-                        let value = btree.get(&key);
-                        results.push((key, value));
-                    }
-                }
-            },
-            Err(_) => {
-                // Lock contention - return empty results for ultra-fast path
+            }
+            index::PrimaryIndex::BTree(btree) => {
                 for &key in keys {
-                    results.push((key, None));
+                    let value = btree.get(&key);
+                    results.push((key, value));
                 }
             }
         }
@@ -1321,8 +1317,20 @@ impl PersistentEventLog {
     }
 
     /// Swap the primary index (for RMI rebuilding)
-    pub async fn swap_primary_index(&self, _new_index: index::PrimaryIndex) -> Result<()> {
-        // TODO: Implement index swapping
+    pub async fn swap_primary_index(&self, new_index: index::PrimaryIndex) -> Result<()> {
+        // Atomic swap for zero-contention reads during rebuild
+        self.index_atomic.store(Arc::new(new_index.clone()));
+        
+        // Update legacy index for compatibility
+        let mut legacy_index = self.index.write().await;
+        *legacy_index = new_index;
+        
+        // Metrics: track successful swap
+        #[cfg(not(feature = "bench-no-metrics"))]
+        {
+            crate::metrics::RMI_SWAPS_TOTAL.inc();
+        }
+        
         Ok(())
     }
 

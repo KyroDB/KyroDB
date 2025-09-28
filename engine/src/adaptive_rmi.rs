@@ -136,12 +136,14 @@ pub struct SIMDCapabilities {
 }
 
 #[derive(Debug, Clone)]
+#[repr(align(64))] // Cache-line aligned for optimal CPU performance
 pub struct LocalLinearModel {
     slope: f64,
     intercept: f64,
     key_min: u64,
     key_max: u64,
     error_bound: u32,
+    _padding: [u8; 4], // Ensure 64-byte alignment
 }
 
 impl LocalLinearModel {
@@ -153,6 +155,7 @@ impl LocalLinearModel {
                 key_min: 0,
                 key_max: 0,
                 error_bound: 0,
+                _padding: [0; 4],
             };
         }
 
@@ -163,6 +166,7 @@ impl LocalLinearModel {
                 key_min: data[0].0,
                 key_max: data[0].0,
                 error_bound: 0,
+                _padding: [0; 4],
             };
         }
 
@@ -217,6 +221,7 @@ impl LocalLinearModel {
             key_min,
             key_max,
             error_bound: final_error_bound,
+            _padding: [0; 4],
         }
     }
 
@@ -237,17 +242,33 @@ impl LocalLinearModel {
     }
 }
 
-#[derive(Debug, Default)]
+#[repr(align(64))] // Cache-line aligned for optimal CPU performance  
 pub struct SegmentMetrics {
     access_count: AtomicU64,
     last_access: AtomicU64,
     /// Total prediction errors
     prediction_errors: AtomicU64,
+    _padding: [u64; 5], // Complete cache-line alignment (64 bytes - 24 bytes = 40 bytes = 5 u64)
+}
+
+impl std::fmt::Debug for SegmentMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentMetrics")
+            .field("access_count", &self.access_count.load(Ordering::Relaxed))
+            .field("last_access", &self.last_access.load(Ordering::Relaxed))
+            .field("prediction_errors", &self.prediction_errors.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl SegmentMetrics {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            access_count: AtomicU64::new(0),
+            last_access: AtomicU64::new(0),
+            prediction_errors: AtomicU64::new(0),
+            _padding: [0; 5],
+        }
     }
 
     #[inline]
@@ -315,7 +336,7 @@ impl SegmentMetrics {
 }
 
 /// A single adaptive segment containing a local model and data
-#[derive(Debug)]
+#[repr(align(64))] // Cache-line aligned for optimal CPU performance
 pub struct AdaptiveSegment {
     /// Local learned model for this key range
     local_model: LocalLinearModel,
@@ -328,6 +349,7 @@ pub struct AdaptiveSegment {
     merge_threshold: u64,
     /// Epoch version for atomic update tracking (prevents TOCTOU races)
     epoch: AtomicU64,
+    _padding: [u8; 0], // Ensure cache-line alignment
 }
 
 impl AdaptiveSegment {
@@ -348,6 +370,7 @@ impl AdaptiveSegment {
             split_threshold,
             merge_threshold,
             epoch: AtomicU64::new(0),
+            _padding: [],
         }
     }
 
@@ -366,6 +389,7 @@ impl AdaptiveSegment {
             split_threshold,
             merge_threshold,
             epoch: AtomicU64::new(0),
+            _padding: [],
         }
     }
 
@@ -668,7 +692,20 @@ impl Clone for AdaptiveSegment {
             split_threshold: self.split_threshold,
             merge_threshold: self.merge_threshold,
             epoch: AtomicU64::new(self.epoch.load(Ordering::Acquire)), // Copy current epoch value
+            _padding: [],
         }
+    }
+}
+
+impl std::fmt::Debug for AdaptiveSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdaptiveSegment")
+            .field("local_model", &self.local_model)
+            .field("data_len", &self.data.len())
+            .field("split_threshold", &self.split_threshold)
+            .field("merge_threshold", &self.merge_threshold)
+            .field("epoch", &self.epoch.load(Ordering::Relaxed))
+            .finish()
     }
 }
 

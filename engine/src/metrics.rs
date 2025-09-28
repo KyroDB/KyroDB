@@ -47,6 +47,7 @@ mod shim {
     pub static RMI_INDEX_SIZE_BYTES: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
     pub static RMI_EPSILON_MAX: Lazy<NoopGauge> = Lazy::new(|| NoopGauge);
     pub static RMI_REBUILDS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
+    pub static RMI_SWAPS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
     pub static RMI_REBUILD_DURATION_SECONDS: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_PROBE_LEN: Lazy<NoopHistogram> = Lazy::new(|| NoopHistogram);
     pub static RMI_MISPREDICTS_TOTAL: Lazy<NoopCounter> = Lazy::new(|| NoopCounter);
@@ -77,7 +78,7 @@ pub use shim::{
     LOOKUP_FALLBACK_SCAN_TOTAL, RMI_EPSILON_HISTOGRAM, RMI_EPSILON_MAX, RMI_HITS_TOTAL,
     RMI_INDEX_LEAVES, RMI_INDEX_SIZE_BYTES, RMI_LOOKUP_LATENCY_DURING_REBUILD_SECONDS,
     RMI_LOOKUP_LATENCY_SECONDS, RMI_MISPREDICTS_TOTAL, RMI_MISSES_TOTAL, RMI_PROBE_LEN,
-    RMI_READS_TOTAL, RMI_REBUILDS_TOTAL, RMI_REBUILD_DURATION_SECONDS, RMI_REBUILD_IN_PROGRESS,
+    RMI_READS_TOTAL, RMI_REBUILDS_TOTAL, RMI_SWAPS_TOTAL, RMI_REBUILD_DURATION_SECONDS, RMI_REBUILD_IN_PROGRESS,
     SNAPSHOTS_TOTAL, SNAPSHOT_LATENCY_SECONDS, SSE_LAGGED_TOTAL, WAL_BLOCK_CACHE_HITS_TOTAL,
     WAL_BLOCK_CACHE_MISSES_TOTAL, WAL_CRC_ERRORS_TOTAL,
 };
@@ -240,6 +241,15 @@ pub static RMI_REBUILDS_TOTAL: Lazy<Counter> = Lazy::new(|| {
         "Total number of successful RMI rebuilds"
     )
     .expect("register kyrodb_rmi_rebuilds_total")
+});
+
+#[cfg(not(feature = "bench-no-metrics"))]
+pub static RMI_SWAPS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "kyrodb_rmi_swaps_total",
+        "Total number of successful atomic index swaps"
+    )
+    .expect("register kyrodb_rmi_swaps_total")
 });
 
 #[cfg(not(feature = "bench-no-metrics"))]
