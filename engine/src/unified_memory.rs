@@ -11,6 +11,7 @@ use std::sync::Arc;
 /// **REALISTIC MEMORY LIMITS** - No more 64GB nonsense
 const TOTAL_MEMORY_LIMIT_MB: usize = 128;           // 128MB total (realistic)
 const ZERO_ALLOC_POOL_SIZE_MB: usize = 32;          // 32MB for zero-alloc pool
+#[allow(dead_code)]
 const EMERGENCY_RESERVE_MB: usize = 16;             // 16MB emergency reserve
 
 /// Buffer size categories for optimal memory pooling
@@ -33,6 +34,7 @@ struct ZeroAllocPool {
     large_available: AtomicUsize,
     
     /// Total memory allocated (for monitoring only)
+    #[allow(dead_code)]
     total_allocated: AtomicUsize,
 }
 
@@ -94,7 +96,7 @@ impl UnifiedMemoryManager {
     }
     
     /// **ZERO-ALLOCATION GET** - Borrow buffer from pool (never allocates)
-    pub fn get_zero_alloc_buffer(&self, min_size: usize) -> Option<ZeroAllocBuffer> {
+    pub fn get_zero_alloc_buffer(&self, min_size: usize) -> Option<ZeroAllocBuffer<'_>> {
         let category = if min_size <= SMALL_BUFFER_SIZE {
             BufferCategory::Small
         } else if min_size <= MEDIUM_BUFFER_SIZE {
