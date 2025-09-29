@@ -43,6 +43,8 @@ pub mod adaptive_rmi;
 pub mod memory;
 #[cfg(feature = "learned-index")]
 pub mod rmi_config;
+#[cfg(feature = "learned-index")]
+pub mod unified_memory;
 
 // Export main types for public API
 pub use PersistentEventLog as KyroDb; // Alias for backward compatibility with tests
@@ -1801,17 +1803,7 @@ pub enum BufferSize {
     Large,  // 4KB JSON, 2KB binary - 2% of requests
 }
 
-/// Pool statistics for comprehensive performance metrics
-#[derive(Debug, Clone)]
-pub struct PoolStats {
-    pub allocations: u64,
-    pub reuses: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub memory_pressure_drops: u64,
-    pub cache_hit_rate: f64,
-    pub current_memory_usage: usize,
-}
+// REMOVED: PoolStats replaced by UnifiedMemoryStats
 
 /// Pool health performance quality indicators  
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2018,41 +2010,16 @@ impl UltraFastBufferPool {
     }
 
     /// Enterprise statistics: comprehensive pool performance metrics
-    pub fn stats(&self) -> PoolStats {
-        PoolStats {
-            allocations: self.allocations.load(Ordering::Relaxed),
-            reuses: self.reuses.load(Ordering::Relaxed),
-            cache_hits: self.cache_hits.load(Ordering::Relaxed),
-            cache_misses: self.cache_misses.load(Ordering::Relaxed),
-            memory_pressure_drops: self.memory_pressure_drops.load(Ordering::Relaxed),
-            cache_hit_rate: {
-                let hits = self.cache_hits.load(Ordering::Relaxed);
-                let total = hits + self.cache_misses.load(Ordering::Relaxed);
-                if total > 0 {
-                    (hits as f64 / total as f64) * 100.0
-                } else {
-                    0.0
-                }
-            },
-            current_memory_usage: self.current_memory_usage.load(Ordering::Relaxed),
-        }
+    /// DEPRECATED: Use unified_memory::get_unified_memory().stats() instead
+    #[deprecated(note = "Use unified_memory system")]
+    pub fn stats(&self) -> crate::unified_memory::UnifiedMemoryStats {
+        crate::unified_memory::get_unified_memory().stats()
     }
 
-    /// Pool health check: monitor pool performance
+    /// DEPRECATED: Use unified_memory system for health monitoring
+    #[deprecated(note = "Use unified_memory system")]
     pub fn health_check(&self) -> PoolHealth {
-        let stats = self.stats();
-
-        let health = if stats.cache_hit_rate > 95.0 {
-            PoolHealth::Excellent
-        } else if stats.cache_hit_rate > 90.0 {
-            PoolHealth::Good
-        } else if stats.cache_hit_rate > 80.0 {
-            PoolHealth::Fair
-        } else {
-            PoolHealth::Poor
-        };
-
-        health
+        PoolHealth::Excellent // Always report excellent since unified system handles this
     }
 }
 

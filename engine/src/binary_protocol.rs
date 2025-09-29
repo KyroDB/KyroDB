@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 /// Protocol constants
 pub const MAGIC: u32 = 0x4B59524F; // "KYRO"
-pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64MB max frame
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16MB max frame (realistic limit)
 pub const MAX_BATCH_SIZE: usize = 10000; // Max keys/items per batch
 
 /// Command constants

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Maximum memory usage before triggering aggressive cleanup (512 MB)
-const MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
+/// Maximum memory usage before triggering aggressive cleanup (128 MB)
+const MAX_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 
 /// Maximum number of cached index snapshots
 const MAX_INDEX_SNAPSHOTS: usize = 16;
