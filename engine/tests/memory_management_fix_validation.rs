@@ -128,7 +128,7 @@ async fn test_memory_management_issue_resolution_summary() {
         let key = i as u64;
         let expected_value = key * 11;
 
-        if let Some(actual_value) = rmi.lookup(key) {
+        if let Some(actual_value) = rmi.lookup_key_ultra_fast(key) {
             integrity_checks += 1;
             if actual_value != expected_value {
                 integrity_violations += 1;

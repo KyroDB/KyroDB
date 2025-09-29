@@ -344,7 +344,7 @@ async fn test_memory_recovery_after_merge() {
         let key = i as u64;
         let expected_value = key * 23;
 
-        if let Some(actual_value) = rmi.lookup(key) {
+        if let Some(actual_value) = rmi.lookup_key_ultra_fast(key) {
             if actual_value != expected_value {
                 verification_errors += 1;
             }
@@ -400,7 +400,7 @@ async fn test_high_throughput_rag_ingestion_simulation() {
                         successes.fetch_add(1, Ordering::Relaxed);
 
                         // Verify immediate retrieval (RAG query simulation)
-                        if let Some(retrieved_hash) = rmi_clone.lookup(document_key) {
+                        if let Some(retrieved_hash) = rmi_clone.lookup_key_ultra_fast(document_key) {
                             if retrieved_hash != embedding_hash {
                                 eprintln!(
                                     "Data corruption: key={}, expected={}, got={}",

@@ -174,7 +174,7 @@ async fn test_background_task_yielding() {
 
         // Perform a lookup operation
         let key = (i * 10) as u64;
-        let _result = rmi.lookup(key);
+        let _result = rmi.lookup_key_ultra_fast(key);
 
         let latency = op_start.elapsed();
         foreground_latencies.push(latency);
@@ -375,7 +375,7 @@ async fn test_comprehensive_cpu_throttling_protection() {
             "System should remain functional after comprehensive test"
         );
 
-        let lookup_result = rmi.lookup(key);
+        let lookup_result = rmi.lookup_key_ultra_fast(key);
         // Lookup may not find key if insert failed due to back-pressure, both outcomes are valid
         assert!(
             lookup_result.is_some() || lookup_result.is_none(),

@@ -43,7 +43,7 @@ async fn test_memory_management_oom_prevention() {
                         successes.fetch_add(1, Ordering::Relaxed);
 
                         // Verify data integrity
-                        if let Some(retrieved) = rmi_clone.lookup(key) {
+                        if let Some(retrieved) = rmi_clone.lookup_key_ultra_fast(key) {
                             if retrieved != value {
                                 panic!(
                                     "Data integrity violation: key={}, expected={}, got={}",
@@ -139,7 +139,7 @@ async fn test_memory_management_oom_prevention() {
         let key = i as u64;
         let expected_value = key * 13;
 
-        if let Some(actual_value) = rmi.lookup(key) {
+        if let Some(actual_value) = rmi.lookup_key_ultra_fast(key) {
             integrity_checks += 1;
             if actual_value != expected_value {
                 integrity_failures += 1;

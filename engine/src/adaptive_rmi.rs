@@ -2401,9 +2401,29 @@ impl AdaptiveRMI {
 
     #[inline]
     fn linear_probe_segments(segments: &[AdaptiveSegment], key: u64) -> Option<u64> {
-        segments
-            .iter()
-            .find_map(|segment| segment.bounded_search(key))
+        // OPTIMIZED: Use binary search on segment key ranges instead of O(n) linear scan
+        // Each segment maintains sorted data with known min/max keys
+        if segments.is_empty() {
+            return None;
+        }
+
+        // Binary search to find the segment containing the key
+        match segments.binary_search_by(|segment| {
+            if let Some((min_key, max_key)) = segment.key_range() {
+                if key < min_key {
+                    std::cmp::Ordering::Greater
+                } else if key > max_key {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            } else {
+                std::cmp::Ordering::Greater // Empty segment, treat as "greater"
+            }
+        }) {
+            Ok(idx) => segments[idx].bounded_search(key),
+            Err(_) => None, // Key not in any segment range
+        }
     }
 
     /// DEADLOCK-FREE MERGE with strict global lock ordering protocol  
@@ -2806,21 +2826,21 @@ impl AdaptiveRMI {
     /// protection to prevent CPU spinning while maintaining essential database operations.
     pub fn start_background_maintenance(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            // CIRCUIT BREAKER: Bounded interval timing to prevent CPU spinning
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            // Reduced polling frequency to minimize CPU overhead
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            let mut total_iteration_count = 0u64; // Total iterations (never reset)
-            let mut rate_limit_count = 0u64; // For rate limiting (resets every minute)
-            const MAX_ITERATIONS_PER_MINUTE: u64 = 600; // 10 Hz max (600 iterations/minute)
-            const MAX_TOTAL_ITERATIONS: u64 = 300; // Safety limit for testing (5 minutes at 10Hz)
+            let mut total_iteration_count = 0u64;
+            let mut rate_limit_count = 0u64;
+            const MAX_ITERATIONS_PER_MINUTE: u64 = 120; // 2 Hz max (120 iterations/minute)
+            const MAX_TOTAL_ITERATIONS: u64 = 600; // Safety limit (5 minutes at 2Hz)
 
             let mut rate_limit_start = std::time::Instant::now();
             let mut consecutive_errors = 0;
             const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
             println!(
-                "🔧 Starting bounded background maintenance (max 10 Hz, {} total iterations)",
+                "Background maintenance starting (max 2 Hz, {} total iterations)",
                 MAX_TOTAL_ITERATIONS
             );
 
@@ -2828,13 +2848,16 @@ impl AdaptiveRMI {
                 // CRITICAL: Always wait before processing to ensure bounded rate
                 interval.tick().await;
 
+                // COOPERATIVE SCHEDULING: Yield to runtime before heavy operations
+                tokio::task::yield_now().await;
+
                 total_iteration_count += 1;
                 rate_limit_count += 1;
 
                 // EARLY EXIT: Safety limit to prevent infinite loops
                 if total_iteration_count > MAX_TOTAL_ITERATIONS {
                     println!(
-                        " Background maintenance stopping after {} iterations (safety limit)",
+                        "Background maintenance stopping after {} iterations (safety limit)",
                         MAX_TOTAL_ITERATIONS
                     );
                     break;
@@ -2853,24 +2876,26 @@ impl AdaptiveRMI {
                             MAX_ITERATIONS_PER_MINUTE
                         );
 
-                        // BOUNDED SLEEP: Reset rate limiting with recovery delay
+                        // Bounded sleep with cooperative yielding
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        tokio::task::yield_now().await;
                         rate_limit_count = 0;
                         rate_limit_start = std::time::Instant::now();
-                        consecutive_errors = 0; // Reset error count after circuit breaker
+                        consecutive_errors = 0;
                     } else if elapsed.as_secs() >= 60 {
-                        // Reset rate limiting counters every minute for fresh measurement
+                        // Reset rate limiting counters every minute
                         rate_limit_count = 0;
                         rate_limit_start = std::time::Instant::now();
                     }
                 }
+                
                 // ERROR CIRCUIT BREAKER: Stop if too many consecutive failures
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                     println!(
                         "Background maintenance stopping due to {} consecutive errors",
                         consecutive_errors
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await; // Recovery delay
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     break;
                 }
 
@@ -2880,23 +2905,26 @@ impl AdaptiveRMI {
 
                 if hot_utilization > 0.8 {
                     println!(
-                        "🔧 Background merge triggered (hot buffer {}% full)",
+                        "Background merge triggered (hot buffer {}% full)",
                         (hot_utilization * 100.0) as u32
                     );
 
                     match self.merge_hot_buffer().await {
                         Ok(_) => {
-                            consecutive_errors = 0; // Reset error count on success
-                            println!(" Background merge completed successfully");
+                            consecutive_errors = 0;
+                            println!("Background merge completed successfully");
+                            
+                            // COOPERATIVE SCHEDULING: Yield after CPU-intensive merge
+                            tokio::task::yield_now().await;
                         }
                         Err(e) => {
                             consecutive_errors += 1;
                             println!(
-                                "❌ Background merge failed (attempt {}): {}",
+                                "Background merge failed (attempt {}): {}",
                                 consecutive_errors, e
                             );
 
-                            // EXPONENTIAL BACKOFF: Increase delay with each error
+                            // Exponential backoff with cooperative yielding
                             let backoff_duration = std::time::Duration::from_secs(
                                 2_u64.pow(consecutive_errors.min(5)),
                             );
@@ -2912,22 +2940,20 @@ impl AdaptiveRMI {
                 };
 
                 if overflow_pressure {
-                    println!("⚠️  Overflow buffer under pressure - scheduling urgent merge");
-                    // Don't perform merge here, just log the condition
-                    // Let the next hot buffer check handle it
+                    println!("Overflow buffer under pressure - scheduling urgent merge");
                 }
 
-                // BOUNDED LOGGING: Only log every 100 iterations to prevent spam
-                if total_iteration_count % 100 == 0 {
+                // Reduced logging frequency to minimize overhead
+                if total_iteration_count % 200 == 0 {
                     println!(
-                        "🔧 Background maintenance status: iteration {}, hot buffer {:.1}% full",
+                        "Background maintenance status: iteration {}, hot buffer {:.1}% full",
                         total_iteration_count,
                         hot_utilization * 100.0
                     );
                 }
             }
 
-            println!(" Background maintenance loop terminated gracefully");
+            println!("Background maintenance loop terminated gracefully");
         })
     }
 

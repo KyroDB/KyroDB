@@ -48,7 +48,7 @@ async fn test_router_generation_consistency_under_concurrent_modifications() {
 
                 // Multiple lookup attempts to test router consistency
                 for _ in 0..3 {
-                    match rmi_clone.lookup(key) {
+                    match rmi_clone.lookup_key_ultra_fast(key) {
                         Some(_value) => {
                             successful_ops.fetch_add(1, Ordering::Relaxed);
                         }
@@ -143,7 +143,7 @@ async fn test_epoch_based_segment_update_validation() {
                         successes.fetch_add(1, Ordering::Relaxed);
 
                         // Verify data consistency immediately
-                        if let Some(read_value) = rmi_clone.lookup(key) {
+                        if let Some(read_value) = rmi_clone.lookup_key_ultra_fast(key) {
                             if read_value != value {
                                 conflicts.fetch_add(1, Ordering::Relaxed);
                                 eprintln!(
@@ -229,15 +229,15 @@ async fn test_atomic_segment_router_coordination() {
     // let maintenance_handle = rmi.clone().start_background_maintenance();
 
     println!("🔍 Debug: Testing basic lookup before concurrent test...");
-    match rmi.lookup(0) {
+    match rmi.lookup_key_ultra_fast(0) {
         Some(val) => println!("✅ Key 0 found with value: {}", val),
         None => println!("❌ Key 0 not found - this indicates fundamental search issue"),
     }
-    match rmi.lookup(100) {
+    match rmi.lookup_key_ultra_fast(100) {
         Some(val) => println!("✅ Key 100 found with value: {}", val),
         None => println!("❌ Key 100 not found - this indicates fundamental search issue"),
     }
-    match rmi.lookup(500) {
+    match rmi.lookup_key_ultra_fast(500) {
         Some(val) => println!("✅ Key 500 found with value: {}", val),
         None => println!("❌ Key 500 not found - this indicates fundamental search issue"),
     }
@@ -257,7 +257,7 @@ async fn test_atomic_segment_router_coordination() {
                 let key = (thread_id * 150 + i) % 1000; // Cycle through 0-999
                 let expected_value = key * 7;
 
-                match rmi_clone.lookup(key) {
+                match rmi_clone.lookup_key_ultra_fast(key) {
                     Some(value) => {
                         if value == expected_value {
                             successes.fetch_add(1, Ordering::Relaxed);
@@ -357,7 +357,7 @@ async fn test_concurrent_hot_buffer_merges() {
                     match rmi_clone.insert(key, value) {
                         Ok(_) => {
                             // Verify immediately for data integrity
-                            if let Some(read_value) = rmi_clone.lookup(key) {
+                            if let Some(read_value) = rmi_clone.lookup_key_ultra_fast(key) {
                                 if read_value != value {
                                     violations.fetch_add(1, Ordering::Relaxed);
                                     eprintln!(
@@ -473,7 +473,7 @@ async fn test_stress_race_condition_comprehensive() {
                             local_ops += 1;
 
                             // Immediate consistency check
-                            if let Some(read_val) = rmi_clone.lookup(key) {
+                            if let Some(read_val) = rmi_clone.lookup_key_ultra_fast(key) {
                                 if read_val != value {
                                     race_indicators.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -490,7 +490,7 @@ async fn test_stress_race_condition_comprehensive() {
                 // Read burst (check existing data)
                 for i in 0..20 {
                     let key = (thread_id * 100000 + (cycle.saturating_sub(1)) * 100 + i) as u64;
-                    if rmi_clone.lookup(key).is_some() {
+                    if rmi_clone.lookup_key_ultra_fast(key).is_some() {
                         local_ops += 1;
                     }
                 }

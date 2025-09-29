@@ -25,7 +25,7 @@ async fn test_router_consistency_during_concurrent_operations() {
     for i in 0..10 {
         let key = i * 100;
         let expected_value = key + 1;
-        let result = rmi.lookup(key);
+        let result = rmi.lookup_key_ultra_fast(key);
         if result.is_none() {
             // Data might still be in hot buffer, check there too
             println!(

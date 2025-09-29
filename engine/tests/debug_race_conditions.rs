@@ -40,7 +40,7 @@ async fn debug_simple_lookup_issue() {
     let mut failed_lookups = 0;
 
     for i in 0..100 {
-        match rmi.lookup(i) {
+        match rmi.lookup_key_ultra_fast(i) {
             Some(value) => {
                 successful_lookups += 1;
                 if value != i * 10 {
@@ -88,7 +88,7 @@ async fn debug_simple_lookup_issue() {
     let mut failed_lookups2 = 0;
 
     for i in 0..200 {
-        match rmi.lookup(i) {
+        match rmi.lookup_key_ultra_fast(i) {
             Some(value) => {
                 successful_lookups2 += 1;
                 if value != i * 10 {
@@ -152,7 +152,7 @@ async fn debug_router_prediction() {
     for i in 0..10 {
         let key = i * 10;
         let expected = i * 100;
-        match rmi.lookup(key) {
+        match rmi.lookup_key_ultra_fast(key) {
             Some(value) => {
                 if value == expected {
                     println!("✅ Hot buffer: key {} -> value {} (correct)", key, value);
@@ -182,7 +182,7 @@ async fn debug_router_prediction() {
     for i in 0..50 {
         let key = i * 10;
         let expected = i * 100;
-        match rmi.lookup(key) {
+        match rmi.lookup_key_ultra_fast(key) {
             Some(value) => {
                 if value == expected {
                     println!("✅ Segment: key {} -> value {} (correct)", key, value);

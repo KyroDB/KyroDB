@@ -20,7 +20,7 @@ async fn debug_segment_search_detailed() {
     // Check hot buffer first
     println!("\n🔍 Testing hot buffer lookups:");
     for (key, expected_value) in &test_data {
-        match rmi.lookup(*key) {
+        match rmi.lookup_key_ultra_fast(*key) {
             Some(value) => {
                 if value == *expected_value {
                     println!("✅ Hot buffer: key {} -> value {} (correct)", key, value);
@@ -50,7 +50,7 @@ async fn debug_segment_search_detailed() {
     // Test segment lookups
     println!("\n🔍 Testing segment lookups:");
     for (key, expected_value) in &test_data {
-        match rmi.lookup(*key) {
+        match rmi.lookup_key_ultra_fast(*key) {
             Some(value) => {
                 if value == *expected_value {
                     println!("✅ Segment: key {} -> value {} (correct)", key, value);
@@ -70,7 +70,7 @@ async fn debug_segment_search_detailed() {
     // Try some non-existent keys
     println!("\n🔍 Testing non-existent keys:");
     for key in [5, 15, 25, 35, 45, 55] {
-        match rmi.lookup(key) {
+        match rmi.lookup_key_ultra_fast(key) {
             Some(value) => {
                 println!(
                     "❌ Unexpected result for key {}: found value {}",
