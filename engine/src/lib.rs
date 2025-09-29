@@ -1039,13 +1039,17 @@ impl PersistentEventLog {
             .flatten()
     }
 
-    /// 🚀 SIMD-OPTIMIZED BATCH LOOKUP: Process multiple keys with vectorized operations
+    /// SIMD-OPTIMIZED BATCH LOOKUP: Process multiple keys with vectorized operations
     ///
     /// Enterprise-grade batch processing with automatic hardware optimization:
-    /// - Runtime SIMD detection (AVX2: 16 keys, NEON: 4 keys) 
+    /// - Runtime SIMD detection (AVX2: 4 u64/register, NEON: 2 u64/register)
+    /// - Default batch size: 16 keys (AVX2 uses 4 register operations, NEON uses 8)
     /// - Automatic scalar fallback for compatibility
     /// - Adaptive batch sizing based on CPU capabilities
     /// - Cache-optimized memory access patterns
+    ///
+    /// Realistic performance gains: 1.5x to 3x speedup over scalar processing,
+    /// depending on memory bandwidth, cache behavior, and workload characteristics.
     ///
     /// Use for batch processing of 4+ keys to leverage hardware acceleration.
     ///

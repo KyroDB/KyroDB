@@ -47,7 +47,8 @@ pub struct RmiOptimizationConfig {
 impl Default for RmiOptimizationConfig {
     fn default() -> Self {
         Self {
-            simd_batch_size: 16, // Updated for true 16-key SIMD processing
+            // Batch size: total keys processed per function call (AVX2 uses 4 registers to process 16 keys)
+            simd_batch_size: 16,
             cache_buffer_size: 64,
             prefetch_distance: 2,
             memory_pool_size: 16,
@@ -59,7 +60,8 @@ impl Default for RmiOptimizationConfig {
             enable_adaptive_batching: true,
             max_epsilon_bound: 256,
             min_epsilon_bound: 32,
-            simd_width: 16, // Updated for true 16-key SIMD width
+            // SIMD register width: AVX2 = 4 u64 per register (256 bits / 64 bits), NEON = 2 u64 per register (128 bits / 64 bits)
+            simd_width: 4,
             enable_prefetching: true,
             prefetch_window_size: 1000,
             cache_line_alignment: 64,
@@ -166,12 +168,13 @@ impl RmiOptimizationConfig {
         if let Ok(value) = env::var("KYRODB_SIMD_WIDTH") {
             if let Ok(width) = value.parse::<usize>() {
                 // Validate SIMD width matches architectural capabilities
-                let valid_widths = [1, 4, 8, 16]; // 1=scalar, 4=NEON, 8/16=AVX2
+                // Register width = values per SIMD register: scalar=1, NEON=2, AVX2=4
+                let valid_widths = [1, 2, 4];
                 if valid_widths.contains(&width) {
                     config.simd_width = width;
                 } else {
                     eprintln!(
-                        "Warning: Invalid SIMD width {}, must be 1, 4, 8, or 16. Using default: {}",
+                        "Warning: Invalid SIMD width {}, must be 1 (scalar), 2 (NEON), or 4 (AVX2). Using default: {}",
                         width, config.simd_width
                     );
                 }
@@ -235,9 +238,10 @@ impl RmiOptimizationConfig {
         }
 
         // Enhanced SIMD width validation
-        let valid_simd_widths = [1, 4, 8, 16]; // 1=scalar, 4=NEON, 8/16=AVX2
+        // SIMD register width = u64 values per register: 1=scalar, 2=NEON (128-bit), 4=AVX2 (256-bit)
+        let valid_simd_widths = [1, 2, 4];
         if !valid_simd_widths.contains(&self.simd_width) {
-            return Err("SIMD width must be 1, 4, 8, or 16".to_string());
+            return Err("SIMD width must be 1 (scalar), 2 (NEON), or 4 (AVX2)".to_string());
         }
 
         if self.prefetch_window_size < 100 || self.prefetch_window_size > 10000 {
