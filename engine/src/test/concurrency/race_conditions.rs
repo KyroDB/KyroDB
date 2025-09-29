@@ -12,16 +12,21 @@ use tokio::task::JoinSet;
 async fn test_concurrent_read_write_safety() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
     // Write initial data
     for i in 0..100 {
-        log.append(i, format!("value_{}", i).as_bytes().to_vec())
+        append_kv(&log, i, format!("value_{}", i).as_bytes().to_vec())
             .await
             .expect("Failed to append");
     }
+
+    // Build RMI before concurrent operations use lookups
+    #[cfg(feature = "learned-index")]
+    log.build_rmi().await.ok();
 
     // Spawn concurrent readers and writers
     let mut tasks = JoinSet::new();
@@ -31,7 +36,7 @@ async fn test_concurrent_read_write_safety() {
         let log_clone = log.clone();
         tasks.spawn(async move {
             for i in 100..200 {
-                let _ = log_clone.append(i, format!("value_{}", i).as_bytes().to_vec()).await;
+                let _ = append_kv(&log_clone, i, format!("value_{}", i).as_bytes().to_vec()).await;
                 tokio::time::sleep(Duration::from_micros(10)).await;
             }
         });
@@ -43,7 +48,7 @@ async fn test_concurrent_read_write_safety() {
         tasks.spawn(async move {
             for _ in 0..100 {
                 let key = rand::random::<u64>() % 200;
-                let _ = log_clone.lookup(key).await;
+                let _ = lookup_kv(&log_clone, key).await;
                 tokio::time::sleep(Duration::from_micros(5)).await;
             }
         });
@@ -53,8 +58,11 @@ async fn test_concurrent_read_write_safety() {
     while tasks.join_next().await.is_some() {}
 
     // Verify no data corruption
+    #[cfg(feature = "learned-index")]
+    log.build_rmi().await.ok();
+
     for i in 0..100 {
-        let value = log.lookup(i).await.expect("Failed to lookup");
+        let value = lookup_kv(&log, i).await.expect("Failed to lookup");
         assert!(value.is_some(), "Key {} not found", i);
     }
 }
@@ -63,7 +71,8 @@ async fn test_concurrent_read_write_safety() {
 async fn test_hot_buffer_race_conditions() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
@@ -78,7 +87,7 @@ async fn test_hot_buffer_race_conditions() {
             for _ in 0..1000 {
                 let key = keys[rand::random::<usize>() % keys.len()];
                 let value = format!("value_{}", rand::random::<u64>());
-                let _ = log_clone.append(key, value.as_bytes().to_vec()).await;
+                let _ = append_kv(&log_clone, key, value.as_bytes().to_vec()).await;
             }
         });
     }
@@ -90,16 +99,20 @@ async fn test_hot_buffer_race_conditions() {
         tasks.spawn(async move {
             for _ in 0..1000 {
                 let key = keys[rand::random::<usize>() % keys.len()];
-                let _ = log_clone.lookup(key).await;
+                let _ = lookup_kv(&log_clone, key).await;
             }
         });
     }
 
     while tasks.join_next().await.is_some() {}
 
+    // Build RMI before verification lookups
+    #[cfg(feature = "learned-index")]
+    log.build_rmi().await.ok();
+
     // Verify all hot keys exist
     for key in hot_keys {
-        assert!(log.lookup(key).await.expect("Failed to lookup").is_some());
+        assert!(lookup_kv(&log, key).await.expect("Failed to lookup").is_some());
     }
 }
 
@@ -107,16 +120,21 @@ async fn test_hot_buffer_race_conditions() {
 async fn test_cache_invalidation_race() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
     // Write initial data
     for i in 0..100 {
-        log.append(i, format!("initial_{}", i).as_bytes().to_vec())
+        append_kv(&log, i, format!("initial_{}", i).as_bytes().to_vec())
             .await
             .expect("Failed to append");
     }
+
+    // Build RMI before concurrent operations
+    #[cfg(feature = "learned-index")]
+    log.build_rmi().await.ok();
 
     // Concurrent updates and reads to test cache invalidation
     let mut tasks = JoinSet::new();
@@ -128,7 +146,7 @@ async fn test_cache_invalidation_race() {
             for _ in 0..100 {
                 let key = rand::random::<u64>() % 100;
                 let value = format!("updated_{}", rand::random::<u64>());
-                let _ = log_clone.append(key, value.as_bytes().to_vec()).await;
+                let _ = append_kv(&log_clone, key, value.as_bytes().to_vec()).await;
             }
         });
     }
@@ -139,7 +157,7 @@ async fn test_cache_invalidation_race() {
         tasks.spawn(async move {
             for _ in 0..100 {
                 let key = rand::random::<u64>() % 100;
-                if let Ok(Some(value)) = log_clone.lookup(key).await {
+                if let Ok(Some(value)) = lookup_kv(&log_clone, key).await {
                     // Value should be either initial or updated, never corrupted
                     let s = String::from_utf8_lossy(&value);
                     assert!(
@@ -159,7 +177,8 @@ async fn test_cache_invalidation_race() {
 async fn test_snapshot_rebuild_race() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 100, false)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
@@ -169,7 +188,7 @@ async fn test_snapshot_rebuild_race() {
     let log_clone = log.clone();
     tasks.spawn(async move {
         for i in 0..1000 {
-            let _ = log_clone.append(i, format!("value_{}", i).as_bytes().to_vec()).await;
+            let _ = append_kv(&log_clone, i, format!("value_{}", i).as_bytes().to_vec()).await;
         }
     });
 
@@ -179,16 +198,20 @@ async fn test_snapshot_rebuild_race() {
         tasks.spawn(async move {
             for _ in 0..500 {
                 let key = rand::random::<u64>() % 1000;
-                let _ = log_clone.lookup(key).await;
+                let _ = lookup_kv(&log_clone, key).await;
             }
         });
     }
 
     while tasks.join_next().await.is_some() {}
 
+    // Build RMI before verification
+    #[cfg(feature = "learned-index")]
+    log.build_rmi().await.ok();
+
     // Verify data integrity
     for i in 0..1000 {
-        let value = log.lookup(i).await.expect("Failed to lookup");
+        let value = lookup_kv(&log, i).await.expect("Failed to lookup");
         assert!(value.is_some(), "Key {} not found after snapshot rebuild", i);
     }
 }
@@ -198,16 +221,20 @@ async fn test_snapshot_rebuild_race() {
 async fn test_rmi_rebuild_race() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, true)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
     // Write data
     for i in 0..10000 {
-        log.append(i, format!("value_{}", i).as_bytes().to_vec())
+        append_kv(&log, i, format!("value_{}", i).as_bytes().to_vec())
             .await
             .expect("Failed to append");
     }
+
+    // Build RMI initially
+    log.build_rmi().await.ok();
 
     let mut tasks = JoinSet::new();
 
@@ -215,7 +242,7 @@ async fn test_rmi_rebuild_race() {
     let log_clone = log.clone();
     tasks.spawn(async move {
         for _ in 0..5 {
-            let _ = log_clone.rebuild_rmi().await;
+            let _ = log_clone.build_rmi().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
@@ -226,7 +253,7 @@ async fn test_rmi_rebuild_race() {
         tasks.spawn(async move {
             for _ in 0..1000 {
                 let key = rand::random::<u64>() % 10000;
-                let value = log_clone.lookup(key).await.expect("Failed to lookup");
+                let value = lookup_kv(&log_clone, key).await.expect("Failed to lookup");
                 assert!(value.is_some(), "Key {} not found during RMI rebuild", key);
             }
         });

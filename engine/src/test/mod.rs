@@ -16,8 +16,7 @@
 
 // Test modules organized by component
 pub mod utils;
-// Temporarily commented out to test background module
-// pub mod concurrency;
+pub mod concurrency;
 // pub mod memory;
 // pub mod simd;
 // pub mod rmi;

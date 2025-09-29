@@ -13,7 +13,8 @@ use tokio::time::timeout;
 async fn test_no_deadlock_under_heavy_load() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
@@ -24,8 +25,8 @@ async fn test_no_deadlock_under_heavy_load() {
         let log_clone = log.clone();
         tasks.spawn(async move {
             for i in 0..100 {
-                let _ = log_clone.append(i, format!("value_{}", i).as_bytes().to_vec()).await;
-                let _ = log_clone.lookup(i).await;
+                let _ = append_kv(&log_clone, i, format!("value_{}", i).as_bytes().to_vec()).await;
+                let _ = lookup_kv(&log_clone, i).await;
             }
         });
     }
@@ -43,16 +44,21 @@ async fn test_no_deadlock_under_heavy_load() {
 async fn test_lock_ordering_consistency() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
     // Write data
     for i in 0..100 {
-        log.append(i, format!("value_{}", i).as_bytes().to_vec())
+        append_kv(&log, i, format!("value_{}", i).as_bytes().to_vec())
             .await
             .expect("Failed to append");
     }
+
+    // Build RMI before concurrent operations
+    #[cfg(feature = "learned-index")]
+    log.build_rmi().await.ok();
 
     let mut tasks = JoinSet::new();
 
@@ -63,14 +69,14 @@ async fn test_lock_ordering_consistency() {
             for _ in 0..50 {
                 // Lookup requires read lock
                 let key1 = rand::random::<u64>() % 100;
-                let _ = log_clone.lookup(key1).await;
+                let _ = lookup_kv(&log_clone, key1).await;
 
                 // Append requires write lock
                 let key2 = rand::random::<u64>() % 100;
-                let _ = log_clone.append(key2, b"test".to_vec()).await;
+                let _ = append_kv(&log_clone, key2, b"test".to_vec()).await;
 
                 // Another lookup
-                let _ = log_clone.lookup(key1).await;
+                let _ = lookup_kv(&log_clone, key1).await;
             }
         });
     }
@@ -88,7 +94,8 @@ async fn test_lock_ordering_consistency() {
 async fn test_snapshot_during_operations() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 50, false)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
@@ -98,7 +105,7 @@ async fn test_snapshot_during_operations() {
     let log_clone = log.clone();
     tasks.spawn(async move {
         for i in 0..500 {
-            let _ = log_clone.append(i, format!("value_{}", i).as_bytes().to_vec()).await;
+            let _ = append_kv(&log_clone, i, format!("value_{}", i).as_bytes().to_vec()).await;
         }
     });
 
@@ -108,7 +115,7 @@ async fn test_snapshot_during_operations() {
         tasks.spawn(async move {
             for _ in 0..200 {
                 let key = rand::random::<u64>() % 500;
-                let _ = log_clone.lookup(key).await;
+                let _ = lookup_kv(&log_clone, key).await;
             }
         });
     }
@@ -126,7 +133,8 @@ async fn test_snapshot_during_operations() {
 async fn test_graceful_shutdown_no_deadlock() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
@@ -137,7 +145,7 @@ async fn test_graceful_shutdown_no_deadlock() {
         let log_clone = log.clone();
         tasks.spawn(async move {
             for i in 0..100 {
-                let _ = log_clone.append(i, format!("value_{}", i).as_bytes().to_vec()).await;
+                let _ = append_kv(&log_clone, i, format!("value_{}", i).as_bytes().to_vec()).await;
             }
         });
     }
@@ -160,16 +168,20 @@ async fn test_graceful_shutdown_no_deadlock() {
 async fn test_rmi_rebuild_no_deadlock() {
     let data_dir = test_data_dir();
     let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, true)
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
             .expect("Failed to create log")
     );
 
     // Initial data
     for i in 0..1000 {
-        log.append(i, format!("value_{}", i).as_bytes().to_vec())
+        append_kv(&log, i, format!("value_{}", i).as_bytes().to_vec())
             .await
             .expect("Failed to append");
     }
+
+    // Build RMI initially
+    log.build_rmi().await.ok();
 
     let mut tasks = JoinSet::new();
 
@@ -177,7 +189,7 @@ async fn test_rmi_rebuild_no_deadlock() {
     let log_clone = log.clone();
     tasks.spawn(async move {
         for _ in 0..3 {
-            let _ = log_clone.rebuild_rmi().await;
+            let _ = log_clone.build_rmi().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
@@ -188,7 +200,7 @@ async fn test_rmi_rebuild_no_deadlock() {
         tasks.spawn(async move {
             for _ in 0..100 {
                 let key = rand::random::<u64>() % 1000;
-                let _ = log_clone.lookup(key).await;
+                let _ = lookup_kv(&log_clone, key).await;
             }
         });
     }
