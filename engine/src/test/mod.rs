@@ -23,5 +23,5 @@ pub mod concurrency;
 // pub mod wal;
 // pub mod snapshot;
 pub mod background;
-// pub mod integration;
+pub mod integration;
 // pub mod stress;
