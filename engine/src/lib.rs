@@ -1975,3 +1975,7 @@ static ULTRA_FAST_POOL: OnceLock<UltraFastBufferPool> = OnceLock::new();
 pub fn get_ultra_fast_pool() -> &'static UltraFastBufferPool {
     ULTRA_FAST_POOL.get_or_init(|| UltraFastBufferPool::new())
 }
+
+// Test module - comprehensive test suite
+#[cfg(test)]
+pub mod test;
