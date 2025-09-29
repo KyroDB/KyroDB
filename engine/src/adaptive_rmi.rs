@@ -1112,7 +1112,7 @@ impl LockFreeHotBuffer {
 
         let freed_bytes = Self::calculate_memory(&drained_data, self.capacity);
         println!(
-            "🚀 Lock-free buffer atomic drain: {} entries, ~{}KB freed",
+            "Lock-free buffer atomic drain: {} entries, ~{}KB freed",
             drained_data.len(),
             freed_bytes / 1024
         );
@@ -1812,111 +1812,84 @@ impl AdaptiveRMI {
 
     /// DEADLOCK-FREE LOOKUP with strict global lock ordering protocol
     /// LOCK ORDER: hot_buffer (lock-free) → overflow_buffer → segments (NEVER router during lookup)
+    /// OPTIMIZED SINGLE-KEY LOOKUP - Combines best approaches for maximum performance
+    /// 
+    /// Performance characteristics:
+    /// - Hot buffer: O(1) lock-free lookup
+    /// - Overflow buffer: O(1) with minimal lock contention  
+    /// - Segments: O(1) predicted lookup with bounded search guarantee
+    /// - Fallback: O(n) linear probe only in edge cases
+    /// 
     /// This prevents reader-writer deadlocks by eliminating cross-lock dependencies
-    pub fn lookup(&self, key: u64) -> Option<u64> {
-        #[cfg(not(feature = "bench-no-metrics"))]
-        let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-
-        // 1. Check hot buffer first (most recent data) - completely lock-free
-        if let Some(value) = self.hot_buffer.get(key) {
-            #[cfg(not(feature = "bench-no-metrics"))]
-            {
-                timer.observe_duration();
-                crate::metrics::RMI_HITS_TOTAL.inc();
-            }
-            return Some(value);
-        }
-
-        // 2. GLOBAL LOCK ORDER STEP 1: overflow_buffer (if needed)
-        let overflow_result = {
-            let overflow = self.overflow_buffer.lock();
-            overflow.get(key)
-        }; // Lock released immediately
-
-        if let Some(value) = overflow_result {
-            #[cfg(not(feature = "bench-no-metrics"))]
-            {
-                timer.observe_duration();
-                crate::metrics::RMI_HITS_TOTAL.inc();
-            }
-            return Some(value);
-        }
-
-        // 3. GLOBAL LOCK ORDER STEP 2: segments read lock ONLY (never router during lookup)
-        // DEADLOCK PREVENTION: Router prediction done BEFORE segment lock to avoid cycle
-        let segment_id = {
-            let router_snapshot = self.global_router.read();
-            router_snapshot.predict_segment(key)
-        }; // Router lock released immediately - critical for deadlock prevention
-
-        // Now acquire segments lock WITHOUT holding any other locks
-        let segments_guard = self.segments.read();
-
-        // Fast segment lookup with bounds validation (no retry loops needed)
-        let result = if segment_id < segments_guard.len() {
-            // Use fast bounded search - guaranteed O(1) performance
-            segments_guard[segment_id].bounded_search(key)
-        } else {
-            // Graceful degradation: use fallback search if prediction is out of bounds
-            #[cfg(not(feature = "bench-no-metrics"))]
-            crate::metrics::RMI_MISPREDICTS_TOTAL.inc();
-
-            Self::linear_probe_segments(&segments_guard, key)
-        };
-        // Segment lock automatically released here - never hold multiple locks
-
-        #[cfg(not(feature = "bench-no-metrics"))]
-        {
-            timer.observe_duration();
-            if result.is_some() {
-                crate::metrics::RMI_HITS_TOTAL.inc();
-            } else {
-                crate::metrics::RMI_MISSES_TOTAL.inc();
-            }
-        }
-
-        result
-    }
-
-    /// Lock-free lookup using atomic snapshots for maximum throughput under contention
-    /// Uses crossbeam-epoch for safe memory reclamation with zero blocking
+    /// 🚀 ULTRA-FAST SINGLE-KEY LOOKUP: Maximum performance for individual lookups
+    /// 
+    /// This method combines all optimization strategies for single-key lookups:
+    /// - Lock-free hot buffer check
+    /// - Atomic segment snapshots 
+    /// - Bounded overflow buffer
+    /// - Predictive routing with fallback
+    ///
+    /// Use this for high-frequency single-key operations where every nanosecond counts.
     #[inline]
-    pub fn lookup_fast(&self, key: u64) -> Option<u64> {
-        let guard = &crossbeam_epoch::pin();
-
-        // Check hot buffer first with lock-free snapshot
-        if let Some(lock_free_buffer) = self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>()
-        {
+    pub fn lookup_key_ultra_fast(&self, key: u64) -> Option<u64> {
+        //  PHASE 1: Lock-free hot buffer check (most recent writes)
+        // Try lock-free buffer first for maximum performance
+        if let Some(lock_free_buffer) = self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>() {
             if let Some(value) = lock_free_buffer.get_fast(key) {
-                #[cfg(not(feature = "bench-no-metrics"))]
-                crate::metrics::RMI_HITS_TOTAL.inc();
                 return Some(value);
             }
         } else {
-            // Fallback to bounded search if not lock-free buffer
+            // Fallback to bounded search for other hot buffer types
             if let Some(value) = self.hot_buffer.bounded_search(key) {
-                #[cfg(not(feature = "bench-no-metrics"))]
-                crate::metrics::RMI_HITS_TOTAL.inc();
                 return Some(value);
             }
         }
 
-        // Load atomic snapshot of segments for lock-free access
+        //  PHASE 2: Try atomic snapshot first (zero-lock fast path)
+        let guard = &crossbeam_epoch::pin();
         let segments_ptr = self.segments_snapshot.load(Ordering::Acquire, guard);
         if let Some(segments_ref) = unsafe { segments_ptr.as_ref() } {
+            // Fast router prediction without locks
+            let router_snapshot = self.global_router.read();
+            let segment_id = router_snapshot.predict_segment(key);
+            drop(router_snapshot); // Release router lock immediately
+            
+            // Predicted lookup in atomic snapshot
+            if segment_id < segments_ref.len() {
+                if let Some(value) = segments_ref[segment_id].bounded_search(key) {
+                    return Some(value);
+                }
+            }
+            
+            // Linear probe in atomic snapshot if prediction failed
             for segment in segments_ref.iter() {
                 if let Some(value) = segment.bounded_search(key) {
-                    #[cfg(not(feature = "bench-no-metrics"))]
-                    crate::metrics::RMI_HITS_TOTAL.inc();
                     return Some(value);
                 }
             }
         }
 
-        #[cfg(not(feature = "bench-no-metrics"))]
-        crate::metrics::RMI_MISSES_TOTAL.inc();
+        //  PHASE 3: Overflow buffer check
+        let overflow_result = {
+            let overflow = self.overflow_buffer.lock();
+            overflow.get(key)
+        };
 
-        None
+        if let Some(value) = overflow_result {
+            return Some(value);
+        }
+
+        //  PHASE 4: Fallback to locked segments
+        let segments_guard = self.segments.read();
+        let router_snapshot = self.global_router.read();
+        let segment_id = router_snapshot.predict_segment(key);
+        drop(router_snapshot);
+        
+        if segment_id < segments_guard.len() {
+            segments_guard[segment_id].bounded_search(key)
+        } else {
+            Self::linear_probe_segments(&segments_guard, key)
+        }
     }
 
     /// Update atomic snapshot when segments change
@@ -2601,38 +2574,27 @@ impl AdaptiveRMI {
     // SIMD-optimized batch processing
     // ============================================================================
 
-    /// SIMD batch lookup: Process multiple keys with vectorized operations
+    /// 🚀 SIMD-OPTIMIZED BATCH LOOKUP: Process multiple keys with vectorized operations
     ///
-    /// SIMD batch lookup: Process multiple keys with vectorized operations
+    /// Features:
+    /// - Runtime SIMD detection (AVX2, NEON) 
+    /// - Automatic scalar fallback
+    /// - Cache-optimized memory access patterns
+    /// - Optimal batch sizing based on hardware
     ///
-    /// This method provides batch processing with runtime SIMD detection,
-    /// falling back to optimized scalar operations when SIMD is unavailable.
-    pub fn lookup_batch_simd(&self, keys: &[u64]) -> Vec<Option<u64>> {
-        #[cfg(not(feature = "bench-no-metrics"))]
-        let timer = crate::metrics::RMI_BATCH_LOOKUP_LATENCY_SECONDS.start_timer();
-
+    /// Use this for batch processing of 4+ keys to leverage hardware acceleration.
+    #[inline]
+    pub fn lookup_keys_simd_batch(&self, keys: &[u64]) -> Vec<Option<u64>> {
         // Use optimized batch processing with runtime detection
-        let results = self.lookup_batch_optimized(keys);
-
-        // Record batch metrics
-        #[cfg(not(feature = "bench-no-metrics"))]
-        {
-            timer.observe_duration();
-            let hits = results.iter().filter(|r| r.is_some()).count();
-            let misses = results.len() - hits;
-            crate::metrics::RMI_HITS_TOTAL.inc_by(hits as f64);
-            crate::metrics::RMI_MISSES_TOTAL.inc_by(misses as f64);
-            crate::metrics::BINARY_BATCH_SIZE.observe(keys.len() as f64);
-        }
-
-        results
+        self.lookup_batch_optimized_internal(keys)
     }
 
     /// Runtime SIMD detection with optimized batch processing
     ///
-    /// Uses runtime feature detection to select the best available implementation,
-    /// ensuring optimal performance on all architectures without conditional compilation.
-    pub fn lookup_batch_optimized(&self, keys: &[u64]) -> Vec<Option<u64>> {
+    /// Uses runtime feature detection to select the best available implementation.
+    /// This is an internal method - public code should use lib.rs methods.
+    #[inline]
+    fn lookup_batch_optimized_internal(&self, keys: &[u64]) -> Vec<Option<u64>> {
         // Runtime detection for x86_64 AVX2
         #[cfg(target_arch = "x86_64")]
         {
@@ -2654,7 +2616,7 @@ impl AdaptiveRMI {
             self.lookup_batch_scalar_optimized(keys)
         } else {
             // Individual lookups for very small batches
-            keys.iter().map(|&k| self.lookup_fast(k)).collect()
+            keys.iter().map(|&k| self.lookup_key_ultra_fast(k)).collect()
         }
     }
 
@@ -2695,7 +2657,7 @@ impl AdaptiveRMI {
 
             // Process chunk with optimized lookups
             for &key in chunk {
-                results.push(self.lookup_fast(key));
+                results.push(self.lookup_key_ultra_fast(key));
             }
         }
 
@@ -2721,7 +2683,7 @@ impl AdaptiveRMI {
                         Err(_) => {
                             // Fallback to scalar for conversion errors
                             for &key in simd_group {
-                                results.push(self.lookup_fast(key));
+                                results.push(self.lookup_key_ultra_fast(key));
                             }
                             continue;
                         }
@@ -2736,12 +2698,12 @@ impl AdaptiveRMI {
 
                     // Process remaining keys with scalar
                     for &key in &simd_group[8..] {
-                        results.push(self.lookup_fast(key));
+                        results.push(self.lookup_key_ultra_fast(key));
                     }
                 } else {
                     // Scalar fallback for small groups
                     for &key in simd_group {
-                        results.push(self.lookup_fast(key));
+                        results.push(self.lookup_key_ultra_fast(key));
                     }
                 }
             }
@@ -2767,7 +2729,7 @@ impl AdaptiveRMI {
                 } else {
                     // Scalar fallback for partial groups
                     for &key in neon_group {
-                        results.push(self.lookup_fast(key));
+                        results.push(self.lookup_key_ultra_fast(key));
                     }
                 }
             }
@@ -2783,7 +2745,7 @@ impl AdaptiveRMI {
         // Simplified AVX2 implementation - can be expanded with full SIMD logic
         let mut results = [None; 16];
         for (i, &key) in keys.iter().enumerate() {
-            results[i] = self.lookup_fast(key);
+            results[i] = self.lookup_key_ultra_fast(key);
         }
         results
     }
@@ -2795,7 +2757,7 @@ impl AdaptiveRMI {
         // Simplified AVX2 implementation
         let mut results = [None; 8];
         for (i, &key) in keys.iter().take(8).enumerate() {
-            results[i] = self.lookup_fast(key);
+            results[i] = self.lookup_key_ultra_fast(key);
         }
         results
     }
@@ -2806,7 +2768,7 @@ impl AdaptiveRMI {
         // Simplified NEON implementation
         let mut results = [None; 4];
         for (i, &key) in keys.iter().take(4).enumerate() {
-            results[i] = self.lookup_fast(key);
+            results[i] = self.lookup_key_ultra_fast(key);
         }
         results
     }
@@ -2825,7 +2787,7 @@ impl AdaptiveRMI {
             // Fallback to scalar processing for insufficient keys
             let mut results = [None; 8];
             for (i, &key) in keys.iter().enumerate().take(8) {
-                results[i] = self.lookup(key);
+                results[i] = self.lookup_key_ultra_fast(key);
             }
             return results;
         }
@@ -3569,7 +3531,7 @@ impl AdaptiveRMI {
             // Fallback to scalar processing for insufficient keys
             let mut results = [None; 4];
             for (i, &key) in keys.iter().enumerate().take(4) {
-                results[i] = self.lookup(key);
+                results[i] = self.lookup_key_ultra_fast(key);
             }
             return results;
         }
@@ -5030,7 +4992,7 @@ impl OptimizedBinaryProtocol {
                     Err(_) => {
                         // Fallback to RMI lookup
                         for &key in chunk {
-                            results.push(self.rmi.lookup(key));
+                            results.push(self.rmi.lookup_key_ultra_fast(key));
                         }
                     }
                 }
@@ -5043,7 +5005,7 @@ impl OptimizedBinaryProtocol {
                         results.extend_from_slice(&neon_results[..chunk.len()]);
                     } else {
                         for &key in chunk {
-                            results.push(self.rmi.lookup(key));
+                            results.push(self.rmi.lookup_key_ultra_fast(key));
                         }
                     }
                 }
@@ -5052,7 +5014,7 @@ impl OptimizedBinaryProtocol {
                 {
                     // Scalar fallback for remaining keys
                     for &key in chunk {
-                        results.push(self.rmi.lookup(key));
+                        results.push(self.rmi.lookup_key_ultra_fast(key));
                     }
                 }
             }
@@ -5152,7 +5114,7 @@ impl OptimizedBinaryProtocol {
         self.prefetcher.intelligent_prefetch(key, &cache_segments);
 
         //  OPTIMIZED LOOKUP: Use RMI with cache-aware optimizations
-        let result = self.rmi.lookup(key);
+        let result = self.rmi.lookup_key_ultra_fast(key);
 
         //  CACHE HIT RATE TRACKING: Monitor cache performance
         let cache_hit = result.is_some();

@@ -695,7 +695,7 @@ fn create_ultra_fast_lookup_routes(
                     vec![]
                 };
 
-                let raw_results = log.lookup_keys_ultra_batch(&keys);
+                let raw_results = log.lookup_keys_simd_batch(&keys);
                 // Convert to format expected by ultra-fast client: [{"value": "123"}, {"value": null}, ...]
                 let json_results: Vec<serde_json::Value> = raw_results
                     .into_iter()

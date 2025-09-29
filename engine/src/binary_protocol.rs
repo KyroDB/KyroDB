@@ -179,7 +179,7 @@ async fn process_batch_lookup(
 
     // Ultra-fast SIMD batch lookup using enhanced RMI optimizations
     let start_time = std::time::Instant::now();
-    let results = log.lookup_keys_ultra_batch(&keys);
+    let results = log.lookup_keys_simd_batch(&keys);
     let _lookup_duration = start_time.elapsed();
 
     // Performance metrics recording (TODO: implement)

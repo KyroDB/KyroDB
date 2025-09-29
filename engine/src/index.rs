@@ -94,7 +94,7 @@ impl PrimaryIndex {
             #[cfg(feature = "learned-index")]
             PrimaryIndex::AdaptiveRmi(ar) => {
                 let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                let res = ar.lookup(*key);
+                let res = ar.lookup_key_ultra_fast(*key);
                 timer.observe_duration();
                 if res.is_some() {
                     crate::metrics::RMI_HITS_TOTAL.inc();
@@ -213,6 +213,6 @@ impl RmiIndex {
     }
 
     pub fn predict_get(&self, key: &u64) -> Option<u64> {
-        self.inner.lookup(*key)
+        self.inner.lookup_key_ultra_fast(*key)
     }
 }

@@ -696,9 +696,7 @@ impl BufferPool {
         while let Some(front) = pool.front() {
             if now.duration_since(front.last_used) > stale_threshold {
                 if let Some(evicted) = pool.pop_front() {
-                    self.total_pooled = self
-                        .total_pooled
-                        .saturating_sub(evicted.buffer.capacity());
+                    self.total_pooled = self.total_pooled.saturating_sub(evicted.buffer.capacity());
                     self.eviction_count = self.eviction_count.saturating_add(1);
                 } else {
                     break;
@@ -815,7 +813,6 @@ impl BufferPool {
     fn try_buffer_from_size(&mut self, size: usize) -> Option<Vec<u8>> {
         self.try_get_buffer(size)
     }
-
 }
 
 impl Default for MemoryManager {
