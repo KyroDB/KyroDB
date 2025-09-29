@@ -39,9 +39,6 @@ pub mod metrics;
 #[cfg(feature = "learned-index")]
 pub mod adaptive_rmi;
 #[cfg(feature = "learned-index")]
-#[cfg(feature = "learned-index")]
-pub mod memory;
-#[cfg(feature = "learned-index")]
 pub mod rmi_config;
 #[cfg(feature = "learned-index")]
 pub mod unified_memory;
