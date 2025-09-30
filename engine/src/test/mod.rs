@@ -18,7 +18,7 @@
 pub mod utils;
 pub mod concurrency;
 pub mod memory;
-// pub mod simd;
+pub mod simd;  // ✅ SIMD runtime detection and correctness tests
 pub mod rmi;
 // pub mod wal;
 // pub mod snapshot;

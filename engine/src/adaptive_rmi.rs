@@ -3498,7 +3498,7 @@ unsafe fn simd_neon_zero_lock_batch(
     /// This is an internal method - public code should use lib.rs methods.
     #[inline]
     #[allow(dead_code)]
-    fn lookup_batch_optimized_internal(&self, keys: &[u64]) -> Vec<Option<u64>> {
+    pub(crate) fn lookup_batch_optimized_internal(&self, keys: &[u64]) -> Vec<Option<u64>> {
         // Runtime detection for x86_64 AVX2
         #[cfg(target_arch = "x86_64")]
         {
