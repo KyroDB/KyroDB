@@ -16,6 +16,7 @@
 
 // Test modules organized by component
 pub mod utils;
+pub mod utils_tests;  // Tests for test utilities themselves
 pub mod concurrency;
 pub mod memory;
 pub mod simd;  // ✅ SIMD runtime detection and correctness tests
