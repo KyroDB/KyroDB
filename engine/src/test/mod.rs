@@ -19,7 +19,7 @@ pub mod utils;
 pub mod concurrency;
 pub mod memory;
 // pub mod simd;
-// pub mod rmi;
+pub mod rmi;
 // pub mod wal;
 // pub mod snapshot;
 pub mod background;
