@@ -154,9 +154,9 @@ async fn test_epoch_based_segment_update_validation() {
                         }
                     }
                     Err(e) => {
-                        if !e.to_string().contains("memory pressure") {
-                            eprintln!("Unexpected error: {}", e);
-                        }
+                        // ANY error during concurrent operations indicates a problem
+                        conflicts.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("Insert error (potential race condition): {}", e);
                     }
                 }
 
@@ -368,9 +368,9 @@ async fn test_concurrent_hot_buffer_merges() {
                             }
                         }
                         Err(e) => {
-                            if !e.to_string().contains("memory pressure") {
-                                conflicts.fetch_add(1, Ordering::Relaxed);
-                            }
+                            // ANY error indicates a potential race condition
+                            conflicts.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("Insert error (potential race condition): {}", e);
                         }
                     }
                 }
@@ -480,9 +480,9 @@ async fn test_stress_race_condition_comprehensive() {
                             }
                         }
                         Err(e) => {
-                            if !e.to_string().contains("memory pressure") {
-                                race_indicators.fetch_add(1, Ordering::Relaxed);
-                            }
+                            // ANY error indicates a potential race condition
+                            race_indicators.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("Insert error (potential race condition): {}", e);
                         }
                     }
                 }
