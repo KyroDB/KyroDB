@@ -1244,12 +1244,19 @@ impl PersistentEventLog {
     #[cfg(feature = "learned-index")]
     pub async fn build_rmi(&self) -> Result<()> {
         let pairs = self.collect_key_offset_pairs().await;
-        let mut index_guard = self.index.write().await;
-        if pairs.is_empty() {
-            *index_guard = index::PrimaryIndex::new_adaptive_rmi();
+        
+        // Build new index
+        let new_index = if pairs.is_empty() {
+            index::PrimaryIndex::new_adaptive_rmi()
         } else {
-            *index_guard = index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs);
-        }
+            index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs)
+        };
+        
+        // Atomic swap: Update lock-free atomic first, then RwLock for compatibility
+        self.index_atomic.store(Arc::new(new_index.clone()));
+        let mut index_guard = self.index.write().await;
+        *index_guard = new_index;
+        
         Ok(())
     }
 

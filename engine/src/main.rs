@@ -194,13 +194,66 @@ async fn main() -> Result<()> {
             #[cfg(not(feature = "learned-index"))]
             let _ = (rmi_rebuild_appends.as_ref(), rmi_rebuild_ratio.as_ref());
 
-            // Optional warm-on-start: fault-in snapshot and RMI pages before serving
-            if std::env::var("KYRODB_WARM_ON_START").ok().as_deref() == Some("1") {
-                println!("Warm-on-start enabled; warming data and index pages...");
-                if let Err(err) = log.warmup().await {
-                    eprintln!("Warmup failed: {err:?}");
+            // Auto-warmup for production performance: build RMI + fault-in mmap pages
+            // Default enabled (set KYRODB_WARM_ON_START=0 to disable)
+            let should_warmup = std::env::var("KYRODB_WARM_ON_START")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(1)
+                == 1;
+
+            if should_warmup {
+                println!("🔥 Auto-warmup enabled: preparing system for maximum performance");
+
+                // Step 0: Create snapshot if WAL has data (RMI reads from snapshot, not WAL)
+                let wal_size = log.wal_size_bytes().await;
+                if wal_size > 0 {
+                    println!("🔥 Creating snapshot from WAL ({} bytes)...", wal_size);
+                    match log.snapshot().await {
+                        Ok(_) => {
+                            println!("✅ Snapshot created successfully");
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  Snapshot creation failed: {}", e);
+                            eprintln!("   Ultra-fast endpoints may not work until snapshot is created");
+                        }
+                    }
                 }
-                println!("Warm-on-start complete.");
+
+                // Step 1: Build RMI index for ultra-fast lookups (if learned-index enabled)
+                #[cfg(feature = "learned-index")]
+                {
+                    println!("🔥 Building RMI index on startup...");
+                    match log.build_rmi().await {
+                        Ok(_) => {
+                            println!("✅ RMI index built successfully");
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  RMI build failed: {}", e);
+                            eprintln!("   Ultra-fast endpoints (/v1/lookup_ultra, /v1/get_ultra) will fall back to slower paths");
+                        }
+                    }
+                }
+
+                // Step 2: Warmup mmap pages (fault-in snapshot and index data)
+                println!("🔥 Warming up mmap pages (snapshot + index data)...");
+                match log.warmup().await {
+                    Ok(_) => {
+                        println!("✅ Mmap warmup complete");
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Warmup failed: {}", e);
+                        eprintln!("   First requests may experience cold-start latency");
+                    }
+                }
+
+                println!("✅ System ready for benchmarking with maximum performance");
+                println!("   Ultra-fast endpoints: /v1/lookup_ultra, /v1/get_ultra");
+                println!("   Standard endpoints: /v1/lookup, /v1/get");
+            } else {
+                println!("⚠️  Auto-warmup disabled (KYRODB_WARM_ON_START=0)");
+                println!("   Cold-start latency will be present on first requests");
+                println!("   Ultra-fast endpoints may not be optimized");
             }
 
             // Configure WAL rotation if requested
