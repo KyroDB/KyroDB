@@ -33,7 +33,15 @@ pub async fn open_test_log(data_dir: impl AsRef<std::path::Path>) -> anyhow::Res
     // This ensures WAL writes are flushed immediately, not batched
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
     
-    crate::PersistentEventLog::open(data_dir.as_ref()).await
+    let log = crate::PersistentEventLog::open(data_dir.as_ref()).await?;
+    
+    // Build empty RMI index immediately for tests (hot_buffer check fix makes this safe)
+    #[cfg(feature = "learned-index")]
+    {
+        log.build_rmi().await.ok(); // Ignore errors if no data yet
+    }
+    
+    Ok(log)
 }
 
 /// Sync index after writes (makes RMI writes immediately visible for tests)

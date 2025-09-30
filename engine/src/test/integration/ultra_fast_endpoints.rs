@@ -373,22 +373,23 @@ async fn test_standard_endpoints_work_without_rmi() {
             .expect("Failed to append");
     }
 
-    // ARCHITECTURE NOTE: With learned-index feature, RMI is the default index.
-    // Without calling build_rmi(), the RMI is empty and lookups return None.
-    // This is by design - RMI requires explicit bulk building for performance.
+    // ARCHITECTURE NOTE: With hot_buffer check fix, lookups work immediately after writes
+    // even without building RMI. The hot_buffer is checked FIRST before the snapshot.
+    // This eliminates the async lag window (0-500ms) between writes and background merge.
     // 
-    // Standard lookups will return None when RMI is empty:
+    // Standard lookups should work immediately (hot_buffer check):
     for i in (0..100).step_by(10) {
         let value = lookup_kv(&log, i)
             .await
             .expect("Lookup should not error");
         
-        // With empty RMI and learned-index feature, lookups return None
-        // This validates that the system doesn't crash with empty RMI
-        assert!(value.is_none(), "Empty RMI should return None for key {}", i);
+        // With hot_buffer check fix, lookups work immediately
+        assert!(value.is_some(), "Hot buffer check should find key {} immediately", i);
+        let expected = format!("value_{}", i);
+        assert_eq!(value.unwrap(), expected.as_bytes(), "Value mismatch for key {}", i);
     }
     
-    // After building RMI, lookups should work:
+    // After building RMI, lookups should still work (snapshot path):
     log.snapshot().await.expect("Failed to create snapshot");
     log.build_rmi().await.expect("Failed to build RMI");
     log.warmup().await.expect("Failed to warmup");
@@ -397,6 +398,6 @@ async fn test_standard_endpoints_work_without_rmi() {
         let value = lookup_kv(&log, i)
             .await
             .expect("Lookup should not error");
-        assert!(value.is_some(), "After RMI build, key {} should be found", i);
+        assert!(value.is_some(), "After RMI build, key {} should still be found", i);
     }
 }
