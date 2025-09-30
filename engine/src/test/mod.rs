@@ -11,17 +11,15 @@
 //! - HTTP endpoints (integration tests)
 //! - Stress tests (high concurrency, large datasets)
 //!
-//! Created: September 30, 2025
-//! Purpose: Replace legacy tests/ and examples/ directories with modern, comprehensive tests
 
 // Test modules organized by component
 pub mod utils;
 pub mod utils_tests;  // Tests for test utilities themselves
 pub mod concurrency;
 pub mod memory;
-pub mod simd;  // ✅ SIMD runtime detection and correctness tests
+pub mod simd;  // SIMD runtime detection and correctness tests
 pub mod rmi;
-// pub mod wal;
+pub mod wal;
 pub mod snapshot;
 pub mod background;
 pub mod integration;

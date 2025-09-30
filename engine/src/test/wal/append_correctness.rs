@@ -3,27 +3,31 @@
 //! Tests for Write-Ahead Log append operations and durability
 
 use crate::test::utils::*;
-use crate::PersistentEventLog;
 use std::sync::Arc;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_basic_wal_append() {
     let data_dir = test_data_dir();
-    let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
-            .expect("Failed to create log")
-    );
+    let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
 
     // Append data
     for i in 0..100 {
-        log.append(i, format!("value_{}", i).as_bytes().to_vec())
+        append_kv(&log, i, format!("value_{}", i).into_bytes())
             .await
             .expect("Failed to append");
     }
 
+    // Snapshot for persistence
+    log.snapshot().await.unwrap();
+    
+    #[cfg(feature = "learned-index")]
+    {
+        log.build_rmi().await.unwrap();
+    }
+
     // Verify all data exists
     for i in 0..100 {
-        let value = log.lookup(i).await.expect("Failed to lookup");
+        let value = lookup_kv(&log, i).await.expect("Failed to lookup");
         assert!(value.is_some(), "Key {} not found", i);
         assert_eq!(
             String::from_utf8_lossy(&value.unwrap()),
@@ -32,40 +36,43 @@ async fn test_basic_wal_append() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_wal_append_ordering() {
     let data_dir = test_data_dir();
-    let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
-            .expect("Failed to create log")
-    );
+    let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
 
     // Append updates to same key
     for i in 0..10 {
-        log.append(42, format!("version_{}", i).as_bytes().to_vec())
+        append_kv(&log, 42, format!("version_{}", i).into_bytes())
             .await
             .expect("Failed to append");
     }
 
+    log.snapshot().await.unwrap();
+    
+    #[cfg(feature = "learned-index")]
+    {
+        log.build_rmi().await.unwrap();
+    }
+
     // Should return latest version
-    let value = log.lookup(42).await.expect("Failed to lookup");
+    let value = lookup_kv(&log, 42).await.expect("Failed to lookup");
     assert_eq!(
         String::from_utf8_lossy(&value.unwrap()),
         "version_9"
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_wal_durability_after_restart() {
     let data_dir = test_data_dir();
     
     // Write data
     {
-        let log = PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
-            .expect("Failed to create log");
+        let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
 
         for i in 0..100 {
-            log.append(i, format!("value_{}", i).as_bytes().to_vec())
+            append_kv(&log, i, format!("value_{}", i).into_bytes())
                 .await
                 .expect("Failed to append");
         }
@@ -74,13 +81,20 @@ async fn test_wal_durability_after_restart() {
         drop(log);
     }
 
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
     // Restart and verify data persisted
     {
-        let log = PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
-            .expect("Failed to recover log");
+        let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
+        log.snapshot().await.unwrap();
+        
+        #[cfg(feature = "learned-index")]
+        {
+            log.build_rmi().await.unwrap();
+        }
 
         for i in 0..100 {
-            let value = log.lookup(i).await.expect("Failed to lookup");
+            let value = lookup_kv(&log, i).await.expect("Failed to lookup");
             assert!(
                 value.is_some(),
                 "Key {} not found after restart",
@@ -94,13 +108,10 @@ async fn test_wal_durability_after_restart() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_wal_appends() {
     let data_dir = test_data_dir();
-    let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
-            .expect("Failed to create log")
-    );
+    let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
 
     let mut tasks = tokio::task::JoinSet::new();
 
@@ -110,8 +121,7 @@ async fn test_concurrent_wal_appends() {
         tasks.spawn(async move {
             for i in 0..100 {
                 let key = thread_id * 100 + i;
-                log_clone
-                    .append(key, format!("value_{}_{}", thread_id, i).as_bytes().to_vec())
+                append_kv(&log_clone, key, format!("value_{}_{}", thread_id, i).into_bytes())
                     .await
                     .expect("Failed to append");
             }
@@ -120,34 +130,45 @@ async fn test_concurrent_wal_appends() {
 
     while tasks.join_next().await.is_some() {}
 
+    log.snapshot().await.unwrap();
+    
+    #[cfg(feature = "learned-index")]
+    {
+        log.build_rmi().await.unwrap();
+    }
+
     // Verify all data
     for thread_id in 0..20 {
         for i in 0..100 {
             let key = thread_id * 100 + i;
-            let value = log.lookup(key).await.expect("Failed to lookup");
+            let value = lookup_kv(&log, key).await.expect("Failed to lookup");
             assert!(value.is_some(), "Key {} not found", key);
         }
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_wal_with_large_entries() {
     let data_dir = test_data_dir();
-    let log = Arc::new(
-        PersistentEventLog::new(data_dir.path().to_path_buf(), 10, 10000, false)
-            .expect("Failed to create log")
-    );
+    let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
 
     // Append large entries (64KB each)
     for i in 0..10 {
-        log.append(i, fixtures::value_of_size(fixtures::LARGE_VALUE))
+        append_kv(&log, i, fixtures::value_of_size(fixtures::LARGE_VALUE))
             .await
             .expect("Failed to append large entry");
     }
 
+    log.snapshot().await.unwrap();
+    
+    #[cfg(feature = "learned-index")]
+    {
+        log.build_rmi().await.unwrap();
+    }
+
     // Verify large entries
     for i in 0..10 {
-        let value = log.lookup(i).await.expect("Failed to lookup");
+        let value = lookup_kv(&log, i).await.expect("Failed to lookup");
         assert!(value.is_some(), "Large entry {} not found", i);
         assert_eq!(
             value.unwrap().len(),
