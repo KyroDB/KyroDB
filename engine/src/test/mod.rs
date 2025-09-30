@@ -24,4 +24,4 @@ pub mod rmi;
 pub mod snapshot;
 pub mod background;
 pub mod integration;
-// pub mod stress;
+pub mod stress;

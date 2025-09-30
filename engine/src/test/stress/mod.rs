@@ -1,5 +1,17 @@
-//! Stress tests for high concurrency and large datasets.
+//! Stress Testing Module
+//!
+//! Comprehensive stress tests to validate KyroDB under extreme conditions:
+//! - High concurrency (1000+ threads)
+//! - Large datasets (millions of keys)
+//! - Memory pressure scenarios
+//! - Lock contention under load
+//! - RMI performance degradation
+//! - Recovery after failures
 
-// TODO: Implement these modules
-// pub mod high_concurrency;
-// pub mod large_datasets;
+pub mod concurrent_operations;
+pub mod large_dataset;
+pub mod memory_pressure;
+pub mod lock_contention;
+pub mod rmi_stress;
+pub mod recovery_stress;
+pub mod endurance;
