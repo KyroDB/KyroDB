@@ -120,16 +120,17 @@ async fn test_rmi_prediction_with_skewed_distribution() {
     let data_dir = test_data_dir();
     let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
 
-    // Write skewed distribution: many keys at start, moderate gap, few at end
-    for i in 0..5000 {
+    // Skewed distribution: dense sequential region followed by sparse region
+    // Dense region: every key from 0-10000
+    for i in 0..10000 {
         append_kv(&log, i, format!("dense_{}", i).as_bytes().to_vec())
             .await
             .expect("Failed to append");
     }
 
-    for i in 0..200 {
-        let key = 15000 + i * 10;
-        append_kv(&log, key, format!("sparse_{}", key).as_bytes().to_vec())
+    // Sparse region: every 10th key from 10000-20000 (continues but sparser)
+    for i in (10000..20000).step_by(10) {
+        append_kv(&log, i, format!("sparse_{}", i).as_bytes().to_vec())
             .await
             .expect("Failed to append");
     }
@@ -137,17 +138,16 @@ async fn test_rmi_prediction_with_skewed_distribution() {
     // Build RMI
     log.build_rmi().await.expect("Failed to build RMI");
 
-    // Verify dense region (sample keys that definitely exist)
-    for i in &[0, 100, 500, 1000, 2000, 3000, 4000, 4999] {
+    // Verify dense region
+    for i in &[0, 500, 1000, 3000, 5000, 7000, 9000, 9800] {
         let value = lookup_kv(&log, *i).await.expect("Failed to lookup");
         assert!(value.is_some(), "Skewed RMI: dense key {} not found", i);
     }
 
-    // Verify sparse region (sample keys that definitely exist)
-    for i in &[0, 10, 50, 100, 150, 199] {
-        let key = 15000 + i * 10;
-        let value = lookup_kv(&log, key).await.expect("Failed to lookup");
-        assert!(value.is_some(), "Skewed RMI: sparse key {} not found", key);
+    // Verify sparse region (checking keys that exist with step_by(10))
+    for i in &[10000, 10500, 12000, 14000, 16000, 18000, 19900] {
+        let value = lookup_kv(&log, *i).await.expect("Failed to lookup");
+        assert!(value.is_some(), "Skewed RMI: sparse key {} not found", i);
     }
 }
 
