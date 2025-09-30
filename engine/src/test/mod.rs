@@ -21,7 +21,7 @@ pub mod memory;
 pub mod simd;  // ✅ SIMD runtime detection and correctness tests
 pub mod rmi;
 // pub mod wal;
-// pub mod snapshot;
+pub mod snapshot;
 pub mod background;
 pub mod integration;
 // pub mod stress;

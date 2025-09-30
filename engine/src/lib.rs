@@ -475,7 +475,11 @@ impl PersistentEventLog {
                     index::PrimaryIndex::new_adaptive_rmi()
                 } else {
                     pairs.sort_by_key(|(k, _)| *k);
-                    pairs.dedup_by(|a, b| a.0 == b.0); // Keep only latest values for duplicate keys
+                    // Keep only latest values for duplicate keys
+                    // dedup_by keeps first occurrence, so reverse to keep last
+                    pairs.reverse();
+                    pairs.dedup_by_key(|(k, _)| *k);
+                    pairs.reverse();
                     index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs)
                 }
             }
@@ -920,6 +924,21 @@ impl PersistentEventLog {
     }
 
 
+    /// Force synchronous index update (for testing)
+    /// 
+    /// Makes all pending writes immediately visible to lookups.
+    /// **Use only for testing!** In production, async updates provide better throughput.
+    #[cfg(test)]
+    pub fn sync_index_for_test(&self) {
+        let idx = self.index_atomic.load();
+        
+        #[cfg(feature = "learned-index")]
+        if let index::PrimaryIndex::AdaptiveRmi(rmi) = &**idx {
+            rmi.sync_snapshot_for_test();
+        }
+        // BTree doesn't need sync - updates are immediate
+    }
+
     /// Lock-free index access for specialized high-performance scenarios
     /// Returns the current index snapshot without any locking overhead
     pub fn get_index_snapshot(&self) -> Option<std::sync::Arc<index::PrimaryIndex>> {
@@ -1013,9 +1032,12 @@ impl PersistentEventLog {
         let temp_path = snapshot_path.with_extension("bin.tmp");
         
         {
+            use bincode::Options;
             let file = File::create(&temp_path).context("creating snapshot temp file")?;
             let mut writer = BufWriter::new(file);
-            bincode::serialize_into(&mut writer, &events).context("serializing snapshot")?;
+            // Use same bincode configuration as recovery (with 16 MiB limit for safety)
+            let bopt = bincode::options().with_limit(16 * 1024 * 1024);
+            bopt.serialize_into(&mut writer, &events).context("serializing snapshot")?;
             writer.flush().context("flushing snapshot")?;
             writer.get_ref().sync_all().context("syncing snapshot")?;
         }

@@ -23,6 +23,25 @@ pub fn test_data_dir() -> TempDir {
     TempDir::new().expect("Failed to create temp dir")
 }
 
+/// Open a log with test-friendly settings (RMI enabled with sync support)
+pub async fn open_test_log(data_dir: impl AsRef<std::path::Path>) -> anyhow::Result<crate::PersistentEventLog> {
+    // Enable RMI for tests to exercise the production code path
+    #[cfg(feature = "learned-index")]
+    std::env::set_var("KYRODB_USE_ADAPTIVE_RMI", "true");
+    
+    // Disable group commit for tests to ensure immediate durability
+    // This ensures WAL writes are flushed immediately, not batched
+    std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
+    
+    crate::PersistentEventLog::open(data_dir.as_ref()).await
+}
+
+/// Sync index after writes (makes RMI writes immediately visible for tests)
+#[cfg(test)]
+pub fn sync_index_after_writes(log: &crate::PersistentEventLog) {
+    log.sync_index_for_test();
+}
+
 /// Create a temp directory at a specific path with a name
 pub fn temp_data_dir(name: &str) -> PathBuf {
     let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -131,8 +150,23 @@ pub async fn append_kv(log: &Arc<PersistentEventLog>, key: u64, value: Vec<u8>) 
     log.append_kv(Uuid::new_v4(), key, value).await
 }
 
+/// Helper: Append key-value pair to log (works with direct reference)
+pub async fn append_kv_ref(log: &PersistentEventLog, key: u64, value: Vec<u8>) -> anyhow::Result<u64> {
+    log.append_kv(Uuid::new_v4(), key, value).await
+}
+
 /// Helper: Lookup value by key
 pub async fn lookup_kv(log: &Arc<PersistentEventLog>, key: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    lookup_kv_impl(log.as_ref(), key).await
+}
+
+/// Helper: Lookup value by key (works with direct reference)
+pub async fn lookup_kv_ref(log: &PersistentEventLog, key: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    lookup_kv_impl(log, key).await
+}
+
+/// Internal implementation for lookup
+async fn lookup_kv_impl(log: &PersistentEventLog, key: u64) -> anyhow::Result<Option<Vec<u8>>> {
     if let Some(offset) = log.lookup_key(key).await {
         if let Some(payload) = log.get(offset).await {
             // Decode KV format: [key:u64][len:u64][value...]

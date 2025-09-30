@@ -855,6 +855,11 @@ pub trait HotBuffer: std::fmt::Debug + Send + Sync {
     fn get(&self, key: u64) -> Option<u64> {
         self.bounded_search(key)
     }
+    
+    /// Get all entries for test synchronization (non-draining)
+    fn get_all_for_sync(&self) -> Vec<(u64, u64)> {
+        self.get_snapshot()
+    }
 }
 
 /// Bounded hot buffer for recent writes
@@ -1615,6 +1620,11 @@ impl BoundedOverflowBuffer {
     pub fn get_pressure_level(&self) -> usize {
         self.pressure_level.load(Ordering::Relaxed)
     }
+    
+    /// Get all pending writes for test synchronization (non-draining)
+    pub fn get_all_pending(&self) -> Vec<(u64, u64)> {
+        self.data.iter().map(|(&k, &v)| (k, v)).collect()
+    }
 }
 
 // ========================================================================
@@ -2049,6 +2059,57 @@ impl AdaptiveRMI {
         self.write_queue.push(WriteOperation::Compact);
     }
     
+    /// Force synchronous snapshot update (for testing)
+    /// 
+    /// This method immediately flushes the hot_buffer and overflow_buffer
+    /// into the zero_lock_snapshot, making writes visible to lookups.
+    /// 
+    /// **Use only for testing!** In production, the background worker
+    /// handles async updates for better throughput.
+    pub fn sync_snapshot_for_test(&self) {
+        // Step 1: Collect all pending writes from hot buffer
+        let hot_writes = self.hot_buffer.get_all_for_sync();
+        
+        // Step 2: Collect pending writes from overflow buffer
+        let overflow_writes = {
+            let overflow = self.overflow_buffer.lock();
+            overflow.get_all_pending()
+        };
+        
+        // Step 3: Merge all writes
+        let mut all_writes: Vec<(u64, u64)> = hot_writes;
+        all_writes.extend(overflow_writes);
+        
+        if all_writes.is_empty() {
+            return; // Nothing to sync
+        }
+        
+        // Step 4: Update zero_lock_snapshot atomically
+        let current = self.zero_lock_snapshot.load();
+        
+        // Merge new writes into hot_data
+        let mut new_hot_data = (*current.hot_data).clone();
+        for (key, value) in all_writes {
+            // Update or insert
+            if let Some(existing) = new_hot_data.iter_mut().find(|(k, _)| *k == key) {
+                existing.1 = value; // Update existing
+            } else {
+                new_hot_data.push((key, value)); // Insert new
+            }
+        }
+        
+        // Create new snapshot with updated hot_data
+        let new_snapshot = ImmutableIndexSnapshot::new(
+            (*current.segments).clone(),
+            current.router.clone(),
+            new_hot_data,
+            current.generation + 1,
+        );
+        
+        // Atomic swap
+        self.zero_lock_snapshot.store(Arc::new(new_snapshot));
+    }
+    
     /// Shutdown the zero-lock background worker
     pub fn shutdown_zero_lock(&self) {
         self.write_queue.push(WriteOperation::Shutdown);
@@ -2244,17 +2305,31 @@ impl AdaptiveRMI {
     /// This is the **ultimate performance** lookup method.
     #[inline]
     pub fn lookup_key_ultra_fast(&self, key: u64) -> Option<u64> {
-        // 🔥 **SINGLE ATOMIC LOAD** - Only synchronization operation
+        // Phase 0a: Check hot_buffer FIRST - captures most recent writes (not yet merged)
+        // This eliminates the async lag between writes and background merge
+        if let Some(value) = self.hot_buffer.get(key) {
+            return Some(value);
+        }
+        
+        // Phase 0b: Check overflow_buffer - captures writes when hot_buffer is full
+        {
+            let overflow = self.overflow_buffer.lock();
+            if let Some(value) = overflow.get(key) {
+                return Some(value);
+            }
+        }
+        
+        // Single atomic load - only synchronization operation
         let snapshot = self.zero_lock_snapshot.load();
         
-        // 🔥 **ZERO-ALLOCATION COMPUTATION** - Pure computation, no heap activity
+        // Zero-allocation computation - pure computation, no heap activity
         Self::lookup_zero_alloc_inline(&snapshot, key)
     }
     
     /// **ZERO-ALLOCATION INLINE LOOKUP** - No heap allocations whatsoever
     #[inline(always)]
     fn lookup_zero_alloc_inline(snapshot: &ImmutableIndexSnapshot, key: u64) -> Option<u64> {
-        // PHASE 1: Zero-copy hot data search (no Vec iteration, direct slice access)
+        // PHASE 1: Zero-copy hot data search (background-merged writes)
         let hot_slice = snapshot.hot_data.as_slice();
         for i in (0..hot_slice.len()).rev() {
             let (k, v) = unsafe { *hot_slice.get_unchecked(i) };
@@ -3113,11 +3188,42 @@ impl AdaptiveRMI {
     /// Use this for batch processing of 4+ keys for ultimate throughput.
     #[inline]
     pub fn lookup_keys_simd_batch(&self, keys: &[u64]) -> Vec<Option<u64>> {
-        // 🔥 **SINGLE ATOMIC LOAD** - Only synchronization operation
-        let snapshot = self.zero_lock_snapshot.load();
+        let mut results = Vec::with_capacity(keys.len());
         
-        // 🔥 **ZERO-ALLOCATION SIMD** - Pre-allocated buffers, no heap activity
-        Self::simd_batch_zero_alloc(&snapshot, keys)
+        // Phase 0: Check hot_buffer and overflow_buffer for all keys first
+        let mut need_snapshot_lookup = Vec::with_capacity(keys.len());
+        
+        for &key in keys {
+            // Check hot_buffer first
+            if let Some(value) = self.hot_buffer.get(key) {
+                results.push(Some(value));
+                continue;
+            }
+            
+            // Check overflow_buffer second
+            let found_in_overflow = {
+                let overflow = self.overflow_buffer.lock();
+                overflow.get(key)
+            };
+            
+            if let Some(value) = found_in_overflow {
+                results.push(Some(value));
+            } else {
+                // Mark for snapshot lookup
+                need_snapshot_lookup.push((results.len(), key));
+                results.push(None); // Placeholder
+            }
+        }
+        
+        // Phase 1: Snapshot lookup for remaining keys
+        if !need_snapshot_lookup.is_empty() {
+            let snapshot = self.zero_lock_snapshot.load();
+            for (idx, key) in need_snapshot_lookup {
+                results[idx] = Self::lookup_zero_alloc_inline(&snapshot, key);
+            }
+        }
+        
+        results
     }
     
     /// **ZERO-ALLOCATION SIMD BATCH** - No heap allocations during processing
