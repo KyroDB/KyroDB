@@ -17,7 +17,7 @@
 // Test modules organized by component
 pub mod utils;
 pub mod concurrency;
-// pub mod memory;
+pub mod memory;
 // pub mod simd;
 // pub mod rmi;
 // pub mod wal;

@@ -1,7 +1,6 @@
-//! Memory management tests for buffer pool, cache coherency, and memory limits.
+//! Memory Management Tests
 
 pub mod buffer_management;
-
-// TODO: Implement these modules
-// pub mod cache_coherency;
-// pub mod memory_limits;
+pub mod cache_coherency;
+pub mod leak_detection;
+pub mod memory_limits;
