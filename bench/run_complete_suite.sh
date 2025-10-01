@@ -37,7 +37,7 @@ echo ""
 
 # Health check
 echo -e "${YELLOW}🏥 Checking server health...${NC}"
-if ! curl -s -f "${BASE_URL}/health" > /dev/null 2>&1; then
+if ! curl -s -f "${BASE_URL}/v1/health" > /dev/null 2>&1; then
     echo -e "${RED}❌ Server not responding at ${BASE_URL}${NC}"
     echo -e "${YELLOW}💡 Start the server with:${NC}"
     echo -e "   cd ${ROOT_DIR}"

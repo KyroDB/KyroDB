@@ -55,7 +55,7 @@ cargo build -p bench --release
 
 # Server health check
 echo -e "${YELLOW}🏥 Checking server health...${NC}"
-if ! curl -s -f "$BASE/health" > /dev/null 2>&1; then
+if ! curl -s -f "$BASE/v1/health" > /dev/null 2>&1; then
     echo -e "${RED}❌ Server not responding at $BASE${NC}"
     echo -e "${YELLOW}💡 Start the server with:${NC}"
     echo -e "   ./target/release/kyrodb-engine serve 127.0.0.1 3030 --features learned-index"

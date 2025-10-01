@@ -139,7 +139,7 @@ impl BenchClient for HttpClient {
     }
 
     async fn health(&self) -> Result<bool> {
-        let url = format!("{}/health", self.base_url);
+        let url = format!("{}/v1/health", self.base_url);
         
         match self.client.get(&url).send().await {
             Ok(response) => Ok(response.status().is_success()),
