@@ -1,7 +1,15 @@
 [package]
-name = "bench"
+name = "kyrodb-bench"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "kyrodb_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kyrodb-bench"
+path = "src/main.rs"
 
 [features]
 default = []
