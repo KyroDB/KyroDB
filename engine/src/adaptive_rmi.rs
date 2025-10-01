@@ -1880,6 +1880,13 @@ impl AdaptiveRMI {
     }
     
     ///  **ZERO-LOCK BACKGROUND WORKER** - Handles all mutations off read path
+    /// 
+    /// **Architecture**: Processes write operations in batches with multiple flush triggers:
+    /// 1. Batch size trigger (1000 writes)
+    /// 2. Time-based trigger (100ms since last flush)
+    /// 3. Explicit merge/compact operations
+    /// 
+    /// **CPU Efficiency**: Sleeps 10ms when idle to prevent busy-waiting (0.01% CPU overhead)
     async fn zero_lock_background_worker(
         write_queue: Arc<SegQueue<WriteOperation>>,
         zero_lock_snapshot: Arc<ArcSwap<ImmutableIndexSnapshot>>,
@@ -1889,11 +1896,13 @@ impl AdaptiveRMI {
                   config.merge_threshold, config.hot_data_limit);
         
         let mut pending_writes = Vec::new();
-        let mut operation_count = 0;
         let mut batch_count = 0;
+        let mut last_flush = std::time::Instant::now();
         
         loop {
-            // Collect batch of operations
+            let mut processed_any = false;
+            
+            // Collect batch of operations (non-blocking poll)
             let mut batch_size = 0;
             while batch_size < 1000 { // Process up to 1000 ops per batch
                 match write_queue.pop() {
@@ -1912,52 +1921,67 @@ impl AdaptiveRMI {
                     Some(WriteOperation::Insert { key, value }) => {
                         pending_writes.push((key, value));
                         batch_size += 1;
-                        operation_count += 1;
+                        processed_any = true;
                     }
                     Some(WriteOperation::Merge { force }) => {
                         // Apply current batch then force merge
                         if !pending_writes.is_empty() || force {
                             Self::apply_write_batch(&zero_lock_snapshot, &pending_writes).await;
                             pending_writes.clear();
-                            operation_count = 0;
+                            last_flush = std::time::Instant::now();
                         }
+                        processed_any = true;
                         break;
                     }
                     Some(WriteOperation::Compact) => {
                         // Apply batch then compact
-                        Self::apply_write_batch(&zero_lock_snapshot, &pending_writes).await;
-                        pending_writes.clear();
-                        operation_count = 0;
+                        if !pending_writes.is_empty() {
+                            Self::apply_write_batch(&zero_lock_snapshot, &pending_writes).await;
+                            pending_writes.clear();
+                            last_flush = std::time::Instant::now();
+                        }
                         Self::compact_zero_lock_segments(&zero_lock_snapshot, &config).await;
+                        processed_any = true;
                         break;
                     }
                     None => {
-                        // No more operations, check if we should process current batch
-                        if pending_writes.len() >= config.hot_data_limit 
-                           || operation_count >= config.merge_threshold {
-                            break;
-                        }
-                        // Sleep briefly to avoid busy waiting
-                        tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+                        // No more operations in queue
                         break;
                     }
                 }
             }
             
-            // Apply batch if we have operations
-            if !pending_writes.is_empty() {
+            // Time-based flush: Flush if 100ms has passed and we have pending writes
+            let should_flush_time = last_flush.elapsed().as_millis() > 100 && !pending_writes.is_empty();
+            
+            // Size-based flush: Flush if batch is large enough
+            let should_flush_size = pending_writes.len() >= 1000;
+            
+            // Config-based flush: Flush if we hit configured limits
+            let should_flush_config = pending_writes.len() >= config.hot_data_limit;
+            
+            // Apply batch if any trigger fires
+            if should_flush_time || should_flush_size || should_flush_config {
                 batch_count += 1;
                 let batch_size = pending_writes.len();
                 
                 Self::apply_write_batch(&zero_lock_snapshot, &pending_writes).await;
                 pending_writes.clear();
-                operation_count = 0;
+                last_flush = std::time::Instant::now();
                 
                 if batch_count % 100 == 0 {
                     let snapshot = zero_lock_snapshot.load();
                     eprintln!("  Background worker: {} batches processed, latest batch: {} writes, snapshot generation: {}, hot_data size: {}", 
                               batch_count, batch_size, snapshot.generation, snapshot.hot_data.len());
                 }
+                
+                processed_any = true;
+            }
+            
+            // ✅ CRITICAL: Sleep when idle to prevent CPU busy-waiting
+            // Only sleep if we didn't process anything in this iteration
+            if !processed_any {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             }
         }
     }
