@@ -1696,11 +1696,11 @@ impl ImmutableIndexSnapshot {
         None
     }
     
-    ///  **ZERO-LOCK BATCH LOOKUP** - Vectorized pure computation with SIMD
+    ///  **ZERO-LOCK BATCH LOOKUP** - Simple batch processing on immutable snapshot
     #[inline]
     pub fn lookup_batch_zero_lock(&self, keys: &[u64]) -> Vec<Option<u64>> {
-        // For batch operations, use the optimized SIMD path
-        self.lookup_keys_simd_batch(keys)
+        // Simple iteration - SIMD optimization happens at AdaptiveRMI level
+        keys.iter().map(|&key| self.lookup_zero_lock(key)).collect()
     }
     
     /// Get snapshot statistics
