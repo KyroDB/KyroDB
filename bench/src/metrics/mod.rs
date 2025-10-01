@@ -1,7 +1,7 @@
+use anyhow::Result;
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use anyhow::Result;
 
 pub mod reporter;
 pub use reporter::ResultsReporter;
@@ -66,18 +66,18 @@ impl MetricsCollector {
             start_time: Instant::now(),
         })
     }
-    
+
     pub fn record_success(&mut self, latency: Duration) {
         let _ = self.histogram.record(latency.as_micros() as u64);
         self.total_ops += 1;
         self.successful_ops += 1;
     }
-    
+
     pub fn record_failure(&mut self) {
         self.total_ops += 1;
         self.failed_ops += 1;
     }
-    
+
     pub fn merge(&mut self, other: &MetricsCollector) -> Result<()> {
         self.histogram.add(&other.histogram)?;
         self.total_ops += other.total_ops;
@@ -85,19 +85,15 @@ impl MetricsCollector {
         self.failed_ops += other.failed_ops;
         Ok(())
     }
-    
-    pub fn finalize(
-        &self,
-        phase: BenchmarkPhase,
-        workload: String,
-    ) -> BenchmarkResults {
+
+    pub fn finalize(&self, phase: BenchmarkPhase, workload: String) -> BenchmarkResults {
         let duration = self.start_time.elapsed();
         let throughput = if duration.as_secs_f64() > 0.0 {
             self.successful_ops as f64 / duration.as_secs_f64()
         } else {
             0.0
         };
-        
+
         BenchmarkResults {
             phase,
             workload,

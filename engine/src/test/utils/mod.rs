@@ -2,8 +2,8 @@
 //!
 //! Reusable test infrastructure for all test modules
 
-pub mod fixtures;
 pub mod assertions;
+pub mod fixtures;
 pub mod test_server;
 
 // Re-export commonly used items
@@ -24,23 +24,25 @@ pub fn test_data_dir() -> TempDir {
 }
 
 /// Open a log with test-friendly settings (RMI enabled with sync support)
-pub async fn open_test_log(data_dir: impl AsRef<std::path::Path>) -> anyhow::Result<crate::PersistentEventLog> {
+pub async fn open_test_log(
+    data_dir: impl AsRef<std::path::Path>,
+) -> anyhow::Result<crate::PersistentEventLog> {
     // Enable RMI for tests to exercise the production code path
     #[cfg(feature = "learned-index")]
     std::env::set_var("KYRODB_USE_ADAPTIVE_RMI", "true");
-    
+
     // Disable group commit for tests to ensure immediate durability
     // This ensures WAL writes are flushed immediately, not batched
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-    
+
     let log = crate::PersistentEventLog::open(data_dir.as_ref()).await?;
-    
+
     // Build empty RMI index immediately for tests (hot_buffer check fix makes this safe)
     #[cfg(feature = "learned-index")]
     {
         log.build_rmi().await.ok(); // Ignore errors if no data yet
     }
-    
+
     Ok(log)
 }
 
@@ -118,7 +120,7 @@ where
 {
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    
+
     while start.elapsed() < timeout {
         if condition() {
             return true;
@@ -129,17 +131,14 @@ where
 }
 
 /// Retry an operation with exponential backoff
-pub async fn retry_with_backoff<F, Fut, T, E>(
-    mut operation: F,
-    max_retries: usize,
-) -> Result<T, E>
+pub async fn retry_with_backoff<F, Fut, T, E>(mut operation: F, max_retries: usize) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
     let mut retries = 0;
     let mut delay_ms = 10;
-    
+
     loop {
         match operation().await {
             Ok(result) => return Ok(result),
@@ -154,12 +153,20 @@ where
 }
 
 /// Helper: Append key-value pair to log
-pub async fn append_kv(log: &Arc<PersistentEventLog>, key: u64, value: Vec<u8>) -> anyhow::Result<u64> {
+pub async fn append_kv(
+    log: &Arc<PersistentEventLog>,
+    key: u64,
+    value: Vec<u8>,
+) -> anyhow::Result<u64> {
     log.append_kv(Uuid::new_v4(), key, value).await
 }
 
 /// Helper: Append key-value pair to log (works with direct reference)
-pub async fn append_kv_ref(log: &PersistentEventLog, key: u64, value: Vec<u8>) -> anyhow::Result<u64> {
+pub async fn append_kv_ref(
+    log: &PersistentEventLog,
+    key: u64,
+    value: Vec<u8>,
+) -> anyhow::Result<u64> {
     log.append_kv(Uuid::new_v4(), key, value).await
 }
 

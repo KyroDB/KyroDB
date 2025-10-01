@@ -10,7 +10,9 @@ async fn test_basic_snapshot_recovery() {
 
     // Phase 1: Write data and create snapshot
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         for i in 0..100 {
             append_kv_ref(&log, i, format!("value_{}", i).as_bytes().to_vec())
@@ -24,7 +26,9 @@ async fn test_basic_snapshot_recovery() {
 
     // Phase 2: Reopen and verify recovery
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         for i in 0..100 {
@@ -49,7 +53,9 @@ async fn test_recovery_with_wal_replay() {
 
     // Phase 1: Write data, snapshot, then write more
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         // Write and snapshot
         for i in 0..50 {
@@ -71,7 +77,9 @@ async fn test_recovery_with_wal_replay() {
 
     // Phase 2: Reopen and verify both snapshot and WAL data
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         // Verify snapshot data
@@ -112,7 +120,9 @@ async fn test_recovery_with_updates_after_snapshot() {
 
     // Phase 1: Write, snapshot, then update some keys
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         // Initial data
         for i in 0..100 {
@@ -135,7 +145,9 @@ async fn test_recovery_with_updates_after_snapshot() {
 
     // Phase 2: Verify recovery shows latest values
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         // Updated keys should have version 2
@@ -176,7 +188,9 @@ async fn test_recovery_after_crash_simulation() {
 
     // Phase 1: Write data and snapshot
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         for i in 0..200 {
             append_kv_ref(&log, i, format!("value_{}", i).as_bytes().to_vec())
@@ -193,7 +207,9 @@ async fn test_recovery_after_crash_simulation() {
 
     // Phase 2: Recover from "crash"
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         // Verify all data is recoverable
@@ -219,7 +235,9 @@ async fn test_recovery_with_large_dataset() {
 
     // Phase 1: Write large dataset and snapshot
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         for i in 0..5000 {
             let value = format!("large_value_{}", i).repeat(5);
@@ -234,7 +252,9 @@ async fn test_recovery_with_large_dataset() {
 
     // Phase 2: Verify recovery of large dataset
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         // Spot check various keys
@@ -260,7 +280,9 @@ async fn test_recovery_without_snapshot() {
 
     // Phase 1: Write data but NO snapshot
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         for i in 0..100 {
             append_kv_ref(&log, i, format!("wal_only_{}", i).as_bytes().to_vec())
@@ -273,7 +295,9 @@ async fn test_recovery_without_snapshot() {
 
     // Phase 2: Recover from WAL only
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         for i in 0..100 {
@@ -298,7 +322,9 @@ async fn test_recovery_with_multiple_snapshots() {
 
     // Phase 1: Multiple snapshot cycles
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         // Cycle 1
         for i in 0..50 {
@@ -330,7 +356,9 @@ async fn test_recovery_with_multiple_snapshots() {
 
     // Phase 2: Verify recovery uses latest snapshot
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         // All data from all cycles should be present
@@ -339,7 +367,7 @@ async fn test_recovery_with_multiple_snapshots() {
                 .await
                 .expect("Lookup failed")
                 .expect("Key not found after multiple snapshots");
-            
+
             let expected = if i < 50 {
                 format!("cycle_1_{}", i)
             } else if i < 100 {
@@ -364,7 +392,9 @@ async fn test_recovery_rmi_coordination() {
 
     // Phase 1: Write, snapshot, build RMI
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         for i in 0..1000 {
             append_kv_ref(&log, i, format!("value_{}", i).as_bytes().to_vec())
@@ -381,17 +411,21 @@ async fn test_recovery_rmi_coordination() {
 
     // Phase 2: Recover and rebuild RMI
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         #[cfg(feature = "learned-index")]
-        log.build_rmi().await.expect("Failed to rebuild RMI after recovery");
+        log.build_rmi()
+            .await
+            .expect("Failed to rebuild RMI after recovery");
 
         // Verify data via ultra-fast lookups
         #[cfg(feature = "learned-index")]
         {
             log.warmup().await.ok();
-            
+
             for i in [0, 100, 500, 999] {
                 let offset = log.lookup_key_ultra_fast(i);
                 assert!(
@@ -412,7 +446,9 @@ async fn test_recovery_data_integrity() {
 
     // Phase 1: Complex write pattern
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         // Initial writes
         for i in 0..100 {
@@ -448,7 +484,9 @@ async fn test_recovery_data_integrity() {
 
     // Phase 2: Verify complete data integrity
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         for (key, expected_value) in &expected_data {
@@ -472,7 +510,9 @@ async fn test_recovery_performance() {
 
     // Phase 1: Write large dataset and snapshot
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         for i in 0..10_000 {
             append_kv_ref(&log, i, format!("value_{}", i).as_bytes().to_vec())
@@ -487,7 +527,9 @@ async fn test_recovery_performance() {
     // Phase 2: Measure recovery time
     {
         let start = std::time::Instant::now();
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
         let recovery_time = start.elapsed();
 

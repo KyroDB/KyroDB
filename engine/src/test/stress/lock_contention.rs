@@ -17,7 +17,10 @@ async fn test_hot_buffer_lock_contention() {
     const OPS_PER_THREAD: usize = 1000;
     const DURATION_SECS: u64 = 5;
 
-    println!("\n🔒 Testing hot buffer lock contention with {} threads...", NUM_THREADS);
+    println!(
+        "\n🔒 Testing hot buffer lock contention with {} threads...",
+        NUM_THREADS
+    );
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let running = Arc::new(AtomicBool::new(true));
@@ -32,7 +35,7 @@ async fn test_hot_buffer_lock_contention() {
 
         let handle = tokio::spawn(async move {
             let mut local_count = 0;
-            
+
             while running_flag.load(Ordering::Relaxed) {
                 let key = (thread_id as u64 * 1_000_000) + local_count;
                 let value = vec![0u8; 64];
@@ -71,10 +74,19 @@ async fn test_hot_buffer_lock_contention() {
     println!("\n📊 Hot Buffer Lock Contention Results:");
     println!("   Operations completed: {}", total_ops);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_ops as f64 / elapsed.as_secs_f64());
-    println!("   Avg ops/thread: {:.2}", total_ops as f64 / NUM_THREADS as f64);
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_ops as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Avg ops/thread: {:.2}",
+        total_ops as f64 / NUM_THREADS as f64
+    );
 
-    assert!(total_ops > 0, "Should complete operations despite contention");
+    assert!(
+        total_ops > 0,
+        "Should complete operations despite contention"
+    );
 }
 
 /// Test overflow buffer lock contention
@@ -92,7 +104,10 @@ async fn test_overflow_buffer_lock_contention() {
     const NUM_THREADS: usize = 50;
     const OPS_PER_THREAD: usize = 500;
 
-    println!("\n🔒 Testing overflow buffer lock contention with {} threads...", NUM_THREADS);
+    println!(
+        "\n🔒 Testing overflow buffer lock contention with {} threads...",
+        NUM_THREADS
+    );
 
     let success_count = Arc::new(AtomicUsize::new(0));
     let overflow_count = Arc::new(AtomicUsize::new(0));
@@ -143,7 +158,10 @@ async fn test_overflow_buffer_lock_contention() {
     println!("   Successful ops: {}", total_success);
     println!("   Overflow events: {}", total_overflow);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_success as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_success as f64 / elapsed.as_secs_f64()
+    );
 
     assert!(total_success > 0, "Should complete some operations");
 }
@@ -170,8 +188,10 @@ async fn test_reader_writer_lock_contention() {
     const NUM_WRITERS: usize = 20;
     const DURATION_SECS: u64 = 10;
 
-    println!("\n🔒 Testing reader-writer contention: {} readers, {} writers...",
-        NUM_READERS, NUM_WRITERS);
+    println!(
+        "\n🔒 Testing reader-writer contention: {} readers, {} writers...",
+        NUM_READERS, NUM_WRITERS
+    );
 
     let read_count = Arc::new(AtomicUsize::new(0));
     let write_count = Arc::new(AtomicUsize::new(0));
@@ -189,7 +209,7 @@ async fn test_reader_writer_lock_contention() {
         let handle = tokio::spawn(async move {
             while running_flag.load(Ordering::Relaxed) {
                 let key = (reader_id % 10_000) as u64;
-                
+
                 if lookup_kv(&log_clone, key).await.is_ok() {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
@@ -211,7 +231,7 @@ async fn test_reader_writer_lock_contention() {
 
         let handle = tokio::spawn(async move {
             let mut local_count = 0u64;
-            
+
             while running_flag.load(Ordering::Relaxed) {
                 let key = (writer_id as u64 * 1_000_000) + local_count + 20_000;
                 let value = format!("writer_{}_{}", writer_id, local_count).into_bytes();
@@ -247,9 +267,18 @@ async fn test_reader_writer_lock_contention() {
     println!("   Writes: {}", total_writes);
     println!("   Total ops: {}", total_ops);
     println!("   Duration: {:?}", elapsed);
-    println!("   Read throughput: {:.2} ops/sec", total_reads as f64 / elapsed.as_secs_f64());
-    println!("   Write throughput: {:.2} ops/sec", total_writes as f64 / elapsed.as_secs_f64());
-    println!("   Total throughput: {:.2} ops/sec", total_ops as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Read throughput: {:.2} ops/sec",
+        total_reads as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Write throughput: {:.2} ops/sec",
+        total_writes as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Total throughput: {:.2} ops/sec",
+        total_ops as f64 / elapsed.as_secs_f64()
+    );
 
     assert!(total_reads > 0, "Should complete reads under contention");
     assert!(total_writes > 0, "Should complete writes under contention");
@@ -308,7 +337,7 @@ async fn test_snapshot_lock_contention() {
 
         let handle = tokio::spawn(async move {
             let mut local_count = 0u64;
-            
+
             while running_flag.load(Ordering::Relaxed) {
                 let key = (thread_id as u64 * 1_000_000) + local_count + 10_000;
                 let value = format!("concurrent_{}", local_count).into_bytes();
@@ -344,11 +373,23 @@ async fn test_snapshot_lock_contention() {
     println!("   Snapshots completed: {}", total_snapshots);
     println!("   Writes completed: {}", total_writes);
     println!("   Duration: {:?}", elapsed);
-    println!("   Snapshot rate: {:.2}/sec", total_snapshots as f64 / elapsed.as_secs_f64());
-    println!("   Write throughput: {:.2} ops/sec", total_writes as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Snapshot rate: {:.2}/sec",
+        total_snapshots as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Write throughput: {:.2} ops/sec",
+        total_writes as f64 / elapsed.as_secs_f64()
+    );
 
-    assert!(total_snapshots > 0, "Should complete snapshots despite contention");
-    assert!(total_writes > 0, "Should complete writes despite contention");
+    assert!(
+        total_snapshots > 0,
+        "Should complete snapshots despite contention"
+    );
+    assert!(
+        total_writes > 0,
+        "Should complete writes despite contention"
+    );
 }
 
 /// Test no deadlocks under extreme contention
@@ -375,8 +416,10 @@ async fn test_no_deadlocks_extreme_contention() {
     const DURATION_SECS: u64 = 15;
 
     println!("\n🔒 Testing for deadlocks under extreme contention...");
-    println!("   {} readers, {} writers, {} snapshotters, {} RMI rebuilders",
-        NUM_READERS, NUM_WRITERS, NUM_SNAPSHOT_THREADS, NUM_RMI_REBUILDERS);
+    println!(
+        "   {} readers, {} writers, {} snapshotters, {} RMI rebuilders",
+        NUM_READERS, NUM_WRITERS, NUM_SNAPSHOT_THREADS, NUM_RMI_REBUILDERS
+    );
 
     let read_count = Arc::new(AtomicUsize::new(0));
     let write_count = Arc::new(AtomicUsize::new(0));
@@ -475,9 +518,9 @@ async fn test_no_deadlocks_extreme_contention() {
 
     for handle in handles {
         let remaining = timeout.saturating_sub(wait_start.elapsed());
-        
+
         match tokio::time::timeout(remaining, handle).await {
-            Ok(_) => {}, // Thread completed
+            Ok(_) => {} // Thread completed
             Err(_) => {
                 panic!("DEADLOCK DETECTED: Thread did not complete within timeout");
             }
@@ -497,8 +540,10 @@ async fn test_no_deadlocks_extreme_contention() {
     println!("   Snapshots: {}", total_snapshots);
     println!("   RMI rebuilds: {}", total_rebuilds);
     println!("   Duration: {:?}", elapsed);
-    println!("   Total throughput: {:.2} ops/sec",
-        (total_reads + total_writes) as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Total throughput: {:.2} ops/sec",
+        (total_reads + total_writes) as f64 / elapsed.as_secs_f64()
+    );
 
     // All operations should complete
     assert!(total_reads > 0, "Reads should complete");

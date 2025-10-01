@@ -36,10 +36,10 @@ pub mod metrics;
 pub mod runner;
 pub mod workload;
 
-pub use client::{BenchClient, ClientConfig, ClientType, create_client};
+pub use client::{create_client, BenchClient, ClientConfig, ClientType};
 pub use metrics::{BenchmarkResults, MetricsCollector, ResultsReporter};
 pub use runner::{BenchmarkRunner, RunnerConfig};
-pub use workload::{Workload, WorkloadConfig, WorkloadType, create_workload};
+pub use workload::{create_workload, Workload, WorkloadConfig, WorkloadType};
 
 /// Core benchmark configuration
 #[derive(Debug, Clone)]
@@ -80,48 +80,50 @@ pub async fn run_full_suite(config: BenchmarkConfig) -> Result<Vec<BenchmarkResu
     println!("Workers: {}", config.workers);
     println!("Duration: {}s", config.duration_secs);
     println!();
-    
+
     // Create client
     let client_config = ClientConfig {
         base_url: config.server_url.clone(),
         timeout_secs: 30,
         pool_size: config.workers,
         auth_token: None,
+        max_in_flight: config.workers,
+        max_retries: 5,
     };
-    
+
     // Create HTTP client (only HTTP supported for now in runner)
     let http_client = client::HttpClient::new(client_config)?;
-    
+
     // Create runner
     let runner_config = RunnerConfig {
         workers: config.workers,
         duration_secs: config.duration_secs,
         warmup_secs: config.warmup_secs,
     };
-    
+
     let mut runner = BenchmarkRunner::new(http_client, runner_config);
-    
+
     // Phase 1: Microbenchmarks
     println!("🔬 Phase 1: Raw Engine Microbenchmarks");
     runner.run_microbenchmarks().await?;
-    
+
     // Phase 2: HTTP Layer
     println!("🌐 Phase 2: HTTP Layer Benchmarks");
     runner.run_http_benchmarks().await?;
-    
+
     // Phase 3: Integration
     println!("🔗 Phase 3: Integration Tests");
     runner.run_integration_benchmarks().await?;
-    
+
     // Phase 4: Comparison
     println!("⚖️  Phase 4: RMI vs BTree Comparison");
     runner.run_comparison_benchmarks().await?;
-    
+
     let results = runner.collect_results();
-    
+
     println!("\n🎉 Benchmark suite complete!");
     println!("Results saved to: {}", config.output_dir);
-    
+
     Ok(results)
 }
 
@@ -132,11 +134,13 @@ pub async fn run_quick_test(config: BenchmarkConfig) -> Result<BenchmarkResults>
         timeout_secs: 10,
         pool_size: 8,
         auth_token: None,
+        max_in_flight: 8,
+        max_retries: 5,
     };
-    
+
     // Create HTTP client
     let http_client = client::HttpClient::new(client_config)?;
-    
+
     let workload_config = WorkloadConfig {
         key_count: 10_000,
         value_size: 256,
@@ -144,12 +148,14 @@ pub async fn run_quick_test(config: BenchmarkConfig) -> Result<BenchmarkResults>
         distribution: workload::Distribution::Uniform,
         duration_secs: 10,
     };
-    
+
     let executor = runner::executor::WorkloadExecutor::new_with_http(http_client, 8);
     let workload = create_workload(WorkloadType::Mixed, workload_config)?;
-    let results = executor.execute(workload, metrics::BenchmarkPhase::HttpLayer).await?;
-    
+    let results = executor
+        .execute(workload, metrics::BenchmarkPhase::HttpLayer)
+        .await?;
+
     ResultsReporter::print_summary(&results);
-    
+
     Ok(results)
 }

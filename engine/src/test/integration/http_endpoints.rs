@@ -75,9 +75,13 @@ async fn test_update_operations() {
 
     // Update same key multiple times
     for i in 0..10 {
-        append_kv(&server.log, 200, format!("updated_{}", i).as_bytes().to_vec())
-            .await
-            .expect("Failed to append");
+        append_kv(
+            &server.log,
+            200,
+            format!("updated_{}", i).as_bytes().to_vec(),
+        )
+        .await
+        .expect("Failed to append");
     }
 
     // Build RMI before lookup
@@ -86,10 +90,7 @@ async fn test_update_operations() {
 
     // Should return latest value
     let value = lookup_kv(&server.log, 200).await.expect("Failed to lookup");
-    assert_eq!(
-        String::from_utf8_lossy(&value.unwrap()),
-        "updated_9"
-    );
+    assert_eq!(String::from_utf8_lossy(&value.unwrap()), "updated_9");
 
     server.shutdown().await;
 }
@@ -134,7 +135,11 @@ async fn test_snapshot_integration() {
     }
 
     // Trigger snapshot
-    server.log.snapshot().await.expect("Failed to create snapshot");
+    server
+        .log
+        .snapshot()
+        .await
+        .expect("Failed to create snapshot");
 
     // Build RMI before lookups
     #[cfg(feature = "learned-index")]
@@ -192,7 +197,9 @@ async fn test_nonexistent_key() {
     #[cfg(feature = "learned-index")]
     server.log.build_rmi().await.ok();
 
-    let value = lookup_kv(&server.log, 99999).await.expect("Failed to lookup");
+    let value = lookup_kv(&server.log, 99999)
+        .await
+        .expect("Failed to lookup");
     assert!(value.is_none(), "Nonexistent key should return None");
 
     server.shutdown().await;
@@ -203,10 +210,10 @@ async fn test_persistence_across_restarts() {
     // Set durability level to ensure writes are flushed
     std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-    
+
     let data_dir = test_data_dir();
     let path = data_dir.path().to_path_buf();
-    
+
     // First instance - write data
     {
         let log = Arc::new(PersistentEventLog::open(path.clone()).await.unwrap());
@@ -231,11 +238,7 @@ async fn test_persistence_across_restarts() {
 
         for i in 0..100 {
             let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-            assert!(
-                value.is_some(),
-                "Key {} not persisted across restart",
-                i
-            );
+            assert!(value.is_some(), "Key {} not persisted across restart", i);
             assert_eq!(
                 String::from_utf8_lossy(&value.unwrap()),
                 format!("persisted_{}", i)

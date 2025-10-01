@@ -11,7 +11,7 @@ use tokio::time::Instant;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_recovery_after_write_crash() {
     let data_dir = test_data_dir();
-    
+
     // Phase 1: Write data and simulate crash
     {
         let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
@@ -34,11 +34,11 @@ async fn test_recovery_after_write_crash() {
     {
         println!("\n🔄 Recovering from crash...");
         let recover_start = Instant::now();
-        
+
         let log = Arc::new(
             PersistentEventLog::open(data_dir.path().to_path_buf())
                 .await
-                .unwrap()
+                .unwrap(),
         );
 
         let recover_elapsed = recover_start.elapsed();
@@ -73,15 +73,19 @@ async fn test_recovery_with_multiple_snapshots() {
         let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
 
         println!("\n📝 Creating multiple snapshots...");
-        
+
         for snapshot_round in 0..5 {
             // Write data
             let key_offset = snapshot_round * 2_000;
             for i in 0..2_000 {
                 let key = (key_offset + i) as u64;
-                append_kv(&log, key, format!("snap_{}_{}", snapshot_round, i).into_bytes())
-                    .await
-                    .unwrap();
+                append_kv(
+                    &log,
+                    key,
+                    format!("snap_{}_{}", snapshot_round, i).into_bytes(),
+                )
+                .await
+                .unwrap();
             }
 
             // Create snapshot
@@ -98,7 +102,7 @@ async fn test_recovery_with_multiple_snapshots() {
         let log = Arc::new(
             PersistentEventLog::open(data_dir.path().to_path_buf())
                 .await
-                .unwrap()
+                .unwrap(),
         );
 
         #[cfg(feature = "learned-index")]
@@ -117,7 +121,10 @@ async fn test_recovery_with_multiple_snapshots() {
         }
 
         println!("   Found {}/{} sampled keys", found, total_keys / 100);
-        assert!(found >= (total_keys / 100) * 95 / 100, "Should recover 95%+ of all snapshots");
+        assert!(
+            found >= (total_keys / 100) * 95 / 100,
+            "Should recover 95%+ of all snapshots"
+        );
     }
 }
 
@@ -135,23 +142,31 @@ async fn test_rapid_restart_stress() {
         let log = Arc::new(
             PersistentEventLog::open(data_dir.path().to_path_buf())
                 .await
-                .unwrap()
+                .unwrap(),
         );
 
         // Write some data
         let key_offset = restart_round * KEYS_PER_CYCLE;
         for i in 0..KEYS_PER_CYCLE {
             let key = (key_offset + i) as u64;
-            append_kv(&log, key, format!("restart_{}_{}", restart_round, i).into_bytes())
-                .await
-                .unwrap();
+            append_kv(
+                &log,
+                key,
+                format!("restart_{}_{}", restart_round, i).into_bytes(),
+            )
+            .await
+            .unwrap();
         }
 
         // Snapshot and close
         log.snapshot().await.unwrap();
         drop(log);
 
-        println!("   Restart {}/{} completed", restart_round + 1, NUM_RESTARTS);
+        println!(
+            "   Restart {}/{} completed",
+            restart_round + 1,
+            NUM_RESTARTS
+        );
     }
 
     // Final verification
@@ -159,7 +174,7 @@ async fn test_rapid_restart_stress() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .unwrap()
+            .unwrap(),
     );
 
     #[cfg(feature = "learned-index")]
@@ -205,11 +220,11 @@ async fn test_wal_replay_recovery() {
     {
         println!("\n🔄 Recovering with WAL replay...");
         let recover_start = Instant::now();
-        
+
         let log = Arc::new(
             PersistentEventLog::open(data_dir.path().to_path_buf())
                 .await
-                .unwrap()
+                .unwrap(),
         );
 
         let recover_elapsed = recover_start.elapsed();

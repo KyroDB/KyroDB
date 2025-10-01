@@ -14,6 +14,8 @@ pub struct ClientConfig {
     pub timeout_secs: u64,
     pub pool_size: usize,
     pub auth_token: Option<String>,
+    pub max_in_flight: usize,
+    pub max_retries: usize,
 }
 
 impl Default for ClientConfig {
@@ -23,6 +25,8 @@ impl Default for ClientConfig {
             timeout_secs: 30,
             pool_size: 1000,
             auth_token: None,
+            max_in_flight: 1000,
+            max_retries: 5,
         }
     }
 }
@@ -32,22 +36,22 @@ impl Default for ClientConfig {
 pub trait BenchClient: Send + Sync {
     /// PUT operation
     async fn put(&self, key: u64, value: Vec<u8>) -> Result<()>;
-    
+
     /// GET operation
     async fn get(&self, key: u64) -> Result<Option<Vec<u8>>>;
-    
+
     /// Batch lookup (returns offsets)
     async fn lookup_batch(&self, keys: Vec<u64>) -> Result<Vec<(u64, Option<u64>)>>;
-    
+
     /// Build RMI index
     async fn build_rmi(&self) -> Result<()>;
-    
+
     /// Warmup mmap pages
     async fn warmup(&self) -> Result<()>;
-    
+
     /// Create snapshot
     async fn snapshot(&self) -> Result<()>;
-    
+
     /// Health check
     async fn health(&self) -> Result<bool>;
 }

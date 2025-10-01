@@ -17,7 +17,10 @@ async fn test_1_million_keys() {
     const NUM_KEYS: usize = 1_000_000;
     const BATCH_SIZE: usize = 10_000;
 
-    println!("\n📝 Inserting {} keys in batches of {}...", NUM_KEYS, BATCH_SIZE);
+    println!(
+        "\n📝 Inserting {} keys in batches of {}...",
+        NUM_KEYS, BATCH_SIZE
+    );
     let start_time = Instant::now();
 
     let inserted_count = Arc::new(AtomicUsize::new(0));
@@ -50,10 +53,13 @@ async fn test_1_million_keys() {
         let current_count = inserted_count.load(Ordering::Relaxed);
         if current_count % 100_000 == 0 && current_count > 0 {
             let elapsed = start_time.elapsed();
-            println!("   Progress: {}/{} keys ({:.1}%), {:.2} ops/sec",
-                current_count, NUM_KEYS,
+            println!(
+                "   Progress: {}/{} keys ({:.1}%), {:.2} ops/sec",
+                current_count,
+                NUM_KEYS,
                 (current_count as f64 / NUM_KEYS as f64) * 100.0,
-                current_count as f64 / elapsed.as_secs_f64());
+                current_count as f64 / elapsed.as_secs_f64()
+            );
         }
     }
 
@@ -63,7 +69,10 @@ async fn test_1_million_keys() {
     println!("\n📊 Insertion Results:");
     println!("   Keys inserted: {}", total_inserted);
     println!("   Duration: {:?}", insert_elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_inserted as f64 / insert_elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_inserted as f64 / insert_elapsed.as_secs_f64()
+    );
 
     assert_eq!(total_inserted, NUM_KEYS, "Should insert all keys");
 
@@ -98,9 +107,15 @@ async fn test_1_million_keys() {
     println!("   Lookups attempted: {}", NUM_LOOKUPS);
     println!("   Found: {}", found_count);
     println!("   Duration: {:?}", lookup_elapsed);
-    println!("   Lookup throughput: {:.2} ops/sec", NUM_LOOKUPS as f64 / lookup_elapsed.as_secs_f64());
+    println!(
+        "   Lookup throughput: {:.2} ops/sec",
+        NUM_LOOKUPS as f64 / lookup_elapsed.as_secs_f64()
+    );
 
-    assert!(found_count >= NUM_LOOKUPS * 95 / 100, "Should find at least 95% of keys");
+    assert!(
+        found_count >= NUM_LOOKUPS * 95 / 100,
+        "Should find at least 95% of keys"
+    );
 }
 
 /// Test 10 million keys (long-running test)
@@ -114,7 +129,10 @@ async fn test_10_million_keys() {
     const BATCH_SIZE: usize = 50_000;
     const PARALLEL_WORKERS: usize = 16;
 
-    println!("\n📝 Inserting {} keys with {} parallel workers...", NUM_KEYS, PARALLEL_WORKERS);
+    println!(
+        "\n📝 Inserting {} keys with {} parallel workers...",
+        NUM_KEYS, PARALLEL_WORKERS
+    );
     let start_time = Instant::now();
 
     let inserted_count = Arc::new(AtomicUsize::new(0));
@@ -134,7 +152,7 @@ async fn test_10_million_keys() {
 
                 if append_kv(&log_clone, key, value).await.is_ok() {
                     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    
+
                     if count % 500_000 == 0 {
                         println!("   Worker {} progress: {} keys", worker_id, count);
                     }
@@ -156,9 +174,15 @@ async fn test_10_million_keys() {
     println!("\n📊 10M Keys Insertion Results:");
     println!("   Keys inserted: {}", total_inserted);
     println!("   Duration: {:?}", insert_elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_inserted as f64 / insert_elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_inserted as f64 / insert_elapsed.as_secs_f64()
+    );
 
-    assert!(total_inserted >= NUM_KEYS * 95 / 100, "Should insert at least 95% of keys");
+    assert!(
+        total_inserted >= NUM_KEYS * 95 / 100,
+        "Should insert at least 95% of keys"
+    );
 }
 
 /// Test large values (1KB each)
@@ -170,8 +194,12 @@ async fn test_large_values_1kb() {
     const NUM_KEYS: usize = 100_000;
     const VALUE_SIZE: usize = 1024; // 1KB
 
-    println!("\n📝 Inserting {} keys with {}B values (total: ~{}MB)...",
-        NUM_KEYS, VALUE_SIZE, (NUM_KEYS * VALUE_SIZE) / (1024 * 1024));
+    println!(
+        "\n📝 Inserting {} keys with {}B values (total: ~{}MB)...",
+        NUM_KEYS,
+        VALUE_SIZE,
+        (NUM_KEYS * VALUE_SIZE) / (1024 * 1024)
+    );
 
     let start_time = Instant::now();
     let value_template = vec![0xAB; VALUE_SIZE];
@@ -195,20 +223,30 @@ async fn test_large_values_1kb() {
     println!("\n📊 Large Values Results:");
     println!("   Keys inserted: {}", NUM_KEYS);
     println!("   Duration: {:?}", insert_elapsed);
-    println!("   Throughput: {:.2} ops/sec", NUM_KEYS as f64 / insert_elapsed.as_secs_f64());
-    println!("   Data throughput: {:.2} MB/sec",
-        (NUM_KEYS * VALUE_SIZE) as f64 / (1024.0 * 1024.0) / insert_elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        NUM_KEYS as f64 / insert_elapsed.as_secs_f64()
+    );
+    println!(
+        "   Data throughput: {:.2} MB/sec",
+        (NUM_KEYS * VALUE_SIZE) as f64 / (1024.0 * 1024.0) / insert_elapsed.as_secs_f64()
+    );
 
     // Verify a sample of keys
     println!("\n🔍 Verifying sample of large values...");
     for i in (0..NUM_KEYS).step_by(1000) {
         let value = lookup_kv(&log, i as u64).await.unwrap().unwrap();
         assert_eq!(value.len(), VALUE_SIZE, "Value size mismatch for key {}", i);
-        
+
         // Verify unique suffix
         let mut expected_suffix = [0u8; 8];
         expected_suffix.copy_from_slice(&i.to_le_bytes());
-        assert_eq!(&value[..8], &expected_suffix, "Value content mismatch for key {}", i);
+        assert_eq!(
+            &value[..8],
+            &expected_suffix,
+            "Value content mismatch for key {}",
+            i
+        );
     }
 
     println!("   ✅ All sampled values verified");
@@ -224,8 +262,12 @@ async fn test_very_large_values_10kb() {
     const NUM_KEYS: usize = 10_000;
     const VALUE_SIZE: usize = 10 * 1024; // 10KB
 
-    println!("\n📝 Inserting {} keys with {}KB values (total: ~{}MB)...",
-        NUM_KEYS, VALUE_SIZE / 1024, (NUM_KEYS * VALUE_SIZE) / (1024 * 1024));
+    println!(
+        "\n📝 Inserting {} keys with {}KB values (total: ~{}MB)...",
+        NUM_KEYS,
+        VALUE_SIZE / 1024,
+        (NUM_KEYS * VALUE_SIZE) / (1024 * 1024)
+    );
 
     let start_time = Instant::now();
     let value_template = vec![0xCD; VALUE_SIZE];
@@ -246,9 +288,14 @@ async fn test_very_large_values_10kb() {
     println!("\n📊 Very Large Values Results:");
     println!("   Keys inserted: {}", NUM_KEYS);
     println!("   Duration: {:?}", insert_elapsed);
-    println!("   Throughput: {:.2} ops/sec", NUM_KEYS as f64 / insert_elapsed.as_secs_f64());
-    println!("   Data throughput: {:.2} MB/sec",
-        (NUM_KEYS * VALUE_SIZE) as f64 / (1024.0 * 1024.0) / insert_elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        NUM_KEYS as f64 / insert_elapsed.as_secs_f64()
+    );
+    println!(
+        "   Data throughput: {:.2} MB/sec",
+        (NUM_KEYS * VALUE_SIZE) as f64 / (1024.0 * 1024.0) / insert_elapsed.as_secs_f64()
+    );
 }
 
 /// Test sparse key space (large gaps between keys)
@@ -260,7 +307,11 @@ async fn test_sparse_key_space() {
     const NUM_KEYS: usize = 100_000;
     const KEY_SPACING: u64 = 1_000_000; // 1M gap between keys
 
-    println!("\n📝 Inserting {} keys with {}M spacing...", NUM_KEYS, KEY_SPACING / 1_000_000);
+    println!(
+        "\n📝 Inserting {} keys with {}M spacing...",
+        NUM_KEYS,
+        KEY_SPACING / 1_000_000
+    );
 
     let start_time = Instant::now();
 
@@ -281,7 +332,10 @@ async fn test_sparse_key_space() {
     println!("   Keys inserted: {}", NUM_KEYS);
     println!("   Key range: 0 to {}", (NUM_KEYS as u64 - 1) * KEY_SPACING);
     println!("   Duration: {:?}", insert_elapsed);
-    println!("   Throughput: {:.2} ops/sec", NUM_KEYS as f64 / insert_elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        NUM_KEYS as f64 / insert_elapsed.as_secs_f64()
+    );
 
     // Build RMI for sparse keys
     println!("\n🔧 Building RMI for sparse keys...");
@@ -303,7 +357,11 @@ async fn test_sparse_key_space() {
         }
     }
 
-    println!("   ✅ Found {}/{} sampled keys", found_count, NUM_KEYS / 100);
+    println!(
+        "   ✅ Found {}/{} sampled keys",
+        found_count,
+        NUM_KEYS / 100
+    );
     assert_eq!(found_count, NUM_KEYS / 100, "Should find all sampled keys");
 }
 
@@ -343,8 +401,12 @@ async fn test_sequential_scan_large_dataset() {
 
         if i % 50_000 == 0 && i > 0 {
             let elapsed = scan_start.elapsed();
-            println!("   Scan progress: {}/{} keys ({:.2} ops/sec)",
-                i, NUM_KEYS, i as f64 / elapsed.as_secs_f64());
+            println!(
+                "   Scan progress: {}/{} keys ({:.2} ops/sec)",
+                i,
+                NUM_KEYS,
+                i as f64 / elapsed.as_secs_f64()
+            );
         }
     }
 
@@ -354,7 +416,13 @@ async fn test_sequential_scan_large_dataset() {
     println!("   Keys scanned: {}", NUM_KEYS);
     println!("   Found: {}", found_count);
     println!("   Duration: {:?}", scan_elapsed);
-    println!("   Scan throughput: {:.2} ops/sec", NUM_KEYS as f64 / scan_elapsed.as_secs_f64());
+    println!(
+        "   Scan throughput: {:.2} ops/sec",
+        NUM_KEYS as f64 / scan_elapsed.as_secs_f64()
+    );
 
-    assert_eq!(found_count, NUM_KEYS, "Should find all keys in sequential scan");
+    assert_eq!(
+        found_count, NUM_KEYS,
+        "Should find all keys in sequential scan"
+    );
 }

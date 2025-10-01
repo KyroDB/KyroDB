@@ -36,12 +36,17 @@ async fn test_ultra_fast_endpoints_require_rmi_warmup() {
 
     // Verify ultra-fast lookups work
     for i in (0..5000).step_by(100) {
-        let offset = log
-            .lookup_key_ultra_fast(i)
-            .expect(&format!("Ultra-fast lookup should succeed after RMI build for key {}", i));
-        
+        let offset = log.lookup_key_ultra_fast(i).expect(&format!(
+            "Ultra-fast lookup should succeed after RMI build for key {}",
+            i
+        ));
+
         // Offset should be a valid WAL offset (>= 0)
-        assert!(offset < u64::MAX, "Ultra-fast lookup returned invalid offset for key {}", i);
+        assert!(
+            offset < u64::MAX,
+            "Ultra-fast lookup returned invalid offset for key {}",
+            i
+        );
     }
 }
 
@@ -129,12 +134,13 @@ async fn test_get_ultra_returns_actual_values() {
         let offset = log
             .lookup_key_ultra_fast(key)
             .expect("Ultra-fast lookup should succeed");
-        
+
         // Offset should be a valid WAL offset (not the key value!)
         assert!(
             offset < u64::MAX,
             "Invalid offset for key {}: got {}",
-            key, offset
+            key,
+            offset
         );
     }
 }
@@ -168,9 +174,14 @@ async fn test_ultra_fast_with_sparse_keys() {
         let offset = log
             .lookup_key_ultra_fast(key)
             .expect("Ultra-fast lookup should work with sparse keys");
-        
+
         // Offset should be a valid WAL offset
-        assert!(offset < u64::MAX, "Wrong offset for sparse key {}: got {}", key, offset);
+        assert!(
+            offset < u64::MAX,
+            "Wrong offset for sparse key {}: got {}",
+            key,
+            offset
+        );
     }
 
     // Verify non-existent keys return None
@@ -221,9 +232,14 @@ async fn test_ultra_fast_with_clustered_keys() {
         let offset = log
             .lookup_key_ultra_fast(key)
             .expect(&format!("Ultra-fast lookup should work for key {}", key));
-        
+
         // Offset should be a valid WAL offset
-        assert!(offset < u64::MAX, "Wrong offset for clustered key {}: got {}", key, offset);
+        assert!(
+            offset < u64::MAX,
+            "Wrong offset for clustered key {}: got {}",
+            key,
+            offset
+        );
     }
 }
 
@@ -256,7 +272,9 @@ async fn test_ultra_fast_after_updates() {
     }
 
     // Correct workflow after updates: snapshot → rebuild_rmi → warmup
-    log.snapshot().await.expect("Failed to create snapshot after updates");
+    log.snapshot()
+        .await
+        .expect("Failed to create snapshot after updates");
     log.build_rmi().await.expect("Failed to rebuild RMI");
     log.warmup().await.expect("Failed to warmup");
 
@@ -266,14 +284,21 @@ async fn test_ultra_fast_after_updates() {
         let offset = log
             .lookup_key_ultra_fast(i)
             .expect("Ultra-fast lookup should work after updates");
-        
+
         // Offset should be a valid WAL offset
-        assert!(offset < u64::MAX, "Invalid offset for key {}: got {}", i, offset);
-        
+        assert!(
+            offset < u64::MAX,
+            "Invalid offset for key {}: got {}",
+            i,
+            offset
+        );
+
         // Verify we can still get the value through standard API
-        let value = lookup_kv(&log, i).await.expect("Failed to lookup updated key");
+        let value = lookup_kv(&log, i)
+            .await
+            .expect("Failed to lookup updated key");
         assert!(value.is_some(), "Key {} should exist after update", i);
-        
+
         let value_bytes = value.unwrap();
         let value_str = String::from_utf8_lossy(&value_bytes);
         assert!(
@@ -376,28 +401,37 @@ async fn test_standard_endpoints_work_without_rmi() {
     // ARCHITECTURE NOTE: With hot_buffer check fix, lookups work immediately after writes
     // even without building RMI. The hot_buffer is checked FIRST before the snapshot.
     // This eliminates the async lag window (0-500ms) between writes and background merge.
-    // 
+    //
     // Standard lookups should work immediately (hot_buffer check):
     for i in (0..100).step_by(10) {
-        let value = lookup_kv(&log, i)
-            .await
-            .expect("Lookup should not error");
-        
+        let value = lookup_kv(&log, i).await.expect("Lookup should not error");
+
         // With hot_buffer check fix, lookups work immediately
-        assert!(value.is_some(), "Hot buffer check should find key {} immediately", i);
+        assert!(
+            value.is_some(),
+            "Hot buffer check should find key {} immediately",
+            i
+        );
         let expected = format!("value_{}", i);
-        assert_eq!(value.unwrap(), expected.as_bytes(), "Value mismatch for key {}", i);
+        assert_eq!(
+            value.unwrap(),
+            expected.as_bytes(),
+            "Value mismatch for key {}",
+            i
+        );
     }
-    
+
     // After building RMI, lookups should still work (snapshot path):
     log.snapshot().await.expect("Failed to create snapshot");
     log.build_rmi().await.expect("Failed to build RMI");
     log.warmup().await.expect("Failed to warmup");
-    
+
     for i in (0..100).step_by(10) {
-        let value = lookup_kv(&log, i)
-            .await
-            .expect("Lookup should not error");
-        assert!(value.is_some(), "After RMI build, key {} should still be found", i);
+        let value = lookup_kv(&log, i).await.expect("Lookup should not error");
+        assert!(
+            value.is_some(),
+            "After RMI build, key {} should still be found",
+            i
+        );
     }
 }

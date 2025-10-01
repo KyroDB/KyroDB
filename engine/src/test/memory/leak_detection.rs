@@ -11,7 +11,11 @@ use tokio::time::{sleep, Duration};
 #[tokio::test]
 async fn test_no_leaks_after_simple_operations() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Perform operations
     for i in 0..1000 {
@@ -32,7 +36,7 @@ async fn test_no_leaks_after_simple_operations() {
 
     // Drop log and verify cleanup
     drop(log);
-    
+
     // Allow cleanup to complete
     sleep(Duration::from_millis(100)).await;
 }
@@ -40,7 +44,11 @@ async fn test_no_leaks_after_simple_operations() {
 #[tokio::test]
 async fn test_hot_buffer_drain_consistency() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write to hot buffer
     for i in 0..100 {
@@ -69,7 +77,11 @@ async fn test_hot_buffer_drain_consistency() {
 #[tokio::test]
 async fn test_no_leaks_during_concurrent_operations() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     let mut tasks = JoinSet::new();
 
@@ -80,10 +92,10 @@ async fn test_no_leaks_during_concurrent_operations() {
             for i in 0..100 {
                 let key = thread_id * 100 + i;
                 let value = format!("t{}_v{}", thread_id, i).as_bytes().to_vec();
-                
+
                 // Append
                 let _ = append_kv(&log_clone, key, value).await;
-                
+
                 // Immediate lookup
                 let _ = lookup_kv(&log_clone, key).await;
             }
@@ -109,7 +121,11 @@ async fn test_no_leaks_during_concurrent_operations() {
 #[tokio::test]
 async fn test_memory_cleanup_on_updates() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initial values
     for i in 0..500 {
@@ -126,9 +142,7 @@ async fn test_memory_cleanup_on_updates() {
     for update_round in 0..10 {
         for i in 0..500 {
             let value = format!("update_{}_{}", update_round, i).as_bytes().to_vec();
-            append_kv(&log, i, value)
-                .await
-                .expect("Failed to append");
+            append_kv(&log, i, value).await.expect("Failed to append");
         }
 
         // Periodic RMI rebuild
@@ -158,7 +172,11 @@ async fn test_memory_cleanup_on_updates() {
 #[tokio::test]
 async fn test_buffer_return_on_eviction() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Fill enough to trigger eviction
     for i in 0..10_000 {
@@ -200,7 +218,11 @@ async fn test_buffer_return_on_eviction() {
 #[tokio::test]
 async fn test_no_leaks_with_large_values() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write large values that could leak if not properly managed
     for i in 0..100 {
@@ -228,14 +250,23 @@ async fn test_no_leaks_with_large_values() {
     for i in 0..100 {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
         assert!(value.is_some(), "Large value leak test: key {} missing", i);
-        assert_eq!(value.unwrap().len(), 256, "Large value leak test: wrong size for key {}", i);
+        assert_eq!(
+            value.unwrap().len(),
+            256,
+            "Large value leak test: wrong size for key {}",
+            i
+        );
     }
 }
 
 #[tokio::test]
 async fn test_atomic_hot_buffer_size_consistency() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     let mut tasks = JoinSet::new();
 
@@ -276,7 +307,11 @@ async fn test_atomic_hot_buffer_size_consistency() {
 #[tokio::test]
 async fn test_cleanup_after_snapshot() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data
     for i in 0..1000 {
@@ -319,16 +354,18 @@ async fn test_cleanup_after_snapshot() {
 #[tokio::test]
 async fn test_long_running_operation_no_leaks() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Simulate long-running operation with repeated cycles
     for cycle in 0..50 {
         // Write phase
         for i in 0..100 {
             let value = format!("cycle_{}_key_{}", cycle, i).as_bytes().to_vec();
-            append_kv(&log, i, value)
-                .await
-                .expect("Failed to append");
+            append_kv(&log, i, value).await.expect("Failed to append");
         }
 
         // Read phase
@@ -366,7 +403,11 @@ async fn test_long_running_operation_no_leaks() {
 #[tokio::test]
 async fn test_buffer_lifecycle_completeness() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Test complete buffer lifecycle: allocate -> use -> return
     for round in 0..20 {
@@ -374,9 +415,7 @@ async fn test_buffer_lifecycle_completeness() {
         for i in 0..200 {
             let key = i;
             let value = format!("round_{}_value_{}", round, i).as_bytes().to_vec();
-            append_kv(&log, key, value)
-                .await
-                .expect("Failed to append");
+            append_kv(&log, key, value).await.expect("Failed to append");
         }
 
         // Build RMI (processes buffers)
@@ -386,7 +425,12 @@ async fn test_buffer_lifecycle_completeness() {
         // Verify buffers usable in next round
         for i in (0..200).step_by(20) {
             let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-            assert!(value.is_some(), "Buffer lifecycle: key {} missing in round {}", i, round);
+            assert!(
+                value.is_some(),
+                "Buffer lifecycle: key {} missing in round {}",
+                i,
+                round
+            );
         }
     }
 

@@ -43,7 +43,6 @@ async fn test_group_commit_batching() {
     server.cleanup().await;
 }
 
-
 #[tokio::test]
 async fn test_compaction_reduces_wal_size() {
     // Test that compaction reduces WAL size by removing old versions
@@ -299,7 +298,10 @@ async fn test_concurrent_compactions_are_serialized() {
     // Data should still be intact
     for i in 0..500 {
         let value = lookup_kv(log, i).await.unwrap();
-        assert!(value.is_some(), "Data should survive concurrent compactions");
+        assert!(
+            value.is_some(),
+            "Data should survive concurrent compactions"
+        );
     }
 
     server.cleanup().await;

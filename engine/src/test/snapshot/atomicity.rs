@@ -12,7 +12,9 @@ use tokio::time::{sleep, Duration};
 #[tokio::test]
 async fn test_snapshot_atomic_file_creation() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write data
     for i in 0..100 {
@@ -44,7 +46,11 @@ async fn test_snapshot_atomic_file_creation() {
 #[tokio::test]
 async fn test_snapshot_consistency_under_reads() {
     let data_dir = test_data_dir();
-    let log = Arc::new(open_test_log(data_dir.path()).await.expect("Failed to create log"));
+    let log = Arc::new(
+        open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log"),
+    );
 
     // Write initial data
     for i in 0..500 {
@@ -103,7 +109,11 @@ async fn test_snapshot_consistency_under_reads() {
 #[tokio::test]
 async fn test_snapshot_isolation_from_writes() {
     let data_dir = test_data_dir();
-    let log = Arc::new(open_test_log(data_dir.path()).await.expect("Failed to create log"));
+    let log = Arc::new(
+        open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log"),
+    );
 
     // Write initial data
     for i in 0..200 {
@@ -135,7 +145,12 @@ async fn test_snapshot_isolation_from_writes() {
     let log_writer = log.clone();
     tasks.spawn(async move {
         for i in 200..300 {
-            let _ = append_kv(&log_writer, i, format!("concurrent_{}", i).as_bytes().to_vec()).await;
+            let _ = append_kv(
+                &log_writer,
+                i,
+                format!("concurrent_{}", i).as_bytes().to_vec(),
+            )
+            .await;
         }
     });
 
@@ -151,7 +166,9 @@ async fn test_snapshot_isolation_from_writes() {
 #[tokio::test]
 async fn test_snapshot_point_in_time_consistency() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write version 1
     for i in 0..100 {
@@ -183,10 +200,7 @@ async fn test_snapshot_point_in_time_consistency() {
 
     // Second snapshot should be different (captures version 2)
     // Sizes might be same if value lengths are equal, but content differs
-    println!(
-        "Snapshot sizes: {} -> {}",
-        snapshot_1_size, snapshot_2_size
-    );
+    println!("Snapshot sizes: {} -> {}", snapshot_1_size, snapshot_2_size);
 
     // Verify current state has version 2
     for i in 0..100 {
@@ -207,7 +221,11 @@ async fn test_snapshot_point_in_time_consistency() {
 #[tokio::test]
 async fn test_snapshot_no_partial_writes() {
     let data_dir = test_data_dir();
-    let log = Arc::new(open_test_log(data_dir.path()).await.expect("Failed to create log"));
+    let log = Arc::new(
+        open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log"),
+    );
 
     // Write data
     for i in 0..500 {
@@ -224,9 +242,7 @@ async fn test_snapshot_no_partial_writes() {
     // Multiple snapshot attempts
     for _ in 0..3 {
         let log_clone = log.clone();
-        tasks.spawn(async move {
-            log_clone.snapshot().await
-        });
+        tasks.spawn(async move { log_clone.snapshot().await });
     }
 
     // Wait for all snapshots
@@ -241,10 +257,7 @@ async fn test_snapshot_no_partial_writes() {
 
     // Verify NO partial temp files
     let temp_path = data_dir.path().join("snapshot.bin.tmp");
-    assert!(
-        !temp_path.exists(),
-        "No partial temp files should remain"
-    );
+    assert!(!temp_path.exists(), "No partial temp files should remain");
 
     // Verify data integrity
     for i in [0, 100, 250, 499] {
@@ -264,7 +277,9 @@ async fn test_snapshot_no_partial_writes() {
 #[tokio::test]
 async fn test_snapshot_durability_guarantee() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write critical data
     for i in 0..100 {
@@ -290,7 +305,9 @@ async fn test_snapshot_durability_guarantee() {
     );
 
     // Recover and verify
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
     sync_index_after_writes(&log); // Sync after recovery
 
     for i in 0..100 {
@@ -311,7 +328,9 @@ async fn test_snapshot_durability_guarantee() {
 #[tokio::test]
 async fn test_snapshot_all_or_nothing() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write data
     for i in 0..300 {
@@ -338,14 +357,19 @@ async fn test_snapshot_all_or_nothing() {
 
     // Deserialize to verify completeness (use same bincode config as snapshot creation)
     let bopt = bincode::options().with_limit(16 * 1024 * 1024);
-    let _events: Vec<crate::Event> =
-        bopt.deserialize(&snapshot_data).expect("Snapshot should be complete and valid");
+    let _events: Vec<crate::Event> = bopt
+        .deserialize(&snapshot_data)
+        .expect("Snapshot should be complete and valid");
 }
 
 #[tokio::test]
 async fn test_snapshot_concurrent_access_safety() {
     let data_dir = test_data_dir();
-    let log = Arc::new(open_test_log(data_dir.path()).await.expect("Failed to create log"));
+    let log = Arc::new(
+        open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log"),
+    );
 
     // Write initial data
     for i in 0..1000 {
@@ -411,7 +435,9 @@ async fn test_snapshot_recoverable_after_partial_write_cleanup() {
 
     // Phase 1: Create snapshot
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
 
         for i in 0..100 {
             append_kv_ref(&log, i, format!("value_{}", i).as_bytes().to_vec())
@@ -429,7 +455,9 @@ async fn test_snapshot_recoverable_after_partial_write_cleanup() {
 
     // Phase 3: Reopen should ignore temp file and use valid snapshot
     {
-        let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+        let log = open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log");
         sync_index_after_writes(&log); // Sync after recovery
 
         // Should recover from valid snapshot, ignoring temp
@@ -451,7 +479,9 @@ async fn test_snapshot_recoverable_after_partial_write_cleanup() {
 #[tokio::test]
 async fn test_snapshot_idempotent_on_failure() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write data
     for i in 0..100 {

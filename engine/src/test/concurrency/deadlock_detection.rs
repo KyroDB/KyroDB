@@ -15,7 +15,7 @@ async fn test_no_deadlock_under_heavy_load() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     let mut tasks = JoinSet::new();
@@ -37,7 +37,10 @@ async fn test_no_deadlock_under_heavy_load() {
     })
     .await;
 
-    assert!(result.is_ok(), "Operations deadlocked - did not complete within timeout");
+    assert!(
+        result.is_ok(),
+        "Operations deadlocked - did not complete within timeout"
+    );
 }
 
 #[tokio::test]
@@ -46,7 +49,7 @@ async fn test_lock_ordering_consistency() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     // Write data
@@ -96,7 +99,7 @@ async fn test_snapshot_during_operations() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     let mut tasks = JoinSet::new();
@@ -135,7 +138,7 @@ async fn test_graceful_shutdown_no_deadlock() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     let mut tasks = JoinSet::new();
@@ -170,7 +173,7 @@ async fn test_rmi_rebuild_no_deadlock() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     // Initial data

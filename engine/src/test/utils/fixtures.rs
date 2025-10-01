@@ -139,7 +139,10 @@ impl WorkloadPattern {
                     })
                     .collect()
             }
-            WorkloadPattern::HotCold { hot_ratio, hot_keys } => {
+            WorkloadPattern::HotCold {
+                hot_ratio,
+                hot_keys,
+            } => {
                 let mut rng = rand::thread_rng();
                 (0..count)
                     .map(|_| {

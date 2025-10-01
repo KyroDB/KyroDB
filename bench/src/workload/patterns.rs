@@ -1,7 +1,7 @@
-use super::{Workload, WorkloadConfig, Operation, DistributionGenerator};
+use super::{DistributionGenerator, Operation, Workload, WorkloadConfig};
 use anyhow::Result;
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::time::Instant;
 
 /// Read-heavy workload (95% reads, 5% writes)
@@ -16,13 +16,9 @@ pub struct ReadHeavyWorkload {
 impl ReadHeavyWorkload {
     pub fn new(mut config: WorkloadConfig) -> Result<Self> {
         config.read_ratio = 0.95;
-        
+
         Ok(Self {
-            key_gen: DistributionGenerator::new(
-                config.distribution.clone(),
-                config.key_count,
-                42,
-            )?,
+            key_gen: DistributionGenerator::new(config.distribution.clone(), config.key_count, 42)?,
             value_rng: StdRng::seed_from_u64(43),
             op_rng: StdRng::seed_from_u64(44),
             start_time: Instant::now(),
@@ -35,14 +31,14 @@ impl Workload for ReadHeavyWorkload {
     fn name(&self) -> &str {
         "read_heavy"
     }
-    
+
     fn config(&self) -> &WorkloadConfig {
         &self.config
     }
-    
+
     fn next_operation(&mut self) -> Operation {
         let key = self.key_gen.next_key();
-        
+
         if self.op_rng.gen::<f64>() < self.config.read_ratio {
             Operation::Get { key }
         } else {
@@ -51,7 +47,7 @@ impl Workload for ReadHeavyWorkload {
             Operation::Put { key, value }
         }
     }
-    
+
     fn is_complete(&self) -> bool {
         self.start_time.elapsed().as_secs() >= self.config.duration_secs
     }
@@ -69,13 +65,9 @@ pub struct WriteHeavyWorkload {
 impl WriteHeavyWorkload {
     pub fn new(mut config: WorkloadConfig) -> Result<Self> {
         config.read_ratio = 0.10;
-        
+
         Ok(Self {
-            key_gen: DistributionGenerator::new(
-                config.distribution.clone(),
-                config.key_count,
-                42,
-            )?,
+            key_gen: DistributionGenerator::new(config.distribution.clone(), config.key_count, 42)?,
             value_rng: StdRng::seed_from_u64(43),
             op_rng: StdRng::seed_from_u64(44),
             start_time: Instant::now(),
@@ -88,14 +80,14 @@ impl Workload for WriteHeavyWorkload {
     fn name(&self) -> &str {
         "write_heavy"
     }
-    
+
     fn config(&self) -> &WorkloadConfig {
         &self.config
     }
-    
+
     fn next_operation(&mut self) -> Operation {
         let key = self.key_gen.next_key();
-        
+
         if self.op_rng.gen::<f64>() < self.config.read_ratio {
             Operation::Get { key }
         } else {
@@ -104,7 +96,7 @@ impl Workload for WriteHeavyWorkload {
             Operation::Put { key, value }
         }
     }
-    
+
     fn is_complete(&self) -> bool {
         self.start_time.elapsed().as_secs() >= self.config.duration_secs
     }
@@ -122,13 +114,9 @@ pub struct MixedWorkload {
 impl MixedWorkload {
     pub fn new(mut config: WorkloadConfig) -> Result<Self> {
         config.read_ratio = 0.50;
-        
+
         Ok(Self {
-            key_gen: DistributionGenerator::new(
-                config.distribution.clone(),
-                config.key_count,
-                42,
-            )?,
+            key_gen: DistributionGenerator::new(config.distribution.clone(), config.key_count, 42)?,
             value_rng: StdRng::seed_from_u64(43),
             op_rng: StdRng::seed_from_u64(44),
             start_time: Instant::now(),
@@ -141,14 +129,14 @@ impl Workload for MixedWorkload {
     fn name(&self) -> &str {
         "mixed"
     }
-    
+
     fn config(&self) -> &WorkloadConfig {
         &self.config
     }
-    
+
     fn next_operation(&mut self) -> Operation {
         let key = self.key_gen.next_key();
-        
+
         if self.op_rng.gen::<f64>() < self.config.read_ratio {
             Operation::Get { key }
         } else {
@@ -157,7 +145,7 @@ impl Workload for MixedWorkload {
             Operation::Put { key, value }
         }
     }
-    
+
     fn is_complete(&self) -> bool {
         self.start_time.elapsed().as_secs() >= self.config.duration_secs
     }
@@ -176,13 +164,9 @@ pub struct ScanHeavyWorkload {
 impl ScanHeavyWorkload {
     pub fn new(mut config: WorkloadConfig) -> Result<Self> {
         config.read_ratio = 0.99;
-        
+
         Ok(Self {
-            key_gen: DistributionGenerator::new(
-                config.distribution.clone(),
-                config.key_count,
-                42,
-            )?,
+            key_gen: DistributionGenerator::new(config.distribution.clone(), config.key_count, 42)?,
             value_rng: StdRng::seed_from_u64(43),
             op_rng: StdRng::seed_from_u64(44),
             scan_rng: StdRng::seed_from_u64(45),
@@ -196,11 +180,11 @@ impl Workload for ScanHeavyWorkload {
     fn name(&self) -> &str {
         "scan_heavy"
     }
-    
+
     fn config(&self) -> &WorkloadConfig {
         &self.config
     }
-    
+
     fn next_operation(&mut self) -> Operation {
         if self.op_rng.gen::<f64>() < self.config.read_ratio {
             // 20% of reads are scans
@@ -219,7 +203,7 @@ impl Workload for ScanHeavyWorkload {
             Operation::Put { key, value }
         }
     }
-    
+
     fn is_complete(&self) -> bool {
         self.start_time.elapsed().as_secs() >= self.config.duration_secs
     }

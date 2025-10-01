@@ -10,7 +10,11 @@ use tokio::task::JoinSet;
 #[tokio::test]
 async fn test_large_dataset_memory_behavior() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write large dataset (but within reasonable bounds)
     // 10K keys with 4KB values = ~40MB
@@ -35,11 +39,15 @@ async fn test_large_dataset_memory_behavior() {
 #[tokio::test]
 async fn test_memory_pressure_with_large_values() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write progressively larger values to create memory pressure
     let sizes = vec![1024, 4096, 16384, 65536];
-    
+
     for (idx, &size) in sizes.iter().enumerate() {
         for i in 0..100 {
             let key = (idx as u64 * 100) + i;
@@ -59,7 +67,12 @@ async fn test_memory_pressure_with_large_values() {
             let key = (idx as u64 * 100) + i;
             let value = lookup_kv(&log, key).await.expect("Failed to lookup");
             assert!(value.is_some(), "Memory pressure: key {} missing", key);
-            assert_eq!(value.unwrap().len(), size, "Value size incorrect for key {}", key);
+            assert_eq!(
+                value.unwrap().len(),
+                size,
+                "Value size incorrect for key {}",
+                key
+            );
         }
     }
 }
@@ -67,7 +80,11 @@ async fn test_memory_pressure_with_large_values() {
 #[tokio::test]
 async fn test_concurrent_memory_allocation() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     let mut tasks = JoinSet::new();
 
@@ -96,7 +113,11 @@ async fn test_concurrent_memory_allocation() {
         for i in 0..100 {
             let key = thread_id * 100 + i;
             let value = lookup_kv(&log, key).await.expect("Failed to lookup");
-            assert!(value.is_some(), "Concurrent allocation: key {} missing", key);
+            assert!(
+                value.is_some(),
+                "Concurrent allocation: key {} missing",
+                key
+            );
             assert_eq!(value.unwrap().len(), 2048);
         }
     }
@@ -105,15 +126,17 @@ async fn test_concurrent_memory_allocation() {
 #[tokio::test]
 async fn test_memory_reclamation_after_operations() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Allocate and update repeatedly to test reclamation
     for cycle in 0..10 {
         for i in 0..500 {
             let value = format!("cycle_{}_key_{}", cycle, i).as_bytes().to_vec();
-            append_kv(&log, i, value)
-                .await
-                .expect("Failed to append");
+            append_kv(&log, i, value).await.expect("Failed to append");
         }
 
         // Build RMI after each cycle
@@ -137,7 +160,11 @@ async fn test_memory_reclamation_after_operations() {
 #[tokio::test]
 async fn test_buffer_pool_exhaustion_recovery() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Create burst load to exhaust pools
     let mut tasks = JoinSet::new();
@@ -169,7 +196,11 @@ async fn test_buffer_pool_exhaustion_recovery() {
 #[tokio::test]
 async fn test_mixed_workload_memory_behavior() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Mix of small, medium, large operations
     let mut tasks = JoinSet::new();
@@ -254,7 +285,11 @@ async fn test_mixed_workload_memory_behavior() {
 #[tokio::test]
 async fn test_memory_behavior_across_snapshots() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Phase 1: Pre-snapshot workload
     for i in 0..1000 {
@@ -292,7 +327,11 @@ async fn test_memory_behavior_across_snapshots() {
 #[tokio::test]
 async fn test_sustained_memory_pressure() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Sustained load over multiple iterations
     for iteration in 0..20 {
@@ -301,9 +340,7 @@ async fn test_sustained_memory_pressure() {
             let value = format!("iteration_{}_key_{}", iteration, i)
                 .as_bytes()
                 .to_vec();
-            append_kv(&log, key, value)
-                .await
-                .expect("Failed to append");
+            append_kv(&log, key, value).await.expect("Failed to append");
         }
 
         // Periodic RMI builds
@@ -333,7 +370,11 @@ async fn test_sustained_memory_pressure() {
 #[tokio::test]
 async fn test_memory_cleanup_after_heavy_operations() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Heavy operations
     for batch in 0..50 {
@@ -343,9 +384,7 @@ async fn test_memory_cleanup_after_heavy_operations() {
                 .repeat(10) // Make values larger
                 .as_bytes()
                 .to_vec();
-            append_kv(&log, key, value)
-                .await
-                .expect("Failed to append");
+            append_kv(&log, key, value).await.expect("Failed to append");
         }
 
         // RMI build every 10 batches
@@ -366,6 +405,10 @@ async fn test_memory_cleanup_after_heavy_operations() {
         // Should have latest batch data
         let value_bytes = value.unwrap();
         let value_str = String::from_utf8_lossy(&value_bytes);
-        assert!(value_str.contains("batch_49"), "Memory cleanup: stale data for key {}", i);
+        assert!(
+            value_str.contains("batch_49"),
+            "Memory cleanup: stale data for key {}",
+            i
+        );
     }
 }

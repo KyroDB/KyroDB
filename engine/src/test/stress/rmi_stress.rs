@@ -15,7 +15,10 @@ async fn test_rmi_skewed_distribution_stress() {
 
     const NUM_KEYS: usize = 100_000;
 
-    println!("\n📝 Inserting {} keys with Zipfian distribution...", NUM_KEYS);
+    println!(
+        "\n📝 Inserting {} keys with Zipfian distribution...",
+        NUM_KEYS
+    );
 
     // Zipfian: 80% of operations hit 20% of keys
     for i in 0..NUM_KEYS {
@@ -34,7 +37,7 @@ async fn test_rmi_skewed_distribution_stress() {
 
     println!("\n🔧 Building RMI for skewed data...");
     log.snapshot().await.unwrap();
-    
+
     let rmi_start = Instant::now();
     log.build_rmi().await.unwrap();
     let rmi_elapsed = rmi_start.elapsed();
@@ -45,7 +48,7 @@ async fn test_rmi_skewed_distribution_stress() {
     println!("\n🔍 Testing lookups on hot keys (20%)...");
     let hot_start = Instant::now();
     let hot_keys: Vec<u64> = (0..NUM_KEYS as u64 / 5).collect();
-    
+
     let mut found = 0;
     for &key in &hot_keys {
         if lookup_kv(&log, key).await.unwrap().is_some() {
@@ -59,7 +62,10 @@ async fn test_rmi_skewed_distribution_stress() {
     println!("   Keys tested: {}", hot_keys.len());
     println!("   Found: {}", found);
     println!("   Duration: {:?}", hot_elapsed);
-    println!("   Throughput: {:.2} ops/sec", hot_keys.len() as f64 / hot_elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        hot_keys.len() as f64 / hot_elapsed.as_secs_f64()
+    );
 }
 
 /// Test RMI rebuild frequency stress
@@ -72,7 +78,10 @@ async fn test_rmi_frequent_rebuilds() {
     const NUM_REBUILDS: usize = 20;
     const KEYS_PER_REBUILD: usize = 5_000;
 
-    println!("\n🔧 Testing {} RMI rebuilds with {} keys each...", NUM_REBUILDS, KEYS_PER_REBUILD);
+    println!(
+        "\n🔧 Testing {} RMI rebuilds with {} keys each...",
+        NUM_REBUILDS, KEYS_PER_REBUILD
+    );
 
     let mut rebuild_times = Vec::new();
 
@@ -81,25 +90,35 @@ async fn test_rmi_frequent_rebuilds() {
         let key_offset = rebuild_round * KEYS_PER_REBUILD;
         for i in 0..KEYS_PER_REBUILD {
             let key = (key_offset + i) as u64;
-            append_kv(&log, key, format!("rebuild_{}_{}", rebuild_round, i).into_bytes())
-                .await
-                .unwrap();
+            append_kv(
+                &log,
+                key,
+                format!("rebuild_{}_{}", rebuild_round, i).into_bytes(),
+            )
+            .await
+            .unwrap();
         }
 
         // Rebuild RMI
         log.snapshot().await.unwrap();
-        
+
         let rebuild_start = Instant::now();
         log.build_rmi().await.unwrap();
         let rebuild_time = rebuild_start.elapsed();
 
         rebuild_times.push(rebuild_time);
 
-        println!("   Rebuild {}/{}: {:?}", rebuild_round + 1, NUM_REBUILDS, rebuild_time);
+        println!(
+            "   Rebuild {}/{}: {:?}",
+            rebuild_round + 1,
+            NUM_REBUILDS,
+            rebuild_time
+        );
     }
 
     // Calculate statistics
-    let avg_rebuild_time = rebuild_times.iter().sum::<std::time::Duration>() / rebuild_times.len() as u32;
+    let avg_rebuild_time =
+        rebuild_times.iter().sum::<std::time::Duration>() / rebuild_times.len() as u32;
     let min_rebuild_time = rebuild_times.iter().min().unwrap();
     let max_rebuild_time = rebuild_times.iter().max().unwrap();
 
@@ -149,16 +168,24 @@ async fn test_rmi_with_continuous_updates() {
     for round in 0..NUM_UPDATE_ROUNDS {
         // Update all keys
         for i in 0..NUM_KEYS {
-            append_kv(&log, i as u64, format!("update_{}_{}", round, i).into_bytes())
-                .await
-                .unwrap();
+            append_kv(
+                &log,
+                i as u64,
+                format!("update_{}_{}", round, i).into_bytes(),
+            )
+            .await
+            .unwrap();
         }
 
         // Rebuild after updates
         log.snapshot().await.unwrap();
         log.build_rmi().await.unwrap();
 
-        println!("   Update round {}/{} completed", round + 1, NUM_UPDATE_ROUNDS);
+        println!(
+            "   Update round {}/{} completed",
+            round + 1,
+            NUM_UPDATE_ROUNDS
+        );
     }
 
     // Verify latest values
@@ -166,8 +193,12 @@ async fn test_rmi_with_continuous_updates() {
     for i in (0..NUM_KEYS).step_by(100) {
         let value = lookup_kv(&log, i as u64).await.unwrap().unwrap();
         let expected = format!("update_{}_{}", NUM_UPDATE_ROUNDS - 1, i);
-        assert_eq!(String::from_utf8(value).unwrap(), expected,
-            "Should have latest value for key {}", i);
+        assert_eq!(
+            String::from_utf8(value).unwrap(),
+            expected,
+            "Should have latest value for key {}",
+            i
+        );
     }
 
     println!("   ✅ All values verified as latest");
@@ -183,7 +214,10 @@ async fn test_rmi_many_segments_stress() {
     // Insert highly random keys to force many segments
     const NUM_KEYS: usize = 50_000;
 
-    println!("\n📝 Inserting {} random keys to stress RMI segmentation...", NUM_KEYS);
+    println!(
+        "\n📝 Inserting {} random keys to stress RMI segmentation...",
+        NUM_KEYS
+    );
 
     let mut keys = Vec::new();
     for i in 0..NUM_KEYS {
@@ -194,7 +228,7 @@ async fn test_rmi_many_segments_stress() {
 
     println!("\n🔧 Building RMI with many segments...");
     log.snapshot().await.unwrap();
-    
+
     let rmi_start = Instant::now();
     log.build_rmi().await.unwrap();
     let rmi_elapsed = rmi_start.elapsed();
@@ -218,7 +252,10 @@ async fn test_rmi_many_segments_stress() {
     println!("   Keys tested: {}", NUM_KEYS / 10);
     println!("   Found: {}", found);
     println!("   Lookup duration: {:?}", lookup_elapsed);
-    println!("   Lookup throughput: {:.2} ops/sec", found as f64 / lookup_elapsed.as_secs_f64());
+    println!(
+        "   Lookup throughput: {:.2} ops/sec",
+        found as f64 / lookup_elapsed.as_secs_f64()
+    );
 
     assert_eq!(found, NUM_KEYS / 10, "All keys should be found");
 }

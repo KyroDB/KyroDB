@@ -60,10 +60,15 @@ async fn test_1000_concurrent_writers() {
     println!("   Total writes: {}", total_ops);
     println!("   Errors: {}", errors);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_ops as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_ops as f64 / elapsed.as_secs_f64()
+    );
 
-    assert!(total_ops >= (NUM_THREADS * WRITES_PER_THREAD * 95) / 100, 
-            "Should have at least 95% success rate");
+    assert!(
+        total_ops >= (NUM_THREADS * WRITES_PER_THREAD * 95) / 100,
+        "Should have at least 95% success rate"
+    );
 }
 
 /// Test 1000 concurrent readers with immediate consistency
@@ -105,7 +110,7 @@ async fn test_1000_concurrent_readers() {
         let handle = tokio::spawn(async move {
             for i in 0..READS_PER_THREAD {
                 let key = (i * NUM_THREADS + thread_id) as u64 % NUM_KEYS as u64;
-                
+
                 match lookup_kv(&log_clone, key).await {
                     Ok(Some(_)) => {
                         success.fetch_add(1, Ordering::Relaxed);
@@ -136,10 +141,15 @@ async fn test_1000_concurrent_readers() {
     println!("   Successful reads: {}", total_ops);
     println!("   Not found: {}", not_found);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_ops as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_ops as f64 / elapsed.as_secs_f64()
+    );
 
-    assert!(total_ops >= (NUM_THREADS * READS_PER_THREAD * 95) / 100,
-            "Should have at least 95% success rate");
+    assert!(
+        total_ops >= (NUM_THREADS * READS_PER_THREAD * 95) / 100,
+        "Should have at least 95% success rate"
+    );
 }
 
 /// Test mixed workload: 500 writers + 500 readers
@@ -185,7 +195,7 @@ async fn test_mixed_workload_1000_threads() {
         let handle = tokio::spawn(async move {
             for i in 0..OPS_PER_THREAD {
                 let key = (thread_id as u64 * 1000000) + i as u64;
-                
+
                 if lookup_kv(&log_clone, key).await.is_ok() {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
@@ -210,10 +220,15 @@ async fn test_mixed_workload_1000_threads() {
     println!("   Reads: {}", total_reads);
     println!("   Total ops: {}", total_ops);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_ops as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_ops as f64 / elapsed.as_secs_f64()
+    );
 
-    assert!(total_writes >= (NUM_WRITER_THREADS * OPS_PER_THREAD * 90) / 100,
-            "Writers should have at least 90% success rate");
+    assert!(
+        total_writes >= (NUM_WRITER_THREADS * OPS_PER_THREAD * 90) / 100,
+        "Writers should have at least 90% success rate"
+    );
 }
 
 /// Test hot buffer overflow under extreme concurrent writes
@@ -271,11 +286,16 @@ async fn test_hot_buffer_overflow_stress() {
     println!("   Successful writes: {}", total_success);
     println!("   Overflow errors: {}", total_overflow);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_success as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_success as f64 / elapsed.as_secs_f64()
+    );
 
     // Should handle gracefully even if some writes overflow
-    assert!(total_success >= (NUM_THREADS * WRITES_PER_THREAD * 80) / 100,
-            "Should have at least 80% success rate even under extreme load");
+    assert!(
+        total_success >= (NUM_THREADS * WRITES_PER_THREAD * 80) / 100,
+        "Should have at least 80% success rate even under extreme load"
+    );
 }
 
 /// Test lock contention with rapid snapshot operations
@@ -357,8 +377,14 @@ async fn test_snapshot_under_concurrent_load() {
     println!("   Total writes: {}", total_writes);
     println!("   Total snapshots: {}", total_snapshots);
     println!("   Duration: {:?}", elapsed);
-    println!("   Write throughput: {:.2} ops/sec", total_writes as f64 / elapsed.as_secs_f64());
-    println!("   Snapshots/sec: {:.2}", total_snapshots as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Write throughput: {:.2} ops/sec",
+        total_writes as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Snapshots/sec: {:.2}",
+        total_snapshots as f64 / elapsed.as_secs_f64()
+    );
 
     assert!(total_writes > 0, "Should complete some writes");
     assert!(total_snapshots > 0, "Should complete some snapshots");
@@ -423,11 +449,11 @@ async fn test_rmi_rebuild_under_load() {
             let mut local_count = 0u64;
             while running_flag.load(Ordering::Relaxed) == 1 {
                 let key = local_count % 1000;
-                
+
                 if lookup_kv(&log_clone, key).await.is_ok() {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
-                
+
                 local_count += 1;
             }
         });
@@ -477,10 +503,19 @@ async fn test_rmi_rebuild_under_load() {
     println!("   Total reads: {}", total_reads);
     println!("   RMI rebuilds: {}", total_rebuilds);
     println!("   Duration: {:?}", elapsed);
-    println!("   Write throughput: {:.2} ops/sec", total_writes as f64 / elapsed.as_secs_f64());
-    println!("   Read throughput: {:.2} ops/sec", total_reads as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Write throughput: {:.2} ops/sec",
+        total_writes as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Read throughput: {:.2} ops/sec",
+        total_reads as f64 / elapsed.as_secs_f64()
+    );
 
     assert!(total_writes > 0, "Should complete writes during rebuilds");
     assert!(total_reads > 0, "Should complete reads during rebuilds");
-    assert!(total_rebuilds >= NUM_RMI_REBUILDS - 1, "Should complete most RMI rebuilds");
+    assert!(
+        total_rebuilds >= NUM_RMI_REBUILDS - 1,
+        "Should complete most RMI rebuilds"
+    );
 }

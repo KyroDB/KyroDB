@@ -215,7 +215,9 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             eprintln!("⚠️  Snapshot creation failed: {}", e);
-                            eprintln!("   Ultra-fast endpoints may not work until snapshot is created");
+                            eprintln!(
+                                "   Ultra-fast endpoints may not work until snapshot is created"
+                            );
                         }
                     }
                 }

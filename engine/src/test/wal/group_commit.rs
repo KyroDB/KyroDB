@@ -21,7 +21,7 @@ async fn test_group_commit_batching() {
     let elapsed = start.elapsed();
 
     log.snapshot().await.unwrap();
-    
+
     #[cfg(feature = "learned-index")]
     {
         log.build_rmi().await.unwrap();
@@ -34,7 +34,7 @@ async fn test_group_commit_batching() {
         "Group commit took too long: took {:?}",
         elapsed
     );
-    
+
     println!("Batched 1000 appends completed in {:?}", elapsed);
 
     // Verify all data
@@ -47,7 +47,7 @@ async fn test_group_commit_batching() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_group_commit_durability() {
     let data_dir = test_data_dir();
-    
+
     // Write with group commit
     {
         let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
@@ -69,7 +69,7 @@ async fn test_group_commit_durability() {
     {
         let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
         log.snapshot().await.unwrap();
-        
+
         #[cfg(feature = "learned-index")]
         {
             log.build_rmi().await.unwrap();
@@ -77,11 +77,7 @@ async fn test_group_commit_durability() {
 
         for i in 0..100 {
             let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-            assert!(
-                value.is_some(),
-                "Key {} not durable after group commit",
-                i
-            );
+            assert!(value.is_some(), "Key {} not durable after group commit", i);
         }
     }
 }
@@ -99,9 +95,13 @@ async fn test_concurrent_group_commits() {
         tasks.spawn(async move {
             for i in 0..100 {
                 let key = thread_id * 100 + i;
-                append_kv(&log_clone, key, format!("value_{}_{}", thread_id, i).into_bytes())
-                    .await
-                    .expect("Failed to append");
+                append_kv(
+                    &log_clone,
+                    key,
+                    format!("value_{}_{}", thread_id, i).into_bytes(),
+                )
+                .await
+                .expect("Failed to append");
             }
         });
     }
@@ -112,7 +112,7 @@ async fn test_concurrent_group_commits() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     log.snapshot().await.unwrap();
-    
+
     #[cfg(feature = "learned-index")]
     {
         log.build_rmi().await.unwrap();
@@ -131,7 +131,7 @@ async fn test_concurrent_group_commits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_group_commit_performance() {
     let data_dir = test_data_dir();
-    
+
     // Test with batching
     let start = Instant::now();
     {
@@ -142,7 +142,7 @@ async fn test_group_commit_performance() {
                 .await
                 .expect("Failed to append");
         }
-        
+
         log.snapshot().await.unwrap();
     }
     let with_batching = start.elapsed();
@@ -157,7 +157,7 @@ async fn test_group_commit_performance() {
             append_kv(&log, i, fixtures::value_of_size(256))
                 .await
                 .expect("Failed to append");
-            
+
             if i % 100 == 0 {
                 log.snapshot().await.unwrap();
             }

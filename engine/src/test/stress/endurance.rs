@@ -17,7 +17,10 @@ async fn test_sustained_write_load_1hour() {
     const DURATION_SECS: u64 = 3600; // 1 hour
     const NUM_WORKERS: usize = 8;
 
-    println!("\n⏱️  Running sustained write load for {} seconds (1 hour)...", DURATION_SECS);
+    println!(
+        "\n⏱️  Running sustained write load for {} seconds (1 hour)...",
+        DURATION_SECS
+    );
     println!("   Workers: {}", NUM_WORKERS);
 
     let write_count = Arc::new(AtomicUsize::new(0));
@@ -44,8 +47,11 @@ async fn test_sustained_write_load_1hour() {
 
                     if total % 100_000 == 0 {
                         let elapsed = start_time.elapsed();
-                        println!("   Progress: {} ops, {:.2} ops/sec",
-                            total, total as f64 / elapsed.as_secs_f64());
+                        println!(
+                            "   Progress: {} ops, {:.2} ops/sec",
+                            total,
+                            total as f64 / elapsed.as_secs_f64()
+                        );
                     }
                 }
 
@@ -74,7 +80,10 @@ async fn test_sustained_write_load_1hour() {
     println!("\n📊 Sustained Write Load Results:");
     println!("   Total writes: {}", total_writes);
     println!("   Duration: {:?}", elapsed);
-    println!("   Avg throughput: {:.2} ops/sec", total_writes as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Avg throughput: {:.2} ops/sec",
+        total_writes as f64 / elapsed.as_secs_f64()
+    );
     println!("   ✅ System remained stable for 1 hour");
 }
 
@@ -103,7 +112,10 @@ async fn test_sustained_mixed_30min() {
     const NUM_WRITERS: usize = 8;
     const NUM_READERS: usize = 8;
 
-    println!("\n⏱️  Running sustained mixed load for {} seconds (30 min)...", DURATION_SECS);
+    println!(
+        "\n⏱️  Running sustained mixed load for {} seconds (30 min)...",
+        DURATION_SECS
+    );
 
     let write_count = Arc::new(AtomicUsize::new(0));
     let read_count = Arc::new(AtomicUsize::new(0));
@@ -174,9 +186,12 @@ async fn test_sustained_mixed_30min() {
             let reads = read_counter.load(Ordering::Relaxed);
             let elapsed = start_time.elapsed();
 
-            println!("   Progress: {} writes, {} reads, {:.2} total ops/sec",
-                writes, reads,
-                (writes + reads) as f64 / elapsed.as_secs_f64());
+            println!(
+                "   Progress: {} writes, {} reads, {:.2} total ops/sec",
+                writes,
+                reads,
+                (writes + reads) as f64 / elapsed.as_secs_f64()
+            );
         }
     });
 
@@ -198,8 +213,14 @@ async fn test_sustained_mixed_30min() {
     println!("   Total writes: {}", total_writes);
     println!("   Total reads: {}", total_reads);
     println!("   Duration: {:?}", elapsed);
-    println!("   Write throughput: {:.2} ops/sec", total_writes as f64 / elapsed.as_secs_f64());
-    println!("   Read throughput: {:.2} ops/sec", total_reads as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Write throughput: {:.2} ops/sec",
+        total_writes as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Read throughput: {:.2} ops/sec",
+        total_reads as f64 / elapsed.as_secs_f64()
+    );
     println!("   ✅ System remained stable for 30 minutes");
 }
 
@@ -212,7 +233,10 @@ async fn test_continuous_snapshots_10min() {
     const DURATION_SECS: u64 = 600; // 10 minutes
     const SNAPSHOT_INTERVAL_SECS: u64 = 30;
 
-    println!("\n⏱️  Running continuous snapshots for {} seconds (10 min)...", DURATION_SECS);
+    println!(
+        "\n⏱️  Running continuous snapshots for {} seconds (10 min)...",
+        DURATION_SECS
+    );
 
     let write_count = Arc::new(AtomicUsize::new(0));
     let snapshot_count = Arc::new(AtomicUsize::new(0));
@@ -277,8 +301,10 @@ async fn test_continuous_snapshots_10min() {
     println!("   Snapshot interval: {}s", SNAPSHOT_INTERVAL_SECS);
     println!("   ✅ System remained stable with continuous snapshots");
 
-    assert!(total_snapshots >= ((DURATION_SECS / SNAPSHOT_INTERVAL_SECS) - 1) as usize,
-            "Should complete most scheduled snapshots");
+    assert!(
+        total_snapshots >= ((DURATION_SECS / SNAPSHOT_INTERVAL_SECS) - 1) as usize,
+        "Should complete most scheduled snapshots"
+    );
 }
 
 /// Test memory stability over time
@@ -290,7 +316,10 @@ async fn test_memory_stability_15min() {
     const DURATION_SECS: u64 = 900; // 15 minutes
     const VALUE_SIZE: usize = 1024; // 1KB values
 
-    println!("\n⏱️  Running memory stability test for {} seconds (15 min)...", DURATION_SECS);
+    println!(
+        "\n⏱️  Running memory stability test for {} seconds (15 min)...",
+        DURATION_SECS
+    );
 
     let write_count = Arc::new(AtomicUsize::new(0));
     let running = Arc::new(AtomicBool::new(true));
@@ -315,8 +344,12 @@ async fn test_memory_stability_15min() {
                 if total % 10_000 == 0 {
                     let elapsed = start_time.elapsed();
                     let mb_written = (total * VALUE_SIZE) / (1024 * 1024);
-                    println!("   Progress: {} ops, ~{}MB written, {:.2} ops/sec",
-                        total, mb_written, total as f64 / elapsed.as_secs_f64());
+                    println!(
+                        "   Progress: {} ops, ~{}MB written, {:.2} ops/sec",
+                        total,
+                        mb_written,
+                        total as f64 / elapsed.as_secs_f64()
+                    );
                 }
             }
 
@@ -333,7 +366,7 @@ async fn test_memory_stability_15min() {
     let snapshotter = tokio::spawn(async move {
         while running_snapshotter.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            
+
             if log_snapshotter.snapshot().await.is_ok() {
                 println!("   Periodic snapshot completed");
             }
@@ -356,7 +389,13 @@ async fn test_memory_stability_15min() {
     println!("   Total writes: {}", total_writes);
     println!("   Total data: ~{}MB", total_mb);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_writes as f64 / elapsed.as_secs_f64());
-    println!("   Data rate: {:.2} MB/sec", total_mb as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_writes as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Data rate: {:.2} MB/sec",
+        total_mb as f64 / elapsed.as_secs_f64()
+    );
     println!("   ✅ Memory remained stable over 15 minutes");
 }

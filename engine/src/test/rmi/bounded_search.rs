@@ -10,7 +10,11 @@ use std::sync::Arc;
 #[cfg(feature = "learned-index")]
 async fn test_bounded_search_basic() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data
     for i in 0..1000 {
@@ -37,7 +41,11 @@ async fn test_bounded_search_basic() {
 #[cfg(feature = "learned-index")]
 async fn test_epsilon_bound_guarantee() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write many keys to create multiple segments
     for i in 0..20000 {
@@ -64,7 +72,11 @@ async fn test_epsilon_bound_guarantee() {
 #[cfg(feature = "learned-index")]
 async fn test_probe_window_correctness() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write sequential data
     for i in 0..5000 {
@@ -78,7 +90,7 @@ async fn test_probe_window_correctness() {
 
     // Test keys at various positions (validates probe window [pos - ε, pos + ε])
     let test_keys = vec![0, 1, 100, 500, 1000, 2500, 4999];
-    
+
     for &key in &test_keys {
         let value = lookup_kv(&log, key).await.expect("Failed to lookup");
         assert!(
@@ -93,7 +105,11 @@ async fn test_probe_window_correctness() {
 #[cfg(feature = "learned-index")]
 async fn test_worst_case_search_complexity() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Create data pattern that challenges model prediction
     // Mix of exponential and linear patterns, with enough density
@@ -123,14 +139,22 @@ async fn test_worst_case_search_complexity() {
 #[cfg(feature = "learned-index")]
 async fn test_simd_probe_with_aligned_keys() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write cache-aligned keys (multiples of 64)
     for i in 0..1000 {
         let key = i * 64;
-        append_kv(&log, key, format!("simd_aligned_{}", key).as_bytes().to_vec())
-            .await
-            .expect("Failed to append");
+        append_kv(
+            &log,
+            key,
+            format!("simd_aligned_{}", key).as_bytes().to_vec(),
+        )
+        .await
+        .expect("Failed to append");
     }
 
     // Build RMI
@@ -140,11 +164,7 @@ async fn test_simd_probe_with_aligned_keys() {
     for i in (0..1000).step_by(8) {
         let key = i * 64;
         let value = lookup_kv(&log, key).await.expect("Failed to lookup");
-        assert!(
-            value.is_some(),
-            "SIMD aligned: key {} not found",
-            key
-        );
+        assert!(value.is_some(), "SIMD aligned: key {} not found", key);
     }
 }
 
@@ -152,7 +172,11 @@ async fn test_simd_probe_with_aligned_keys() {
 #[cfg(feature = "learned-index")]
 async fn test_segment_boundary_search() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write enough data to create multiple segments (TARGET_SEGMENT_SIZE = 8192)
     for i in 0..25000 {
@@ -166,11 +190,11 @@ async fn test_segment_boundary_search() {
 
     // Test keys at likely segment boundaries
     let boundary_keys = vec![
-        0,      // First segment start
-        8191,   // First segment end
-        8192,   // Second segment start
-        16384,  // Third segment start
-        24999,  // Last key
+        0,     // First segment start
+        8191,  // First segment end
+        8192,  // Second segment start
+        16384, // Third segment start
+        24999, // Last key
     ];
 
     for &key in &boundary_keys {
@@ -187,7 +211,11 @@ async fn test_segment_boundary_search() {
 #[cfg(feature = "learned-index")]
 async fn test_binary_search_fallback() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data with irregular spacing (challenges prediction)
     // Use more reasonable spacing that still challenges but is denser
@@ -205,11 +233,7 @@ async fn test_binary_search_fallback() {
     for i in (0..2000).step_by(20) {
         let key = i * 5 + (i % 3);
         let value = lookup_kv(&log, key).await.expect("Failed to lookup");
-        assert!(
-            value.is_some(),
-            "Binary fallback: key {} not found",
-            key
-        );
+        assert!(value.is_some(), "Binary fallback: key {} not found", key);
     }
 }
 
@@ -217,7 +241,11 @@ async fn test_binary_search_fallback() {
 #[cfg(feature = "learned-index")]
 async fn test_concurrent_bounded_searches() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data
     for i in 0..10000 {
@@ -255,7 +283,11 @@ async fn test_concurrent_bounded_searches() {
 #[cfg(feature = "learned-index")]
 async fn test_epsilon_with_dense_segments() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Dense sequential keys (ideal for RMI)
     for i in 0..30000 {
@@ -271,11 +303,7 @@ async fn test_epsilon_with_dense_segments() {
     // Verify perfect accuracy with sequential lookups
     for i in (0..30000).step_by(100) {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-        assert!(
-            value.is_some(),
-            "Dense epsilon: key {} not found",
-            i
-        );
+        assert!(value.is_some(), "Dense epsilon: key {} not found", i);
     }
 }
 
@@ -283,7 +311,11 @@ async fn test_epsilon_with_dense_segments() {
 #[cfg(feature = "learned-index")]
 async fn test_epsilon_with_sparse_segments() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Sparse keys (challenging for RMI)
     for i in 0..1000 {

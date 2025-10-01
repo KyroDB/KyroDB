@@ -63,14 +63,14 @@ impl TestServer {
         // Use synchronous durability for reliable testing
         std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
         std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-        
+
         // ✅ FORCE LEARNED INDEX: Test the actual system we built
         #[cfg(feature = "learned-index")]
         std::env::set_var("KYRODB_USE_ADAPTIVE_RMI", "true");
-        
+
         #[cfg(not(feature = "learned-index"))]
         std::env::set_var("KYRODB_USE_ADAPTIVE_RMI", "false");
-        
+
         let data_dir = super::temp_data_dir("default");
         let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await?);
 
@@ -82,10 +82,7 @@ impl TestServer {
             log.build_rmi().await.ok(); // Ignore errors if no data yet
         }
 
-        Ok(Self {
-            log,
-            data_dir,
-        })
+        Ok(Self { log, data_dir })
     }
 
     /// Start with specific group commit delay (in microseconds)
@@ -94,25 +91,25 @@ impl TestServer {
         std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
         std::env::set_var("KYRODB_GROUP_COMMIT_DELAY_MICROS", delay_micros.to_string());
         std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "1");
-        
+
         // ✅ FORCE LEARNED INDEX: Test actual system
         #[cfg(feature = "learned-index")]
         std::env::set_var("KYRODB_USE_ADAPTIVE_RMI", "true");
-        
+
         #[cfg(not(feature = "learned-index"))]
         std::env::set_var("KYRODB_USE_ADAPTIVE_RMI", "false");
-        
+
         let mut config = TestServerConfig::default();
         config.group_commit_ms = delay_micros / 1000; // Convert to ms for internal use
-        
+
         let server = Self::start(config).await?;
-        
+
         // ✅ Build RMI for learned-index feature
         #[cfg(feature = "learned-index")]
         {
             server.log.build_rmi().await.ok();
         }
-        
+
         Ok(server)
     }
 
@@ -120,23 +117,23 @@ impl TestServer {
     pub async fn start_with_async_durability() -> anyhow::Result<Self> {
         std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_async");
         std::env::set_var("KYRODB_BACKGROUND_FSYNC_INTERVAL_MS", "10");
-        
+
         // ✅ FORCE LEARNED INDEX: Test actual system
         #[cfg(feature = "learned-index")]
         std::env::set_var("KYRODB_USE_ADAPTIVE_RMI", "true");
-        
+
         #[cfg(not(feature = "learned-index"))]
         std::env::set_var("KYRODB_USE_ADAPTIVE_RMI", "false");
-        
+
         let config = TestServerConfig::default();
         let server = Self::start(config).await?;
-        
+
         // ✅ Build RMI for learned-index feature
         #[cfg(feature = "learned-index")]
         {
             server.log.build_rmi().await.ok();
         }
-        
+
         Ok(server)
     }
 
@@ -165,7 +162,11 @@ pub async fn create_test_cluster(count: usize) -> anyhow::Result<Vec<TestServer>
     let mut servers = Vec::with_capacity(count);
     for i in 0..count {
         let mut config = TestServerConfig::default();
-        config.data_dir = std::env::temp_dir().join(format!("kyrodb_test_cluster_{}_{}", i, rand::random::<u64>()));
+        config.data_dir = std::env::temp_dir().join(format!(
+            "kyrodb_test_cluster_{}_{}",
+            i,
+            rand::random::<u64>()
+        ));
         servers.push(TestServer::start(config).await?);
     }
     Ok(servers)

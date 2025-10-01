@@ -10,7 +10,11 @@ use tokio::task::JoinSet;
 #[tokio::test]
 async fn test_hot_buffer_allocation() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data that should trigger hot buffer allocation
     for i in 0..1000 {
@@ -50,7 +54,11 @@ async fn test_hot_buffer_allocation() {
 #[tokio::test]
 async fn test_hot_buffer_cleanup() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Fill hot buffer
     for i in 0..100 {
@@ -88,7 +96,11 @@ async fn test_hot_buffer_cleanup() {
 #[tokio::test]
 async fn test_concurrent_buffer_access() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initial data
     for i in 0..100 {
@@ -142,7 +154,11 @@ async fn test_concurrent_buffer_access() {
 #[tokio::test]
 async fn test_buffer_with_large_values() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write large values (64KB each)
     for i in 0..10 {
@@ -170,7 +186,11 @@ async fn test_buffer_with_large_values() {
 #[tokio::test]
 async fn test_buffer_eviction() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write enough data to trigger buffer eviction (simulate memory pressure)
     for i in 0..10000 {
@@ -198,14 +218,22 @@ async fn test_buffer_eviction() {
 #[tokio::test]
 async fn test_buffer_pool_reuse() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write and update same keys repeatedly to test buffer pool reuse
     for cycle in 0..50 {
         for i in 0..100 {
-            append_kv(&log, i, format!("cycle_{}_value_{}", cycle, i).as_bytes().to_vec())
-                .await
-                .expect("Failed to append");
+            append_kv(
+                &log,
+                i,
+                format!("cycle_{}_value_{}", cycle, i).as_bytes().to_vec(),
+            )
+            .await
+            .expect("Failed to append");
         }
     }
 
@@ -219,14 +247,22 @@ async fn test_buffer_pool_reuse() {
         assert!(value.is_some(), "Key {} not found after reuse cycles", i);
         let value_bytes = value.unwrap();
         let value_str = String::from_utf8_lossy(&value_bytes);
-        assert!(value_str.starts_with("cycle_49_"), "Expected cycle_49 value, got: {}", value_str);
+        assert!(
+            value_str.starts_with("cycle_49_"),
+            "Expected cycle_49 value, got: {}",
+            value_str
+        );
     }
 }
 
 #[tokio::test]
 async fn test_mixed_size_buffer_allocation() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write values of different sizes to test buffer pool categorization
     // Small values (< 256 bytes)
@@ -257,22 +293,35 @@ async fn test_mixed_size_buffer_allocation() {
     // Verify all sizes are retrievable
     for i in 0..100 {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup small");
-        assert!(value.is_some() && value.unwrap().len() == 100, "Small value mismatch");
+        assert!(
+            value.is_some() && value.unwrap().len() == 100,
+            "Small value mismatch"
+        );
     }
     for i in 100..200 {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup medium");
-        assert!(value.is_some() && value.unwrap().len() == 512, "Medium value mismatch");
+        assert!(
+            value.is_some() && value.unwrap().len() == 512,
+            "Medium value mismatch"
+        );
     }
     for i in 200..300 {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup large");
-        assert!(value.is_some() && value.unwrap().len() == 2048, "Large value mismatch");
+        assert!(
+            value.is_some() && value.unwrap().len() == 2048,
+            "Large value mismatch"
+        );
     }
 }
 
 #[tokio::test]
 async fn test_buffer_under_snapshot() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write initial data
     for i in 0..500 {

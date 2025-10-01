@@ -14,8 +14,11 @@ async fn test_buffer_overflow_recovery() {
     let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
 
     const RAPID_WRITES: usize = 100_000;
-    
-    println!("\n📝 Testing buffer overflow with {} rapid writes...", RAPID_WRITES);
+
+    println!(
+        "\n📝 Testing buffer overflow with {} rapid writes...",
+        RAPID_WRITES
+    );
     let start_time = Instant::now();
 
     let success_count = Arc::new(AtomicUsize::new(0));
@@ -61,11 +64,16 @@ async fn test_buffer_overflow_recovery() {
     println!("   Successful writes: {}", total_success);
     println!("   Overflow events: {}", total_overflow);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_success as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_success as f64 / elapsed.as_secs_f64()
+    );
 
     // System should handle gracefully even if some writes fail
-    assert!(total_success >= RAPID_WRITES * 60 / 100,
-            "Should have at least 60% success rate under extreme pressure");
+    assert!(
+        total_success >= RAPID_WRITES * 60 / 100,
+        "Should have at least 60% success rate under extreme pressure"
+    );
 
     // Allow system to recover
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -75,9 +83,11 @@ async fn test_buffer_overflow_recovery() {
     for i in 0..100 {
         let key = (RAPID_WRITES + i) as u64;
         let value = format!("recovery_value_{}", i).into_bytes();
-        
-        assert!(append_kv(&log, key, value).await.is_ok(),
-                "System should recover after overflow");
+
+        assert!(
+            append_kv(&log, key, value).await.is_ok(),
+            "System should recover after overflow"
+        );
     }
 
     println!("   ✅ System recovered successfully");
@@ -92,7 +102,10 @@ async fn test_memory_intensive_workload() {
     const NUM_OPERATIONS: usize = 50_000;
     const LARGE_VALUE_SIZE: usize = 4096; // 4KB values
 
-    println!("\n📝 Running memory-intensive workload with {} ops...", NUM_OPERATIONS);
+    println!(
+        "\n📝 Running memory-intensive workload with {} ops...",
+        NUM_OPERATIONS
+    );
     let start_time = Instant::now();
 
     let success_count = Arc::new(AtomicUsize::new(0));
@@ -119,11 +132,19 @@ async fn test_memory_intensive_workload() {
     println!("   Successful writes: {}", total_success);
     println!("   Total data: ~{}MB", total_mb);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_success as f64 / elapsed.as_secs_f64());
-    println!("   Data throughput: {:.2} MB/sec", total_mb as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_success as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "   Data throughput: {:.2} MB/sec",
+        total_mb as f64 / elapsed.as_secs_f64()
+    );
 
-    assert!(total_success >= NUM_OPERATIONS * 90 / 100,
-            "Should complete at least 90% of operations");
+    assert!(
+        total_success >= NUM_OPERATIONS * 90 / 100,
+        "Should complete at least 90% of operations"
+    );
 }
 
 /// Test snapshot creation under memory pressure
@@ -135,8 +156,11 @@ async fn test_snapshot_under_memory_pressure() {
     const NUM_KEYS: usize = 100_000;
     const VALUE_SIZE: usize = 512;
 
-    println!("\n📝 Pre-populating {} keys with {}B values...", NUM_KEYS, VALUE_SIZE);
-    
+    println!(
+        "\n📝 Pre-populating {} keys with {}B values...",
+        NUM_KEYS, VALUE_SIZE
+    );
+
     for i in 0..NUM_KEYS {
         let key = i as u64;
         let value = vec![0xAB; VALUE_SIZE];
@@ -149,22 +173,33 @@ async fn test_snapshot_under_memory_pressure() {
 
     println!("\n📸 Creating snapshot under memory pressure...");
     let snapshot_start = Instant::now();
-    
-    assert!(log.snapshot().await.is_ok(), "Snapshot should succeed under memory pressure");
-    
+
+    assert!(
+        log.snapshot().await.is_ok(),
+        "Snapshot should succeed under memory pressure"
+    );
+
     let snapshot_elapsed = snapshot_start.elapsed();
 
     println!("\n📊 Snapshot Under Pressure Results:");
     println!("   Keys snapshotted: {}", NUM_KEYS);
     println!("   Snapshot duration: {:?}", snapshot_elapsed);
-    println!("   Throughput: {:.2} keys/sec", NUM_KEYS as f64 / snapshot_elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} keys/sec",
+        NUM_KEYS as f64 / snapshot_elapsed.as_secs_f64()
+    );
 
     // Verify snapshot integrity
     println!("\n🔍 Verifying snapshot integrity...");
     for i in (0..NUM_KEYS).step_by(1000) {
         let value = lookup_kv(&log, i as u64).await.unwrap();
         assert!(value.is_some(), "Key {} should be found after snapshot", i);
-        assert_eq!(value.unwrap().len(), VALUE_SIZE, "Value size mismatch for key {}", i);
+        assert_eq!(
+            value.unwrap().len(),
+            VALUE_SIZE,
+            "Value size mismatch for key {}",
+            i
+        );
     }
 
     println!("   ✅ Snapshot integrity verified");
@@ -184,8 +219,11 @@ async fn test_concurrent_snapshot_attempts() {
     }
 
     const NUM_CONCURRENT_SNAPSHOTS: usize = 10;
-    
-    println!("\n📸 Attempting {} concurrent snapshots...", NUM_CONCURRENT_SNAPSHOTS);
+
+    println!(
+        "\n📸 Attempting {} concurrent snapshots...",
+        NUM_CONCURRENT_SNAPSHOTS
+    );
     let start_time = Instant::now();
 
     let success_count = Arc::new(AtomicUsize::new(0));
@@ -219,7 +257,10 @@ async fn test_concurrent_snapshot_attempts() {
     let total_success = success_count.load(Ordering::Relaxed);
 
     println!("\n📊 Concurrent Snapshots Results:");
-    println!("   Successful snapshots: {}/{}", total_success, NUM_CONCURRENT_SNAPSHOTS);
+    println!(
+        "   Successful snapshots: {}/{}",
+        total_success, NUM_CONCURRENT_SNAPSHOTS
+    );
     println!("   Duration: {:?}", elapsed);
 
     // At least some should succeed (system may serialize them)
@@ -236,7 +277,7 @@ async fn test_rmi_rebuild_memory_pressure() {
     const NUM_KEYS: usize = 200_000;
 
     println!("\n📝 Pre-populating {} keys...", NUM_KEYS);
-    
+
     for i in 0..NUM_KEYS {
         let key = i as u64;
         let value = format!("pressure_value_{}", i).into_bytes();
@@ -251,13 +292,19 @@ async fn test_rmi_rebuild_memory_pressure() {
     log.snapshot().await.unwrap();
 
     let rmi_start = Instant::now();
-    assert!(log.build_rmi().await.is_ok(), "RMI build should succeed under memory pressure");
+    assert!(
+        log.build_rmi().await.is_ok(),
+        "RMI build should succeed under memory pressure"
+    );
     let rmi_elapsed = rmi_start.elapsed();
 
     println!("\n📊 RMI Build Under Pressure Results:");
     println!("   Keys indexed: {}", NUM_KEYS);
     println!("   Build duration: {:?}", rmi_elapsed);
-    println!("   Throughput: {:.2} keys/sec", NUM_KEYS as f64 / rmi_elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} keys/sec",
+        NUM_KEYS as f64 / rmi_elapsed.as_secs_f64()
+    );
 
     // Verify RMI accuracy
     println!("\n🔍 Verifying RMI accuracy...");
@@ -270,7 +317,10 @@ async fn test_rmi_rebuild_memory_pressure() {
 
     let expected = NUM_KEYS / 100;
     println!("   Found {}/{} sampled keys", found_count, expected);
-    assert_eq!(found_count, expected, "RMI should maintain accuracy under pressure");
+    assert_eq!(
+        found_count, expected,
+        "RMI should maintain accuracy under pressure"
+    );
 }
 
 /// Test WAL growth and compaction under pressure
@@ -282,14 +332,20 @@ async fn test_wal_growth_under_pressure() {
     const NUM_KEYS: usize = 50_000;
     const UPDATES_PER_KEY: usize = 5;
 
-    println!("\n📝 Testing WAL growth with {} keys, {} updates each...",
-        NUM_KEYS, UPDATES_PER_KEY);
-    
+    println!(
+        "\n📝 Testing WAL growth with {} keys, {} updates each...",
+        NUM_KEYS, UPDATES_PER_KEY
+    );
+
     let start_time = Instant::now();
 
     for update_round in 0..UPDATES_PER_KEY {
-        println!("   Update round {}/{}...", update_round + 1, UPDATES_PER_KEY);
-        
+        println!(
+            "   Update round {}/{}...",
+            update_round + 1,
+            UPDATES_PER_KEY
+        );
+
         for i in 0..NUM_KEYS {
             let key = i as u64;
             let value = format!("update_{}_{}", update_round, i).into_bytes();
@@ -303,7 +359,10 @@ async fn test_wal_growth_under_pressure() {
     println!("\n📊 WAL Growth Results:");
     println!("   Total operations: {}", total_ops);
     println!("   Duration: {:?}", elapsed);
-    println!("   Throughput: {:.2} ops/sec", total_ops as f64 / elapsed.as_secs_f64());
+    println!(
+        "   Throughput: {:.2} ops/sec",
+        total_ops as f64 / elapsed.as_secs_f64()
+    );
 
     // Check WAL size
     let wal_size = log.wal_size_bytes().await;
@@ -322,8 +381,12 @@ async fn test_wal_growth_under_pressure() {
     for i in (0..NUM_KEYS).step_by(100) {
         let value = lookup_kv(&log, i as u64).await.unwrap().unwrap();
         let expected = format!("update_{}_{}", UPDATES_PER_KEY - 1, i);
-        assert_eq!(String::from_utf8(value).unwrap(), expected,
-            "Should have latest value for key {}", i);
+        assert_eq!(
+            String::from_utf8(value).unwrap(),
+            expected,
+            "Should have latest value for key {}",
+            i
+        );
     }
 
     println!("   ✅ All values verified");

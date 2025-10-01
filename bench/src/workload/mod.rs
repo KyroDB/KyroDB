@@ -1,13 +1,13 @@
 use anyhow::Result;
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution as RandDist, Zipf};
 
 pub mod generator;
 pub mod patterns;
 
 pub use generator::{KeyGenerator, ValueGenerator};
-pub use patterns::{ReadHeavyWorkload, WriteHeavyWorkload, MixedWorkload, ScanHeavyWorkload};
+pub use patterns::{MixedWorkload, ReadHeavyWorkload, ScanHeavyWorkload, WriteHeavyWorkload};
 
 /// Workload configuration
 #[derive(Debug, Clone)]
@@ -35,9 +35,14 @@ impl Default for WorkloadConfig {
 #[derive(Debug, Clone)]
 pub enum Distribution {
     Uniform,
-    Zipf { skew: f64 },
+    Zipf {
+        skew: f64,
+    },
     Sequential,
-    Hotspot { hot_key_ratio: f64, hot_access_ratio: f64 },
+    Hotspot {
+        hot_key_ratio: f64,
+        hot_access_ratio: f64,
+    },
 }
 
 impl Distribution {
@@ -50,7 +55,10 @@ impl Distribution {
                 hot_key_ratio: 0.1,
                 hot_access_ratio: 0.8,
             }),
-            _ => anyhow::bail!("Unknown distribution: {}. Use 'uniform', 'zipf', 'sequential', or 'hotspot'", s),
+            _ => anyhow::bail!(
+                "Unknown distribution: {}. Use 'uniform', 'zipf', 'sequential', or 'hotspot'",
+                s
+            ),
         }
     }
 }
@@ -67,10 +75,10 @@ pub enum Operation {
 pub trait Workload: Send + Sync {
     fn name(&self) -> &str;
     fn config(&self) -> &WorkloadConfig;
-    
+
     /// Generate next operation
     fn next_operation(&mut self) -> Operation;
-    
+
     /// Check if workload is complete
     fn is_complete(&self) -> bool;
 }
@@ -122,12 +130,10 @@ impl DistributionGenerator {
     pub fn new(distribution: Distribution, key_count: u64, seed: u64) -> Result<Self> {
         let rng = StdRng::seed_from_u64(seed);
         let zipf_dist = match &distribution {
-            Distribution::Zipf { skew } => {
-                Some(Zipf::new(key_count, *skew)?)
-            }
+            Distribution::Zipf { skew } => Some(Zipf::new(key_count, *skew)?),
             _ => None,
         };
-        
+
         Ok(Self {
             rng,
             distribution,
@@ -136,12 +142,10 @@ impl DistributionGenerator {
             zipf_dist,
         })
     }
-    
+
     pub fn next_key(&mut self) -> u64 {
         match &self.distribution {
-            Distribution::Uniform => {
-                self.rng.gen_range(0..self.key_count)
-            }
+            Distribution::Uniform => self.rng.gen_range(0..self.key_count),
             Distribution::Zipf { .. } => {
                 if let Some(ref dist) = self.zipf_dist {
                     let sample = dist.sample(&mut self.rng);
@@ -155,9 +159,12 @@ impl DistributionGenerator {
                 self.sequential_counter += 1;
                 key
             }
-            Distribution::Hotspot { hot_key_ratio, hot_access_ratio } => {
+            Distribution::Hotspot {
+                hot_key_ratio,
+                hot_access_ratio,
+            } => {
                 let hot_keys = (self.key_count as f64 * hot_key_ratio) as u64;
-                
+
                 if self.rng.gen::<f64>() < *hot_access_ratio {
                     // Access hot keys
                     self.rng.gen_range(0..hot_keys.max(1))

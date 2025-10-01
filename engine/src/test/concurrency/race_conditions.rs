@@ -14,7 +14,7 @@ async fn test_concurrent_read_write_safety() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     // Write initial data
@@ -30,7 +30,7 @@ async fn test_concurrent_read_write_safety() {
 
     // Spawn concurrent readers and writers
     let mut tasks = JoinSet::new();
-    
+
     // 10 writers
     for _ in 0..10 {
         let log_clone = log.clone();
@@ -73,7 +73,7 @@ async fn test_hot_buffer_race_conditions() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     // Hammer same keys from multiple threads to stress hot buffer
@@ -112,7 +112,10 @@ async fn test_hot_buffer_race_conditions() {
 
     // Verify all hot keys exist
     for key in hot_keys {
-        assert!(lookup_kv(&log, key).await.expect("Failed to lookup").is_some());
+        assert!(lookup_kv(&log, key)
+            .await
+            .expect("Failed to lookup")
+            .is_some());
     }
 }
 
@@ -122,7 +125,7 @@ async fn test_cache_invalidation_race() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     // Write initial data
@@ -179,7 +182,7 @@ async fn test_snapshot_rebuild_race() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     let mut tasks = JoinSet::new();
@@ -212,7 +215,11 @@ async fn test_snapshot_rebuild_race() {
     // Verify data integrity
     for i in 0..1000 {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-        assert!(value.is_some(), "Key {} not found after snapshot rebuild", i);
+        assert!(
+            value.is_some(),
+            "Key {} not found after snapshot rebuild",
+            i
+        );
     }
 }
 
@@ -223,7 +230,7 @@ async fn test_rmi_rebuild_race() {
     let log = Arc::new(
         PersistentEventLog::open(data_dir.path().to_path_buf())
             .await
-            .expect("Failed to create log")
+            .expect("Failed to create log"),
     );
 
     // Write data

@@ -19,7 +19,7 @@ async fn test_basic_wal_append() {
 
     // Snapshot for persistence
     log.snapshot().await.unwrap();
-    
+
     #[cfg(feature = "learned-index")]
     {
         log.build_rmi().await.unwrap();
@@ -49,7 +49,7 @@ async fn test_wal_append_ordering() {
     }
 
     log.snapshot().await.unwrap();
-    
+
     #[cfg(feature = "learned-index")]
     {
         log.build_rmi().await.unwrap();
@@ -57,16 +57,13 @@ async fn test_wal_append_ordering() {
 
     // Should return latest version
     let value = lookup_kv(&log, 42).await.expect("Failed to lookup");
-    assert_eq!(
-        String::from_utf8_lossy(&value.unwrap()),
-        "version_9"
-    );
+    assert_eq!(String::from_utf8_lossy(&value.unwrap()), "version_9");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_wal_durability_after_restart() {
     let data_dir = test_data_dir();
-    
+
     // Write data
     {
         let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
@@ -76,7 +73,7 @@ async fn test_wal_durability_after_restart() {
                 .await
                 .expect("Failed to append");
         }
-        
+
         // Explicitly drop to ensure flush
         drop(log);
     }
@@ -87,7 +84,7 @@ async fn test_wal_durability_after_restart() {
     {
         let log = Arc::new(open_test_log(data_dir.path()).await.unwrap());
         log.snapshot().await.unwrap();
-        
+
         #[cfg(feature = "learned-index")]
         {
             log.build_rmi().await.unwrap();
@@ -95,11 +92,7 @@ async fn test_wal_durability_after_restart() {
 
         for i in 0..100 {
             let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-            assert!(
-                value.is_some(),
-                "Key {} not found after restart",
-                i
-            );
+            assert!(value.is_some(), "Key {} not found after restart", i);
             assert_eq!(
                 String::from_utf8_lossy(&value.unwrap()),
                 format!("value_{}", i)
@@ -121,9 +114,13 @@ async fn test_concurrent_wal_appends() {
         tasks.spawn(async move {
             for i in 0..100 {
                 let key = thread_id * 100 + i;
-                append_kv(&log_clone, key, format!("value_{}_{}", thread_id, i).into_bytes())
-                    .await
-                    .expect("Failed to append");
+                append_kv(
+                    &log_clone,
+                    key,
+                    format!("value_{}_{}", thread_id, i).into_bytes(),
+                )
+                .await
+                .expect("Failed to append");
             }
         });
     }
@@ -131,7 +128,7 @@ async fn test_concurrent_wal_appends() {
     while tasks.join_next().await.is_some() {}
 
     log.snapshot().await.unwrap();
-    
+
     #[cfg(feature = "learned-index")]
     {
         log.build_rmi().await.unwrap();
@@ -160,7 +157,7 @@ async fn test_wal_with_large_entries() {
     }
 
     log.snapshot().await.unwrap();
-    
+
     #[cfg(feature = "learned-index")]
     {
         log.build_rmi().await.unwrap();

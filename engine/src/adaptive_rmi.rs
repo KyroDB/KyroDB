@@ -24,18 +24,17 @@ use tokio::sync::Notify;
 // Architecture-specific SIMD imports with proper conditional compilation
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use std::arch::x86_64::{
-    __m256i, _mm256_cmpeq_epi64, _mm256_extract_epi64, _mm256_loadu_si256,
-    _mm256_min_epi64, _mm256_movemask_epi8, _mm256_set1_epi64x, _mm256_set_epi64x,
-    _mm256_srlv_epi64,
+    __m256i, _mm256_cmpeq_epi64, _mm256_extract_epi64, _mm256_loadu_si256, _mm256_min_epi64,
+    _mm256_movemask_epi8, _mm256_set1_epi64x, _mm256_set_epi64x, _mm256_srlv_epi64,
 };
 ///  **REALISTIC MEMORY MANAGEMENT** - Production-ready limits
 /// Fixed the completely unrealistic 64GB limit to sane production values
-const MAX_OVERFLOW_CAPACITY: usize = 32_768;      // 32K entries (~512KB max)
-const OVERFLOW_PRESSURE_LOW: usize = 19_660;       // 60% of max
-const OVERFLOW_PRESSURE_MEDIUM: usize = 26_214;    // 80% of max  
-const OVERFLOW_PRESSURE_HIGH: usize = 29_491;      // 90% of max
-const OVERFLOW_PRESSURE_CRITICAL: usize = 31_130;  // 95% of max
-const SYSTEM_MEMORY_LIMIT_MB: usize = 64;          // 64MB realistic limit (was 64GB!)
+const MAX_OVERFLOW_CAPACITY: usize = 32_768; // 32K entries (~512KB max)
+const OVERFLOW_PRESSURE_LOW: usize = 19_660; // 60% of max
+const OVERFLOW_PRESSURE_MEDIUM: usize = 26_214; // 80% of max
+const OVERFLOW_PRESSURE_HIGH: usize = 29_491; // 90% of max
+const OVERFLOW_PRESSURE_CRITICAL: usize = 31_130; // 95% of max
+const SYSTEM_MEMORY_LIMIT_MB: usize = 64; // 64MB realistic limit (was 64GB!)
 
 /// Maximum search window size - strict bound to prevent O(n) behavior
 const MAX_SEARCH_WINDOW: usize = 64;
@@ -243,7 +242,7 @@ impl LocalLinearModel {
     }
 }
 
-#[repr(align(64))] // Cache-line aligned for optimal CPU performance  
+#[repr(align(64))] // Cache-line aligned for optimal CPU performance
 pub struct SegmentMetrics {
     access_count: AtomicU64,
     last_access: AtomicU64,
@@ -257,7 +256,10 @@ impl std::fmt::Debug for SegmentMetrics {
         f.debug_struct("SegmentMetrics")
             .field("access_count", &self.access_count.load(Ordering::Relaxed))
             .field("last_access", &self.last_access.load(Ordering::Relaxed))
-            .field("prediction_errors", &self.prediction_errors.load(Ordering::Relaxed))
+            .field(
+                "prediction_errors",
+                &self.prediction_errors.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -681,7 +683,6 @@ impl AdaptiveSegment {
     pub fn get_epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
     }
-
 }
 
 impl Clone for AdaptiveSegment {
@@ -854,7 +855,7 @@ pub trait HotBuffer: std::fmt::Debug + Send + Sync {
     fn get(&self, key: u64) -> Option<u64> {
         self.bounded_search(key)
     }
-    
+
     /// Get all entries for test synchronization (non-draining)
     fn get_all_for_sync(&self) -> Vec<(u64, u64)> {
         self.get_snapshot()
@@ -1619,7 +1620,7 @@ impl BoundedOverflowBuffer {
     pub fn get_pressure_level(&self) -> usize {
         self.pressure_level.load(Ordering::Relaxed)
     }
-    
+
     /// Get all pending writes for test synchronization (non-draining)
     pub fn get_all_pending(&self) -> Vec<(u64, u64)> {
         self.data.iter().map(|(&k, &v)| (k, v)).collect()
@@ -1627,11 +1628,11 @@ impl BoundedOverflowBuffer {
 }
 
 // ========================================================================
-//                      ZERO-LOCK READ ARCHITECTURE 
+//                      ZERO-LOCK READ ARCHITECTURE
 // ========================================================================
 
 ///  **ZERO-LOCK IMMUTABLE INDEX SNAPSHOT**
-/// 
+///
 /// Complete immutable snapshot of all index data for lock-free reads.
 /// This structure can be safely shared across threads without any synchronization.
 #[derive(Debug, Clone)]
@@ -1652,12 +1653,12 @@ impl ImmutableIndexSnapshot {
     /// Create new immutable snapshot from current state
     pub fn new(
         segments: Vec<AdaptiveSegment>,
-        router: GlobalRoutingModel, 
+        router: GlobalRoutingModel,
         hot_data: Vec<(u64, u64)>,
         generation: u64,
     ) -> Self {
         let total_keys = segments.iter().map(|s| s.len()).sum::<usize>() + hot_data.len();
-        
+
         Self {
             segments: Arc::new(segments),
             router,
@@ -1666,19 +1667,19 @@ impl ImmutableIndexSnapshot {
             total_keys,
         }
     }
-    
+
     /// Get snapshot generation (for testing)
     #[cfg(test)]
     pub fn get_generation(&self) -> u64 {
         self.generation
     }
-    
+
     /// Get hot data reference (for testing)
     #[cfg(test)]
     pub fn get_hot_data(&self) -> &Arc<Vec<(u64, u64)>> {
         &self.hot_data
     }
-    
+
     ///  **ZERO-LOCK LOOKUP** - Pure computation, no synchronization
     #[inline]
     pub fn lookup_zero_lock(&self, key: u64) -> Option<u64> {
@@ -1688,33 +1689,33 @@ impl ImmutableIndexSnapshot {
                 return Some(v);
             }
         }
-        
+
         // PHASE 2: Predict segment and search
         let segment_id = self.router.predict_segment(key);
-        
+
         if segment_id < self.segments.len() {
             if let Some(value) = self.segments[segment_id].bounded_search(key) {
                 return Some(value);
             }
         }
-        
+
         // PHASE 3: Linear probe if prediction failed
         for segment in self.segments.iter() {
             if let Some(value) = segment.bounded_search(key) {
                 return Some(value);
             }
         }
-        
+
         None
     }
-    
+
     ///  **ZERO-LOCK BATCH LOOKUP** - Simple batch processing on immutable snapshot
     #[inline]
     pub fn lookup_batch_zero_lock(&self, keys: &[u64]) -> Vec<Option<u64>> {
         // Simple iteration - SIMD optimization happens at AdaptiveRMI level
         keys.iter().map(|&key| self.lookup_zero_lock(key)).collect()
     }
-    
+
     /// Get snapshot statistics
     pub fn stats(&self) -> IndexSnapshotStats {
         IndexSnapshotStats {
@@ -1731,7 +1732,7 @@ impl ImmutableIndexSnapshot {
 pub struct IndexSnapshotStats {
     pub generation: u64,
     pub total_keys: usize,
-    pub segment_count: usize, 
+    pub segment_count: usize,
     pub hot_data_count: usize,
 }
 
@@ -1744,7 +1745,7 @@ enum WriteOperation {
     Shutdown,
 }
 
-/// RMI configuration for zero-lock architecture 
+/// RMI configuration for zero-lock architecture
 #[derive(Debug, Clone)]
 struct ZeroLockConfig {
     hot_data_limit: usize,
@@ -1756,9 +1757,9 @@ struct ZeroLockConfig {
 impl Default for ZeroLockConfig {
     fn default() -> Self {
         Self {
-            hot_data_limit: 1024,      // Max hot data before merge
-            merge_threshold: 10000,     // Operations before merge
-            segment_size_limit: 8192,   // Max segment size
+            hot_data_limit: 1024,     // Max hot data before merge
+            merge_threshold: 10000,   // Operations before merge
+            segment_size_limit: 8192, // Max segment size
         }
     }
 }
@@ -1772,16 +1773,16 @@ impl Default for ZeroLockConfig {
 pub struct AdaptiveRMI {
     /// 🔥 **ZERO-LOCK SNAPSHOT** - Single atomic read source (eliminates ALL lock contention)
     zero_lock_snapshot: Arc<ArcSwap<ImmutableIndexSnapshot>>,
-    
+
     /// 🔥 **WRITE QUEUE** - Lock-free write operations
     write_queue: Arc<SegQueue<WriteOperation>>,
-    
+
     /// 🔥 **BACKGROUND WORKER** - Handles all mutations off read path
     background_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    
+
     /// Configuration for zero-lock processing
     zero_lock_config: ZeroLockConfig,
-    
+
     // ====== LEGACY FIELDS (for compatibility) ======
     /// Multiple independent segments that can be updated separately
     segments: Arc<RwLock<Vec<AdaptiveSegment>>>,
@@ -1830,19 +1831,19 @@ impl AdaptiveRMI {
 
         // Create initial zero-lock snapshot
         let initial_snapshot = ImmutableIndexSnapshot::new(
-            Vec::new(),                                     // No segments initially
+            Vec::new(),                                       // No segments initially
             GlobalRoutingModel::new(Vec::new(), router_bits), // Empty router
-            Vec::new(),                                     // No hot data
-            0,                                              // Generation 0
+            Vec::new(),                                       // No hot data
+            0,                                                // Generation 0
         );
-        
+
         let rmi = Self {
             // ZERO-LOCK ARCHITECTURE
             zero_lock_snapshot: Arc::new(ArcSwap::from_pointee(initial_snapshot)),
             write_queue: Arc::new(SegQueue::new()),
             background_handle: Arc::new(Mutex::new(None)),
             zero_lock_config: ZeroLockConfig::default(),
-            
+
             // LEGACY ARCHITECTURE (for compatibility)
             segments: Arc::new(RwLock::new(Vec::new())),
             segments_snapshot: Atomic::new(Vec::new()),
@@ -1856,66 +1857,78 @@ impl AdaptiveRMI {
                 MAX_OVERFLOW_CAPACITY,
             ))),
         };
-        
+
         // Start zero-lock background worker
         rmi.start_zero_lock_worker();
         rmi
     }
-    
+
     // ====================================================================
-    //                      ZERO-LOCK METHODS 
+    //                      ZERO-LOCK METHODS
     // ====================================================================
-    
+
     /// Start the background worker for zero-lock processing
     fn start_zero_lock_worker(&self) {
         let write_queue = Arc::clone(&self.write_queue);
         let zero_lock_snapshot = Arc::clone(&self.zero_lock_snapshot);
         let config = self.zero_lock_config.clone();
-        
+
         let handle = tokio::spawn(async move {
             Self::zero_lock_background_worker(write_queue, zero_lock_snapshot, config).await;
         });
-        
+
         *self.background_handle.lock() = Some(handle);
     }
-    
+
     ///  **ZERO-LOCK BACKGROUND WORKER** - Handles all mutations off read path
-    /// 
+    ///
     /// **Architecture**: Processes write operations in batches with multiple flush triggers:
     /// 1. Batch size trigger (1000 writes)
     /// 2. Time-based trigger (100ms since last flush)
     /// 3. Explicit merge/compact operations
-    /// 
+    ///
     /// **CPU Efficiency**: Sleeps 10ms when idle to prevent busy-waiting (0.01% CPU overhead)
     async fn zero_lock_background_worker(
         write_queue: Arc<SegQueue<WriteOperation>>,
         zero_lock_snapshot: Arc<ArcSwap<ImmutableIndexSnapshot>>,
         config: ZeroLockConfig,
     ) {
-        eprintln!("🚀 Zero-lock background worker started (merge_threshold={}, hot_data_limit={})", 
-                  config.merge_threshold, config.hot_data_limit);
-        
+        eprintln!(
+            "🚀 Zero-lock background worker started (merge_threshold={}, hot_data_limit={})",
+            config.merge_threshold, config.hot_data_limit
+        );
+
         let mut pending_writes = Vec::new();
         let mut batch_count = 0;
         let mut last_flush = std::time::Instant::now();
-        
+
         loop {
             let mut processed_any = false;
-            
+
             // Collect batch of operations (non-blocking poll)
             let mut batch_size = 0;
-            while batch_size < 1000 { // Process up to 1000 ops per batch
+            while batch_size < 1000 {
+                // Process up to 1000 ops per batch
                 match write_queue.pop() {
                     Some(WriteOperation::Shutdown) => {
-                        eprintln!("🛑 Zero-lock background worker shutting down (processed {} batches)", batch_count);
+                        eprintln!(
+                            "🛑 Zero-lock background worker shutting down (processed {} batches)",
+                            batch_count
+                        );
                         // Process final batch then exit
                         if !pending_writes.is_empty() {
-                            eprintln!("  Flushing final {} writes to snapshot", pending_writes.len());
+                            eprintln!(
+                                "  Flushing final {} writes to snapshot",
+                                pending_writes.len()
+                            );
                             Self::apply_write_batch(&zero_lock_snapshot, &pending_writes).await;
                         }
                         let final_snapshot = zero_lock_snapshot.load();
-                        eprintln!("  Final snapshot: generation={}, hot_data={} entries", 
-                                  final_snapshot.generation, final_snapshot.hot_data.len());
+                        eprintln!(
+                            "  Final snapshot: generation={}, hot_data={} entries",
+                            final_snapshot.generation,
+                            final_snapshot.hot_data.len()
+                        );
                         return;
                     }
                     Some(WriteOperation::Insert { key, value }) => {
@@ -1950,34 +1963,35 @@ impl AdaptiveRMI {
                     }
                 }
             }
-            
+
             // Time-based flush: Flush if 100ms has passed and we have pending writes
-            let should_flush_time = last_flush.elapsed().as_millis() > 100 && !pending_writes.is_empty();
-            
+            let should_flush_time =
+                last_flush.elapsed().as_millis() > 100 && !pending_writes.is_empty();
+
             // Size-based flush: Flush if batch is large enough
             let should_flush_size = pending_writes.len() >= 1000;
-            
+
             // Config-based flush: Flush if we hit configured limits
             let should_flush_config = pending_writes.len() >= config.hot_data_limit;
-            
+
             // Apply batch if any trigger fires
             if should_flush_time || should_flush_size || should_flush_config {
                 batch_count += 1;
                 let batch_size = pending_writes.len();
-                
+
                 Self::apply_write_batch(&zero_lock_snapshot, &pending_writes).await;
                 pending_writes.clear();
                 last_flush = std::time::Instant::now();
-                
+
                 if batch_count % 100 == 0 {
                     let snapshot = zero_lock_snapshot.load();
                     eprintln!("  Background worker: {} batches processed, latest batch: {} writes, snapshot generation: {}, hot_data size: {}", 
                               batch_count, batch_size, snapshot.generation, snapshot.hot_data.len());
                 }
-                
+
                 processed_any = true;
             }
-            
+
             // ✅ CRITICAL: Sleep when idle to prevent CPU busy-waiting
             // Only sleep if we didn't process anything in this iteration
             if !processed_any {
@@ -1985,7 +1999,7 @@ impl AdaptiveRMI {
             }
         }
     }
-    
+
     /// Apply a batch of write operations atomically
     async fn apply_write_batch(
         zero_lock_snapshot: &ArcSwap<ImmutableIndexSnapshot>,
@@ -1994,153 +2008,153 @@ impl AdaptiveRMI {
         if writes.is_empty() {
             return;
         }
-        
+
         // Load current snapshot
         let current = zero_lock_snapshot.load();
-        
+
         // Merge new writes with existing hot data
         let mut new_hot_data = (*current.hot_data).clone();
         new_hot_data.extend_from_slice(writes);
-        
+
         // Sort by key for efficient lookups
         new_hot_data.sort_by_key(|(k, _)| *k);
         new_hot_data.dedup_by_key(|(k, _)| *k); // Remove duplicates, keeping latest
-        
+
         // Create new snapshot
         let new_snapshot = ImmutableIndexSnapshot::new(
-            (*current.segments).clone(),    // Keep existing segments
-            current.router.clone(),         // Keep existing router  
-            new_hot_data,                   // Updated hot data
-            current.generation + 1,         // Increment generation
+            (*current.segments).clone(), // Keep existing segments
+            current.router.clone(),      // Keep existing router
+            new_hot_data,                // Updated hot data
+            current.generation + 1,      // Increment generation
         );
-        
+
         // 🔥 **ATOMIC SWAP** - This is the ONLY synchronization point!
         zero_lock_snapshot.store(Arc::new(new_snapshot));
     }
-    
+
     /// Compact segments to maintain performance
     async fn compact_zero_lock_segments(
         zero_lock_snapshot: &ArcSwap<ImmutableIndexSnapshot>,
         config: &ZeroLockConfig,
     ) {
         let current = zero_lock_snapshot.load();
-        
+
         // If hot data is large, merge it into segments
         if current.hot_data.len() >= config.hot_data_limit {
             Self::merge_hot_data_to_segments(zero_lock_snapshot, config).await;
         }
     }
-    
+
     /// Merge hot data into segments for compaction
     async fn merge_hot_data_to_segments(
         zero_lock_snapshot: &ArcSwap<ImmutableIndexSnapshot>,
         _config: &ZeroLockConfig,
     ) {
         let current = zero_lock_snapshot.load();
-        
+
         if current.hot_data.is_empty() {
             return;
         }
-        
+
         // Combine hot data with existing segments
         let mut all_data: Vec<(u64, u64)> = current.hot_data.iter().copied().collect();
-        
+
         for segment in current.segments.iter() {
             all_data.extend(segment.data.iter().copied());
         }
-        
+
         // Sort and deduplicate
         all_data.sort_by_key(|(k, _)| *k);
         all_data.dedup_by_key(|(k, _)| *k);
-        
+
         // Build new segments
         let new_segments = Self::build_segments_from_sorted_data(&all_data);
         let new_router = Self::build_router_from_segments(&new_segments);
-        
+
         // Create new snapshot with merged data
         let new_snapshot = ImmutableIndexSnapshot::new(
             new_segments,
             new_router,
-            Vec::new(),                    // Clear hot data after merge
+            Vec::new(), // Clear hot data after merge
             current.generation + 1,
         );
-        
+
         // Atomic update
         zero_lock_snapshot.store(Arc::new(new_snapshot));
     }
-    
+
     /// Build segments from sorted data
     fn build_segments_from_sorted_data(data: &[(u64, u64)]) -> Vec<AdaptiveSegment> {
         const SEGMENT_SIZE: usize = 8192; // Optimal segment size
-        
+
         let mut segments = Vec::new();
-        
+
         for chunk in data.chunks(SEGMENT_SIZE) {
             if !chunk.is_empty() {
                 let segment = AdaptiveSegment::new(chunk.to_vec());
                 segments.push(segment);
             }
         }
-        
+
         segments
     }
-    
+
     /// Build router from segments
     fn build_router_from_segments(segments: &[AdaptiveSegment]) -> GlobalRoutingModel {
         let mut boundaries = Vec::new();
-        
+
         for segment in segments {
             if !segment.data.is_empty() {
                 boundaries.push(segment.data[0].0); // First key of segment
             }
         }
-        
+
         GlobalRoutingModel::new(boundaries, 16)
     }
-    
+
     /// Queue a write operation for background processing
     pub fn queue_write(&self, key: u64, value: u64) {
         self.write_queue.push(WriteOperation::Insert { key, value });
     }
-    
+
     /// Queue a merge operation
     pub fn queue_merge(&self, force: bool) {
         self.write_queue.push(WriteOperation::Merge { force });
     }
-    
+
     /// Queue a compaction operation
     pub fn queue_compact(&self) {
         self.write_queue.push(WriteOperation::Compact);
     }
-    
+
     /// Force synchronous snapshot update (for testing)
-    /// 
+    ///
     /// This method immediately flushes the hot_buffer and overflow_buffer
     /// into the zero_lock_snapshot, making writes visible to lookups.
-    /// 
+    ///
     /// **Use only for testing!** In production, the background worker
     /// handles async updates for better throughput.
     pub fn sync_snapshot_for_test(&self) {
         // Step 1: Collect all pending writes from hot buffer
         let hot_writes = self.hot_buffer.get_all_for_sync();
-        
+
         // Step 2: Collect pending writes from overflow buffer
         let overflow_writes = {
             let overflow = self.overflow_buffer.lock();
             overflow.get_all_pending()
         };
-        
+
         // Step 3: Merge all writes
         let mut all_writes: Vec<(u64, u64)> = hot_writes;
         all_writes.extend(overflow_writes);
-        
+
         if all_writes.is_empty() {
             return; // Nothing to sync
         }
-        
+
         // Step 4: Update zero_lock_snapshot atomically
         let current = self.zero_lock_snapshot.load();
-        
+
         // Merge new writes into hot_data
         let mut new_hot_data = (*current.hot_data).clone();
         for (key, value) in all_writes {
@@ -2151,7 +2165,7 @@ impl AdaptiveRMI {
                 new_hot_data.push((key, value)); // Insert new
             }
         }
-        
+
         // Create new snapshot with updated hot_data
         let new_snapshot = ImmutableIndexSnapshot::new(
             (*current.segments).clone(),
@@ -2159,24 +2173,24 @@ impl AdaptiveRMI {
             new_hot_data,
             current.generation + 1,
         );
-        
+
         // Atomic swap
         self.zero_lock_snapshot.store(Arc::new(new_snapshot));
     }
-    
+
     /// Shutdown the zero-lock background worker
     pub fn shutdown_zero_lock(&self) {
         self.write_queue.push(WriteOperation::Shutdown);
     }
-    
+
     /// Get current snapshot (for testing/debugging)
     #[cfg(test)]
     pub fn get_snapshot(&self) -> arc_swap::Guard<Arc<ImmutableIndexSnapshot>> {
         self.zero_lock_snapshot.load()
     }
-    
+
     // ====================================================================
-    //                      ZERO-LOCK LOOKUP METHODS 
+    //                      ZERO-LOCK LOOKUP METHODS
     // ====================================================================
 
     /// Build Adaptive RMI from sorted key-value pairs
@@ -2254,19 +2268,19 @@ impl AdaptiveRMI {
 
         // Create initial zero-lock snapshot with the built data
         let initial_snapshot = ImmutableIndexSnapshot::new(
-            segments.clone(),                                     // Initial segments
-            global_router.clone(),                                // Initial router
-            Vec::new(),                                           // No hot data initially
-            0,                                                    // Generation 0
+            segments.clone(),      // Initial segments
+            global_router.clone(), // Initial router
+            Vec::new(),            // No hot data initially
+            0,                     // Generation 0
         );
-        
+
         let rmi = Self {
             // ZERO-LOCK ARCHITECTURE
             zero_lock_snapshot: Arc::new(ArcSwap::from_pointee(initial_snapshot)),
             write_queue: Arc::new(SegQueue::new()),
             background_handle: Arc::new(Mutex::new(None)),
             zero_lock_config: ZeroLockConfig::default(),
-            
+
             // LEGACY ARCHITECTURE (for compatibility)
             segments: Arc::new(RwLock::new(segments)),
             segments_snapshot,
@@ -2277,7 +2291,7 @@ impl AdaptiveRMI {
                 MAX_OVERFLOW_CAPACITY,
             ))),
         };
-        
+
         // Start zero-lock background worker
         rmi.start_zero_lock_worker();
         rmi
@@ -2290,7 +2304,7 @@ impl AdaptiveRMI {
         // STEP 0: Queue write to background worker for snapshot sync
         // This ensures writes are eventually visible in zero_lock_snapshot
         self.queue_write(key, value);
-        
+
         // STEP 1: Try hot buffer first (lock-free operation)
         // This provides immediate visibility for hot_buffer.get() calls
         if self.hot_buffer.try_insert(key, value)? {
@@ -2350,16 +2364,16 @@ impl AdaptiveRMI {
     /// DEADLOCK-FREE LOOKUP with strict global lock ordering protocol
     /// LOCK ORDER: hot_buffer (lock-free) → overflow_buffer → segments (NEVER router during lookup)
     /// OPTIMIZED SINGLE-KEY LOOKUP - Combines best approaches for maximum performance
-    /// 
+    ///
     /// Performance characteristics:
     /// - Hot buffer: O(1) lock-free lookup
     /// - Overflow buffer: O(1) with minimal lock contention  
     /// - Segments: O(1) predicted lookup with bounded search guarantee
     /// - Fallback: O(n) linear probe only in edge cases
-    /// 
+    ///
     /// This prevents reader-writer deadlocks by eliminating cross-lock dependencies
-    ///  ZERO-ALLOCATION ZERO-LOCK LOOKUP: Revolutionary architecture 
-    /// 
+    ///  ZERO-ALLOCATION ZERO-LOCK LOOKUP: Revolutionary architecture
+    ///
     /// **ZERO SYNCHRONIZATION + ZERO ALLOCATION**:
     /// - Single atomic snapshot load (never blocks)
     /// - Pure computation on immutable data  
@@ -2375,7 +2389,7 @@ impl AdaptiveRMI {
         if let Some(value) = self.hot_buffer.get(key) {
             return Some(value);
         }
-        
+
         // Phase 0b: Check overflow_buffer - captures writes when hot_buffer is full
         {
             let overflow = self.overflow_buffer.lock();
@@ -2383,14 +2397,14 @@ impl AdaptiveRMI {
                 return Some(value);
             }
         }
-        
+
         // Single atomic load - only synchronization operation
         let snapshot = self.zero_lock_snapshot.load();
-        
+
         // Zero-allocation computation - pure computation, no heap activity
         Self::lookup_zero_alloc_inline(&snapshot, key)
     }
-    
+
     /// **ZERO-ALLOCATION INLINE LOOKUP** - No heap allocations whatsoever
     #[inline(always)]
     fn lookup_zero_alloc_inline(snapshot: &ImmutableIndexSnapshot, key: u64) -> Option<u64> {
@@ -2402,61 +2416,61 @@ impl AdaptiveRMI {
                 return Some(v);
             }
         }
-        
+
         // PHASE 2: Zero-allocation segment prediction and search
         let segment_id = Self::predict_segment_zero_alloc(&snapshot.router, key);
-        
+
         if segment_id < snapshot.segments.len() {
             let segment = unsafe { snapshot.segments.get_unchecked(segment_id) };
             if let Some(value) = Self::bounded_search_zero_alloc(segment, key) {
                 return Some(value);
             }
         }
-        
+
         // PHASE 3: Zero-allocation linear probe (only if prediction fails)
         for segment in snapshot.segments.iter() {
             if let Some(value) = Self::bounded_search_zero_alloc(segment, key) {
                 return Some(value);
             }
         }
-        
+
         None
     }
-    
+
     /// **ZERO-ALLOCATION SEGMENT PREDICTION** - Pure arithmetic, no allocations
     #[inline(always)]
     fn predict_segment_zero_alloc(router: &GlobalRoutingModel, key: u64) -> usize {
         if router.router.is_empty() {
             return 0;
         }
-        
+
         let shift = 64u32.saturating_sub(router.router_bits as u32);
         let prefix = (key >> shift) as usize;
         let idx = prefix.min(router.router.len().saturating_sub(1));
-        
+
         router.router[idx] as usize
     }
-    
+
     /// **ZERO-ALLOCATION BOUNDED SEARCH** - Direct slice access, no Vec operations
     #[inline(always)]
     fn bounded_search_zero_alloc(segment: &AdaptiveSegment, key: u64) -> Option<u64> {
         if !segment.local_model.contains_key(key) {
             return None;
         }
-        
+
         let predicted_pos = segment.local_model.predict(key);
         let epsilon = segment.local_model.error_bound() as usize;
-        
+
         let data_slice = segment.data.as_slice();
         let len = data_slice.len();
-        
+
         if len == 0 {
             return None;
         }
-        
+
         let start = predicted_pos.saturating_sub(epsilon).min(len - 1);
         let end = (predicted_pos + epsilon + 1).min(len);
-        
+
         // Direct slice access with bounds checking
         for i in start..end {
             let (k, v) = unsafe { *data_slice.get_unchecked(i) };
@@ -2464,17 +2478,18 @@ impl AdaptiveRMI {
                 return Some(v);
             }
         }
-        
+
         None
     }
-    
+
     /// Legacy lookup method (for compatibility)
     #[inline]
     #[allow(dead_code)]
     fn lookup_key_ultra_fast_legacy(&self, key: u64) -> Option<u64> {
         //  PHASE 1: Lock-free hot buffer check (most recent writes)
         // Try lock-free buffer first for maximum performance
-        if let Some(lock_free_buffer) = self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>() {
+        if let Some(lock_free_buffer) = self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>()
+        {
             if let Some(value) = lock_free_buffer.get_fast(key) {
                 return Some(value);
             }
@@ -2493,14 +2508,14 @@ impl AdaptiveRMI {
             let router_snapshot = self.global_router.read();
             let segment_id = router_snapshot.predict_segment(key);
             drop(router_snapshot); // Release router lock immediately
-            
+
             // Predicted lookup in atomic snapshot
             if segment_id < segments_ref.len() {
                 if let Some(value) = segments_ref[segment_id].bounded_search(key) {
                     return Some(value);
                 }
             }
-            
+
             // Linear probe in atomic snapshot if prediction failed
             for segment in segments_ref.iter() {
                 if let Some(value) = segment.bounded_search(key) {
@@ -2524,7 +2539,7 @@ impl AdaptiveRMI {
         let router_snapshot = self.global_router.read();
         let segment_id = router_snapshot.predict_segment(key);
         drop(router_snapshot);
-        
+
         if segment_id < segments_guard.len() {
             segments_guard[segment_id].bounded_search(key)
         } else {
@@ -3030,7 +3045,7 @@ impl AdaptiveRMI {
                         rate_limit_start = std::time::Instant::now();
                     }
                 }
-                
+
                 // ERROR CIRCUIT BREAKER: Stop if too many consecutive failures
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                     println!(
@@ -3055,7 +3070,7 @@ impl AdaptiveRMI {
                         Ok(_) => {
                             consecutive_errors = 0;
                             println!("Background merge completed successfully");
-                            
+
                             // COOPERATIVE SCHEDULING: Yield after CPU-intensive merge
                             tokio::task::yield_now().await;
                         }
@@ -3246,7 +3261,7 @@ impl AdaptiveRMI {
     /// - Single atomic snapshot load (never blocks)
     /// - Pre-allocated result buffers (no heap activity)
     /// - SIMD vectorization on immutable data
-    /// - Runtime detection (AVX2, NEON) 
+    /// - Runtime detection (AVX2, NEON)
     /// - Pure computation, no locks, no allocations
     /// - ~2-5ns per key in batch (theoretical maximum)
     ///
@@ -3254,23 +3269,23 @@ impl AdaptiveRMI {
     #[inline]
     pub fn lookup_keys_simd_batch(&self, keys: &[u64]) -> Vec<Option<u64>> {
         let mut results = Vec::with_capacity(keys.len());
-        
+
         // Phase 0: Check hot_buffer and overflow_buffer for all keys first
         let mut need_snapshot_lookup = Vec::with_capacity(keys.len());
-        
+
         for &key in keys {
             // Check hot_buffer first
             if let Some(value) = self.hot_buffer.get(key) {
                 results.push(Some(value));
                 continue;
             }
-            
+
             // Check overflow_buffer second
             let found_in_overflow = {
                 let overflow = self.overflow_buffer.lock();
                 overflow.get(key)
             };
-            
+
             if let Some(value) = found_in_overflow {
                 results.push(Some(value));
             } else {
@@ -3279,109 +3294,119 @@ impl AdaptiveRMI {
                 results.push(None); // Placeholder
             }
         }
-        
+
         // Phase 1: Snapshot lookup for remaining keys using SIMD
         if !need_snapshot_lookup.is_empty() {
             let snapshot = self.zero_lock_snapshot.load();
-            
+
             // Extract just the keys for SIMD batch processing
-            let keys_to_lookup: Vec<u64> = need_snapshot_lookup.iter()
-                .map(|(_, key)| *key)
-                .collect();
-            
+            let keys_to_lookup: Vec<u64> =
+                need_snapshot_lookup.iter().map(|(_, key)| *key).collect();
+
             // Use SIMD batch lookup
             let batch_results = Self::simd_batch_zero_alloc(&snapshot, &keys_to_lookup);
-            
+
             // Place results back into correct positions
             for (i, (idx, _)) in need_snapshot_lookup.iter().enumerate() {
                 results[*idx] = batch_results[i];
             }
         }
-        
+
         results
     }
-    
+
     /// **ZERO-ALLOCATION SIMD BATCH** - No heap allocations during processing
     #[inline]
     fn simd_batch_zero_alloc(snapshot: &ImmutableIndexSnapshot, keys: &[u64]) -> Vec<Option<u64>> {
         // Pre-allocate result vector once (only allocation in entire operation)
         let mut results = Vec::with_capacity(keys.len());
-        
+
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && keys.len() >= 16 {
                 return unsafe { Self::simd_avx2_zero_alloc_batch(snapshot, keys, results) };
             }
         }
-        
+
         #[cfg(target_arch = "aarch64")]
         {
             if std::arch::is_aarch64_feature_detected!("neon") && keys.len() >= 8 {
                 return Self::simd_neon_zero_alloc_batch(snapshot, keys, results);
             }
         }
-        
+
         // Scalar zero-allocation fallback
         for &key in keys {
             results.push(Self::lookup_zero_alloc_inline(snapshot, key));
         }
-        
+
         results
     }
-    
+
     /// **AVX2 ZERO-ALLOCATION BATCH** - Full SIMD vectorization without heap allocations
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_avx2_zero_alloc_batch(
         snapshot: &ImmutableIndexSnapshot,
         keys: &[u64],
-        mut results: Vec<Option<u64>>
+        mut results: Vec<Option<u64>>,
     ) -> Vec<Option<u64>> {
         use std::arch::x86_64::*;
-        
+
         // Process keys in optimal AVX2-aligned chunks
         let mut key_idx = 0;
-        
+
         // Process 4-key chunks with AVX2 (256-bit register = 4x u64)
         while key_idx + 4 <= keys.len() {
             let chunk = &keys[key_idx..key_idx + 4];
-            
+
             // Load 4 keys into AVX2 register
             let keys_vec = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
-            
+
             // Extract keys for processing
             let key0 = _mm256_extract_epi64(keys_vec, 0) as u64;
             let key1 = _mm256_extract_epi64(keys_vec, 1) as u64;
             let key2 = _mm256_extract_epi64(keys_vec, 2) as u64;
             let key3 = _mm256_extract_epi64(keys_vec, 3) as u64;
-            
+
             // PHASE 1: Vectorized hot data search
             let mut found = [false; 4];
             let mut values = [0u64; 4];
-            
+
             let hot_slice = snapshot.hot_data.as_slice();
             if !hot_slice.is_empty() {
                 // Process hot buffer in 4-entry chunks for SIMD comparison
                 for hot_chunk_start in (0..hot_slice.len()).step_by(4).rev() {
                     let hot_chunk_end = (hot_chunk_start + 4).min(hot_slice.len());
                     let hot_chunk = &hot_slice[hot_chunk_start..hot_chunk_end];
-                    
+
                     if hot_chunk.len() >= 4 {
                         // Load hot buffer keys into SIMD register
-                        let hot_keys_array = [hot_chunk[0].0, hot_chunk[1].0, hot_chunk[2].0, hot_chunk[3].0];
-                        let hot_keys_vec = _mm256_loadu_si256(hot_keys_array.as_ptr() as *const __m256i);
-                        
+                        let hot_keys_array = [
+                            hot_chunk[0].0,
+                            hot_chunk[1].0,
+                            hot_chunk[2].0,
+                            hot_chunk[3].0,
+                        ];
+                        let hot_keys_vec =
+                            _mm256_loadu_si256(hot_keys_array.as_ptr() as *const __m256i);
+
                         // Compare each search key against all hot keys
                         for i in 0..4 {
-                            if found[i] { continue; }
-                            
+                            if found[i] {
+                                continue;
+                            }
+
                             let search_key = match i {
-                                0 => key0, 1 => key1, 2 => key2, _ => key3,
+                                0 => key0,
+                                1 => key1,
+                                2 => key2,
+                                _ => key3,
                             };
                             let search_vec = _mm256_set1_epi64x(search_key as i64);
                             let cmp_result = _mm256_cmpeq_epi64(search_vec, hot_keys_vec);
                             let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp_result));
-                            
+
                             if mask != 0 {
                                 for j in 0..4 {
                                     if mask & (1 << j) != 0 {
@@ -3395,39 +3420,56 @@ impl AdaptiveRMI {
                     } else {
                         // Scalar fallback for partial chunks
                         for &(k, v) in hot_chunk.iter().rev() {
-                            if !found[0] && k == key0 { found[0] = true; values[0] = v; }
-                            if !found[1] && k == key1 { found[1] = true; values[1] = v; }
-                            if !found[2] && k == key2 { found[2] = true; values[2] = v; }
-                            if !found[3] && k == key3 { found[3] = true; values[3] = v; }
+                            if !found[0] && k == key0 {
+                                found[0] = true;
+                                values[0] = v;
+                            }
+                            if !found[1] && k == key1 {
+                                found[1] = true;
+                                values[1] = v;
+                            }
+                            if !found[2] && k == key2 {
+                                found[2] = true;
+                                values[2] = v;
+                            }
+                            if !found[3] && k == key3 {
+                                found[3] = true;
+                                values[3] = v;
+                            }
                         }
                     }
-                    
+
                     // Early exit if all found
-                    if found.iter().all(|&f| f) { break; }
+                    if found.iter().all(|&f| f) {
+                        break;
+                    }
                 }
             }
-            
+
             // PHASE 2: Segment-based search for missing keys
             for i in 0..4 {
                 if found[i] {
                     results.push(Some(values[i]));
                     continue;
                 }
-                
+
                 let search_key = match i {
-                    0 => key0, 1 => key1, 2 => key2, _ => key3,
+                    0 => key0,
+                    1 => key1,
+                    2 => key2,
+                    _ => key3,
                 };
-                
+
                 // Predict segment
                 let segment_id = Self::predict_segment_zero_alloc(&snapshot.router, search_key);
-                
+
                 // Bounded search in predicted segment
                 let mut segment_value = None;
                 if segment_id < snapshot.segments.len() {
                     let segment = &snapshot.segments[segment_id];
                     segment_value = Self::bounded_search_zero_alloc(segment, search_key);
                 }
-                
+
                 // Fallback linear probe if prediction failed
                 if segment_value.is_none() {
                     for segment in snapshot.segments.iter() {
@@ -3437,74 +3479,76 @@ impl AdaptiveRMI {
                         }
                     }
                 }
-                
+
                 results.push(segment_value);
             }
-            
+
             key_idx += 4;
         }
-        
+
         // Process remaining keys with scalar
         while key_idx < keys.len() {
             results.push(Self::lookup_zero_alloc_inline(snapshot, keys[key_idx]));
             key_idx += 1;
         }
-        
+
         results
     }
-    
+
     /// NEON ZERO-ALLOCATION BATCH** - Full ARM SIMD vectorization without heap allocations
     #[cfg(target_arch = "aarch64")]
     fn simd_neon_zero_alloc_batch(
         _snapshot: &ImmutableIndexSnapshot,
         keys: &[u64],
-        mut results: Vec<Option<u64>>
+        mut results: Vec<Option<u64>>,
     ) -> Vec<Option<u64>> {
         use std::arch::aarch64::*;
-        
+
         // Process keys in optimal NEON-aligned chunks
         let mut key_idx = 0;
-        
+
         // Process 2-key chunks with NEON (128-bit register = 2x u64)
         while key_idx + 2 <= keys.len() {
             let chunk = &keys[key_idx..key_idx + 2];
-            
+
             unsafe {
                 // Load 2 keys into NEON register
                 let keys_vec = vld1q_u64(chunk.as_ptr());
-                
+
                 // Extract keys for processing
                 let key0 = vgetq_lane_u64(keys_vec, 0);
                 let key1 = vgetq_lane_u64(keys_vec, 1);
-                
+
                 // PHASE 1: Vectorized hot data search
                 let mut found = [false; 2];
                 let mut values = [0u64; 2];
-                
+
                 let hot_slice = _snapshot.hot_data.as_slice();
                 if !hot_slice.is_empty() {
                     // Process hot buffer in 2-entry chunks for SIMD comparison
                     for hot_chunk_start in (0..hot_slice.len()).step_by(2).rev() {
                         let hot_chunk_end = (hot_chunk_start + 2).min(hot_slice.len());
                         let hot_chunk = &hot_slice[hot_chunk_start..hot_chunk_end];
-                        
+
                         if hot_chunk.len() >= 2 {
                             // Load hot buffer keys into NEON register
                             let hot_keys_array = [hot_chunk[0].0, hot_chunk[1].0];
                             let hot_keys_vec = vld1q_u64(hot_keys_array.as_ptr());
-                            
+
                             // Compare each search key against all hot keys
                             for i in 0..2 {
-                                if found[i] { continue; }
-                                
+                                if found[i] {
+                                    continue;
+                                }
+
                                 let search_key = if i == 0 { key0 } else { key1 };
                                 let search_vec = vdupq_n_u64(search_key);
                                 let cmp_result = vceqq_u64(search_vec, hot_keys_vec);
-                                
+
                                 // Extract comparison results
                                 let mask0 = vgetq_lane_u64(cmp_result, 0);
                                 let mask1 = vgetq_lane_u64(cmp_result, 1);
-                                
+
                                 if mask0 != 0 {
                                     found[i] = true;
                                     values[i] = hot_chunk[0].1;
@@ -3516,35 +3560,44 @@ impl AdaptiveRMI {
                         } else {
                             // Scalar fallback for partial chunks
                             for &(k, v) in hot_chunk.iter().rev() {
-                                if !found[0] && k == key0 { found[0] = true; values[0] = v; }
-                                if !found[1] && k == key1 { found[1] = true; values[1] = v; }
+                                if !found[0] && k == key0 {
+                                    found[0] = true;
+                                    values[0] = v;
+                                }
+                                if !found[1] && k == key1 {
+                                    found[1] = true;
+                                    values[1] = v;
+                                }
                             }
                         }
-                        
+
                         // Early exit if all found
-                        if found.iter().all(|&f| f) { break; }
+                        if found.iter().all(|&f| f) {
+                            break;
+                        }
                     }
                 }
-                
+
                 // PHASE 2: Segment-based search for missing keys
                 for i in 0..2 {
                     if found[i] {
                         results.push(Some(values[i]));
                         continue;
                     }
-                    
+
                     let search_key = if i == 0 { key0 } else { key1 };
-                    
+
                     // Predict segment
-                    let segment_id = Self::predict_segment_zero_alloc(&_snapshot.router, search_key);
-                    
+                    let segment_id =
+                        Self::predict_segment_zero_alloc(&_snapshot.router, search_key);
+
                     // Bounded search in predicted segment
                     let mut segment_value = None;
                     if segment_id < _snapshot.segments.len() {
                         let segment = &_snapshot.segments[segment_id];
                         segment_value = Self::bounded_search_zero_alloc(segment, search_key);
                     }
-                    
+
                     // Fallback linear probe if prediction failed
                     if segment_value.is_none() {
                         for segment in _snapshot.segments.iter() {
@@ -3554,30 +3607,30 @@ impl AdaptiveRMI {
                             }
                         }
                     }
-                    
+
                     results.push(segment_value);
                 }
             }
-            
+
             key_idx += 2;
         }
-        
+
         // Process remaining keys with scalar
         while key_idx < keys.len() {
             results.push(Self::lookup_zero_alloc_inline(_snapshot, keys[key_idx]));
             key_idx += 1;
         }
-        
+
         results
     }
-    
+
     /// SIMD batch processing on immutable snapshot
     #[inline]
     #[allow(dead_code)]
     fn simd_batch_on_snapshot(
-        &self, 
+        &self,
         snapshot: &ImmutableIndexSnapshot,
-        keys: &[u64]
+        keys: &[u64],
     ) -> Vec<Option<u64>> {
         // Runtime SIMD detection with zero-lock data
         #[cfg(target_arch = "x86_64")]
@@ -3586,79 +3639,79 @@ impl AdaptiveRMI {
                 return unsafe { self.simd_avx2_zero_lock_batch(snapshot, keys) };
             }
         }
-        
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("neon") && keys.len() >= 8 {
-            return unsafe { self.simd_neon_zero_lock_batch(snapshot, keys) };
-        }
-    }        // Scalar fallback on zero-lock data
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") && keys.len() >= 8 {
+                return unsafe { self.simd_neon_zero_lock_batch(snapshot, keys) };
+            }
+        } // Scalar fallback on zero-lock data
         snapshot.lookup_batch_zero_lock(keys)
     }
-    
+
     /// AVX2 SIMD processing on zero-lock snapshot - Full vectorization
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn simd_avx2_zero_lock_batch(
         &self,
-        _snapshot: &ImmutableIndexSnapshot, 
-        keys: &[u64]
+        _snapshot: &ImmutableIndexSnapshot,
+        keys: &[u64],
     ) -> Vec<Option<u64>> {
         let mut results = Vec::with_capacity(keys.len());
         let mut key_idx = 0;
-        
+
         // Process in 8-key batches using optimized SIMD lookup
         while key_idx + 8 <= keys.len() {
             let chunk = &keys[key_idx..key_idx + 8];
-            
+
             // Use existing optimized SIMD lookup infrastructure
             let batch_results = self.lookup_8_keys_optimized_simd(chunk);
             results.extend_from_slice(&batch_results);
-            
+
             key_idx += 8;
         }
-        
+
         // Process remaining keys with scalar
         while key_idx < keys.len() {
             results.push(self.lookup_key_ultra_fast(keys[key_idx]));
             key_idx += 1;
         }
-    
-    results
-}
 
-/// NEON SIMD processing on zero-lock snapshot - Full vectorization
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[allow(dead_code)]
-unsafe fn simd_neon_zero_lock_batch(
-    &self,
-    _snapshot: &ImmutableIndexSnapshot,
-    keys: &[u64]
-) -> Vec<Option<u64>> {
-    let mut results = Vec::with_capacity(keys.len());
-    let mut key_idx = 0;
-    
-    // Process in 4-key batches with NEON
-    while key_idx + 4 <= keys.len() {
-        let chunk = &keys[key_idx..key_idx + 4];
-        
-        // Use existing optimized NEON lookup
-        let batch_results = self.lookup_4_keys_neon_impl(chunk);
-        results.extend_from_slice(&batch_results);
-        
-        key_idx += 4;
+        results
     }
-    
-    // Process remaining keys with scalar
-    while key_idx < keys.len() {
-        results.push(self.lookup_key_ultra_fast(keys[key_idx]));
-        key_idx += 1;
+
+    /// NEON SIMD processing on zero-lock snapshot - Full vectorization
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    #[allow(dead_code)]
+    unsafe fn simd_neon_zero_lock_batch(
+        &self,
+        _snapshot: &ImmutableIndexSnapshot,
+        keys: &[u64],
+    ) -> Vec<Option<u64>> {
+        let mut results = Vec::with_capacity(keys.len());
+        let mut key_idx = 0;
+
+        // Process in 4-key batches with NEON
+        while key_idx + 4 <= keys.len() {
+            let chunk = &keys[key_idx..key_idx + 4];
+
+            // Use existing optimized NEON lookup
+            let batch_results = self.lookup_4_keys_neon_impl(chunk);
+            results.extend_from_slice(&batch_results);
+
+            key_idx += 4;
+        }
+
+        // Process remaining keys with scalar
+        while key_idx < keys.len() {
+            results.push(self.lookup_key_ultra_fast(keys[key_idx]));
+            key_idx += 1;
+        }
+
+        results
     }
-    
-    results
-}
-    
+
     /// Legacy SIMD batch method (for compatibility)
     #[inline]
     #[allow(dead_code)]
@@ -3695,7 +3748,9 @@ unsafe fn simd_neon_zero_lock_batch(
             self.lookup_batch_scalar_optimized(keys)
         } else {
             // Individual lookups for very small batches
-            keys.iter().map(|&k| self.lookup_key_ultra_fast(k)).collect()
+            keys.iter()
+                .map(|&k| self.lookup_key_ultra_fast(k))
+                .collect()
         }
     }
 
@@ -3844,9 +3899,9 @@ unsafe fn simd_neon_zero_lock_batch(
     #[allow(dead_code)]
     fn lookup_4_keys_neon_impl(&self, keys: &[u64]) -> [Option<u64>; 4] {
         use std::arch::aarch64::*;
-        
+
         let mut results = [None; 4];
-        
+
         if keys.len() < 4 {
             // Fallback for insufficient keys
             for (i, &key) in keys.iter().enumerate().take(4) {
@@ -3854,45 +3909,52 @@ unsafe fn simd_neon_zero_lock_batch(
             }
             return results;
         }
-        
+
         unsafe {
             // Load 4 keys (use two NEON registers, 2 keys each)
             let keys_lo = vld1q_u64(keys[0..2].as_ptr());
             let keys_hi = vld1q_u64(keys[2..4].as_ptr());
-            
+
             let key0 = vgetq_lane_u64(keys_lo, 0);
             let key1 = vgetq_lane_u64(keys_lo, 1);
             let key2 = vgetq_lane_u64(keys_hi, 0);
             let key3 = vgetq_lane_u64(keys_hi, 1);
-            
+
             // PHASE 1: Hot buffer search with NEON
             let mut found = [false; 4];
             let mut values = [0u64; 4];
-            
-            if let Some(lock_free_buffer) = self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>() {
+
+            if let Some(lock_free_buffer) =
+                self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>()
+            {
                 let snapshot = lock_free_buffer.get_snapshot();
-                
+
                 for hot_chunk_start in (0..snapshot.len()).step_by(2).rev() {
                     let hot_chunk_end = (hot_chunk_start + 2).min(snapshot.len());
                     let hot_chunk = &snapshot[hot_chunk_start..hot_chunk_end];
-                    
+
                     if hot_chunk.len() >= 2 {
                         let hot_keys_array = [hot_chunk[0].0, hot_chunk[1].0];
                         let hot_keys_vec = vld1q_u64(hot_keys_array.as_ptr());
-                        
+
                         // Compare each search key
                         for i in 0..4 {
-                            if found[i] { continue; }
-                            
+                            if found[i] {
+                                continue;
+                            }
+
                             let search_key = match i {
-                                0 => key0, 1 => key1, 2 => key2, _ => key3,
+                                0 => key0,
+                                1 => key1,
+                                2 => key2,
+                                _ => key3,
                             };
                             let search_vec = vdupq_n_u64(search_key);
                             let cmp_result = vceqq_u64(search_vec, hot_keys_vec);
-                            
+
                             let mask0 = vgetq_lane_u64(cmp_result, 0);
                             let mask1 = vgetq_lane_u64(cmp_result, 1);
-                            
+
                             if mask0 != 0 {
                                 found[i] = true;
                                 values[i] = hot_chunk[0].1;
@@ -3903,14 +3965,28 @@ unsafe fn simd_neon_zero_lock_batch(
                         }
                     } else {
                         for &(k, v) in hot_chunk.iter().rev() {
-                            if !found[0] && k == key0 { found[0] = true; values[0] = v; }
-                            if !found[1] && k == key1 { found[1] = true; values[1] = v; }
-                            if !found[2] && k == key2 { found[2] = true; values[2] = v; }
-                            if !found[3] && k == key3 { found[3] = true; values[3] = v; }
+                            if !found[0] && k == key0 {
+                                found[0] = true;
+                                values[0] = v;
+                            }
+                            if !found[1] && k == key1 {
+                                found[1] = true;
+                                values[1] = v;
+                            }
+                            if !found[2] && k == key2 {
+                                found[2] = true;
+                                values[2] = v;
+                            }
+                            if !found[3] && k == key3 {
+                                found[3] = true;
+                                values[3] = v;
+                            }
                         }
                     }
-                    
-                    if found.iter().all(|&f| f) { break; }
+
+                    if found.iter().all(|&f| f) {
+                        break;
+                    }
                 }
             } else {
                 // Fallback to bounded search for other buffer types
@@ -3922,20 +3998,23 @@ unsafe fn simd_neon_zero_lock_batch(
                     }
                 }
             }
-            
+
             // PHASE 2: Segment lookup for missing keys
             for i in 0..4 {
                 if found[i] {
                     results[i] = Some(values[i]);
                 } else {
                     let search_key = match i {
-                        0 => key0, 1 => key1, 2 => key2, _ => key3,
+                        0 => key0,
+                        1 => key1,
+                        2 => key2,
+                        _ => key3,
                     };
                     results[i] = self.lookup_key_ultra_fast(search_key);
                 }
             }
         }
-        
+
         results
     }
 
@@ -4047,10 +4126,10 @@ unsafe fn simd_neon_zero_lock_batch(
         // Load 16 keys into 4 AVX2 registers
         // Each __m256i holds exactly 4 u64 values (256 bits / 64 bits = 4)
         let keys_ptr = keys.as_ptr() as *const __m256i;
-        let keys_0 = _mm256_loadu_si256(keys_ptr);         // Keys 0-3  (register 1)
-        let keys_1 = _mm256_loadu_si256(keys_ptr.add(1));  // Keys 4-7  (register 2)
-        let keys_2 = _mm256_loadu_si256(keys_ptr.add(2));  // Keys 8-11 (register 3)
-        let keys_3 = _mm256_loadu_si256(keys_ptr.add(3));  // Keys 12-15 (register 4)
+        let keys_0 = _mm256_loadu_si256(keys_ptr); // Keys 0-3  (register 1)
+        let keys_1 = _mm256_loadu_si256(keys_ptr.add(1)); // Keys 4-7  (register 2)
+        let keys_2 = _mm256_loadu_si256(keys_ptr.add(2)); // Keys 8-11 (register 3)
+        let keys_3 = _mm256_loadu_si256(keys_ptr.add(3)); // Keys 12-15 (register 4)
 
         // Execute 4 separate 4-wide SIMD operations for hot buffer lookup
         let hot_results_0_3 = self.simd_hot_buffer_lookup(keys_0, keys_1);
@@ -4359,7 +4438,7 @@ unsafe fn simd_neon_zero_lock_batch(
             _mm256_extract_epi64(keys_hi, 2) as u64,
             _mm256_extract_epi64(keys_hi, 3) as u64,
         ];
-        
+
         let missing_keys: Vec<(usize, u64)> = hot_results
             .iter()
             .enumerate()
@@ -4510,7 +4589,7 @@ unsafe fn simd_neon_zero_lock_batch(
             _mm256_extract_epi64(keys_hi, 2) as u64,
             _mm256_extract_epi64(keys_hi, 3) as u64,
         ];
-        
+
         let missing_keys_with_segments: Vec<(usize, u64, usize)> = (0..8)
             .filter_map(|i| {
                 if hot_results[i].is_none() && overflow_results[i].is_none() {
@@ -4545,8 +4624,7 @@ unsafe fn simd_neon_zero_lock_batch(
                         simd_processed[result_idx % 4] = true;
                     } else if segment_id >= segments_guard.len() {
                         // Graceful degradation: use fallback search if prediction is out of bounds
-                        results[result_idx] =
-                            Self::linear_probe_segments(&segments_guard, key);
+                        results[result_idx] = Self::linear_probe_segments(&segments_guard, key);
                     }
                 }
             } else {
@@ -4556,8 +4634,7 @@ unsafe fn simd_neon_zero_lock_batch(
                         results[result_idx] = segments_guard[segment_id].bounded_search(key);
                     } else {
                         // Graceful degradation: use fallback search if prediction is out of bounds
-                        results[result_idx] =
-                            Self::linear_probe_segments(&segments_guard, key);
+                        results[result_idx] = Self::linear_probe_segments(&segments_guard, key);
                     }
                 }
             }

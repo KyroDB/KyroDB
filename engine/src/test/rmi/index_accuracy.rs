@@ -10,7 +10,11 @@ use std::sync::Arc;
 #[cfg(feature = "learned-index")]
 async fn test_rmi_basic_accuracy() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write sequential keys
     for i in 0..1000 {
@@ -40,7 +44,11 @@ async fn test_rmi_basic_accuracy() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_with_sparse_keys() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write sparse keys (every 100)
     for i in 0..100 {
@@ -71,7 +79,11 @@ async fn test_rmi_with_sparse_keys() {
     for i in 0..100 {
         let key = i * 100 + 50; // Between sparse keys
         let value = lookup_kv(&log, key).await.expect("Failed to lookup");
-        assert!(value.is_none(), "Sparse RMI: non-existent key {} found", key);
+        assert!(
+            value.is_none(),
+            "Sparse RMI: non-existent key {} found",
+            key
+        );
     }
 }
 
@@ -79,7 +91,11 @@ async fn test_rmi_with_sparse_keys() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_with_clustered_keys() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write clustered keys - closer together for better RMI handling
     // Cluster 1: 0-999, Cluster 2: 5000-5999, Cluster 3: 10000-10999
@@ -87,9 +103,13 @@ async fn test_rmi_with_clustered_keys() {
         let base = cluster * 5000;
         for i in 0..1000 {
             let key = base + i;
-            append_kv(&log, key, format!("cluster_{}_{}", cluster, i).as_bytes().to_vec())
-                .await
-                .expect("Failed to append");
+            append_kv(
+                &log,
+                key,
+                format!("cluster_{}_{}", cluster, i).as_bytes().to_vec(),
+            )
+            .await
+            .expect("Failed to append");
         }
     }
 
@@ -118,7 +138,11 @@ async fn test_rmi_with_clustered_keys() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_prediction_with_skewed_distribution() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Skewed distribution: dense sequential region followed by sparse region
     // Dense region: every key from 0-10000
@@ -155,7 +179,11 @@ async fn test_rmi_prediction_with_skewed_distribution() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_with_updates() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initial values
     for i in 0..500 {
@@ -194,7 +222,11 @@ async fn test_rmi_with_updates() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_large_key_range() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write keys across large range
     let keys = vec![
@@ -209,9 +241,13 @@ async fn test_rmi_large_key_range() {
     ];
 
     for &key in &keys {
-        append_kv(&log, key, format!("large_range_{}", key).as_bytes().to_vec())
-            .await
-            .expect("Failed to append");
+        append_kv(
+            &log,
+            key,
+            format!("large_range_{}", key).as_bytes().to_vec(),
+        )
+        .await
+        .expect("Failed to append");
     }
 
     // Build RMI
@@ -235,7 +271,11 @@ async fn test_rmi_large_key_range() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_boundary_keys() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write boundary keys
     let boundaries = vec![
@@ -278,7 +318,11 @@ async fn test_rmi_boundary_keys() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_accuracy_after_multiple_rebuilds() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write initial data
     for i in 0..300 {
@@ -309,7 +353,7 @@ async fn test_rmi_accuracy_after_multiple_rebuilds() {
 
     // Final verification
     log.build_rmi().await.expect("Failed to final build");
-    
+
     for i in (0..300).step_by(30) {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
         assert!(value.is_some(), "Final RMI: key {} not found", i);
@@ -320,7 +364,11 @@ async fn test_rmi_accuracy_after_multiple_rebuilds() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_with_random_access_pattern() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write sequential keys
     for i in 0..1000 {
@@ -337,7 +385,7 @@ async fn test_rmi_with_random_access_pattern() {
     for _ in 0..500 {
         rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
         let key = (rng_state % 1000) as u64;
-        
+
         let value = lookup_kv(&log, key).await.expect("Failed to lookup");
         assert!(value.is_some(), "Random access RMI: key {} not found", key);
     }
@@ -347,7 +395,11 @@ async fn test_rmi_with_random_access_pattern() {
 #[cfg(feature = "learned-index")]
 async fn test_rmi_error_bound_validation() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data that challenges error bounds
     for i in 0..10000 {

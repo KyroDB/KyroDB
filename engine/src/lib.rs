@@ -638,7 +638,7 @@ impl PersistentEventLog {
             return Some(bytes);
         }
         crate::metrics::WAL_BLOCK_CACHE_MISSES_TOTAL.inc();
-        
+
         if let Some(ref mmap) = *self.snapshot_mmap.read().await {
             if let Some(ref idx) = *self.snapshot_payload_index.read().await {
                 if let Some((start, len)) = idx.get(&offset).copied() {
@@ -654,7 +654,7 @@ impl PersistentEventLog {
                 }
             }
         }
-        
+
         let read = self.inner.read().await;
         if let Some(ev) = read.iter().find(|e| e.offset == offset) {
             let bytes = ev.payload.clone();
@@ -675,7 +675,7 @@ impl PersistentEventLog {
             return Some(bytes);
         }
         crate::metrics::WAL_BLOCK_CACHE_MISSES_TOTAL.inc();
-        
+
         if let Some(ref mmap) = *self.snapshot_mmap.read().await {
             if let Some(ref idx) = *self.snapshot_payload_index.read().await {
                 if let Some((start, len)) = idx.get(&offset).copied() {
@@ -683,7 +683,7 @@ impl PersistentEventLog {
                     if end <= mmap.len() {
                         let mut bytes = Vec::with_capacity(len);
                         bytes.extend_from_slice(&mmap[start..end]);
-                        
+
                         if len <= 1024 {
                             self.wal_block_cache
                                 .write()
@@ -695,7 +695,7 @@ impl PersistentEventLog {
                 }
             }
         }
-        
+
         let read = self.inner.read().await;
         if let Some(ev) = read.iter().find(|e| e.offset == offset) {
             let bytes = ev.payload.clone();
@@ -708,7 +708,8 @@ impl PersistentEventLog {
             return Some(bytes);
         }
         None
-    }    /// Append (durably) and return its offset.
+    }
+    /// Append (durably) and return its offset.
     pub async fn append(&self, request_id: Uuid, payload: Vec<u8>) -> Result<u64> {
         let timer = metrics::APPEND_LATENCY_SECONDS.start_timer();
 
@@ -877,7 +878,7 @@ impl PersistentEventLog {
             index::PrimaryIndex::AdaptiveRmi(adaptive) => {
                 // RMI lookup with bounded search
                 let timer = crate::metrics::RMI_LOOKUP_LATENCY_SECONDS.start_timer();
-                    let result = adaptive.lookup_key_ultra_fast(key);
+                let result = adaptive.lookup_key_ultra_fast(key);
                 timer.observe_duration();
 
                 if result.is_some() {
@@ -893,7 +894,6 @@ impl PersistentEventLog {
             }
         }
     }
-
 
     /// Batch lookup: process multiple keys efficiently with single lock acquisition
 
@@ -923,15 +923,14 @@ impl PersistentEventLog {
         }
     }
 
-
     /// Force synchronous index update (for testing)
-    /// 
+    ///
     /// Makes all pending writes immediately visible to lookups.
     /// **Use only for testing!** In production, async updates provide better throughput.
     #[cfg(test)]
     pub fn sync_index_for_test(&self) {
         let idx = self.index_atomic.load();
-        
+
         #[cfg(feature = "learned-index")]
         if let index::PrimaryIndex::AdaptiveRmi(rmi) = &**idx {
             rmi.sync_snapshot_for_test();
@@ -971,22 +970,22 @@ impl PersistentEventLog {
     pub fn lookup_keys_simd_batch(&self, keys: &[u64]) -> Vec<(u64, Option<u64>)> {
         let mut results = Vec::with_capacity(keys.len());
         let index = self.index_atomic.load();
-        
+
         match &**index {
             #[cfg(feature = "learned-index")]
             index::PrimaryIndex::AdaptiveRmi(adaptive) => {
                 let simd_results = adaptive.lookup_keys_simd_batch(keys);
-                
+
                 for (i, &key) in keys.iter().enumerate() {
                     let value = simd_results.get(i).copied().unwrap_or(None);
                     results.push((key, value));
                 }
-                
+
                 #[cfg(not(feature = "bench-no-metrics"))]
                 {
                     let timer = crate::metrics::RMI_BATCH_LOOKUP_LATENCY_SECONDS.start_timer();
                     timer.observe_duration();
-                    
+
                     let hits = results.iter().filter(|(_, v)| v.is_some()).count();
                     crate::metrics::RMI_HITS_TOTAL.inc_by(hits as f64);
                     crate::metrics::RMI_MISSES_TOTAL.inc_by((keys.len() - hits) as f64);
@@ -1022,7 +1021,7 @@ impl PersistentEventLog {
     /// Create a database snapshot
     pub async fn snapshot(&self) -> Result<()> {
         let timer = metrics::SNAPSHOT_LATENCY_SECONDS.start_timer();
-        
+
         let events = {
             let guard = self.inner.read().await;
             guard.clone()
@@ -1030,21 +1029,22 @@ impl PersistentEventLog {
 
         let snapshot_path = self.data_dir.join("snapshot.bin");
         let temp_path = snapshot_path.with_extension("bin.tmp");
-        
+
         {
             use bincode::Options;
             let file = File::create(&temp_path).context("creating snapshot temp file")?;
             let mut writer = BufWriter::new(file);
             // Use same bincode configuration as recovery (with 16 MiB limit for safety)
             let bopt = bincode::options().with_limit(16 * 1024 * 1024);
-            bopt.serialize_into(&mut writer, &events).context("serializing snapshot")?;
+            bopt.serialize_into(&mut writer, &events)
+                .context("serializing snapshot")?;
             writer.flush().context("flushing snapshot")?;
             writer.get_ref().sync_all().context("syncing snapshot")?;
         }
-        
+
         std::fs::rename(&temp_path, &snapshot_path).context("renaming snapshot")?;
         fsync_dir(&self.data_dir).context("fsync data dir after snapshot")?;
-        
+
         metrics::SNAPSHOTS_TOTAL.inc();
         timer.observe_duration();
         Ok(())
@@ -1056,16 +1056,16 @@ impl PersistentEventLog {
             .ok()
             .and_then(|s| s.parse::<bool>().ok())
             .unwrap_or(false);
-            
+
         if !warmup_enabled {
             return Ok(());
         }
-        
+
         let data_path = self.data_dir.join("snapshot.data");
         if !data_path.exists() {
             return Ok(());
         }
-        
+
         if let Ok(file) = File::open(&data_path) {
             if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
                 if let Some(index_map) = Self::build_snapshot_data_index(&mmap) {
@@ -1074,24 +1074,24 @@ impl PersistentEventLog {
                 }
             }
         }
-        
+
         Ok(())
     }
 
     /// Get memory usage statistics
     pub async fn memory_usage_bytes(&self) -> u64 {
         let mut total = 0u64;
-        
+
         total += self.inner.read().await.len() as u64 * std::mem::size_of::<Event>() as u64;
-        
+
         if let Some(ref mmap) = *self.snapshot_mmap.read().await {
             total += mmap.len() as u64;
         }
-        
+
         if let Some(ref idx) = *self.snapshot_payload_index.read().await {
             total += idx.len() as u64 * std::mem::size_of::<(u64, (usize, usize))>() as u64;
         }
-        
+
         total
     }
 
@@ -1127,13 +1127,14 @@ impl PersistentEventLog {
         let memory_mb = self.memory_usage_bytes().await / (1024 * 1024);
         let records = self.total_records().await;
         let wal_mb = self.wal_size_bytes().await / (1024 * 1024);
-        
+
         serde_json::json!({
             "status": "healthy",
             "memory_mb": memory_mb,
             "records": records,
             "wal_mb": wal_mb,
-        }).to_string()
+        })
+        .to_string()
     }
 
     /// Get database metrics
@@ -1206,7 +1207,6 @@ impl PersistentEventLog {
         Ok(())
     }
 
-
     /// Enable/disable debug mode
     pub async fn debug(&self, _enabled: bool) -> Result<()> {
         Ok(())
@@ -1271,26 +1271,26 @@ impl PersistentEventLog {
         if let index::PrimaryIndex::AdaptiveRmi(adaptive_rmi) = &**current_index {
             // Force merge of hot_buffer and overflow_buffer into snapshot
             adaptive_rmi.sync_snapshot_for_test();
-            
+
             // Also queue a merge to ensure background worker processes everything
             adaptive_rmi.queue_merge(true); // force=true for immediate processing
-            
+
             // Wait for background worker to process (bounded wait with timeout)
             let start = std::time::Instant::now();
             let timeout = std::time::Duration::from_secs(5);
-            
+
             // Poll until buffers are drained or timeout
             while start.elapsed() < timeout {
                 let stats = adaptive_rmi.get_stats();
-                
+
                 if stats.hot_buffer_size == 0 && stats.overflow_size == 0 {
                     break; // All writes processed
                 }
-                
+
                 // Small sleep to avoid busy-waiting
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             }
-            
+
             // Log warning if timeout occurred (non-fatal, allows RMI build to proceed)
             if start.elapsed() >= timeout {
                 eprintln!(
@@ -1299,22 +1299,22 @@ impl PersistentEventLog {
                 );
             }
         }
-        
+
         // Collect key-offset pairs from WAL snapshot
         let pairs = self.collect_key_offset_pairs().await;
-        
+
         // Build new index
         let new_index = if pairs.is_empty() {
             index::PrimaryIndex::new_adaptive_rmi()
         } else {
             index::PrimaryIndex::new_adaptive_rmi_from_pairs(&pairs)
         };
-        
+
         // Atomic swap: Update lock-free atomic first, then RwLock for compatibility
         self.index_atomic.store(Arc::new(new_index.clone()));
         let mut index_guard = self.index.write().await;
         *index_guard = new_index;
-        
+
         Ok(())
     }
 
@@ -1887,14 +1887,13 @@ impl UltraFastBufferPool {
             pool.binary_buffers_large.push(Vec::with_capacity(2048));
         }
 
-        let initial_memory = (800 * 256) + (180 * 1024) + (20 * 4096) +
-            (800 * 64) + (180 * 512) + (20 * 2048);
+        let initial_memory =
+            (800 * 256) + (180 * 1024) + (20 * 4096) + (800 * 64) + (180 * 512) + (20 * 2048);
         pool.current_memory_usage
             .store(initial_memory, Ordering::Relaxed);
 
         pool
     }
-
 
     pub fn get_json_buffer(&self) -> String {
         self.get_json_buffer_sized(BufferSize::Small)

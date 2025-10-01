@@ -1,5 +1,5 @@
 /// Tests for build_rmi() synchronization with background worker
-/// 
+///
 /// These tests verify that build_rmi() correctly waits for the background worker
 /// to process all pending writes before building the RMI index.
 
@@ -13,7 +13,7 @@ mod build_rmi_sync_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_build_rmi_waits_for_pending_writes() -> Result<()> {
         use uuid::Uuid;
-        
+
         let temp_dir = TempDir::new()?;
         let log = PersistentEventLog::open(temp_dir.path()).await?;
 
@@ -47,9 +47,12 @@ mod build_rmi_sync_tests {
         }
 
         println!("Found {}/1000 keys via RMI lookup", found_count);
-        
+
         if !missing_keys.is_empty() {
-            println!("Missing keys: {:?}", &missing_keys[..missing_keys.len().min(10)]);
+            println!(
+                "Missing keys: {:?}",
+                &missing_keys[..missing_keys.len().min(10)]
+            );
         }
 
         assert_eq!(
@@ -66,7 +69,7 @@ mod build_rmi_sync_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_build_rmi_with_large_batch() -> Result<()> {
         use uuid::Uuid;
-        
+
         let temp_dir = TempDir::new()?;
         let log = PersistentEventLog::open(temp_dir.path()).await?;
 
@@ -86,12 +89,15 @@ mod build_rmi_sync_tests {
         let build_start = std::time::Instant::now();
         log.build_rmi().await?;
         let build_duration = build_start.elapsed();
-        
-        println!("Built RMI in {:?} after waiting for background worker", build_duration);
+
+        println!(
+            "Built RMI in {:?} after waiting for background worker",
+            build_duration
+        );
 
         // Verify all keys are visible
         let mut found_count = 0;
-        
+
         for i in 0..10_000 {
             let key = i;
             if log.lookup_key(key).await.is_some() {
@@ -115,7 +121,7 @@ mod build_rmi_sync_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_build_rmi_with_concurrent_writes() -> Result<()> {
         use uuid::Uuid;
-        
+
         let temp_dir = TempDir::new()?;
         let log = PersistentEventLog::open(temp_dir.path()).await?;
 
@@ -123,7 +129,7 @@ mod build_rmi_sync_tests {
 
         // Spawn 10 concurrent writers, each writing 100 keys
         let mut handles = Vec::new();
-        
+
         for worker_id in 0..10 {
             let log_clone = log.clone();
             let handle = tokio::spawn(async move {
@@ -150,7 +156,7 @@ mod build_rmi_sync_tests {
 
         // Verify all 1000 keys are visible
         let mut found_count = 0;
-        
+
         for key in 0..1000 {
             if log.lookup_key(key).await.is_some() {
                 found_count += 1;
@@ -173,7 +179,7 @@ mod build_rmi_sync_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_build_rmi_timeout_is_non_fatal() -> Result<()> {
         use uuid::Uuid;
-        
+
         let temp_dir = TempDir::new()?;
         let log = PersistentEventLog::open(temp_dir.path()).await?;
 
@@ -191,7 +197,7 @@ mod build_rmi_sync_tests {
 
         // Build RMI (even if timeout occurs, should not fail)
         let result = log.build_rmi().await;
-        
+
         assert!(
             result.is_ok(),
             "build_rmi() should succeed even if timeout occurs, but got error: {:?}",

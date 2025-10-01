@@ -10,7 +10,11 @@ use std::sync::Arc;
 #[cfg(feature = "learned-index")]
 async fn test_segment_creation_from_data() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write enough data to create multiple segments (TARGET_SEGMENT_SIZE = 8192)
     for i in 0..25000 {
@@ -25,11 +29,7 @@ async fn test_segment_creation_from_data() {
     // Verify all keys accessible across all segments
     for i in (0..25000).step_by(100) {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-        assert!(
-            value.is_some(),
-            "Multi-segment: key {} not found",
-            i
-        );
+        assert!(value.is_some(), "Multi-segment: key {} not found", i);
     }
 }
 
@@ -37,7 +37,11 @@ async fn test_segment_creation_from_data() {
 #[cfg(feature = "learned-index")]
 async fn test_single_segment_handling() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write less than TARGET_SEGMENT_SIZE
     for i in 0..1000 {
@@ -60,7 +64,11 @@ async fn test_single_segment_handling() {
 #[cfg(feature = "learned-index")]
 async fn test_large_segment_count() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write enough for many segments
     for i in 0..100000 {
@@ -75,11 +83,7 @@ async fn test_large_segment_count() {
     // Verify keys across all segments
     for i in (0..100000).step_by(1000) {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-        assert!(
-            value.is_some(),
-            "Many segments: key {} not found",
-            i
-        );
+        assert!(value.is_some(), "Many segments: key {} not found", i);
     }
 }
 
@@ -87,7 +91,11 @@ async fn test_large_segment_count() {
 #[cfg(feature = "learned-index")]
 async fn test_segment_boundaries_accuracy() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data spanning multiple segments
     for i in 0..30000 {
@@ -102,7 +110,9 @@ async fn test_segment_boundaries_accuracy() {
     // Test keys at likely segment boundaries (multiples of 8192)
     for segment_start in (0..30000).step_by(8192) {
         // Test start of segment
-        let value = lookup_kv(&log, segment_start).await.expect("Failed to lookup");
+        let value = lookup_kv(&log, segment_start)
+            .await
+            .expect("Failed to lookup");
         assert!(
             value.is_some(),
             "Segment boundary: start key {} not found",
@@ -111,7 +121,9 @@ async fn test_segment_boundaries_accuracy() {
 
         // Test near boundary
         if segment_start > 0 {
-            let value = lookup_kv(&log, segment_start - 1).await.expect("Failed to lookup");
+            let value = lookup_kv(&log, segment_start - 1)
+                .await
+                .expect("Failed to lookup");
             assert!(
                 value.is_some(),
                 "Segment boundary: pre-boundary key {} not found",
@@ -125,7 +137,11 @@ async fn test_segment_boundaries_accuracy() {
 #[cfg(feature = "learned-index")]
 async fn test_adaptation_after_updates() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initial data
     for i in 0..5000 {
@@ -145,7 +161,9 @@ async fn test_adaptation_after_updates() {
     }
 
     // Rebuild (should adapt to new distribution)
-    log.build_rmi().await.expect("Failed to rebuild after updates");
+    log.build_rmi()
+        .await
+        .expect("Failed to rebuild after updates");
 
     // Verify all keys accessible with adapted segments
     for i in (0..20000).step_by(100) {
@@ -162,7 +180,11 @@ async fn test_adaptation_after_updates() {
 #[cfg(feature = "learned-index")]
 async fn test_segment_with_skewed_distribution() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Skewed distribution: dense sequential region followed by sparse region WITH OVERLAP
     // Dense region: every key from 0-10000
@@ -199,7 +221,11 @@ async fn test_segment_with_skewed_distribution() {
 #[cfg(feature = "learned-index")]
 async fn test_segment_split_threshold_behavior() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Start with data slightly under segment size
     for i in 0..8000 {
@@ -219,16 +245,14 @@ async fn test_segment_split_threshold_behavior() {
     }
 
     // Rebuild (should create more segments)
-    log.build_rmi().await.expect("Failed to rebuild after split threshold");
+    log.build_rmi()
+        .await
+        .expect("Failed to rebuild after split threshold");
 
     // Verify all keys accessible
     for i in (0..18000).step_by(100) {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-        assert!(
-            value.is_some(),
-            "Split threshold: key {} not found",
-            i
-        );
+        assert!(value.is_some(), "Split threshold: key {} not found", i);
     }
 }
 
@@ -236,7 +260,11 @@ async fn test_segment_split_threshold_behavior() {
 #[cfg(feature = "learned-index")]
 async fn test_model_quality_with_sequential_keys() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Perfect sequential keys (ideal for linear model)
     for i in 0..20000 {
@@ -251,11 +279,7 @@ async fn test_model_quality_with_sequential_keys() {
     // All lookups should be very fast with perfect predictions
     for i in (0..20000).step_by(50) {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-        assert!(
-            value.is_some(),
-            "Sequential model: key {} not found",
-            i
-        );
+        assert!(value.is_some(), "Sequential model: key {} not found", i);
     }
 }
 
@@ -263,18 +287,22 @@ async fn test_model_quality_with_sequential_keys() {
 #[cfg(feature = "learned-index")]
 async fn test_model_quality_with_random_keys() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Random keys (challenging for linear model)
     let mut rng_state = 42u64;
     let mut keys = Vec::new();
-    
+
     for _ in 0..10000 {
         rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
         let key = rng_state % 1000000;
         keys.push(key);
     }
-    
+
     keys.sort_unstable();
     keys.dedup();
 
@@ -290,11 +318,7 @@ async fn test_model_quality_with_random_keys() {
     // Verify all random keys accessible
     for &key in keys.iter().step_by(100) {
         let value = lookup_kv(&log, key).await.expect("Failed to lookup");
-        assert!(
-            value.is_some(),
-            "Random model: key {} not found",
-            key
-        );
+        assert!(value.is_some(), "Random model: key {} not found", key);
     }
 }
 
@@ -302,7 +326,11 @@ async fn test_model_quality_with_random_keys() {
 #[cfg(feature = "learned-index")]
 async fn test_segment_with_power_of_two_keys() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Sequential keys as primary data (ensures enough density)
     for i in 0..5000 {
@@ -340,11 +368,7 @@ async fn test_segment_with_power_of_two_keys() {
         let key = 2u64.pow(i);
         if key < 5000 {
             let value = lookup_kv(&log, key).await.expect("Failed to lookup");
-            assert!(
-                value.is_some(),
-                "Power of 2: key {} not found",
-                key
-            );
+            assert!(value.is_some(), "Power of 2: key {} not found", key);
         }
     }
 }

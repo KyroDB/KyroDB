@@ -4,13 +4,15 @@
 
 use crate::test::utils::*;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
 use tokio::task::JoinSet;
+use tokio::time::{sleep, Duration};
 
 #[tokio::test]
 async fn test_basic_snapshot_creation() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write some data
     for i in 0..100 {
@@ -37,7 +39,9 @@ async fn test_basic_snapshot_creation() {
 #[tokio::test]
 async fn test_snapshot_atomicity() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write data
     for i in 0..100 {
@@ -61,29 +65,35 @@ async fn test_snapshot_atomicity() {
 
     // Verify final snapshot exists
     let snapshot_path = data_dir.path().join("snapshot.bin");
-    assert!(
-        snapshot_path.exists(),
-        "Final snapshot file should exist"
-    );
+    assert!(snapshot_path.exists(), "Final snapshot file should exist");
 }
 
 #[tokio::test]
 async fn test_snapshot_with_empty_database() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Create snapshot on empty database
-    log.snapshot().await.expect("Failed to create snapshot on empty database");
+    log.snapshot()
+        .await
+        .expect("Failed to create snapshot on empty database");
 
     // Verify snapshot file exists
     let snapshot_path = data_dir.path().join("snapshot.bin");
-    assert!(snapshot_path.exists(), "Snapshot should be created even for empty database");
+    assert!(
+        snapshot_path.exists(),
+        "Snapshot should be created even for empty database"
+    );
 }
 
 #[tokio::test]
 async fn test_multiple_snapshots_overwrite() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // First snapshot with 50 keys
     for i in 0..50 {
@@ -92,7 +102,9 @@ async fn test_multiple_snapshots_overwrite() {
             .expect("Failed to append");
     }
     sync_index_after_writes(&log);
-    log.snapshot().await.expect("Failed to create first snapshot");
+    log.snapshot()
+        .await
+        .expect("Failed to create first snapshot");
 
     let snapshot_path = data_dir.path().join("snapshot.bin");
     let size1 = std::fs::metadata(&snapshot_path)
@@ -110,7 +122,9 @@ async fn test_multiple_snapshots_overwrite() {
     sync_index_after_writes(&log);
 
     // Second snapshot should overwrite
-    log.snapshot().await.expect("Failed to create second snapshot");
+    log.snapshot()
+        .await
+        .expect("Failed to create second snapshot");
 
     let size2 = std::fs::metadata(&snapshot_path)
         .expect("Failed to read snapshot 2")
@@ -128,7 +142,9 @@ async fn test_multiple_snapshots_overwrite() {
 #[tokio::test]
 async fn test_snapshot_with_large_dataset() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write 10K keys
     for i in 0..10_000 {
@@ -142,7 +158,9 @@ async fn test_snapshot_with_large_dataset() {
     sync_index_after_writes(&log);
 
     // Create snapshot
-    log.snapshot().await.expect("Failed to create snapshot with large dataset");
+    log.snapshot()
+        .await
+        .expect("Failed to create snapshot with large dataset");
 
     // Verify snapshot exists and has substantial size
     let snapshot_path = data_dir.path().join("snapshot.bin");
@@ -157,7 +175,11 @@ async fn test_snapshot_with_large_dataset() {
 #[tokio::test]
 async fn test_snapshot_during_writes() {
     let data_dir = test_data_dir();
-    let log = Arc::new(open_test_log(data_dir.path()).await.expect("Failed to create log"));
+    let log = Arc::new(
+        open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log"),
+    );
 
     let mut tasks = JoinSet::new();
 
@@ -179,7 +201,10 @@ async fn test_snapshot_during_writes() {
         sleep(Duration::from_millis(50)).await;
         // Sync before snapshot to capture existing data
         sync_index_after_writes(&log_snapshot);
-        log_snapshot.snapshot().await.expect("Snapshot failed during writes");
+        log_snapshot
+            .snapshot()
+            .await
+            .expect("Snapshot failed during writes");
     });
 
     // Wait for both tasks
@@ -187,13 +212,18 @@ async fn test_snapshot_during_writes() {
 
     // Verify snapshot was created successfully
     let snapshot_path = data_dir.path().join("snapshot.bin");
-    assert!(snapshot_path.exists(), "Snapshot should exist after concurrent writes");
+    assert!(
+        snapshot_path.exists(),
+        "Snapshot should exist after concurrent writes"
+    );
 }
 
 #[tokio::test]
 async fn test_snapshot_idempotency() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write data
     for i in 0..100 {
@@ -237,7 +267,9 @@ async fn test_snapshot_idempotency() {
 #[tokio::test]
 async fn test_snapshot_preserves_all_data() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     let test_data: Vec<(u64, Vec<u8>)> = (0..500)
         .map(|i| (i, format!("test_value_{}", i).as_bytes().to_vec()))
@@ -273,7 +305,9 @@ async fn test_snapshot_preserves_all_data() {
 #[tokio::test]
 async fn test_snapshot_with_updates() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write initial values
     for i in 0..100 {
@@ -328,7 +362,9 @@ async fn test_snapshot_with_updates() {
 #[tokio::test]
 async fn test_snapshot_fsync_durability() {
     let data_dir = test_data_dir();
-    let log = open_test_log(data_dir.path()).await.expect("Failed to create log");
+    let log = open_test_log(data_dir.path())
+        .await
+        .expect("Failed to create log");
 
     // Write data
     for i in 0..100 {
@@ -347,13 +383,20 @@ async fn test_snapshot_fsync_durability() {
     // (We can't easily test actual durability, but we can verify the file is written and flushed)
     let snapshot_path = data_dir.path().join("snapshot.bin");
     let metadata = std::fs::metadata(&snapshot_path).expect("Snapshot file should exist");
-    assert!(metadata.len() > 0, "Snapshot should have content after fsync");
+    assert!(
+        metadata.len() > 0,
+        "Snapshot should have content after fsync"
+    );
 }
 
 #[tokio::test]
 async fn test_concurrent_snapshot_requests() {
     let data_dir = test_data_dir();
-    let log = Arc::new(open_test_log(data_dir.path()).await.expect("Failed to create log"));
+    let log = Arc::new(
+        open_test_log(data_dir.path())
+            .await
+            .expect("Failed to create log"),
+    );
 
     // Write data
     for i in 0..1000 {
@@ -369,9 +412,7 @@ async fn test_concurrent_snapshot_requests() {
     let mut tasks = JoinSet::new();
     for _ in 0..5 {
         let log_clone = log.clone();
-        tasks.spawn(async move {
-            log_clone.snapshot().await
-        });
+        tasks.spawn(async move { log_clone.snapshot().await });
     }
 
     // All should succeed (or at least not corrupt the snapshot)
@@ -382,10 +423,7 @@ async fn test_concurrent_snapshot_requests() {
         }
     }
 
-    assert!(
-        success_count > 0,
-        "At least one snapshot should succeed"
-    );
+    assert!(success_count > 0, "At least one snapshot should succeed");
 
     // Verify final snapshot is valid
     let snapshot_path = data_dir.path().join("snapshot.bin");

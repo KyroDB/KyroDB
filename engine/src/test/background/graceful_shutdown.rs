@@ -46,7 +46,7 @@ async fn test_pending_group_commit_flushed() {
     // NOTE: This test is renamed but we keep the group commit test for future implementation
     std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0"); // Disabled for now
-    
+
     let data_dir = utils::temp_data_dir("sync_flush");
     let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
 
@@ -67,13 +67,13 @@ async fn test_pending_group_commit_flushed() {
 
     // Drop and reopen
     std::mem::drop(log.clone());
-    
+
     let reopened = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
-    
+
     // ✅ Build RMI after reopening
     #[cfg(feature = "learned-index")]
     reopened.build_rmi().await.ok();
-    
+
     for i in 0..20 {
         let value = lookup_kv(&reopened, i).await.unwrap();
         assert!(value.is_some(), "Data should persist after fsync");
@@ -87,7 +87,7 @@ async fn test_concurrent_operations_complete_before_shutdown() {
     // Test that concurrent operations complete gracefully
     std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-    
+
     let data_dir = utils::temp_data_dir("concurrent_ops");
     let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
 
@@ -127,7 +127,7 @@ async fn test_wal_integrity_after_clean_shutdown() {
     // Test WAL integrity after clean shutdown
     std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-    
+
     let data_dir = utils::temp_data_dir("wal_integrity");
     let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
 
@@ -156,7 +156,7 @@ async fn test_snapshot_persisted_on_shutdown() {
     // Test that snapshot persists through shutdown
     std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-    
+
     let data_dir = utils::temp_data_dir("snapshot_persist");
     let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
 
@@ -167,7 +167,7 @@ async fn test_snapshot_persisted_on_shutdown() {
 
     // Create snapshot
     log.snapshot().await.unwrap();
-    
+
     // Give time for snapshot to fully flush
     sleep(Duration::from_millis(10)).await;
 
@@ -177,7 +177,7 @@ async fn test_snapshot_persisted_on_shutdown() {
 
     // Shutdown and reopen
     std::mem::drop(log.clone());
-    
+
     let reopened = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
 
     // Verify data from snapshot
@@ -194,26 +194,26 @@ async fn test_no_corruption_on_rapid_shutdown() {
     // Test repeated open/close cycles don't corrupt data
     std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-    
+
     let data_dir = utils::temp_data_dir("rapid_shutdown");
 
     // Do rapid open/write/close cycles
     for iteration in 0..10 {
         let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
-        
+
         // Write some data
         for i in 0..5 {
             let key = iteration * 10 + i;
             append_kv(&log, key, vec![key as u8; 50]).await.unwrap();
         }
-        
+
         // Drop immediately
         std::mem::drop(log);
     }
 
     // Final open to verify all data persisted
     let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
-    
+
     for iteration in 0..10 {
         for i in 0..5 {
             let key = iteration * 10 + i;
@@ -236,7 +236,7 @@ async fn test_background_tasks_terminate_cleanly() {
     std::env::set_var("KYRODB_BACKGROUND_FSYNC_INTERVAL_MS", "5");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "1");
     std::env::set_var("KYRODB_GROUP_COMMIT_DELAY_MICROS", "5000");
-    
+
     let data_dir = utils::temp_data_dir("background_terminate");
     let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
 
@@ -261,7 +261,7 @@ async fn test_fsync_completes_before_drop() {
     std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_async");
     std::env::set_var("KYRODB_BACKGROUND_FSYNC_INTERVAL_MS", "10");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-    
+
     let data_dir = utils::temp_data_dir("fsync_before_drop");
     let log = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
 
@@ -275,7 +275,7 @@ async fn test_fsync_completes_before_drop() {
 
     // Drop and reopen
     std::mem::drop(log.clone());
-    
+
     let reopened = Arc::new(PersistentEventLog::open(data_dir.clone()).await.unwrap());
 
     // Verify data persisted
@@ -292,10 +292,10 @@ async fn test_multiple_databases_shutdown_independently() {
     // Test multiple DB instances shut down independently
     std::env::set_var("KYRODB_DURABILITY_LEVEL", "enterprise_safe");
     std::env::set_var("KYRODB_GROUP_COMMIT_ENABLED", "0");
-    
+
     let data_dir1 = utils::temp_data_dir("multi_db1");
     let data_dir2 = utils::temp_data_dir("multi_db2");
-    
+
     let log1 = Arc::new(PersistentEventLog::open(data_dir1.clone()).await.unwrap());
     let log2 = Arc::new(PersistentEventLog::open(data_dir2.clone()).await.unwrap());
 
@@ -326,11 +326,11 @@ async fn test_multiple_databases_shutdown_independently() {
 
     // Verify first DB persisted
     let log1_reopened = Arc::new(PersistentEventLog::open(data_dir1.clone()).await.unwrap());
-    
+
     // ✅ Build RMI after reopening
     #[cfg(feature = "learned-index")]
     log1_reopened.build_rmi().await.ok();
-    
+
     for i in 0..50 {
         let value = lookup_kv(&log1_reopened, i).await.unwrap();
         assert!(value.is_some(), "DB1 data should persist");

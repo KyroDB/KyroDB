@@ -10,7 +10,11 @@ use tokio::task::JoinSet;
 #[tokio::test]
 async fn test_cache_invalidation_on_update() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write initial value
     append_kv(&log, 42, b"initial".to_vec())
@@ -36,13 +40,21 @@ async fn test_cache_invalidation_on_update() {
 
     // Read and verify cache shows updated value
     let value2 = lookup_kv(&log, 42).await.expect("Failed to lookup");
-    assert_eq!(value2.unwrap(), b"updated", "Cache not invalidated on update");
+    assert_eq!(
+        value2.unwrap(),
+        b"updated",
+        "Cache not invalidated on update"
+    );
 }
 
 #[tokio::test]
 async fn test_concurrent_cache_updates() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initialize keys
     for i in 0..100 {
@@ -85,13 +97,21 @@ async fn test_concurrent_cache_updates() {
 #[tokio::test]
 async fn test_cache_coherency_across_snapshots() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data before snapshot
     for i in 0..500 {
-        append_kv(&log, i, format!("before_snapshot_{}", i).as_bytes().to_vec())
-            .await
-            .expect("Failed to append");
+        append_kv(
+            &log,
+            i,
+            format!("before_snapshot_{}", i).as_bytes().to_vec(),
+        )
+        .await
+        .expect("Failed to append");
     }
 
     // Build RMI
@@ -137,14 +157,22 @@ async fn test_cache_coherency_across_snapshots() {
 #[tokio::test]
 async fn test_hot_buffer_cache_coherency() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write hot keys
     let hot_keys = vec![10, 20, 30, 40, 50];
     for &key in &hot_keys {
-        append_kv(&log, key, format!("hot_initial_{}", key).as_bytes().to_vec())
-            .await
-            .expect("Failed to append");
+        append_kv(
+            &log,
+            key,
+            format!("hot_initial_{}", key).as_bytes().to_vec(),
+        )
+        .await
+        .expect("Failed to append");
     }
 
     // Build RMI
@@ -160,9 +188,13 @@ async fn test_hot_buffer_cache_coherency() {
 
     // Update hot keys
     for &key in &hot_keys {
-        append_kv(&log, key, format!("hot_updated_{}", key).as_bytes().to_vec())
-            .await
-            .expect("Failed to append");
+        append_kv(
+            &log,
+            key,
+            format!("hot_updated_{}", key).as_bytes().to_vec(),
+        )
+        .await
+        .expect("Failed to append");
     }
 
     // Rebuild RMI
@@ -185,7 +217,11 @@ async fn test_hot_buffer_cache_coherency() {
 #[tokio::test]
 async fn test_cache_eviction_coherency() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Fill cache with enough data to trigger eviction
     for i in 0..5000 {
@@ -231,7 +267,11 @@ async fn test_cache_eviction_coherency() {
 #[tokio::test]
 async fn test_read_your_own_writes() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write-read-write-read pattern
     for i in 0..100 {
@@ -274,7 +314,11 @@ async fn test_read_your_own_writes() {
 #[tokio::test]
 async fn test_cache_consistency_under_load() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initialize dataset
     for i in 0..1000 {
@@ -295,14 +339,16 @@ async fn test_cache_consistency_under_load() {
         tasks.spawn(async move {
             for iter in 0..50 {
                 let key = (thread_id * 20 + iter) % 1000;
-                
+
                 // Read
                 let _ = lookup_kv(&log_clone, key).await;
-                
+
                 // Write
-                let value = format!("t{}_i{}_k{}", thread_id, iter, key).as_bytes().to_vec();
+                let value = format!("t{}_i{}_k{}", thread_id, iter, key)
+                    .as_bytes()
+                    .to_vec();
                 let _ = append_kv(&log_clone, key, value).await;
-                
+
                 // Read again
                 let _ = lookup_kv(&log_clone, key).await;
             }
@@ -325,7 +371,11 @@ async fn test_cache_consistency_under_load() {
 #[tokio::test]
 async fn test_cache_after_rmi_rebuild() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initial data
     for i in 0..500 {

@@ -9,9 +9,9 @@
 //! - Recovery after failures
 
 pub mod concurrent_operations;
-pub mod large_dataset;
-pub mod memory_pressure;
-pub mod lock_contention;
-pub mod rmi_stress;
-pub mod recovery_stress;
 pub mod endurance;
+pub mod large_dataset;
+pub mod lock_contention;
+pub mod memory_pressure;
+pub mod recovery_stress;
+pub mod rmi_stress;

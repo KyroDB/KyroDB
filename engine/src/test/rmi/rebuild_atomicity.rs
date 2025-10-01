@@ -12,7 +12,11 @@ use tokio::time::sleep;
 #[cfg(feature = "learned-index")]
 async fn test_zero_lock_reads_during_rebuild() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write initial data
     for i in 0..5000 {
@@ -30,7 +34,11 @@ async fn test_zero_lock_reads_during_rebuild() {
         for _ in 0..100 {
             for i in (0..5000).step_by(50) {
                 let value = lookup_kv(&log_clone, i).await.expect("Failed to lookup");
-                assert!(value.is_some(), "Read blocked during rebuild: key {} not found", i);
+                assert!(
+                    value.is_some(),
+                    "Read blocked during rebuild: key {} not found",
+                    i
+                );
             }
             sleep(Duration::from_micros(100)).await;
         }
@@ -39,12 +47,16 @@ async fn test_zero_lock_reads_during_rebuild() {
     // Add more data and rebuild multiple times
     for round in 0..5 {
         sleep(Duration::from_millis(10)).await;
-        
+
         for i in 0..100 {
             let key = 5000 + round * 100 + i;
-            append_kv(&log, key, format!("round_{}_{}", round, i).as_bytes().to_vec())
-                .await
-                .expect("Failed to append");
+            append_kv(
+                &log,
+                key,
+                format!("round_{}_{}", round, i).as_bytes().to_vec(),
+            )
+            .await
+            .expect("Failed to append");
         }
 
         // Rebuild (should not block readers)
@@ -52,14 +64,20 @@ async fn test_zero_lock_reads_during_rebuild() {
     }
 
     // Wait for readers to complete
-    reader_handle.await.expect("Reader thread failed (likely blocked)");
+    reader_handle
+        .await
+        .expect("Reader thread failed (likely blocked)");
 }
 
 #[tokio::test]
 #[cfg(feature = "learned-index")]
 async fn test_atomic_index_swap() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data
     for i in 0..3000 {
@@ -84,7 +102,11 @@ async fn test_atomic_index_swap() {
     // Verify all keys accessible after swap
     for i in (0..6000).step_by(50) {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
-        assert!(value.is_some(), "Atomic swap: key {} not found after swap", i);
+        assert!(
+            value.is_some(),
+            "Atomic swap: key {} not found after swap",
+            i
+        );
     }
 }
 
@@ -92,7 +114,11 @@ async fn test_atomic_index_swap() {
 #[cfg(feature = "learned-index")]
 async fn test_consistency_during_rebuild() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data
     for i in 0..8000 {
@@ -125,7 +151,9 @@ async fn test_consistency_during_rebuild() {
 
     // Rebuild while readers are active
     sleep(Duration::from_millis(5)).await;
-    log.build_rmi().await.expect("Failed to rebuild during concurrent reads");
+    log.build_rmi()
+        .await
+        .expect("Failed to rebuild during concurrent reads");
 
     // Wait for all readers
     for handle in handles {
@@ -137,7 +165,11 @@ async fn test_consistency_during_rebuild() {
 #[cfg(feature = "learned-index")]
 async fn test_no_stale_reads_after_swap() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initial data
     for i in 0..2000 {
@@ -176,7 +208,11 @@ async fn test_no_stale_reads_after_swap() {
 #[cfg(feature = "learned-index")]
 async fn test_multiple_rebuild_cycles() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initial data
     for i in 0..1000 {
@@ -188,7 +224,9 @@ async fn test_multiple_rebuild_cycles() {
     // Multiple rebuild cycles
     for cycle in 0..10 {
         // Build RMI
-        log.build_rmi().await.expect(&format!("Failed to build RMI cycle {}", cycle));
+        log.build_rmi()
+            .await
+            .expect(&format!("Failed to build RMI cycle {}", cycle));
 
         // Verify existing keys
         for i in (0..1000).step_by(100) {
@@ -199,15 +237,19 @@ async fn test_multiple_rebuild_cycles() {
         // Add more data for next cycle
         for i in 0..200 {
             let key = 1000 + cycle * 200 + i;
-            append_kv(&log, key, format!("cycle_{}_{}", cycle + 1, key).as_bytes().to_vec())
-                .await
-                .expect("Failed to append");
+            append_kv(
+                &log,
+                key,
+                format!("cycle_{}_{}", cycle + 1, key).as_bytes().to_vec(),
+            )
+            .await
+            .expect("Failed to append");
         }
     }
 
     // Final verification
     log.build_rmi().await.expect("Failed to final build");
-    
+
     for i in (0..1000).step_by(50) {
         let value = lookup_kv(&log, i).await.expect("Failed to lookup");
         assert!(value.is_some(), "Final cycle: key {} not found", i);
@@ -218,7 +260,11 @@ async fn test_multiple_rebuild_cycles() {
 #[cfg(feature = "learned-index")]
 async fn test_concurrent_reads_during_rebuild() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data
     for i in 0..10000 {
@@ -252,7 +298,9 @@ async fn test_concurrent_reads_during_rebuild() {
 
     // Rebuild while readers are active
     sleep(Duration::from_millis(10)).await;
-    log.build_rmi().await.expect("Failed to rebuild during concurrent reads");
+    log.build_rmi()
+        .await
+        .expect("Failed to rebuild during concurrent reads");
 
     // All readers should complete without blocking
     for (i, handle) in handles.into_iter().enumerate() {
@@ -264,7 +312,11 @@ async fn test_concurrent_reads_during_rebuild() {
 #[cfg(feature = "learned-index")]
 async fn test_rebuild_after_large_insertions() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Small initial dataset
     for i in 0..500 {
@@ -284,7 +336,9 @@ async fn test_rebuild_after_large_insertions() {
     }
 
     // Rebuild after large growth
-    log.build_rmi().await.expect("Failed to rebuild after large insertion");
+    log.build_rmi()
+        .await
+        .expect("Failed to rebuild after large insertion");
 
     // Verify all keys accessible
     for i in (0..15000).step_by(100) {
@@ -301,7 +355,11 @@ async fn test_rebuild_after_large_insertions() {
 #[cfg(feature = "learned-index")]
 async fn test_rebuild_with_sparse_updates() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Initial dense data
     for i in 0..5000 {
@@ -322,7 +380,9 @@ async fn test_rebuild_with_sparse_updates() {
     }
 
     // Rebuild
-    log.build_rmi().await.expect("Failed to rebuild after sparse updates");
+    log.build_rmi()
+        .await
+        .expect("Failed to rebuild after sparse updates");
 
     // Verify updated keys
     for i in (0..100).step_by(5) {
@@ -342,7 +402,11 @@ async fn test_rebuild_with_sparse_updates() {
 #[cfg(feature = "learned-index")]
 async fn test_atomicity_guarantees() {
     let data_dir = test_data_dir();
-    let log = Arc::new(PersistentEventLog::open(data_dir.path().to_path_buf()).await.unwrap());
+    let log = Arc::new(
+        PersistentEventLog::open(data_dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
 
     // Write data
     for i in 0..4000 {
@@ -361,27 +425,27 @@ async fn test_atomicity_guarantees() {
             // Either all old keys or all old+new keys, never partial
             let has_3999 = lookup_kv(&log_clone, 3999).await.unwrap().is_some();
             let has_4000 = lookup_kv(&log_clone, 4000).await.unwrap().is_some();
-            
+
             if has_4000 {
                 assert!(
                     has_3999,
                     "Atomicity violation: saw new key but not old keys"
                 );
             }
-            
+
             sleep(Duration::from_micros(100)).await;
         }
     });
 
     // Add new keys and rebuild
     sleep(Duration::from_millis(5)).await;
-    
+
     for i in 4000..5000 {
         append_kv(&log, i, format!("atomic_{}", i).as_bytes().to_vec())
             .await
             .expect("Failed to append");
     }
-    
+
     log.build_rmi().await.expect("Failed to rebuild");
 
     reader.await.expect("Reader detected atomicity violation");
