@@ -1696,10 +1696,11 @@ impl ImmutableIndexSnapshot {
         None
     }
     
-    ///  **ZERO-LOCK BATCH LOOKUP** - Vectorized pure computation
+    ///  **ZERO-LOCK BATCH LOOKUP** - Vectorized pure computation with SIMD
     #[inline]
     pub fn lookup_batch_zero_lock(&self, keys: &[u64]) -> Vec<Option<u64>> {
-        keys.iter().map(|&key| self.lookup_zero_lock(key)).collect()
+        // For batch operations, use the optimized SIMD path
+        self.lookup_keys_simd_batch(keys)
     }
     
     /// Get snapshot statistics
@@ -3214,11 +3215,21 @@ impl AdaptiveRMI {
             }
         }
         
-        // Phase 1: Snapshot lookup for remaining keys
+        // Phase 1: Snapshot lookup for remaining keys using SIMD
         if !need_snapshot_lookup.is_empty() {
             let snapshot = self.zero_lock_snapshot.load();
-            for (idx, key) in need_snapshot_lookup {
-                results[idx] = Self::lookup_zero_alloc_inline(&snapshot, key);
+            
+            // Extract just the keys for SIMD batch processing
+            let keys_to_lookup: Vec<u64> = need_snapshot_lookup.iter()
+                .map(|(_, key)| *key)
+                .collect();
+            
+            // Use SIMD batch lookup
+            let batch_results = Self::simd_batch_zero_alloc(&snapshot, &keys_to_lookup);
+            
+            // Place results back into correct positions
+            for (i, (idx, _)) in need_snapshot_lookup.iter().enumerate() {
+                results[*idx] = batch_results[i];
             }
         }
         
