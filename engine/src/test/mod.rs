@@ -23,5 +23,6 @@ pub mod wal;
 pub mod snapshot;
 pub mod background;
 pub mod background_worker_test;  // Tests for zero-lock background worker
+pub mod build_rmi_sync_test;     // Tests for build_rmi() synchronization with background worker
 pub mod integration;
 pub mod stress;

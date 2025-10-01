@@ -1265,6 +1265,42 @@ impl PersistentEventLog {
     /// Build RMI index
     #[cfg(feature = "learned-index")]
     pub async fn build_rmi(&self) -> Result<()> {
+        // CRITICAL: Force synchronization of pending writes in current RMI (if exists)
+        // This ensures all writes are visible in zero_lock_snapshot before we collect pairs
+        let current_index = self.index_atomic.load();
+        if let index::PrimaryIndex::AdaptiveRmi(adaptive_rmi) = &**current_index {
+            // Force merge of hot_buffer and overflow_buffer into snapshot
+            adaptive_rmi.sync_snapshot_for_test();
+            
+            // Also queue a merge to ensure background worker processes everything
+            adaptive_rmi.queue_merge(true); // force=true for immediate processing
+            
+            // Wait for background worker to process (bounded wait with timeout)
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(5);
+            
+            // Poll until buffers are drained or timeout
+            while start.elapsed() < timeout {
+                let stats = adaptive_rmi.get_stats();
+                
+                if stats.hot_buffer_size == 0 && stats.overflow_size == 0 {
+                    break; // All writes processed
+                }
+                
+                // Small sleep to avoid busy-waiting
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+            
+            // Log warning if timeout occurred (non-fatal, allows RMI build to proceed)
+            if start.elapsed() >= timeout {
+                eprintln!(
+                    "WARNING: build_rmi() timed out waiting for buffer flush after {:?}. Proceeding with available data.",
+                    start.elapsed()
+                );
+            }
+        }
+        
+        // Collect key-offset pairs from WAL snapshot
         let pairs = self.collect_key_offset_pairs().await;
         
         // Build new index
