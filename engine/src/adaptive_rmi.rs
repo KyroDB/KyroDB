@@ -24,8 +24,7 @@ use tokio::sync::Notify;
 // Architecture-specific SIMD imports with proper conditional compilation
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use std::arch::x86_64::{
-    __m256i, _mm256_castsi256_si128, _mm256_cmpeq_epi64, _mm256_cvtepi32_epi64,
-    _mm256_extract_epi64, _mm256_extracti128_si256, _mm256_i64gather_epi32, _mm256_loadu_si256,
+    __m256i, _mm256_cmpeq_epi64, _mm256_extract_epi64, _mm256_loadu_si256,
     _mm256_min_epi64, _mm256_movemask_epi8, _mm256_set1_epi64x, _mm256_set_epi64x,
     _mm256_srlv_epi64,
 };
@@ -4318,7 +4317,7 @@ unsafe fn simd_neon_zero_lock_batch(
         for chunk in missing_keys.chunks(4) {
             if chunk.len() >= 4 && overflow_snapshot.len() >= 4 {
                 // Load 4 search keys into SIMD register
-                let search_keys = _mm256_set_epi64x(
+                let _search_keys = _mm256_set_epi64x(
                     if chunk.len() > 3 {
                         chunk[3].1 as i64
                     } else {
@@ -4360,7 +4359,7 @@ unsafe fn simd_neon_zero_lock_batch(
                         );
 
                         // Compare all 4 search keys against all 4 buffer keys
-                        for (j, &(search_idx, search_key)) in chunk.iter().enumerate() {
+                        for (_j, &(search_idx, search_key)) in chunk.iter().enumerate() {
                             let search_vec = _mm256_set1_epi64x(search_key as i64);
                             let matches = _mm256_cmpeq_epi64(search_vec, buffer_keys);
                             let mask = _mm256_movemask_epi8(matches);
@@ -4594,43 +4593,31 @@ unsafe fn simd_neon_zero_lock_batch(
         let clamped_lo = _mm256_min_epi64(prefixes_lo, max_index);
         let clamped_hi = _mm256_min_epi64(prefixes_hi, max_index);
 
-        // FULLY VECTORIZED GATHER: Use AVX2 gather for true vectorized lookup
-        // This replaces 8 scalar memory accesses with 2 vectorized gather operations
-        let router_ptr = router.router.as_ptr() as *const i32;
-
-        // Convert to i32 indices for gather
-        let indices_lo_i32 = _mm256_cvtepi64_epi32(clamped_lo);
-        let indices_hi_i32 = _mm256_cvtepi64_epi32(clamped_hi);
-
-        // Vectorized gather: Load router values for all indices at once
-        let gathered_lo = _mm256_i32gather_epi32(router_ptr, indices_lo_i32, 4);
-        let gathered_hi = _mm256_i32gather_epi32(router_ptr, indices_hi_i32, 4);
-
-        // Extract gathered i32 values to usize segment IDs
-        let lo_array = [
-            _mm256_extract_epi32(gathered_lo, 0) as usize,
-            _mm256_extract_epi32(gathered_lo, 1) as usize,
-            _mm256_extract_epi32(gathered_lo, 2) as usize,
-            _mm256_extract_epi32(gathered_lo, 3) as usize,
+        // Extract indices and perform router lookup
+        // Manual extraction is fast - happens in registers, not memory
+        // This approach avoids missing AVX2 intrinsics that aren't available in stable Rust
+        let indices = [
+            (_mm256_extract_epi64(clamped_lo, 0) as usize).min(router.router.len() - 1),
+            (_mm256_extract_epi64(clamped_lo, 1) as usize).min(router.router.len() - 1),
+            (_mm256_extract_epi64(clamped_lo, 2) as usize).min(router.router.len() - 1),
+            (_mm256_extract_epi64(clamped_lo, 3) as usize).min(router.router.len() - 1),
+            (_mm256_extract_epi64(clamped_hi, 0) as usize).min(router.router.len() - 1),
+            (_mm256_extract_epi64(clamped_hi, 1) as usize).min(router.router.len() - 1),
+            (_mm256_extract_epi64(clamped_hi, 2) as usize).min(router.router.len() - 1),
+            (_mm256_extract_epi64(clamped_hi, 3) as usize).min(router.router.len() - 1),
         ];
 
-        let hi_array = [
-            _mm256_extract_epi32(gathered_hi, 0) as usize,
-            _mm256_extract_epi32(gathered_hi, 1) as usize,
-            _mm256_extract_epi32(gathered_hi, 2) as usize,
-            _mm256_extract_epi32(gathered_hi, 3) as usize,
-        ];
-
-        // Return final results
+        // Scalar router lookups (fast - array access is ~2-3 cycles)
+        // The router array is typically in L1 cache, making these lookups very cheap
         [
-            lo_array[0],
-            lo_array[1],
-            lo_array[2],
-            lo_array[3],
-            hi_array[0],
-            hi_array[1],
-            hi_array[2],
-            hi_array[3],
+            router.router[indices[0]] as usize,
+            router.router[indices[1]] as usize,
+            router.router[indices[2]] as usize,
+            router.router[indices[3]] as usize,
+            router.router[indices[4]] as usize,
+            router.router[indices[5]] as usize,
+            router.router[indices[6]] as usize,
+            router.router[indices[7]] as usize,
         ]
     }
 
