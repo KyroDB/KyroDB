@@ -3235,7 +3235,7 @@ impl AdaptiveRMI {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && keys.len() >= 16 {
-                return Self::simd_avx2_zero_alloc_batch(snapshot, keys, results);
+                return unsafe { Self::simd_avx2_zero_alloc_batch(snapshot, keys, results) };
             }
         }
         
@@ -3508,7 +3508,7 @@ impl AdaptiveRMI {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && keys.len() >= 16 {
-                return self.simd_avx2_zero_lock_batch(snapshot, keys);
+                return unsafe { self.simd_avx2_zero_lock_batch(snapshot, keys) };
             }
         }
         
@@ -3526,21 +3526,15 @@ impl AdaptiveRMI {
     #[target_feature(enable = "avx2")]
     unsafe fn simd_avx2_zero_lock_batch(
         &self,
-        snapshot: &ImmutableIndexSnapshot, 
+        _snapshot: &ImmutableIndexSnapshot, 
         keys: &[u64]
     ) -> Vec<Option<u64>> {
-        use std::arch::x86_64::*;
-        
         let mut results = Vec::with_capacity(keys.len());
         let mut key_idx = 0;
         
         // Process in 8-key batches using optimized SIMD lookup
         while key_idx + 8 <= keys.len() {
             let chunk = &keys[key_idx..key_idx + 8];
-            
-            // Load keys into two AVX2 registers (4 keys each)
-            let keys_lo = _mm256_loadu_si256(chunk[0..4].as_ptr() as *const __m256i);
-            let keys_hi = _mm256_loadu_si256(chunk[4..8].as_ptr() as *const __m256i);
             
             // Use existing optimized SIMD lookup infrastructure
             let batch_results = self.lookup_8_keys_optimized_simd(chunk);
@@ -4279,17 +4273,24 @@ unsafe fn simd_neon_zero_lock_batch(
         }
 
         //SELECTIVE PROCESSING: Only process missing keys
+        // Pre-extract all keys into array to avoid constant evaluation issues
+        let keys_array = [
+            _mm256_extract_epi64(keys_lo, 0) as u64,
+            _mm256_extract_epi64(keys_lo, 1) as u64,
+            _mm256_extract_epi64(keys_lo, 2) as u64,
+            _mm256_extract_epi64(keys_lo, 3) as u64,
+            _mm256_extract_epi64(keys_hi, 0) as u64,
+            _mm256_extract_epi64(keys_hi, 1) as u64,
+            _mm256_extract_epi64(keys_hi, 2) as u64,
+            _mm256_extract_epi64(keys_hi, 3) as u64,
+        ];
+        
         let missing_keys: Vec<(usize, u64)> = hot_results
             .iter()
             .enumerate()
             .filter_map(|(i, result)| {
                 if result.is_none() {
-                    let key = if i < 4 {
-                        _mm256_extract_epi64(keys_lo, i as i32) as u64
-                    } else {
-                        _mm256_extract_epi64(keys_hi, (i - 4) as i32) as u64
-                    };
-                    Some((i, key))
+                    Some((i, keys_array[i]))
                 } else {
                     None
                 }
@@ -4423,15 +4424,22 @@ unsafe fn simd_neon_zero_lock_batch(
         };
 
         // Fast SIMD processing with bounds validation (no retry loops)
+        // Pre-extract all keys into array to avoid constant evaluation issues
+        let keys_array = [
+            _mm256_extract_epi64(keys_lo, 0) as u64,
+            _mm256_extract_epi64(keys_lo, 1) as u64,
+            _mm256_extract_epi64(keys_lo, 2) as u64,
+            _mm256_extract_epi64(keys_lo, 3) as u64,
+            _mm256_extract_epi64(keys_hi, 0) as u64,
+            _mm256_extract_epi64(keys_hi, 1) as u64,
+            _mm256_extract_epi64(keys_hi, 2) as u64,
+            _mm256_extract_epi64(keys_hi, 3) as u64,
+        ];
+        
         let missing_keys_with_segments: Vec<(usize, u64, usize)> = (0..8)
             .filter_map(|i| {
                 if hot_results[i].is_none() && overflow_results[i].is_none() {
-                    let key = if i < 4 {
-                        _mm256_extract_epi64(keys_lo, i as i32) as u64
-                    } else {
-                        _mm256_extract_epi64(keys_hi, (i - 4) as i32) as u64
-                    };
-                    Some((i, key, segment_ids[i]))
+                    Some((i, keys_array[i], segment_ids[i]))
                 } else {
                     None
                 }
@@ -4463,7 +4471,7 @@ unsafe fn simd_neon_zero_lock_batch(
                     } else if segment_id >= segments_guard.len() {
                         // Graceful degradation: use fallback search if prediction is out of bounds
                         results[result_idx] =
-                            self.fallback_linear_search_with_segments_lock(&segments_guard, key);
+                            Self::linear_probe_segments(&segments_guard, key);
                     }
                 }
             } else {
@@ -4474,7 +4482,7 @@ unsafe fn simd_neon_zero_lock_batch(
                     } else {
                         // Graceful degradation: use fallback search if prediction is out of bounds
                         results[result_idx] =
-                            self.fallback_linear_search_with_segments_lock(&segments_guard, key);
+                            Self::linear_probe_segments(&segments_guard, key);
                     }
                 }
             }
@@ -4588,28 +4596,41 @@ unsafe fn simd_neon_zero_lock_batch(
 
         // FULLY VECTORIZED GATHER: Use AVX2 gather for true vectorized lookup
         // This replaces 8 scalar memory accesses with 2 vectorized gather operations
-        let router_ptr = router.router.as_ptr() as *const i32; // Cast to i32 for _mm256_i64gather_epi32
+        let router_ptr = router.router.as_ptr() as *const i32;
+
+        // Convert to i32 indices for gather
+        let indices_lo_i32 = _mm256_cvtepi64_epi32(clamped_lo);
+        let indices_hi_i32 = _mm256_cvtepi64_epi32(clamped_hi);
 
         // Vectorized gather: Load router values for all indices at once
-        let gathered_lo = _mm256_i64gather_epi32(router_ptr, clamped_lo, 4); // scale=4 for i32
-        let gathered_hi = _mm256_i64gather_epi32(router_ptr, clamped_hi, 4);
+        let gathered_lo = _mm256_i32gather_epi32(router_ptr, indices_lo_i32, 4);
+        let gathered_hi = _mm256_i32gather_epi32(router_ptr, indices_hi_i32, 4);
 
-        // Convert gathered i32 values to u64 segment IDs efficiently
-        let lo_64 = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(gathered_lo));
-        let hi_64 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(gathered_lo, 1));
-        let lo2_64 = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(gathered_hi));
-        let hi2_64 = _mm256_cvtepi32_epi64(_mm256_extracti128_si256(gathered_hi, 1));
+        // Extract gathered i32 values to usize segment IDs
+        let lo_array = [
+            _mm256_extract_epi32(gathered_lo, 0) as usize,
+            _mm256_extract_epi32(gathered_lo, 1) as usize,
+            _mm256_extract_epi32(gathered_lo, 2) as usize,
+            _mm256_extract_epi32(gathered_lo, 3) as usize,
+        ];
 
-        // Extract final results - now with minimal scalar operations
+        let hi_array = [
+            _mm256_extract_epi32(gathered_hi, 0) as usize,
+            _mm256_extract_epi32(gathered_hi, 1) as usize,
+            _mm256_extract_epi32(gathered_hi, 2) as usize,
+            _mm256_extract_epi32(gathered_hi, 3) as usize,
+        ];
+
+        // Return final results
         [
-            _mm256_extract_epi64(lo_64, 0) as usize,
-            _mm256_extract_epi64(lo_64, 1) as usize,
-            _mm256_extract_epi64(lo_64, 2) as usize,
-            _mm256_extract_epi64(lo_64, 3) as usize,
-            _mm256_extract_epi64(hi_64, 0) as usize,
-            _mm256_extract_epi64(hi_64, 1) as usize,
-            _mm256_extract_epi64(hi_64, 2) as usize,
-            _mm256_extract_epi64(hi_64, 3) as usize,
+            lo_array[0],
+            lo_array[1],
+            lo_array[2],
+            lo_array[3],
+            hi_array[0],
+            hi_array[1],
+            hi_array[2],
+            hi_array[3],
         ]
     }
 
