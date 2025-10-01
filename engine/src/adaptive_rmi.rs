@@ -1667,6 +1667,18 @@ impl ImmutableIndexSnapshot {
         }
     }
     
+    /// Get snapshot generation (for testing)
+    #[cfg(test)]
+    pub fn get_generation(&self) -> u64 {
+        self.generation
+    }
+    
+    /// Get hot data reference (for testing)
+    #[cfg(test)]
+    pub fn get_hot_data(&self) -> &Arc<Vec<(u64, u64)>> {
+        &self.hot_data
+    }
+    
     ///  **ZERO-LOCK LOOKUP** - Pure computation, no synchronization
     #[inline]
     pub fn lookup_zero_lock(&self, key: u64) -> Option<u64> {
@@ -1873,8 +1885,12 @@ impl AdaptiveRMI {
         zero_lock_snapshot: Arc<ArcSwap<ImmutableIndexSnapshot>>,
         config: ZeroLockConfig,
     ) {
+        eprintln!("🚀 Zero-lock background worker started (merge_threshold={}, hot_data_limit={})", 
+                  config.merge_threshold, config.hot_data_limit);
+        
         let mut pending_writes = Vec::new();
         let mut operation_count = 0;
+        let mut batch_count = 0;
         
         loop {
             // Collect batch of operations
@@ -1882,10 +1898,15 @@ impl AdaptiveRMI {
             while batch_size < 1000 { // Process up to 1000 ops per batch
                 match write_queue.pop() {
                     Some(WriteOperation::Shutdown) => {
+                        eprintln!("🛑 Zero-lock background worker shutting down (processed {} batches)", batch_count);
                         // Process final batch then exit
                         if !pending_writes.is_empty() {
+                            eprintln!("  Flushing final {} writes to snapshot", pending_writes.len());
                             Self::apply_write_batch(&zero_lock_snapshot, &pending_writes).await;
                         }
+                        let final_snapshot = zero_lock_snapshot.load();
+                        eprintln!("  Final snapshot: generation={}, hot_data={} entries", 
+                                  final_snapshot.generation, final_snapshot.hot_data.len());
                         return;
                     }
                     Some(WriteOperation::Insert { key, value }) => {
@@ -1925,9 +1946,18 @@ impl AdaptiveRMI {
             
             // Apply batch if we have operations
             if !pending_writes.is_empty() {
+                batch_count += 1;
+                let batch_size = pending_writes.len();
+                
                 Self::apply_write_batch(&zero_lock_snapshot, &pending_writes).await;
                 pending_writes.clear();
                 operation_count = 0;
+                
+                if batch_count % 100 == 0 {
+                    let snapshot = zero_lock_snapshot.load();
+                    eprintln!("  Background worker: {} batches processed, latest batch: {} writes, snapshot generation: {}, hot_data size: {}", 
+                              batch_count, batch_size, snapshot.generation, snapshot.hot_data.len());
+                }
             }
         }
     }
@@ -2115,6 +2145,12 @@ impl AdaptiveRMI {
         self.write_queue.push(WriteOperation::Shutdown);
     }
     
+    /// Get current snapshot (for testing/debugging)
+    #[cfg(test)]
+    pub fn get_snapshot(&self) -> arc_swap::Guard<Arc<ImmutableIndexSnapshot>> {
+        self.zero_lock_snapshot.load()
+    }
+    
     // ====================================================================
     //                      ZERO-LOCK LOOKUP METHODS 
     // ====================================================================
@@ -2227,7 +2263,12 @@ impl AdaptiveRMI {
     /// LOCK ORDER: hot_buffer (lock-free) → overflow_buffer (only if needed)
     /// Never acquires segments or router locks to prevent reader-writer deadlocks
     pub fn insert(&self, key: u64, value: u64) -> Result<()> {
+        // STEP 0: Queue write to background worker for snapshot sync
+        // This ensures writes are eventually visible in zero_lock_snapshot
+        self.queue_write(key, value);
+        
         // STEP 1: Try hot buffer first (lock-free operation)
+        // This provides immediate visibility for hot_buffer.get() calls
         if self.hot_buffer.try_insert(key, value)? {
             return Ok(());
         }

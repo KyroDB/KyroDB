@@ -22,5 +22,6 @@ pub mod rmi;
 pub mod wal;
 pub mod snapshot;
 pub mod background;
+pub mod background_worker_test;  // Tests for zero-lock background worker
 pub mod integration;
 pub mod stress;
