@@ -51,7 +51,7 @@ fn bench_index_lookups(c: &mut Criterion) {
                 .zip(values.iter())
                 .map(|(&k, &v)| (k, v))
                 .collect();
-            let rmi = AdaptiveRMI::build_from_pairs(&pairs);
+            let rmi = AdaptiveRMI::build_from_pairs_sync(&pairs);
 
             group.bench_with_input(
                 BenchmarkId::new("rmi", size),
@@ -138,7 +138,7 @@ fn bench_lookup_patterns(c: &mut Criterion) {
             .zip(values.iter())
             .map(|(&k, &v)| (k, v))
             .collect();
-        AdaptiveRMI::build_from_pairs(&pairs)
+        AdaptiveRMI::build_from_pairs_sync(&pairs)
     };
 
     // Test different lookup patterns
@@ -205,7 +205,7 @@ fn bench_sequential_vs_random_access(c: &mut Criterion) {
             .zip(values.iter())
             .map(|(&k, &v)| (k, v))
             .collect();
-        AdaptiveRMI::build_from_pairs(&pairs)
+        AdaptiveRMI::build_from_pairs_sync(&pairs)
     };
 
     // Sequential access (best case for RMI)
@@ -321,7 +321,7 @@ fn bench_massive_scale_lookups(c: &mut Criterion) {
                 .zip(values.iter())
                 .map(|(&k, &v)| (k, v))
                 .collect();
-            let rmi = AdaptiveRMI::build_from_pairs(&pairs);
+            let rmi = AdaptiveRMI::build_from_pairs_sync(&pairs);
 
             group.bench_with_input(
                 BenchmarkId::new("rmi", format!("{}M", size / 1_000_000)),
@@ -376,7 +376,7 @@ fn bench_single_lookup_latency(c: &mut Criterion) {
                 .zip(values.iter())
                 .map(|(&k, &v)| (k, v))
                 .collect();
-            let rmi = AdaptiveRMI::build_from_pairs(&pairs);
+            let rmi = AdaptiveRMI::build_from_pairs_sync(&pairs);
 
             group.bench_function(&format!("rmi_{}M", size / 1_000_000), |b| {
                 b.iter(|| black_box(rmi.lookup(target_key)))

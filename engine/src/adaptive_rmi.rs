@@ -14,7 +14,7 @@ use arc_swap::ArcSwap;
 use crossbeam_epoch::{self, Atomic, Owned};
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "rmi-build-profiler")]
@@ -27,20 +27,20 @@ use std::arch::x86_64::{
     __m256i, _mm256_cmpeq_epi64, _mm256_extract_epi64, _mm256_loadu_si256, _mm256_min_epi64,
     _mm256_movemask_epi8, _mm256_set1_epi64x, _mm256_set_epi64x, _mm256_srlv_epi64,
 };
-///  **REALISTIC MEMORY MANAGEMENT** - Production-ready limits
-/// Fixed the completely unrealistic 64GB limit to sane production values
-const MAX_OVERFLOW_CAPACITY: usize = 32_768; // 32K entries (~512KB max)
-const OVERFLOW_PRESSURE_LOW: usize = 19_660; // 60% of max
-const OVERFLOW_PRESSURE_MEDIUM: usize = 26_214; // 80% of max
-const OVERFLOW_PRESSURE_HIGH: usize = 29_491; // 90% of max
-const OVERFLOW_PRESSURE_CRITICAL: usize = 31_130; // 95% of max
-const SYSTEM_MEMORY_LIMIT_MB: usize = 64; // 64MB realistic limit (was 64GB!)
-
 /// Maximum search window size - strict bound to prevent O(n) behavior
 const MAX_SEARCH_WINDOW: usize = 64;
 
 /// Default hot buffer capacity - tunable via environment
-const DEFAULT_HOT_BUFFER_SIZE: usize = 4096;
+const DEFAULT_HOT_BUFFER_SIZE: usize = 16_384; // 16K (doubled from 4K)
+
+/// Write queue backpressure limits
+const WRITE_QUEUE_SOFT_LIMIT: usize = 100_000; // 100K pending writes before backpressure
+const WRITE_QUEUE_HARD_LIMIT: usize = 500_000; // 500K absolute maximum
+
+/// Background worker batch sizes
+const BACKGROUND_BATCH_SIZE: usize = 50_000; // 50K writes per batch
+const BACKGROUND_FLUSH_INTERVAL_MS: u64 = 10; // 10ms flush interval
+const BACKGROUND_SIZE_TRIGGER: usize = 10_000; // Flush after 10K writes
 
 const MIN_SEGMENT_SIZE: usize = 100;
 const MAX_SEGMENT_SIZE: usize = 8192;
@@ -1311,429 +1311,51 @@ impl BackgroundMerger {
     }
 }
 
-/// Bounded overflow buffer to prevent unbounded memory growth
-#[derive(Debug)]
-/// Optimized overflow buffer with improved lookup performance
-///
-/// Performance improvements implemented:
-/// - Reverse iteration for better temporal locality
-/// - Future: Will be replaced with HashMap-based O(1) lookups
-pub struct BoundedOverflowBuffer {
-    /// O(1) lookup: Replace VecDeque with HashMap for fast access
-    data: HashMap<u64, u64>,
-    /// Maintain insertion order for eviction policy
-    insertion_order: VecDeque<u64>,
-    /// Maximum capacity - hard limit
-    max_capacity: usize,
-    /// Rejection counter for back-pressure signaling
-    rejected_writes: AtomicUsize,
-    /// Pressure level indicator
-    pressure_level: AtomicUsize, // 0=none, 1=low, 2=medium, 3=high, 4=critical
-    /// Memory usage tracking for circuit breaker
-    estimated_memory_mb: AtomicUsize,
-    /// Last memory check timestamp
-    last_memory_check: AtomicU64,
-}
-
-impl BoundedOverflowBuffer {
-    pub fn new(max_capacity: usize) -> Self {
-        Self {
-            data: HashMap::new(),
-            insertion_order: VecDeque::new(),
-            max_capacity,
-            rejected_writes: AtomicUsize::new(0),
-            pressure_level: AtomicUsize::new(0),
-            estimated_memory_mb: AtomicUsize::new(0),
-            last_memory_check: AtomicU64::new(0),
-        }
-    }
-
-    ///  atomic insert with hard memory enforcement and accurate tracking
-    pub fn try_insert(&mut self, key: u64, value: u64) -> Result<bool> {
-        let current_size = self.data.len();
-
-        //  HARD ENFORCEMENT: Apply absolute limits before any processing
-        if let Err(enforcement_msg) = self.enforce_hard_memory_limits() {
-            eprintln!("Memory enforcement triggered: {}", enforcement_msg);
-            // Continue with insertion if enforcement succeeded in making space
-        }
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let last_check = self.last_memory_check.load(Ordering::Relaxed);
-        const MEMORY_CHECK_INTERVAL_MS: u64 = 1000;
-
-        if now - last_check > MEMORY_CHECK_INTERVAL_MS {
-            self.update_accurate_memory_estimate(current_size);
-            self.last_memory_check.store(now, Ordering::Relaxed);
-
-            // Hard circuit breaker: absolute memory protection
-            let memory_mb = self.estimated_memory_mb.load(Ordering::Relaxed);
-            if memory_mb > SYSTEM_MEMORY_LIMIT_MB {
-                self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-                return Err(anyhow!(
-                    "HARD CIRCUIT BREAKER: Absolute memory limit exceeded ({}MB > {}MB)",
-                    memory_mb,
-                    SYSTEM_MEMORY_LIMIT_MB
-                ));
-            }
-        }
-
-        // Enhanced pressure calculation with atomic memory tracking
-        let current_len = self.data.len(); // Re-check after potential enforcement
-        let pressure = if current_len == 0 {
-            0 // none
-        } else if current_len < OVERFLOW_PRESSURE_LOW {
-            1 // low - normal operation
-        } else if current_len < OVERFLOW_PRESSURE_MEDIUM {
-            2 // medium - schedule urgent merge
-        } else if current_len < OVERFLOW_PRESSURE_HIGH {
-            3 // high - reject with retry hint
-        } else if current_len < OVERFLOW_PRESSURE_CRITICAL {
-            4 // critical - hard reject
-        } else {
-            4 // critical - at capacity
-        };
-        self.pressure_level.store(pressure, Ordering::Release); // Use Release for consistency
-
-        //  ABSOLUTE HARD CAPACITY LIMIT - never exceed to prevent OOM
-        if current_len >= self.max_capacity {
-            self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow!("HARD LIMIT: Overflow buffer at absolute maximum capacity ({}). System protection engaged.", 
-                self.max_capacity));
-        }
-
-        // HARD LIMIT: Never exceed capacity under any circumstances
-        if self.data.len() >= self.max_capacity {
-            self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow!(
-                "Hard capacity limit reached: {}/{}",
-                self.data.len(),
-                self.max_capacity
-            ));
-        }
-
-        // GRADUATED BACK-PRESSURE: Enhanced rejection logic with memory awareness
-        if current_len >= OVERFLOW_PRESSURE_CRITICAL {
-            self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-            return Ok(false); // Signal back-pressure - caller should implement exponential backoff
-        }
-
-        // HIGH PRESSURE: Probabilistic rejection with memory-aware scaling
-        if current_len >= OVERFLOW_PRESSURE_HIGH {
-            let rejection_rate = ((current_len - OVERFLOW_PRESSURE_HIGH) * 100)
-                / (OVERFLOW_PRESSURE_CRITICAL - OVERFLOW_PRESSURE_HIGH);
-            let reject = (key % 100) < rejection_rate as u64; // Use key for deterministic but distributed rejection
-
-            if reject {
-                self.rejected_writes.fetch_add(1, Ordering::Relaxed);
-                return Ok(false); // Memory-aware probabilistic rejection
-            }
-        }
-
-        // Evict oldest entries if at capacity
-        while self.data.len() >= self.max_capacity {
-            if let Some(oldest_key) = self.insertion_order.pop_front() {
-                self.data.remove(&oldest_key);
-            } else {
-                break;
-            }
-        }
-
-        // O(1) insert with order tracking
-        let is_new_key = !self.data.contains_key(&key);
-        self.data.insert(key, value);
-
-        // Only add to insertion order if it's a new key
-        if is_new_key {
-            self.insertion_order.push_back(key);
-        }
-
-        self.update_accurate_memory_estimate(self.data.len());
-
-        Ok(true)
-    }
-
-    /// Enhanced memory estimation with HashMap and VecDeque overhead calculation
-    fn update_accurate_memory_estimate(&self, current_size: usize) {
-        // More accurate estimation:
-        // - 16 bytes per (u64, u64) pair in HashMap
-        // - HashMap overhead: ~24 bytes base + capacity * 24 bytes for entries
-        // - VecDeque overhead for insertion_order: ~24 bytes base + capacity * 8 bytes
-        // - Pressure tracking overhead: ~64 bytes
-        let pair_bytes = current_size * 16;
-        let hashmap_overhead = 24 + (self.data.capacity() * 24);
-        let vecdeque_overhead = 24 + (self.insertion_order.capacity() * 8);
-        let tracking_overhead = 64;
-
-        let total_bytes = pair_bytes + hashmap_overhead + vecdeque_overhead + tracking_overhead;
-        let estimated_mb = (total_bytes + 1024 * 1024 - 1) / (1024 * 1024); // Round up
-
-        self.estimated_memory_mb
-            .store(estimated_mb, Ordering::Release);
-
-        // Memory efficiency warning
-        let utilization = (current_size * 100) / self.data.capacity().max(1);
-        let wasted_mb = ((self.data.capacity() - current_size) * 16) / (1024 * 1024);
-
-        if utilization < 50 && wasted_mb > 10 {
-            println!(
-                "Memory efficiency warning: {}% utilization, {}MB wasted capacity",
-                utilization, wasted_mb
-            );
-        }
-    }
-
-    /// O(1) lookup guaranteed with HashMap
-    /// This replaces the O(n) linear search with instant HashMap access
-    pub fn get(&self, key: u64) -> Option<u64> {
-        self.data.get(&key).copied()
-    }
-
-    /// ATOMIC drain operation with memory safety using std::mem::replace
-    pub fn drain_all_atomic(&mut self) -> Vec<(u64, u64)> {
-        // Use atomic replacement to ensure no partial drains
-        let temp_data = std::mem::replace(&mut self.data, HashMap::new());
-        let temp_order = std::mem::replace(&mut self.insertion_order, VecDeque::new());
-
-        // Convert HashMap to Vec preserving insertion order
-        let result: Vec<(u64, u64)> = temp_order
-            .into_iter()
-            .filter_map(|key| temp_data.get(&key).map(|&value| (key, value)))
-            .collect();
-
-        let drained_count = result.len();
-        let freed_bytes = Self::calculate_actual_memory_usage_hashmap(&temp_data);
-
-        // Reset pressure atomically
-        self.pressure_level.store(0, Ordering::Release);
-        self.rejected_writes.store(0, Ordering::Release);
-        self.estimated_memory_mb.store(0, Ordering::Release);
-
-        println!(
-            "Atomic drain completed: {} entries, ~{}MB freed",
-            drained_count,
-            freed_bytes / (1024 * 1024)
-        );
-
-        result
-    }
-
-    /// Calculate actual memory usage for HashMap structure
-    fn calculate_actual_memory_usage_hashmap(data: &HashMap<u64, u64>) -> usize {
-        // Accurate calculation: real HashMap memory usage
-        let entry_size = std::mem::size_of::<(u64, u64)>(); // Exactly 16 bytes
-        let capacity_bytes = data.capacity() * entry_size;
-        let hashmap_overhead = std::mem::size_of::<HashMap<u64, u64>>();
-
-        capacity_bytes + hashmap_overhead
-    }
-
-    /// Hard enforcement against unbounded growth with circuit breaker
-    /// Replaces soft limits with absolute hard limits
-    pub fn enforce_hard_memory_limits(&mut self) -> Result<(), String> {
-        let current_size = self.data.len();
-        let actual_memory_bytes = Self::calculate_actual_memory_usage_hashmap(&self.data);
-        let actual_memory_mb = actual_memory_bytes / (1024 * 1024);
-
-        // Hard limit 1: absolute count limit (prevent integer overflow)
-        if current_size > MAX_OVERFLOW_CAPACITY {
-            // Emergency truncation: Remove oldest entries to enforce hard limit
-            let excess = current_size - MAX_OVERFLOW_CAPACITY;
-
-            // Remove oldest entries using insertion order
-            for _ in 0..excess {
-                if let Some(oldest_key) = self.insertion_order.pop_front() {
-                    self.data.remove(&oldest_key);
-                } else {
-                    break;
-                }
-            }
-
-            self.rejected_writes.fetch_add(excess, Ordering::Relaxed);
-
-            return Err(format!(
-                "HARD LIMIT ENFORCED: Truncated {} excess entries ({}>{} limit)",
-                excess, current_size, MAX_OVERFLOW_CAPACITY
-            ));
-        }
-
-        // Hard limit 2: absolute memory limit (prevent OOM)
-        if actual_memory_mb > SYSTEM_MEMORY_LIMIT_MB {
-            // Emergency truncation: Remove entries until under memory limit
-            let target_size =
-                (SYSTEM_MEMORY_LIMIT_MB * 1024 * 1024) / std::mem::size_of::<(u64, u64)>();
-            let safe_target = target_size.min(MAX_OVERFLOW_CAPACITY * 8 / 10); // 80% of max as safety margin
-
-            if current_size > safe_target {
-                let truncate_count = current_size - safe_target;
-
-                // Remove oldest entries using insertion order
-                for _ in 0..truncate_count {
-                    if let Some(oldest_key) = self.insertion_order.pop_front() {
-                        self.data.remove(&oldest_key);
-                    } else {
-                        break;
-                    }
-                }
-
-                self.rejected_writes
-                    .fetch_add(truncate_count, Ordering::Relaxed);
-
-                return Err(format!(
-                    "MEMORY LIMIT ENFORCED: Truncated {} entries ({}MB>{}MB limit)",
-                    truncate_count, actual_memory_mb, SYSTEM_MEMORY_LIMIT_MB
-                ));
-            }
-        }
-
-        self.estimated_memory_mb
-            .store(actual_memory_mb, Ordering::Release);
-
-        Ok(())
-    }
-
-    /// Get buffer statistics including memory usage
-    pub fn stats(&self) -> (usize, usize, usize, usize, usize) {
-        (
-            self.data.len(),
-            self.max_capacity,
-            self.rejected_writes.load(Ordering::Relaxed),
-            self.pressure_level.load(Ordering::Relaxed),
-            self.estimated_memory_mb.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Check if buffer is under pressure (medium pressure or higher)
-    pub fn is_under_pressure(&self) -> bool {
-        self.pressure_level.load(Ordering::Relaxed) >= 2 // medium or higher pressure
-    }
-
-    /// Check if buffer is under critical pressure requiring immediate action
-    pub fn is_under_critical_pressure(&self) -> bool {
-        self.pressure_level.load(Ordering::Relaxed) >= 4 // critical pressure
-    }
-
-    /// Get current pressure level for monitoring
-    pub fn get_pressure_level(&self) -> usize {
-        self.pressure_level.load(Ordering::Relaxed)
-    }
-
-    /// Get all pending writes for test synchronization (non-draining)
-    pub fn get_all_pending(&self) -> Vec<(u64, u64)> {
-        self.data.iter().map(|(&k, &v)| (k, v)).collect()
-    }
-}
-
-// ========================================================================
-//                      ZERO-LOCK READ ARCHITECTURE
-// ========================================================================
-
-///  **ZERO-LOCK IMMUTABLE INDEX SNAPSHOT**
-///
-/// Complete immutable snapshot of all index data for lock-free reads.
-/// This structure can be safely shared across threads without any synchronization.
+/// Immutable snapshot for zero-lock reads
 #[derive(Debug, Clone)]
 pub struct ImmutableIndexSnapshot {
-    /// Immutable segments with pre-computed cache-optimized layout
-    segments: Arc<Vec<AdaptiveSegment>>,
-    /// Immutable routing model for fast segment prediction  
-    router: GlobalRoutingModel,
-    /// Hot buffer snapshot (recent writes)
-    hot_data: Arc<Vec<(u64, u64)>>,
-    /// Generation number for consistency tracking
-    generation: u64,
-    /// Total key count for statistics
-    total_keys: usize,
+    /// Segments with learned models (sorted, immutable)
+    pub segments: Vec<AdaptiveSegment>,
+
+    /// Router for segment prediction (immutable)
+    pub router: GlobalRoutingModel,
+
+    /// Hot data merged from background worker (sorted)
+    pub hot_data: Vec<(u64, u64)>,
+
+    /// Snapshot generation number (for debugging/metrics)
+    pub generation: u64,
 }
 
 impl ImmutableIndexSnapshot {
-    /// Create new immutable snapshot from current state
     pub fn new(
         segments: Vec<AdaptiveSegment>,
         router: GlobalRoutingModel,
         hot_data: Vec<(u64, u64)>,
         generation: u64,
     ) -> Self {
-        let total_keys = segments.iter().map(|s| s.len()).sum::<usize>() + hot_data.len();
-
         Self {
-            segments: Arc::new(segments),
+            segments,
             router,
-            hot_data: Arc::new(hot_data),
+            hot_data,
             generation,
-            total_keys,
         }
     }
 
-    /// Get snapshot generation (for testing)
-    #[cfg(test)]
+    /// Get snapshot generation number
     pub fn get_generation(&self) -> u64 {
         self.generation
     }
 
-    /// Get hot data reference (for testing)
-    #[cfg(test)]
-    pub fn get_hot_data(&self) -> &Arc<Vec<(u64, u64)>> {
+    /// Get hot data slice
+    pub fn get_hot_data(&self) -> &[(u64, u64)] {
         &self.hot_data
     }
 
-    ///  **ZERO-LOCK LOOKUP** - Pure computation, no synchronization
-    #[inline]
-    pub fn lookup_zero_lock(&self, key: u64) -> Option<u64> {
-        // PHASE 1: Check hot data first (most recent writes)
-        for &(k, v) in self.hot_data.iter().rev() {
-            if k == key {
-                return Some(v);
-            }
-        }
-
-        // PHASE 2: Predict segment and search
-        let segment_id = self.router.predict_segment(key);
-
-        if segment_id < self.segments.len() {
-            if let Some(value) = self.segments[segment_id].bounded_search(key) {
-                return Some(value);
-            }
-        }
-
-        // PHASE 3: Linear probe if prediction failed
-        for segment in self.segments.iter() {
-            if let Some(value) = segment.bounded_search(key) {
-                return Some(value);
-            }
-        }
-
-        None
+    /// Get segments slice
+    pub fn get_segments(&self) -> &[AdaptiveSegment] {
+        &self.segments
     }
-
-    ///  **ZERO-LOCK BATCH LOOKUP** - Simple batch processing on immutable snapshot
-    #[inline]
-    pub fn lookup_batch_zero_lock(&self, keys: &[u64]) -> Vec<Option<u64>> {
-        // Simple iteration - SIMD optimization happens at AdaptiveRMI level
-        keys.iter().map(|&key| self.lookup_zero_lock(key)).collect()
-    }
-
-    /// Get snapshot statistics
-    pub fn stats(&self) -> IndexSnapshotStats {
-        IndexSnapshotStats {
-            generation: self.generation,
-            total_keys: self.total_keys,
-            segment_count: self.segments.len(),
-            hot_data_count: self.hot_data.len(),
-        }
-    }
-}
-
-/// Statistics for index snapshot
-#[derive(Debug, Clone)]
-pub struct IndexSnapshotStats {
-    pub generation: u64,
-    pub total_keys: usize,
-    pub segment_count: usize,
-    pub hot_data_count: usize,
 }
 
 /// Write operations queued for background processing
@@ -1794,8 +1416,6 @@ pub struct AdaptiveRMI {
     hot_buffer: Arc<dyn HotBuffer>,
     /// Background merge coordinator
     merge_scheduler: Arc<BackgroundMerger>,
-    /// Overflow buffer for when hot buffer is full - now bounded to prevent memory exhaustion
-    overflow_buffer: Arc<Mutex<BoundedOverflowBuffer>>,
 }
 
 impl AdaptiveRMI {
@@ -1853,9 +1473,6 @@ impl AdaptiveRMI {
             ))),
             hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
-            overflow_buffer: Arc::new(Mutex::new(BoundedOverflowBuffer::new(
-                MAX_OVERFLOW_CAPACITY,
-            ))),
         };
 
         // Start zero-lock background worker
@@ -2013,7 +1630,7 @@ impl AdaptiveRMI {
         let current = zero_lock_snapshot.load();
 
         // Merge new writes with existing hot data
-        let mut new_hot_data = (*current.hot_data).clone();
+        let mut new_hot_data = current.hot_data.to_vec();
         new_hot_data.extend_from_slice(writes);
 
         // Sort by key for efficient lookups
@@ -2022,10 +1639,10 @@ impl AdaptiveRMI {
 
         // Create new snapshot
         let new_snapshot = ImmutableIndexSnapshot::new(
-            (*current.segments).clone(), // Keep existing segments
-            current.router.clone(),      // Keep existing router
-            new_hot_data,                // Updated hot data
-            current.generation + 1,      // Increment generation
+            current.segments.to_vec(), // Keep existing segments
+            current.router.clone(),    // Keep existing router
+            new_hot_data,              // Updated hot data
+            current.generation + 1,    // Increment generation
         );
 
         // 🔥 **ATOMIC SWAP** - This is the ONLY synchronization point!
@@ -2129,24 +1746,14 @@ impl AdaptiveRMI {
 
     /// Force synchronous snapshot update (for testing)
     ///
-    /// This method immediately flushes the hot_buffer and overflow_buffer
-    /// into the zero_lock_snapshot, making writes visible to lookups.
+    /// This method immediately flushes the hot_buffer into the zero_lock_snapshot,
+    /// making writes visible to lookups.
     ///
     /// **Use only for testing!** In production, the background worker
     /// handles async updates for better throughput.
     pub fn sync_snapshot_for_test(&self) {
         // Step 1: Collect all pending writes from hot buffer
-        let hot_writes = self.hot_buffer.get_all_for_sync();
-
-        // Step 2: Collect pending writes from overflow buffer
-        let overflow_writes = {
-            let overflow = self.overflow_buffer.lock();
-            overflow.get_all_pending()
-        };
-
-        // Step 3: Merge all writes
-        let mut all_writes: Vec<(u64, u64)> = hot_writes;
-        all_writes.extend(overflow_writes);
+        let all_writes = self.hot_buffer.get_all_for_sync();
 
         if all_writes.is_empty() {
             return; // Nothing to sync
@@ -2156,7 +1763,7 @@ impl AdaptiveRMI {
         let current = self.zero_lock_snapshot.load();
 
         // Merge new writes into hot_data
-        let mut new_hot_data = (*current.hot_data).clone();
+        let mut new_hot_data = current.hot_data.to_vec();
         for (key, value) in all_writes {
             // Update or insert
             if let Some(existing) = new_hot_data.iter_mut().find(|(k, _)| *k == key) {
@@ -2168,7 +1775,7 @@ impl AdaptiveRMI {
 
         // Create new snapshot with updated hot_data
         let new_snapshot = ImmutableIndexSnapshot::new(
-            (*current.segments).clone(),
+            current.segments.to_vec(),
             current.router.clone(),
             new_hot_data,
             current.generation + 1,
@@ -2287,9 +1894,6 @@ impl AdaptiveRMI {
             global_router: Arc::new(RwLock::new(global_router)),
             hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
-            overflow_buffer: Arc::new(Mutex::new(BoundedOverflowBuffer::new(
-                MAX_OVERFLOW_CAPACITY,
-            ))),
         };
 
         // Start zero-lock background worker
@@ -2297,85 +1901,126 @@ impl AdaptiveRMI {
         rmi
     }
 
-    /// DEADLOCK-FREE INSERT following global lock ordering protocol
-    /// LOCK ORDER: hot_buffer (lock-free) → overflow_buffer (only if needed)
+    /// Build Adaptive RMI from sorted key-value pairs WITHOUT starting background worker
+    /// This is for benchmarks and tests that don't need the async runtime
+    pub fn build_from_pairs_sync(pairs: &[(u64, u64)]) -> Self {
+        let mut sorted_pairs = pairs.to_vec();
+        sorted_pairs.sort_by_key(|(k, _)| *k);
+
+        if sorted_pairs.is_empty() {
+            // Create empty index without background worker
+            let capacity = DEFAULT_HOT_BUFFER_SIZE;
+            let router_bits = 16;
+            let initial_snapshot = ImmutableIndexSnapshot::new(
+                Vec::new(),
+                GlobalRoutingModel::new(Vec::new(), router_bits),
+                Vec::new(),
+                0,
+            );
+
+            return Self {
+                zero_lock_snapshot: Arc::new(ArcSwap::from_pointee(initial_snapshot)),
+                write_queue: Arc::new(SegQueue::new()),
+                background_handle: Arc::new(Mutex::new(None)),
+                zero_lock_config: ZeroLockConfig::default(),
+                segments: Arc::new(RwLock::new(Vec::new())),
+                segments_snapshot: Atomic::new(Vec::new()),
+                global_router: Arc::new(RwLock::new(GlobalRoutingModel::new(
+                    Vec::new(),
+                    router_bits,
+                ))),
+                hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
+                merge_scheduler: Arc::new(BackgroundMerger::new()),
+            };
+        }
+
+        // Create segments
+        let mut segments = Vec::new();
+        let target_size = TARGET_SEGMENT_SIZE;
+        let num_segments = (sorted_pairs.len() + target_size - 1) / target_size;
+
+        for i in 0..num_segments {
+            let start = i * sorted_pairs.len() / num_segments;
+            let end = ((i + 1) * sorted_pairs.len() / num_segments).min(sorted_pairs.len());
+
+            if start < end {
+                let segment_data = sorted_pairs[start..end].to_vec();
+                segments.push(AdaptiveSegment::new(segment_data));
+            }
+        }
+
+        // Build routing model
+        let boundaries: Vec<u64> = segments
+            .iter()
+            .filter_map(|s| s.key_range().map(|(min, _)| min))
+            .collect();
+
+        let router_bits = 16;
+        let global_router = GlobalRoutingModel::new(boundaries, router_bits);
+        let capacity = DEFAULT_HOT_BUFFER_SIZE;
+        let segments_snapshot = Atomic::new(segments.clone());
+
+        // Create zero-lock snapshot
+        let initial_snapshot = ImmutableIndexSnapshot::new(
+            segments.clone(),
+            global_router.clone(),
+            Vec::new(),
+            0,
+        );
+
+        Self {
+            zero_lock_snapshot: Arc::new(ArcSwap::from_pointee(initial_snapshot)),
+            write_queue: Arc::new(SegQueue::new()),
+            background_handle: Arc::new(Mutex::new(None)),
+            zero_lock_config: ZeroLockConfig::default(),
+            segments: Arc::new(RwLock::new(segments)),
+            segments_snapshot,
+            global_router: Arc::new(RwLock::new(global_router)),
+            hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
+            merge_scheduler: Arc::new(BackgroundMerger::new()),
+        }
+    }
+
+    /// DEADLOCK-FREE INSERT with write queue backpressure
+    /// LOCK ORDER: hot_buffer (lock-free) → write_queue check
     /// Never acquires segments or router locks to prevent reader-writer deadlocks
     pub fn insert(&self, key: u64, value: u64) -> Result<()> {
-        // STEP 0: Queue write to background worker for snapshot sync
-        // This ensures writes are eventually visible in zero_lock_snapshot
+        // STEP 0: Check write_queue backpressure FIRST
+        let queue_size = self.write_queue.len();
+        
+        if queue_size >= WRITE_QUEUE_HARD_LIMIT {
+            return Err(anyhow!(
+                "Write permanently rejected: Queue at hard limit ({}). System cannot keep up with write rate.",
+                WRITE_QUEUE_HARD_LIMIT
+            ));
+        }
+        
+        if queue_size >= WRITE_QUEUE_SOFT_LIMIT {
+            let retry_ms = 50 + ((queue_size - WRITE_QUEUE_SOFT_LIMIT) / 1000);
+            return Err(anyhow!(
+                "Write temporarily rejected: Queue backpressure ({} entries). Retry after {}ms.",
+                queue_size,
+                retry_ms
+            ));
+        }
+
+        // STEP 1: Queue write to background worker for snapshot sync
         self.queue_write(key, value);
 
-        // STEP 1: Try hot buffer first (lock-free operation)
-        // This provides immediate visibility for hot_buffer.get() calls
+        // STEP 2: Try hot buffer (provides immediate visibility for hot reads)
         if self.hot_buffer.try_insert(key, value)? {
             return Ok(());
         }
 
-        // STEP 2: GLOBAL LOCK ORDER - overflow_buffer only if hot buffer full
-        // Get stats quickly to minimize lock time
-        let (
-            _overflow_size,
-            _overflow_capacity,
-            rejected_writes,
-            _pressure_level,
-            _overflow_memory_mb,
-        ) = {
-            let overflow = self.overflow_buffer.lock();
-            overflow.stats()
-        }; // Lock released immediately
-
-        // Memory calculation for monitoring
-        let _hot_memory_kb = {
-            let hot_size = self.hot_buffer.current_size();
-            (hot_size * std::mem::size_of::<(u64, u64)>()) / 1024
-        };
-
-        // STEP 3: GLOBAL LOCK ORDER - overflow_buffer insert attempt
-        // Single atomic insert with minimal lock time
-        let insert_result = {
-            let mut overflow = self.overflow_buffer.lock();
-            let result = overflow.try_insert(key, value);
-            let is_critical = overflow.is_under_critical_pressure();
-            (result, is_critical)
-        }; // Lock released immediately
-
-        match insert_result {
-            (Ok(true), _) => Ok(()),
-            (Ok(false), is_critical) => {
-                if is_critical {
-                    Err(anyhow!(
-                        "Write permanently rejected: System under critical memory pressure. Reduce write rate and implement exponential backoff."
-                    ))
-                } else {
-                    let retry_ms = std::cmp::min(500, 25 * (rejected_writes / 5 + 1));
-                    Err(anyhow!(
-                        "Write temporarily rejected: High memory pressure. Retry after {}ms.",
-                        retry_ms
-                    ))
-                }
-            }
-            (Err(e), _) => {
-                // Propagate buffer error
-                Err(e)
-            }
-        }
+        // Hot buffer full is acceptable - background worker will drain write_queue
+        Ok(())
     }
 
-    /// DEADLOCK-FREE LOOKUP with strict global lock ordering protocol
-    /// LOCK ORDER: hot_buffer (lock-free) → overflow_buffer → segments (NEVER router during lookup)
-    /// OPTIMIZED SINGLE-KEY LOOKUP - Combines best approaches for maximum performance
-    ///
-    /// Performance characteristics:
-    /// - Hot buffer: O(1) lock-free lookup
-    /// - Overflow buffer: O(1) with minimal lock contention  
-    /// - Segments: O(1) predicted lookup with bounded search guarantee
-    /// - Fallback: O(n) linear probe only in edge cases
-    ///
-    /// This prevents reader-writer deadlocks by eliminating cross-lock dependencies
-    ///  ZERO-ALLOCATION ZERO-LOCK LOOKUP: Revolutionary architecture
+    /// ZERO-LOCK ZERO-ALLOCATION LOOKUP: Ultimate performance architecture
     ///
     /// **ZERO SYNCHRONIZATION + ZERO ALLOCATION**:
-    /// - Single atomic snapshot load (never blocks)
+    /// - Hot buffer: O(1) lock-free check for very recent writes
+    /// - Snapshot: Single atomic load (never blocks)
     /// - Pure computation on immutable data  
     /// - No allocations in hot path
     /// - No locks, no contention, no waiting
@@ -2384,25 +2029,22 @@ impl AdaptiveRMI {
     /// This is the **ultimate performance** lookup method.
     #[inline]
     pub fn lookup_key_ultra_fast(&self, key: u64) -> Option<u64> {
-        // Phase 0a: Check hot_buffer FIRST - captures most recent writes (not yet merged)
-        // This eliminates the async lag between writes and background merge
+        // Phase 0: Check hot_buffer FIRST - captures most recent writes (not yet merged)
         if let Some(value) = self.hot_buffer.get(key) {
             return Some(value);
         }
 
-        // Phase 0b: Check overflow_buffer - captures writes when hot_buffer is full
-        {
-            let overflow = self.overflow_buffer.lock();
-            if let Some(value) = overflow.get(key) {
-                return Some(value);
-            }
-        }
-
-        // Single atomic load - only synchronization operation
+        // Phase 1: Single atomic snapshot load - only synchronization operation
         let snapshot = self.zero_lock_snapshot.load();
 
-        // Zero-allocation computation - pure computation, no heap activity
+        // Phase 2: Zero-allocation computation - pure computation, no heap activity
         Self::lookup_zero_alloc_inline(&snapshot, key)
+    }
+
+    /// Backward compatibility alias for lookup_key_ultra_fast
+    #[inline]
+    pub fn lookup(&self, key: u64) -> Option<u64> {
+        self.lookup_key_ultra_fast(key)
     }
 
     /// **ZERO-ALLOCATION INLINE LOOKUP** - No heap allocations whatsoever
@@ -2428,10 +2070,8 @@ impl AdaptiveRMI {
         }
 
         // PHASE 3: Zero-allocation linear probe (only if prediction fails)
-        for segment in snapshot.segments.iter() {
-            if let Some(value) = Self::bounded_search_zero_alloc(segment, key) {
-                return Some(value);
-            }
+        if let Some(value) = Self::linear_probe_segments(snapshot.segments.as_slice(), key) {
+            return Some(value);
         }
 
         None
@@ -2524,17 +2164,7 @@ impl AdaptiveRMI {
             }
         }
 
-        //  PHASE 3: Overflow buffer check
-        let overflow_result = {
-            let overflow = self.overflow_buffer.lock();
-            overflow.get(key)
-        };
-
-        if let Some(value) = overflow_result {
-            return Some(value);
-        }
-
-        //  PHASE 4: Fallback to locked segments
+        //  PHASE 3: Fallback to locked segments
         let segments_guard = self.segments.read();
         let router_snapshot = self.global_router.read();
         let segment_id = router_snapshot.predict_segment(key);
@@ -2584,23 +2214,14 @@ impl AdaptiveRMI {
     }
 
     /// DEADLOCK-FREE MERGE with strict global lock ordering protocol  
-    /// GLOBAL LOCK ORDER: hot_buffer → overflow_buffer → segments → router
+    /// GLOBAL LOCK ORDER: hot_buffer → segments → router
     /// This ordering prevents all possible deadlock cycles by ensuring consistency
+    /// NOTE: This is legacy code - production uses zero-lock background worker
     pub async fn merge_hot_buffer(&self) -> Result<()> {
         self.merge_scheduler.start_merge();
 
         // STEP 1: Drain hot buffer (lock-free atomic operation)
-        let hot_data = self.hot_buffer.drain_atomic();
-
-        // STEP 2: GLOBAL LOCK ORDER - overflow_buffer first
-        let overflow_data = {
-            let mut overflow = self.overflow_buffer.lock();
-            overflow.drain_all_atomic()
-        }; // overflow_buffer lock released immediately
-
-        // STEP 3: Combine and sort all pending writes (lock-free operation)
-        let mut all_writes = hot_data;
-        all_writes.extend(overflow_data);
+        let mut all_writes = self.hot_buffer.drain_atomic();
 
         if all_writes.is_empty() {
             self.merge_scheduler.complete_merge();
@@ -2916,7 +2537,6 @@ impl AdaptiveRMI {
     /// CRITICAL: ALWAYS acquire locks in this exact order to prevent deadlock cycles:
     /// 1. segments (RwLock write)
     /// 2. router (RwLock write)  
-    /// 3. NEVER acquire overflow_buffer here (it's handled separately in calling methods)
     ///
     /// This ordering prevents reader-writer deadlocks by ensuring all write operations
     /// follow the same acquisition sequence, eliminating circular wait conditions.
@@ -3091,14 +2711,7 @@ impl AdaptiveRMI {
                 }
 
                 // LOW-IMPACT OPERATIONS: Quick checks only
-                let overflow_pressure = {
-                    let overflow = self.overflow_buffer.lock();
-                    overflow.is_under_pressure()
-                };
-
-                if overflow_pressure {
-                    println!("Overflow buffer under pressure - scheduling urgent merge");
-                }
+                // Removed overflow buffer pressure check (no longer used)
 
                 // Reduced logging frequency to minimize overhead
                 if total_iteration_count % 200 == 0 {
@@ -3119,16 +2732,14 @@ impl AdaptiveRMI {
         let segments = self.segments.read();
         let hot_buffer_size = self.hot_buffer.current_size();
         let hot_buffer_utilization = self.hot_buffer.utilization();
-        let (overflow_size, _overflow_capacity, _rejected_writes, _pressure, _memory_mb) =
-            self.overflow_buffer.lock().stats();
 
         // Accurate total: Include both segments AND buffer contents
         let segment_keys: usize = segments.iter().map(|s| s.len()).sum();
-        let total_keys = segment_keys + hot_buffer_size + overflow_size; // Include ALL data
+        let total_keys = segment_keys + hot_buffer_size;
         let segment_count = segments.len();
 
         let avg_segment_size = if segment_count > 0 {
-            segment_keys as f64 / segment_count as f64 // Only segment average
+            segment_keys as f64 / segment_count as f64
         } else {
             0.0
         };
@@ -3139,7 +2750,7 @@ impl AdaptiveRMI {
             avg_segment_size,
             hot_buffer_size,
             hot_buffer_utilization,
-            overflow_size,
+            overflow_size: 0, // No longer used
             merge_in_progress: self.merge_scheduler.is_merge_in_progress(),
         }
     }
@@ -3270,7 +2881,7 @@ impl AdaptiveRMI {
     pub fn lookup_keys_simd_batch(&self, keys: &[u64]) -> Vec<Option<u64>> {
         let mut results = Vec::with_capacity(keys.len());
 
-        // Phase 0: Check hot_buffer and overflow_buffer for all keys first
+        // Phase 0: Check hot_buffer for all keys first
         let mut need_snapshot_lookup = Vec::with_capacity(keys.len());
 
         for &key in keys {
@@ -3280,19 +2891,9 @@ impl AdaptiveRMI {
                 continue;
             }
 
-            // Check overflow_buffer second
-            let found_in_overflow = {
-                let overflow = self.overflow_buffer.lock();
-                overflow.get(key)
-            };
-
-            if let Some(value) = found_in_overflow {
-                results.push(Some(value));
-            } else {
-                // Mark for snapshot lookup
-                need_snapshot_lookup.push((results.len(), key));
-                results.push(None); // Placeholder
-            }
+            // Mark for snapshot lookup
+            need_snapshot_lookup.push((results.len(), key));
+            results.push(None); // Placeholder
         }
 
         // Phase 1: Snapshot lookup for remaining keys using SIMD
@@ -3646,7 +3247,13 @@ impl AdaptiveRMI {
                 return unsafe { self.simd_neon_zero_lock_batch(snapshot, keys) };
             }
         } // Scalar fallback on zero-lock data
-        snapshot.lookup_batch_zero_lock(keys)
+        
+        // Scalar lookup on zero-lock snapshot
+        let mut results = Vec::with_capacity(keys.len());
+        for &key in keys {
+            results.push(Self::lookup_zero_alloc_inline(snapshot, key));
+        }
+        results
     }
 
     /// AVX2 SIMD processing on zero-lock snapshot - Full vectorization
@@ -4046,62 +3653,27 @@ impl AdaptiveRMI {
         // Hot buffer lookup (highest probability, fastest access)
         let hot_results = self.simd_hot_buffer_lookup(keys_lo, keys_hi);
 
-        //  PERFORMANCE OPTIMIZATION: Early exit if all keys found in hot buffer
+        // PERFORMANCE OPTIMIZATION: Early exit if all keys found in hot buffer
         let hot_found_count = hot_results.iter().filter(|r| r.is_some()).count();
         if hot_found_count == 8 {
             return hot_results;
         }
 
-        //Overflow buffer lookup (for recently inserted, unsorted data)
-        let overflow_results = self.simd_overflow_buffer_lookup(keys_lo, keys_hi, &hot_results);
-
-        // EARLY EXIT: Check if all keys found in buffers (hot + overflow)
-        let buffer_complete =
-            (0..8).all(|i| hot_results[i].is_some() || overflow_results[i].is_some());
-
-        if buffer_complete {
-            return [
-                hot_results[0].or(overflow_results[0]),
-                hot_results[1].or(overflow_results[1]),
-                hot_results[2].or(overflow_results[2]),
-                hot_results[3].or(overflow_results[3]),
-                hot_results[4].or(overflow_results[4]),
-                hot_results[5].or(overflow_results[5]),
-                hot_results[6].or(overflow_results[6]),
-                hot_results[7].or(overflow_results[7]),
-            ];
-        }
-
-        //  Segment lookup (for persistent, sorted data)
+        // Segment lookup (for persistent, sorted data)
+        let overflow_results = [None; 8]; // Placeholder for compatibility
         let segment_results =
             self.simd_segment_lookup(keys_lo, keys_hi, &hot_results, &overflow_results);
 
-        // Priority: Hot buffer > Overflow buffer > Segments
+        // Priority: Hot buffer > Segments
         [
-            hot_results[0]
-                .or(overflow_results[0])
-                .or(segment_results[0]),
-            hot_results[1]
-                .or(overflow_results[1])
-                .or(segment_results[1]),
-            hot_results[2]
-                .or(overflow_results[2])
-                .or(segment_results[2]),
-            hot_results[3]
-                .or(overflow_results[3])
-                .or(segment_results[3]),
-            hot_results[4]
-                .or(overflow_results[4])
-                .or(segment_results[4]),
-            hot_results[5]
-                .or(overflow_results[5])
-                .or(segment_results[5]),
-            hot_results[6]
-                .or(overflow_results[6])
-                .or(segment_results[6]),
-            hot_results[7]
-                .or(overflow_results[7])
-                .or(segment_results[7]),
+            hot_results[0].or(segment_results[0]),
+            hot_results[1].or(segment_results[1]),
+            hot_results[2].or(segment_results[2]),
+            hot_results[3].or(segment_results[3]),
+            hot_results[4].or(segment_results[4]),
+            hot_results[5].or(segment_results[5]),
+            hot_results[6].or(segment_results[6]),
+            hot_results[7].or(segment_results[7]),
         ]
     }
 
@@ -4161,55 +3733,8 @@ impl AdaptiveRMI {
             return hot_results;
         }
 
-        // Overflow buffer lookup for missing keys
-        let overflow_results_0_3 =
-            self.simd_overflow_buffer_lookup(keys_0, keys_1, &hot_results_0_3);
-        let overflow_results_4_7 =
-            self.simd_overflow_buffer_lookup(keys_2, keys_3, &hot_results_4_7);
-
-        let overflow_results = [
-            overflow_results_0_3[0],
-            overflow_results_0_3[1],
-            overflow_results_0_3[2],
-            overflow_results_0_3[3],
-            overflow_results_0_3[4],
-            overflow_results_0_3[5],
-            overflow_results_0_3[6],
-            overflow_results_0_3[7],
-            overflow_results_4_7[0],
-            overflow_results_4_7[1],
-            overflow_results_4_7[2],
-            overflow_results_4_7[3],
-            overflow_results_4_7[4],
-            overflow_results_4_7[5],
-            overflow_results_4_7[6],
-            overflow_results_4_7[7],
-        ];
-
-        // EARLY EXIT: Check if all keys found in buffers (hot + overflow)
-        let buffer_complete =
-            (0..16).all(|i| hot_results[i].is_some() || overflow_results[i].is_some());
-
-        if buffer_complete {
-            return [
-                hot_results[0].or(overflow_results[0]),
-                hot_results[1].or(overflow_results[1]),
-                hot_results[2].or(overflow_results[2]),
-                hot_results[3].or(overflow_results[3]),
-                hot_results[4].or(overflow_results[4]),
-                hot_results[5].or(overflow_results[5]),
-                hot_results[6].or(overflow_results[6]),
-                hot_results[7].or(overflow_results[7]),
-                hot_results[8].or(overflow_results[8]),
-                hot_results[9].or(overflow_results[9]),
-                hot_results[10].or(overflow_results[10]),
-                hot_results[11].or(overflow_results[11]),
-                hot_results[12].or(overflow_results[12]),
-                hot_results[13].or(overflow_results[13]),
-                hot_results[14].or(overflow_results[14]),
-                hot_results[15].or(overflow_results[15]),
-            ];
-        }
+        // Placeholder for compatibility with segment lookup signature
+        let overflow_results = [None; 16];
 
         // Segment lookup for still missing keys
         let segment_results_0_3 =
@@ -4238,54 +3763,22 @@ impl AdaptiveRMI {
 
         // VECTORIZED RESULT COMBINATION: Efficiently combine all 16 results
         [
-            hot_results[0]
-                .or(overflow_results[0])
-                .or(segment_results[0]),
-            hot_results[1]
-                .or(overflow_results[1])
-                .or(segment_results[1]),
-            hot_results[2]
-                .or(overflow_results[2])
-                .or(segment_results[2]),
-            hot_results[3]
-                .or(overflow_results[3])
-                .or(segment_results[3]),
-            hot_results[4]
-                .or(overflow_results[4])
-                .or(segment_results[4]),
-            hot_results[5]
-                .or(overflow_results[5])
-                .or(segment_results[5]),
-            hot_results[6]
-                .or(overflow_results[6])
-                .or(segment_results[6]),
-            hot_results[7]
-                .or(overflow_results[7])
-                .or(segment_results[7]),
-            hot_results[8]
-                .or(overflow_results[8])
-                .or(segment_results[8]),
-            hot_results[9]
-                .or(overflow_results[9])
-                .or(segment_results[9]),
-            hot_results[10]
-                .or(overflow_results[10])
-                .or(segment_results[10]),
-            hot_results[11]
-                .or(overflow_results[11])
-                .or(segment_results[11]),
-            hot_results[12]
-                .or(overflow_results[12])
-                .or(segment_results[12]),
-            hot_results[13]
-                .or(overflow_results[13])
-                .or(segment_results[13]),
-            hot_results[14]
-                .or(overflow_results[14])
-                .or(segment_results[14]),
-            hot_results[15]
-                .or(overflow_results[15])
-                .or(segment_results[15]),
+            hot_results[0].or(segment_results[0]),
+            hot_results[1].or(segment_results[1]),
+            hot_results[2].or(segment_results[2]),
+            hot_results[3].or(segment_results[3]),
+            hot_results[4].or(segment_results[4]),
+            hot_results[5].or(segment_results[5]),
+            hot_results[6].or(segment_results[6]),
+            hot_results[7].or(segment_results[7]),
+            hot_results[8].or(segment_results[8]),
+            hot_results[9].or(segment_results[9]),
+            hot_results[10].or(segment_results[10]),
+            hot_results[11].or(segment_results[11]),
+            hot_results[12].or(segment_results[12]),
+            hot_results[13].or(segment_results[13]),
+            hot_results[14].or(segment_results[14]),
+            hot_results[15].or(segment_results[15]),
         ]
     }
 
@@ -4402,144 +3895,6 @@ impl AdaptiveRMI {
                 // Early exit if all keys found
                 if results.iter().all(|r| r.is_some()) {
                     break;
-                }
-            }
-        }
-
-        results
-    }
-
-    /// OPTIMIZED SIMD OVERFLOW BUFFER LOOKUP: Selective vectorized overflow search
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    #[target_feature(enable = "avx2")]
-    unsafe fn simd_overflow_buffer_lookup(
-        &self,
-        keys_lo: __m256i,
-        keys_hi: __m256i,
-        hot_results: &[Option<u64>; 8],
-    ) -> [Option<u64>; 8] {
-        let mut results = [None; 8];
-
-        // EARLY EXIT: Skip if all results found in hot buffer
-        let missing_count = hot_results.iter().filter(|r| r.is_none()).count();
-        if missing_count == 0 {
-            return results;
-        }
-
-        //SELECTIVE PROCESSING: Only process missing keys
-        // Pre-extract all keys into array to avoid constant evaluation issues
-        let keys_array = [
-            _mm256_extract_epi64(keys_lo, 0) as u64,
-            _mm256_extract_epi64(keys_lo, 1) as u64,
-            _mm256_extract_epi64(keys_lo, 2) as u64,
-            _mm256_extract_epi64(keys_lo, 3) as u64,
-            _mm256_extract_epi64(keys_hi, 0) as u64,
-            _mm256_extract_epi64(keys_hi, 1) as u64,
-            _mm256_extract_epi64(keys_hi, 2) as u64,
-            _mm256_extract_epi64(keys_hi, 3) as u64,
-        ];
-
-        let missing_keys: Vec<(usize, u64)> = hot_results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, result)| {
-                if result.is_none() {
-                    Some((i, keys_array[i]))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if missing_keys.is_empty() {
-            return results;
-        }
-
-        // MINIMAL LOCK TIME: Get snapshot of overflow buffer
-        let overflow_snapshot = {
-            let overflow = self.overflow_buffer.lock();
-            if overflow.data.is_empty() {
-                return results; // Early exit if overflow is empty
-            }
-            overflow
-                .data
-                .iter()
-                .map(|(&k, &v)| (k, v))
-                .collect::<Vec<_>>()
-        }; // Lock released immediately
-
-        // VECTORIZED OVERFLOW SEARCH: Process missing keys in SIMD batches
-        for chunk in missing_keys.chunks(4) {
-            if chunk.len() >= 4 && overflow_snapshot.len() >= 4 {
-                // Load 4 search keys into SIMD register
-                let _search_keys = _mm256_set_epi64x(
-                    if chunk.len() > 3 {
-                        chunk[3].1 as i64
-                    } else {
-                        0
-                    },
-                    if chunk.len() > 2 {
-                        chunk[2].1 as i64
-                    } else {
-                        0
-                    },
-                    if chunk.len() > 1 {
-                        chunk[1].1 as i64
-                    } else {
-                        0
-                    },
-                    chunk[0].1 as i64,
-                );
-
-                // Search through overflow buffer in SIMD chunks
-                for buffer_chunk in overflow_snapshot.chunks(4) {
-                    if buffer_chunk.len() >= 4 {
-                        let buffer_keys = _mm256_set_epi64x(
-                            if buffer_chunk.len() > 3 {
-                                buffer_chunk[3].0 as i64
-                            } else {
-                                0
-                            },
-                            if buffer_chunk.len() > 2 {
-                                buffer_chunk[2].0 as i64
-                            } else {
-                                0
-                            },
-                            if buffer_chunk.len() > 1 {
-                                buffer_chunk[1].0 as i64
-                            } else {
-                                0
-                            },
-                            buffer_chunk[0].0 as i64,
-                        );
-
-                        // Compare all 4 search keys against all 4 buffer keys
-                        for (_j, &(search_idx, search_key)) in chunk.iter().enumerate() {
-                            let search_vec = _mm256_set1_epi64x(search_key as i64);
-                            let matches = _mm256_cmpeq_epi64(search_vec, buffer_keys);
-                            let mask = _mm256_movemask_epi8(matches);
-
-                            if mask != 0 {
-                                // Find exact match and extract value
-                                for &(k, v) in buffer_chunk {
-                                    if k == search_key {
-                                        results[search_idx] = Some(v);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Scalar fallback for small chunks
-                for &(search_idx, search_key) in chunk {
-                    for &(k, v) in &overflow_snapshot {
-                        if k == search_key {
-                            results[search_idx] = Some(v);
-                            break;
-                        }
-                    }
                 }
             }
         }
@@ -4806,46 +4161,21 @@ impl AdaptiveRMI {
             // Hot buffer (prioritized for Apple Silicon's large cache)
             let hot_results = self.neon_hot_buffer_lookup(keys);
 
-            //  EARLY EXIT: Apple Silicon branch predictor optimization
+            // EARLY EXIT: Apple Silicon branch predictor optimization
             if hot_results.iter().all(|r| r.is_some()) {
                 return hot_results;
             }
 
-            //  Overflow buffer (optimized for M4's advanced cache hierarchy)
-            let overflow_results = self.neon_overflow_buffer_lookup(keys, &hot_results);
-
-            // APPLE SILICON EARLY EXIT: Optimized for M4's execution units
-            let found_in_buffers = hot_results
-                .iter()
-                .zip(overflow_results.iter())
-                .all(|(hot, overflow)| hot.is_some() || overflow.is_some());
-
-            if found_in_buffers {
-                return [
-                    hot_results[0].or(overflow_results[0]),
-                    hot_results[1].or(overflow_results[1]),
-                    hot_results[2].or(overflow_results[2]),
-                    hot_results[3].or(overflow_results[3]),
-                ];
-            }
-
             // Segments (optimized for Apple Silicon's wide execution)
+            let overflow_results = [None; 4]; // Placeholder for compatibility
             let segment_results = self.neon_segment_lookup(keys, &hot_results, &overflow_results);
 
             // NEON RESULT COMBINATION: Optimized for Apple Silicon's execution pipeline
             [
-                hot_results[0]
-                    .or(overflow_results[0])
-                    .or(segment_results[0]),
-                hot_results[1]
-                    .or(overflow_results[1])
-                    .or(segment_results[1]),
-                hot_results[2]
-                    .or(overflow_results[2])
-                    .or(segment_results[2]),
-                hot_results[3]
-                    .or(overflow_results[3])
-                    .or(segment_results[3]),
+                hot_results[0].or(segment_results[0]),
+                hot_results[1].or(segment_results[1]),
+                hot_results[2].or(segment_results[2]),
+                hot_results[3].or(segment_results[3]),
             ]
         }
     }
@@ -4935,113 +4265,6 @@ impl AdaptiveRMI {
         }
 
         // Return enterprise-validated results
-        results
-    }
-
-    /// ARM64 NEON OVERFLOW BUFFER: Selective vectorized overflow search for Apple Silicon
-    ///
-    /// Implements enterprise-grade NEON optimizations with selective search logic.
-    /// Only searches for keys not found in hot buffer, maximizing Apple Silicon efficiency.
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    fn neon_overflow_buffer_lookup(
-        &self,
-        keys: &[u64],
-        hot_results: &[Option<u64>; 4],
-    ) -> [Option<u64>; 4] {
-        use std::arch::aarch64::*;
-
-        // Initialize results and early exits
-        let mut results = [None; 4];
-
-        // ENTERPRISE OPTIMIZATION: Skip if all keys found in hot buffer
-        if hot_results.iter().all(|r| r.is_some()) {
-            return results;
-        }
-
-        // SELECTIVE SEARCH: Count keys that need overflow lookup
-        let unfound_keys: Vec<usize> = (0..4).filter(|&i| hot_results[i].is_none()).collect();
-
-        if unfound_keys.is_empty() {
-            return results;
-        }
-
-        // APPLE SILICON OPTIMIZATION: Atomic overflow buffer snapshot
-        let overflow_snapshot = {
-            let overflow = self.overflow_buffer.lock();
-            if overflow.data.is_empty() {
-                return results;
-            }
-
-            // M4 MACBOOK OPTIMIZATION: Cache-efficient copy for unified memory
-            let mut snapshot = Vec::with_capacity(overflow.data.len());
-            snapshot.extend(overflow.data.iter().map(|(&k, &v)| (k, v)));
-            snapshot
-        };
-
-        //  NEON vectorized overflow search
-        unsafe {
-            let mut found_count = 0;
-            let target_count = unfound_keys.len();
-
-            // NEON 128-BIT PROCESSING: Process overflow in vectorized chunks
-            for chunk in overflow_snapshot.chunks(2) {
-                if found_count >= target_count {
-                    break;
-                } // Early exit optimization
-
-                if chunk.len() >= 2 {
-                    // NEON VECTOR LOAD: Load 2 overflow key-value pairs
-                    let buffer_keys = vld1q_u64([chunk[0].0, chunk[1].0].as_ptr());
-
-                    // SELECTIVE SEARCH: Only check unfound keys from hot buffer
-                    for &idx in &unfound_keys {
-                        if results[idx].is_some() {
-                            continue;
-                        } // Skip already found
-
-                        let search_key = keys[idx];
-
-                        // NEON BROADCAST: Duplicate search key across 128-bit vector
-                        let search_vec = vdupq_n_u64(search_key);
-
-                        // NEON COMPARISON: Vectorized equality check
-                        let matches = vceqq_u64(search_vec, buffer_keys);
-
-                        // APPLE SILICON CONDITIONAL: Extract match results efficiently
-                        let match0 = vgetq_lane_u64(matches, 0);
-                        let match1 = vgetq_lane_u64(matches, 1);
-
-                        if match0 == u64::MAX {
-                            // Full match on lane 0
-                            results[idx] = Some(chunk[0].1);
-                            found_count += 1;
-                        } else if match1 == u64::MAX {
-                            // Full match on lane 1
-                            results[idx] = Some(chunk[1].1);
-                            found_count += 1;
-                        }
-                    }
-                } else {
-                    // SCALAR FALLBACK: Handle remaining single elements efficiently
-                    for &(k, v) in chunk {
-                        for &idx in &unfound_keys {
-                            if results[idx].is_none() && keys[idx] == k {
-                                results[idx] = Some(v);
-                                found_count += 1;
-                                if found_count >= target_count {
-                                    break;
-                                }
-                            }
-                        }
-                        if found_count >= target_count {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        //  Return enterprise-validated results
         results
     }
 

@@ -645,14 +645,32 @@ fn create_ultra_fast_write_routes(
                             StatusCode::OK,
                         ))
                     }
-                    Err(_) => Ok::<_, warp::Rejection>(warp::reply::with_status(
-                        warp::reply::with_header(
-                            "error".as_bytes().to_vec(),
-                            "Content-Type",
-                            "application/octet-stream",
-                        ),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    )),
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        // Detect backpressure conditions and return appropriate status codes
+                        let (status, msg) = if error_msg.contains("temporarily rejected") 
+                            || error_msg.contains("Queue backpressure") {
+                            // 503 Service Unavailable with Retry-After hint
+                            (StatusCode::SERVICE_UNAVAILABLE, error_msg)
+                        } else if error_msg.contains("permanently rejected") 
+                            || error_msg.contains("hard limit") 
+                            || error_msg.contains("cannot keep up") {
+                            // 429 Too Many Requests for hard rejections
+                            (StatusCode::TOO_MANY_REQUESTS, error_msg)
+                        } else {
+                            // 500 for actual internal errors
+                            (StatusCode::INTERNAL_SERVER_ERROR, error_msg)
+                        };
+                        
+                        Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::with_header(
+                                msg.as_bytes().to_vec(),
+                                "Content-Type",
+                                "application/octet-stream",
+                            ),
+                            status,
+                        ))
+                    }
                 }
             }
         });

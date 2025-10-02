@@ -56,7 +56,7 @@ fn benchmark_raw_lookup_scale(c: &mut Criterion) {
                 .map(|(i, &key)| (key, i as u64))
                 .collect();
             let adaptive_rmi =
-                kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
+                kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs_sync(&key_offset_pairs);
             let rmi_index = PrimaryIndex::AdaptiveRmi(Arc::new(adaptive_rmi));
 
             // Benchmark RMI
@@ -143,7 +143,7 @@ fn benchmark_sequential_vs_random_patterns(c: &mut Criterion) {
             .map(|(i, &key)| (key, i as u64))
             .collect();
         let adaptive_rmi =
-            kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
+            kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs_sync(&key_offset_pairs);
         let rmi_index = PrimaryIndex::AdaptiveRmi(Arc::new(adaptive_rmi));
 
         for (pattern_name, pattern_keys) in [
@@ -240,7 +240,7 @@ fn benchmark_scaling_behavior(c: &mut Criterion) {
                 .map(|(i, &key)| (key, i as u64))
                 .collect();
             let adaptive_rmi =
-                kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs(&key_offset_pairs);
+                kyrodb_engine::adaptive_rmi::AdaptiveRMI::build_from_pairs_sync(&key_offset_pairs);
 
             group.bench_with_input(BenchmarkId::new("rmi_scale", size), &size, |b, _| {
                 b.iter(|| black_box(adaptive_rmi.lookup(black_box(lookup_key))))

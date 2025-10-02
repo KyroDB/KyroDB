@@ -68,7 +68,7 @@ Proof points to demonstrate:
 
 ---
 
-## Adoption & Interop
+## Adoption & Interoperability
 
 - Start greenfield AI collections in KyroDB, keep OLTP/warehouse unchanged
 - Import via Kafka/Parquet; dual‑write optional
