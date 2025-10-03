@@ -843,224 +843,45 @@ impl GlobalRoutingModel {
     }
 }
 
-/// Trait for hot buffer implementations that can handle recent writes
-pub trait HotBuffer: std::fmt::Debug + Send + Sync {
-    fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error>;
-    fn bounded_search(&self, key: u64) -> Option<u64>;
-    fn drain_atomic(&self) -> Vec<(u64, u64)>;
-    fn as_any(&self) -> &dyn std::any::Any;
-    fn utilization(&self) -> f32;
-    fn current_size(&self) -> usize;
-    fn get_snapshot(&self) -> Vec<(u64, u64)>;
-    fn get(&self, key: u64) -> Option<u64> {
-        self.bounded_search(key)
-    }
-
-    /// Get all entries for test synchronization (non-draining)
-    fn get_all_for_sync(&self) -> Vec<(u64, u64)> {
-        self.get_snapshot()
-    }
-}
-
-/// Bounded hot buffer for recent writes
+/// Per-core lock-free hot buffer shard
 #[derive(Debug)]
-pub struct BoundedHotBuffer {
-    /// Circular buffer for recent writes
-    buffer: Mutex<VecDeque<(u64, u64)>>,
-    /// Maximum buffer size
-    capacity: usize,
-    /// Current buffer size
-    size: AtomicUsize,
-}
-
-impl BoundedHotBuffer {
-    /// Create new hot buffer with given capacity
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            buffer: Mutex::new(VecDeque::with_capacity(capacity)),
-            capacity,
-            size: AtomicUsize::new(0),
-        }
-    }
-
-    /// Single authoritative implementation
-    /// Try to insert into hot buffer - returns true if successful, false if at capacity
-    pub fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
-        let mut buffer = self.buffer.lock();
-
-        // Atomic check and insert under single lock
-        if buffer.len() >= self.capacity {
-            return Ok(false);
-        }
-
-        buffer.push_back((key, value));
-        self.size.store(buffer.len(), Ordering::Release);
-
-        Ok(true)
-    }
-
-    /// Get value for key from hot buffer
-    pub fn get(&self, key: u64) -> Option<u64> {
-        let buffer = self.buffer.lock();
-
-        // Search from most recent to oldest
-        for &(k, v) in buffer.iter().rev() {
-            if k == key {
-                return Some(v);
-            }
-        }
-        None
-    }
-
-    ///
-    /// Fixes race condition where size and buffer could be inconsistent
-    pub fn drain_atomic(&self) -> Vec<(u64, u64)> {
-        let mut buffer = self.buffer.lock();
-
-        //  atomic SNAPSHOT: Capture state atomically before any modifications
-        let drained_count = buffer.len();
-        let buffer_capacity = buffer.capacity();
-
-        let drained_data: Vec<_> = buffer.drain(..).collect();
-
-        self.size.store(0, Ordering::Release); // Use Release ordering for consistency
-
-        let freed_bytes = Self::calculate_hot_buffer_memory(&drained_data, buffer_capacity);
-
-        println!(
-            " Hot buffer atomic drain: {} entries, ~{}KB freed, capacity: {}",
-            drained_count,
-            freed_bytes / 1024,
-            buffer_capacity
-        );
-
-        drained_data
-    }
-
-    ///
-    fn calculate_hot_buffer_memory(_data: &[(u64, u64)], capacity: usize) -> usize {
-        let tuple_size = std::mem::size_of::<(u64, u64)>();
-        let vec_overhead = std::mem::size_of::<Vec<(u64, u64)>>();
-        let mutex_overhead = std::mem::size_of::<parking_lot::Mutex<Vec<(u64, u64)>>>();
-        let atomic_overhead = std::mem::size_of::<AtomicUsize>();
-
-        // Accurate total: include all allocations and overheads
-        capacity * tuple_size + vec_overhead + mutex_overhead + atomic_overhead
-    }
-
-    ///  MEMORY LEAK FIX: Check buffer state using source of truth (actual buffer)
-    /// Prevents inconsistency between atomic size and buffer length
-    pub fn is_full(&self) -> bool {
-        let buffer = self.buffer.lock();
-        let actual_len = buffer.len();
-
-        // Sync atomic size with reality to prevent drift
-        self.size.store(actual_len, Ordering::Release);
-
-        actual_len >= self.capacity
-    }
-
-    ///  MEMORY LEAK FIX: Get utilization using source of truth
-    /// Prevents reporting incorrect utilization due to size drift
-    pub fn utilization(&self) -> f32 {
-        let buffer = self.buffer.lock();
-        let actual_len = buffer.len();
-
-        // Sync atomic size with reality to prevent drift
-        self.size.store(actual_len, Ordering::Release);
-
-        actual_len as f32 / self.capacity as f32
-    }
-}
-
-impl HotBuffer for BoundedHotBuffer {
-    fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
-        self.try_insert(key, value)
-    }
-
-    fn bounded_search(&self, key: u64) -> Option<u64> {
-        self.get(key) // Use the existing get method
-    }
-
-    fn drain_atomic(&self) -> Vec<(u64, u64)> {
-        // Call the actual method on BoundedHotBuffer
-        let mut buffer = self.buffer.lock();
-        let drained_data: Vec<_> = buffer.drain(..).collect();
-        self.size.store(0, Ordering::Release);
-        drained_data
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn utilization(&self) -> f32 {
-        self.utilization()
-    }
-
-    fn current_size(&self) -> usize {
-        self.size.load(Ordering::Relaxed)
-    }
-
-    fn get_snapshot(&self) -> Vec<(u64, u64)> {
-        let buffer = self.buffer.lock();
-        buffer.iter().copied().collect()
-    }
-}
-
-/// Lock-free hot buffer for zero-contention lookups
-/// Uses atomic snapshots for lock-free reads with bounded memory
-#[derive(Debug)]
-pub struct LockFreeHotBuffer {
-    /// Atomic pointer to current buffer snapshot  
+struct HotBufferShard {
+    /// Lock-free snapshot of buffer data
     buffer_snapshot: Atomic<Vec<(u64, u64)>>,
-    /// Maximum buffer size
+    /// Maximum capacity per shard
     capacity: usize,
-    /// Current buffer size (atomic for consistency)
+    /// Current size (atomic for fast checks)
     size: AtomicUsize,
-    /// Generation counter for ABA prevention
+    /// Generation counter for tracking updates
     generation: AtomicU64,
 }
 
-impl LockFreeHotBuffer {
-    /// Create new lock-free hot buffer with given capacity
-    pub fn new(capacity: usize) -> Self {
-        let initial_buffer = Vec::new();
+impl HotBufferShard {
+    fn new(capacity: usize) -> Self {
         Self {
-            buffer_snapshot: Atomic::new(initial_buffer),
+            buffer_snapshot: Atomic::new(Vec::new()),
             capacity,
             size: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
         }
     }
 
-    /// FAST PATH: Lock-free get operation with zero contention
     #[inline]
     pub fn get_fast(&self, key: u64) -> Option<u64> {
         let guard = &crossbeam_epoch::pin();
         let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
 
         if let Some(buffer) = unsafe { snapshot.as_ref() } {
-            // Search from most recent to oldest (reverse order)
             for &(k, v) in buffer.iter().rev() {
                 if k == key {
                     return Some(v);
                 }
             }
         }
-
         None
     }
 
-    /// Get value for key (compatibility with existing interface)
-    pub fn get(&self, key: u64) -> Option<u64> {
-        self.get_fast(key)
-    }
-
-    /// Try to insert into hot buffer (still uses fallback locking for writes)
-    /// Note: Writes are less frequent than reads, so this optimization focuses on read path
-    pub fn try_insert(&self, key: u64, value: u64) -> Result<bool, anyhow::Error> {
-        // For now, use a simple approach for writes - could be optimized further
+    pub fn try_insert(&self, key: u64, value: u64) -> Result<bool> {
         let guard = &crossbeam_epoch::pin();
         let old_snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
 
@@ -1070,42 +891,32 @@ impl LockFreeHotBuffer {
             Vec::new()
         };
 
-        // Check capacity
         if current_buffer.len() >= self.capacity {
             return Ok(false);
         }
 
-        // Create new buffer with the added element
         let mut new_buffer = current_buffer;
         new_buffer.push((key, value));
 
-        // Atomic update of buffer snapshot
         let new_snapshot = Owned::new(new_buffer);
-        let result = self.buffer_snapshot.compare_exchange(
+        match self.buffer_snapshot.compare_exchange(
             old_snapshot,
             new_snapshot,
             Ordering::AcqRel,
-            Ordering::Relaxed,
+            Ordering::Acquire,
             guard,
-        );
-
-        match result {
+        ) {
             Ok(_) => {
-                self.size.store(
-                    unsafe { old_snapshot.as_ref().map(|b| b.len()).unwrap_or(0) } + 1,
-                    Ordering::Release,
-                );
+                self.size.fetch_add(1, Ordering::Relaxed);
                 self.generation.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
             }
             Err(_) => {
-                // Retry could be implemented here, but for simplicity, just fail
                 Ok(false)
             }
         }
     }
 
-    /// Atomic drain operation for background processing
     pub fn drain_atomic(&self) -> Vec<(u64, u64)> {
         let guard = &crossbeam_epoch::pin();
         let old_snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
@@ -1116,9 +927,8 @@ impl LockFreeHotBuffer {
             Vec::new()
         };
 
-        // Replace with empty buffer
         let empty_buffer = Owned::new(Vec::new());
-        let _result = self.buffer_snapshot.compare_exchange(
+        let _ = self.buffer_snapshot.compare_exchange(
             old_snapshot,
             empty_buffer,
             Ordering::AcqRel,
@@ -1129,100 +939,115 @@ impl LockFreeHotBuffer {
         self.size.store(0, Ordering::Release);
         self.generation.fetch_add(1, Ordering::Relaxed);
 
-        let freed_bytes = Self::calculate_memory(&drained_data, self.capacity);
-        println!(
-            "Lock-free buffer atomic drain: {} entries, ~{}KB freed",
-            drained_data.len(),
-            freed_bytes / 1024
-        );
-
         drained_data
     }
 
-    /// Calculate memory usage
-    fn calculate_memory(data: &[(u64, u64)], capacity: usize) -> usize {
-        let tuple_size = std::mem::size_of::<(u64, u64)>();
-        let vec_overhead = std::mem::size_of::<Vec<(u64, u64)>>();
-        let atomic_overhead = std::mem::size_of::<Atomic<Vec<(u64, u64)>>>();
-
-        let reserved_bytes = capacity * tuple_size;
-        let active_bytes = data.len() * tuple_size;
-
-        reserved_bytes.max(active_bytes) + vec_overhead + atomic_overhead
-    }
-
-    /// Check if buffer is full
-    pub fn is_full(&self) -> bool {
-        let guard = &crossbeam_epoch::pin();
-        let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-
-        if let Some(buffer) = unsafe { snapshot.as_ref() } {
-            let actual_len = buffer.len();
-            self.size.store(actual_len, Ordering::Release);
-            actual_len >= self.capacity
-        } else {
-            false
-        }
-    }
-
-    /// Get current utilization
-    pub fn utilization(&self) -> f32 {
-        let guard = &crossbeam_epoch::pin();
-        let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-
-        if let Some(buffer) = unsafe { snapshot.as_ref() } {
-            let actual_len = buffer.len();
-            self.size.store(actual_len, Ordering::Release);
-            actual_len as f32 / self.capacity as f32
-        } else {
-            0.0
-        }
-    }
-}
-
-impl HotBuffer for LockFreeHotBuffer {
-    fn try_insert(&self, _key: u64, _value: u64) -> Result<bool, anyhow::Error> {
-        // For now, delegate to bounded search - could be enhanced with lock-free insertion
-        Ok(false) // Lock-free insertion is complex, for now return false to use overflow
-    }
-
-    fn bounded_search(&self, key: u64) -> Option<u64> {
-        self.get_fast(key) // Use the existing get_fast method
-    }
-
-    fn drain_atomic(&self) -> Vec<(u64, u64)> {
-        // Implement lock-free drain - for now just return snapshot
-        let guard = &crossbeam_epoch::pin();
-        let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
-
-        if let Some(buffer) = unsafe { snapshot.as_ref() } {
-            buffer.clone()
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn utilization(&self) -> f32 {
-        self.utilization()
-    }
-
-    fn current_size(&self) -> usize {
+    #[inline]
+    pub fn current_size(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }
 
-    fn get_snapshot(&self) -> Vec<(u64, u64)> {
-        let guard = &crossbeam_epoch::pin();
-        let snapshot = self.buffer_snapshot.load(Ordering::Acquire, guard);
+    #[inline]
+    pub fn utilization(&self) -> f32 {
+        self.current_size() as f32 / self.capacity as f32
+    }
+}
 
-        if let Some(buffer) = unsafe { snapshot.as_ref() } {
-            buffer.clone()
-        } else {
-            Vec::new()
+/// Sharded hot buffer pool (one shard per CPU core)
+#[derive(Debug)]
+pub struct ShardedHotBufferPool {
+    shards: Vec<Arc<HotBufferShard>>,
+    num_shards: usize,
+    total_capacity: usize,
+}
+
+impl ShardedHotBufferPool {
+    pub fn new(capacity_per_shard: usize) -> Self {
+        let num_shards = num_cpus::get();
+        let shards = (0..num_shards)
+            .map(|_| Arc::new(HotBufferShard::new(capacity_per_shard)))
+            .collect();
+
+        Self {
+            shards,
+            num_shards,
+            total_capacity: capacity_per_shard * num_shards,
         }
+    }
+
+    #[inline]
+    pub fn insert(&self, key: u64, value: u64) -> Result<bool> {
+        let shard_idx = self.shard_for_key(key);
+        self.shards[shard_idx].try_insert(key, value)
+    }
+
+    #[inline]
+    pub fn get(&self, key: u64) -> Option<u64> {
+        let shard_idx = self.shard_for_key(key);
+        self.shards[shard_idx].get_fast(key)
+    }
+
+    #[inline]
+    fn shard_for_key(&self, key: u64) -> usize {
+        (key % self.num_shards as u64) as usize
+    }
+
+    pub fn drain_all_atomic(&self) -> Vec<(u64, u64)> {
+        self.shards
+            .iter()
+            .flat_map(|shard| shard.drain_atomic())
+            .collect()
+    }
+
+    pub fn total_size(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.current_size())
+            .sum()
+    }
+
+    pub fn max_utilization(&self) -> f32 {
+        self.shards
+            .iter()
+            .map(|shard| shard.utilization())
+            .fold(0.0f32, f32::max)
+    }
+
+    pub fn is_under_pressure(&self) -> bool {
+        self.shards
+            .iter()
+            .any(|shard| shard.utilization() > 0.75)
+    }
+
+    pub fn current_size(&self) -> usize {
+        self.total_size()
+    }
+
+    pub fn utilization(&self) -> f32 {
+        self.total_size() as f32 / self.total_capacity as f32
+    }
+
+    #[inline]
+    pub fn fast_is_empty(&self) -> bool {
+        // Fast path: check atomic size counters without loading buffers
+        self.shards
+            .iter()
+            .all(|shard| shard.size.load(Ordering::Relaxed) == 0)
+    }
+
+    pub fn get_snapshot(&self) -> Vec<(u64, u64)> {
+        self.shards
+            .iter()
+            .flat_map(|shard| {
+                let guard = &crossbeam_epoch::pin();
+                let snapshot = shard.buffer_snapshot.load(Ordering::Acquire, guard);
+                if let Some(buffer) = unsafe { snapshot.as_ref() } {
+                    buffer.clone()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect()
     }
 }
 
@@ -1405,16 +1230,12 @@ pub struct AdaptiveRMI {
     /// Configuration for zero-lock processing
     zero_lock_config: ZeroLockConfig,
 
-    // ====== LEGACY FIELDS (for compatibility) ======
-    /// Multiple independent segments that can be updated separately
+    /// Sharded hot buffers (eliminates write contention)
+    hot_buffer_pool: Arc<ShardedHotBufferPool>,
+
     segments: Arc<RwLock<Vec<AdaptiveSegment>>>,
-    /// Lock-free atomic snapshot of segments for fast reads
     segments_snapshot: Atomic<Vec<AdaptiveSegment>>,
-    /// Global routing table (learns segment boundaries)
     global_router: Arc<RwLock<GlobalRoutingModel>>,
-    /// Hot data buffer for recent writes
-    hot_buffer: Arc<dyn HotBuffer>,
-    /// Background merge coordinator
     merge_scheduler: Arc<BackgroundMerger>,
 }
 
@@ -1438,10 +1259,10 @@ impl AdaptiveRMI {
         eprintln!("Loaded optimized RMI configuration: SIMD width={}, batch size={}, cache buffer size={}",
                  rmi_config.simd_width, rmi_config.simd_batch_size, rmi_config.cache_buffer_size);
 
-        let capacity = std::env::var("KYRODB_HOT_BUFFER_SIZE")
+        let capacity_per_shard = std::env::var("KYRODB_HOT_BUFFER_SHARD_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_HOT_BUFFER_SIZE);
+            .unwrap_or(4096);
 
         let router_bits = std::env::var("KYRODB_RMI_ROUTER_BITS")
             .ok()
@@ -1449,33 +1270,30 @@ impl AdaptiveRMI {
             .map(|b| b.clamp(8, 24))
             .unwrap_or(16);
 
-        // Create initial zero-lock snapshot
+        let hot_buffer_pool = Arc::new(ShardedHotBufferPool::new(capacity_per_shard));
+
         let initial_snapshot = ImmutableIndexSnapshot::new(
-            Vec::new(),                                       // No segments initially
-            GlobalRoutingModel::new(Vec::new(), router_bits), // Empty router
-            Vec::new(),                                       // No hot data
-            0,                                                // Generation 0
+            Vec::new(),
+            GlobalRoutingModel::new(Vec::new(), router_bits),
+            Vec::new(),
+            0,
         );
 
         let rmi = Self {
-            // ZERO-LOCK ARCHITECTURE
             zero_lock_snapshot: Arc::new(ArcSwap::from_pointee(initial_snapshot)),
             write_queue: Arc::new(SegQueue::new()),
             background_handle: Arc::new(Mutex::new(None)),
             zero_lock_config: ZeroLockConfig::default(),
-
-            // LEGACY ARCHITECTURE (for compatibility)
+            hot_buffer_pool,
             segments: Arc::new(RwLock::new(Vec::new())),
             segments_snapshot: Atomic::new(Vec::new()),
             global_router: Arc::new(RwLock::new(GlobalRoutingModel::new(
                 Vec::new(),
                 router_bits,
             ))),
-            hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
         };
 
-        // Start zero-lock background worker
         rmi.start_zero_lock_worker();
         rmi
     }
@@ -1752,28 +1570,23 @@ impl AdaptiveRMI {
     /// **Use only for testing!** In production, the background worker
     /// handles async updates for better throughput.
     pub fn sync_snapshot_for_test(&self) {
-        // Step 1: Collect all pending writes from hot buffer
-        let all_writes = self.hot_buffer.get_all_for_sync();
+        let all_writes = self.hot_buffer_pool.get_snapshot();
 
         if all_writes.is_empty() {
-            return; // Nothing to sync
+            return;
         }
 
-        // Step 4: Update zero_lock_snapshot atomically
         let current = self.zero_lock_snapshot.load();
 
-        // Merge new writes into hot_data
         let mut new_hot_data = current.hot_data.to_vec();
         for (key, value) in all_writes {
-            // Update or insert
             if let Some(existing) = new_hot_data.iter_mut().find(|(k, _)| *k == key) {
-                existing.1 = value; // Update existing
+                existing.1 = value;
             } else {
-                new_hot_data.push((key, value)); // Insert new
+                new_hot_data.push((key, value));
             }
         }
 
-        // Create new snapshot with updated hot_data
         let new_snapshot = ImmutableIndexSnapshot::new(
             current.segments.to_vec(),
             current.router.clone(),
@@ -1781,7 +1594,6 @@ impl AdaptiveRMI {
             current.generation + 1,
         );
 
-        // Atomic swap
         self.zero_lock_snapshot.store(Arc::new(new_snapshot));
     }
 
@@ -1888,15 +1700,13 @@ impl AdaptiveRMI {
             background_handle: Arc::new(Mutex::new(None)),
             zero_lock_config: ZeroLockConfig::default(),
 
-            // LEGACY ARCHITECTURE (for compatibility)
+            hot_buffer_pool: Arc::new(ShardedHotBufferPool::new(capacity)),
             segments: Arc::new(RwLock::new(segments)),
             segments_snapshot,
             global_router: Arc::new(RwLock::new(global_router)),
-            hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
         };
 
-        // Start zero-lock background worker
         rmi.start_zero_lock_worker();
         rmi
     }
@@ -1908,8 +1718,6 @@ impl AdaptiveRMI {
         sorted_pairs.sort_by_key(|(k, _)| *k);
 
         if sorted_pairs.is_empty() {
-            // Create empty index without background worker
-            let capacity = DEFAULT_HOT_BUFFER_SIZE;
             let router_bits = 16;
             let initial_snapshot = ImmutableIndexSnapshot::new(
                 Vec::new(),
@@ -1923,18 +1731,17 @@ impl AdaptiveRMI {
                 write_queue: Arc::new(SegQueue::new()),
                 background_handle: Arc::new(Mutex::new(None)),
                 zero_lock_config: ZeroLockConfig::default(),
+                hot_buffer_pool: Arc::new(ShardedHotBufferPool::new(0)),
                 segments: Arc::new(RwLock::new(Vec::new())),
                 segments_snapshot: Atomic::new(Vec::new()),
                 global_router: Arc::new(RwLock::new(GlobalRoutingModel::new(
                     Vec::new(),
                     router_bits,
                 ))),
-                hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
                 merge_scheduler: Arc::new(BackgroundMerger::new()),
             };
         }
 
-        // Create segments
         let mut segments = Vec::new();
         let target_size = TARGET_SEGMENT_SIZE;
         let num_segments = (sorted_pairs.len() + target_size - 1) / target_size;
@@ -1949,7 +1756,6 @@ impl AdaptiveRMI {
             }
         }
 
-        // Build routing model
         let boundaries: Vec<u64> = segments
             .iter()
             .filter_map(|s| s.key_range().map(|(min, _)| min))
@@ -1957,10 +1763,8 @@ impl AdaptiveRMI {
 
         let router_bits = 16;
         let global_router = GlobalRoutingModel::new(boundaries, router_bits);
-        let capacity = DEFAULT_HOT_BUFFER_SIZE;
         let segments_snapshot = Atomic::new(segments.clone());
 
-        // Create zero-lock snapshot
         let initial_snapshot = ImmutableIndexSnapshot::new(
             segments.clone(),
             global_router.clone(),
@@ -1973,10 +1777,10 @@ impl AdaptiveRMI {
             write_queue: Arc::new(SegQueue::new()),
             background_handle: Arc::new(Mutex::new(None)),
             zero_lock_config: ZeroLockConfig::default(),
+            hot_buffer_pool: Arc::new(ShardedHotBufferPool::new(0)),
             segments: Arc::new(RwLock::new(segments)),
             segments_snapshot,
             global_router: Arc::new(RwLock::new(global_router)),
-            hot_buffer: Arc::new(BoundedHotBuffer::new(capacity)),
             merge_scheduler: Arc::new(BackgroundMerger::new()),
         }
     }
@@ -1985,7 +1789,6 @@ impl AdaptiveRMI {
     /// LOCK ORDER: hot_buffer (lock-free) → write_queue check
     /// Never acquires segments or router locks to prevent reader-writer deadlocks
     pub fn insert(&self, key: u64, value: u64) -> Result<()> {
-        // STEP 0: Check write_queue backpressure FIRST
         let queue_size = self.write_queue.len();
         
         if queue_size >= WRITE_QUEUE_HARD_LIMIT {
@@ -2004,15 +1807,10 @@ impl AdaptiveRMI {
             ));
         }
 
-        // STEP 1: Queue write to background worker for snapshot sync
         self.queue_write(key, value);
 
-        // STEP 2: Try hot buffer (provides immediate visibility for hot reads)
-        if self.hot_buffer.try_insert(key, value)? {
-            return Ok(());
-        }
+        let _ = self.hot_buffer_pool.insert(key, value);
 
-        // Hot buffer full is acceptable - background worker will drain write_queue
         Ok(())
     }
 
@@ -2029,15 +1827,17 @@ impl AdaptiveRMI {
     /// This is the **ultimate performance** lookup method.
     #[inline]
     pub fn lookup_key_ultra_fast(&self, key: u64) -> Option<u64> {
-        // Phase 0: Check hot_buffer FIRST - captures most recent writes (not yet merged)
-        if let Some(value) = self.hot_buffer.get(key) {
+        // Skip hot buffer check if empty (read-only workloads)
+        if self.hot_buffer_pool.fast_is_empty() {
+            let snapshot = self.zero_lock_snapshot.load();
+            return Self::lookup_zero_alloc_inline(&snapshot, key);
+        }
+
+        if let Some(value) = self.hot_buffer_pool.get(key) {
             return Some(value);
         }
 
-        // Phase 1: Single atomic snapshot load - only synchronization operation
         let snapshot = self.zero_lock_snapshot.load();
-
-        // Phase 2: Zero-allocation computation - pure computation, no heap activity
         Self::lookup_zero_alloc_inline(&snapshot, key)
     }
 
@@ -2122,60 +1922,7 @@ impl AdaptiveRMI {
         None
     }
 
-    /// Legacy lookup method (for compatibility)
-    #[inline]
-    #[allow(dead_code)]
-    fn lookup_key_ultra_fast_legacy(&self, key: u64) -> Option<u64> {
-        //  PHASE 1: Lock-free hot buffer check (most recent writes)
-        // Try lock-free buffer first for maximum performance
-        if let Some(lock_free_buffer) = self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>()
-        {
-            if let Some(value) = lock_free_buffer.get_fast(key) {
-                return Some(value);
-            }
-        } else {
-            // Fallback to bounded search for other hot buffer types
-            if let Some(value) = self.hot_buffer.bounded_search(key) {
-                return Some(value);
-            }
-        }
 
-        //  PHASE 2: Try atomic snapshot first (zero-lock fast path)
-        let guard = &crossbeam_epoch::pin();
-        let segments_ptr = self.segments_snapshot.load(Ordering::Acquire, guard);
-        if let Some(segments_ref) = unsafe { segments_ptr.as_ref() } {
-            // Fast router prediction without locks
-            let router_snapshot = self.global_router.read();
-            let segment_id = router_snapshot.predict_segment(key);
-            drop(router_snapshot); // Release router lock immediately
-
-            // Predicted lookup in atomic snapshot
-            if segment_id < segments_ref.len() {
-                if let Some(value) = segments_ref[segment_id].bounded_search(key) {
-                    return Some(value);
-                }
-            }
-
-            // Linear probe in atomic snapshot if prediction failed
-            for segment in segments_ref.iter() {
-                if let Some(value) = segment.bounded_search(key) {
-                    return Some(value);
-                }
-            }
-        }
-
-        //  PHASE 3: Fallback to locked segments
-        let segments_guard = self.segments.read();
-        let router_snapshot = self.global_router.read();
-        let segment_id = router_snapshot.predict_segment(key);
-        drop(router_snapshot);
-
-        if segment_id < segments_guard.len() {
-            segments_guard[segment_id].bounded_search(key)
-        } else {
-            Self::linear_probe_segments(&segments_guard, key)
-        }
-    }
 
     /// Update atomic snapshot when segments change
     /// Called after any modification to maintain consistency
@@ -2220,8 +1967,7 @@ impl AdaptiveRMI {
     pub async fn merge_hot_buffer(&self) -> Result<()> {
         self.merge_scheduler.start_merge();
 
-        // STEP 1: Drain hot buffer (lock-free atomic operation)
-        let mut all_writes = self.hot_buffer.drain_atomic();
+        let mut all_writes = self.hot_buffer_pool.drain_all_atomic();
 
         if all_writes.is_empty() {
             self.merge_scheduler.complete_merge();
@@ -2676,9 +2422,7 @@ impl AdaptiveRMI {
                     break;
                 }
 
-                // SIMPLE MAINTENANCE: Only essential operations
-                // Check hot buffer utilization to decide if merge is needed
-                let hot_utilization = self.hot_buffer.utilization();
+                let hot_utilization = self.hot_buffer_pool.utilization();
 
                 if hot_utilization > 0.8 {
                     println!(
@@ -2710,8 +2454,7 @@ impl AdaptiveRMI {
                     }
                 }
 
-                // LOW-IMPACT OPERATIONS: Quick checks only
-                // Removed overflow buffer pressure check (no longer used)
+           
 
                 // Reduced logging frequency to minimize overhead
                 if total_iteration_count % 200 == 0 {
@@ -2730,10 +2473,9 @@ impl AdaptiveRMI {
     /// Get performance statistics
     pub fn get_stats(&self) -> AdaptiveRMIStats {
         let segments = self.segments.read();
-        let hot_buffer_size = self.hot_buffer.current_size();
-        let hot_buffer_utilization = self.hot_buffer.utilization();
+        let hot_buffer_size = self.hot_buffer_pool.current_size();
+        let hot_buffer_utilization = self.hot_buffer_pool.utilization();
 
-        // Accurate total: Include both segments AND buffer contents
         let segment_keys: usize = segments.iter().map(|s| s.len()).sum();
         let total_keys = segment_keys + hot_buffer_size;
         let segment_count = segments.len();
@@ -2750,7 +2492,7 @@ impl AdaptiveRMI {
             avg_segment_size,
             hot_buffer_size,
             hot_buffer_utilization,
-            overflow_size: 0, // No longer used
+            overflow_size: 0,
             merge_in_progress: self.merge_scheduler.is_merge_in_progress(),
         }
     }
@@ -2881,19 +2623,16 @@ impl AdaptiveRMI {
     pub fn lookup_keys_simd_batch(&self, keys: &[u64]) -> Vec<Option<u64>> {
         let mut results = Vec::with_capacity(keys.len());
 
-        // Phase 0: Check hot_buffer for all keys first
         let mut need_snapshot_lookup = Vec::with_capacity(keys.len());
 
         for &key in keys {
-            // Check hot_buffer first
-            if let Some(value) = self.hot_buffer.get(key) {
+            if let Some(value) = self.hot_buffer_pool.get(key) {
                 results.push(Some(value));
                 continue;
             }
 
-            // Mark for snapshot lookup
             need_snapshot_lookup.push((results.len(), key));
-            results.push(None); // Placeholder
+            results.push(None);
         }
 
         // Phase 1: Snapshot lookup for remaining keys using SIMD
@@ -3531,10 +3270,8 @@ impl AdaptiveRMI {
             let mut found = [false; 4];
             let mut values = [0u64; 4];
 
-            if let Some(lock_free_buffer) =
-                self.hot_buffer.as_any().downcast_ref::<LockFreeHotBuffer>()
             {
-                let snapshot = lock_free_buffer.get_snapshot();
+                let snapshot = self.hot_buffer_pool.get_snapshot();
 
                 for hot_chunk_start in (0..snapshot.len()).step_by(2).rev() {
                     let hot_chunk_end = (hot_chunk_start + 2).min(snapshot.len());
@@ -3593,15 +3330,6 @@ impl AdaptiveRMI {
 
                     if found.iter().all(|&f| f) {
                         break;
-                    }
-                }
-            } else {
-                // Fallback to bounded search for other buffer types
-                let search_keys = [key0, key1, key2, key3];
-                for i in 0..4 {
-                    if let Some(value) = self.hot_buffer.bounded_search(search_keys[i]) {
-                        found[i] = true;
-                        values[i] = value;
                     }
                 }
             }
@@ -3798,18 +3526,17 @@ impl AdaptiveRMI {
 
         let mut results = [None; 8];
 
-        // MINIMAL LOCK TIME: Single atomic snapshot acquisition
-        // Lock strategy: Get all data at once to minimize lock contention
+        // LOCK-FREE SNAPSHOT: Zero-contention snapshot from sharded pool
+        // Sharded architecture enables lock-free concurrent reads
         let buffer_snapshot = {
-            let snapshot = self.hot_buffer.get_snapshot();
+            let snapshot = self.hot_buffer_pool.get_snapshot();
             if snapshot.is_empty() {
                 return results; // Early exit for empty buffer
             }
 
-            // Create snapshot to enable lock-free processing
-            // Clone is necessary to release lock before SIMD processing
+            // Snapshot is already lock-free from sharded pool
             snapshot
-        }; // Lock released immediately after snapshot
+        };
 
         // LOCK-FREE VECTORIZED SEARCH: No locks during actual search operations
         // Extract all 8 keys from SIMD registers for efficient processing
@@ -4191,15 +3918,15 @@ impl AdaptiveRMI {
         //  Early exit optimization for enterprise performance
         let mut results = [None; 4];
 
-        // APPLE SILICON OPTIMIZATION: Single atomic lock acquisition
-        // Leverages unified memory architecture for optimal cache coherency
+        // APPLE SILICON OPTIMIZATION: Lock-free snapshot from sharded pool
+        // Leverages unified memory architecture with zero-contention access
         let buffer_snapshot = {
-            let snapshot = self.hot_buffer.get_snapshot();
+            let snapshot = self.hot_buffer_pool.get_snapshot();
             if snapshot.is_empty() {
                 return results; // Early exit for empty buffer
             }
 
-            // M4 MACBOOK OPTIMIZATION: Cache-aligned copy for unified memory
+            // M4 MACBOOK OPTIMIZATION: Lock-free access with unified memory
             snapshot
         };
 

@@ -96,6 +96,8 @@ fnv = "1.0"
 # Lock-free concurrent data structures
 crossbeam-queue = "0.3"
 crossbeam-epoch = "0.9"
+# CPU core count detection
+num_cpus = "1.16"
 # SIMD optimizations (optional)
 wide = { version = "0.7", optional = true }
 # Failpoints for testing (optional)
