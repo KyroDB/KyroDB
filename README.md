@@ -261,10 +261,6 @@ Our learned cache predicts hot documents **before** you query them:
 
 ---
 
-## 🤝 Contributing
-
-KyroDB is in early development. We welcome contributions aligned with our mission and [`Implementation.md`](Implementation.md) roadmap.
-
 **Development workflow**:
 ```bash
 # Clone repository
@@ -306,7 +302,7 @@ This project is licensed under the **Business Source License 1.1 (BSL 1.1)**.
 
 **Permitted Use**:
 - Development, testing, and non-production use
-- Production use with up to 3 nodes and 1TB of data
+- Production use with up to 1 nodes and 1TB of data
 - Creating derivative works and modifications
 
 **Prohibited Use**:

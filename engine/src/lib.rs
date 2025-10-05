@@ -9,11 +9,11 @@
 
 // ===== Phase 0 modules =====
 
+// Week 1-2: HNSW vector search (CURRENT - Phase 0 Week 1-2)
+pub mod hnsw_index;
+
 // Week 3-8: RMI core for learned cache (predicts doc_id → hotness_score)
 pub mod rmi_core;
-
-// Week 1-2: HNSW vector search (to be implemented next)
-// pub mod hnsw_index;
 
 // Week 3-8: Learned cache predictor (to be implemented)
 // pub mod learned_cache;
@@ -23,5 +23,8 @@ pub mod rmi_core;
 
 // ===== Public API =====
 
-// Re-export RMI core components for learned cache
+// Re-export HNSW components (Phase 0 Week 1-2)
+pub use hnsw_index::{HnswVectorIndex, SearchResult};
+
+// Re-export RMI core components for learned cache (Phase 0 Week 3-8)
 pub use rmi_core::{LocalLinearModel, RmiIndex, RmiSegment};

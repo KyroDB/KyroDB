@@ -11,7 +11,7 @@ use std::sync::Arc;
 const MAX_SEARCH_WINDOW: usize = 16;
 
 /// Local linear model for position prediction
-/// 
+///
 /// Core RMI component: predicts position in sorted array using linear regression.
 /// Reusable for learned cache: predicts doc_id → hotness_score lookup position.
 #[derive(Debug, Clone)]
@@ -102,7 +102,7 @@ impl LocalLinearModel {
 }
 
 /// Segment of sorted data with local learned model
-/// 
+///
 /// Core RMI component: each segment learns a local linear model for its key range.
 /// Reusable for learned cache: segment stores (doc_id, hotness_score) pairs.
 pub struct RmiSegment {
@@ -159,7 +159,7 @@ impl RmiSegment {
 }
 
 /// Segment router: maps key → segment index
-/// 
+///
 /// Core RMI component: top-level model that routes keys to segments.
 /// Reusable for learned cache: routes doc_id to appropriate cache segment.
 pub struct SegmentRouter {
@@ -210,7 +210,7 @@ impl SegmentRouter {
 }
 
 /// Multi-segment RMI index
-/// 
+///
 /// Complete RMI with routing + segments.
 /// This is the base for learned cache predictor (Phase 0 Week 3-8).
 pub struct RmiIndex {

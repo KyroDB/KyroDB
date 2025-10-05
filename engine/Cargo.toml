@@ -22,8 +22,9 @@ learned-cache = []
 bench-no-metrics = []
 
 [dependencies]
-# Phase 0 Week 1-2: HNSW vector search (uncomment when starting)
-# hnswlib = "0.3"
+# Phase 0 Week 1-2: HNSW vector search
+hnsw_rs = "0.3"
+anyhow = "1.0"
 
 # Phase 0 Week 3-8: RMI for learned cache (no external deps, pure Rust)
 
@@ -35,8 +36,20 @@ bench-no-metrics = []
 
 [dev-dependencies]
 # Phase 0 Week 1-2: Testing HNSW recall guarantees
-# proptest = "1.0"
-# rand = "0.8"
+proptest = "1.0"
+rand = "0.8"
+
+[[bench]]
+name = "hnsw_knn"
+harness = false
+
+[dependencies.criterion]
+version = "0.5"
+optional = true
+
+[dev-dependencies.criterion]
+version = "0.5"
+features = ["html_reports"]
 
 [build-dependencies]
 # None needed yet
