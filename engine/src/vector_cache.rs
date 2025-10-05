@@ -32,13 +32,13 @@ pub struct CachedVector {
 pub struct VectorCache {
     /// Main cache storage (doc_id → cached vector)
     cache: Arc<RwLock<HashMap<u64, CachedVector>>>,
-    
+
     /// LRU queue (front = oldest, back = newest)
     lru_queue: Arc<RwLock<VecDeque<u64>>>,
-    
+
     /// Maximum capacity
     capacity: usize,
-    
+
     /// Cache statistics
     hits: Arc<RwLock<u64>>,
     misses: Arc<RwLock<u64>>,
@@ -75,18 +75,18 @@ impl VectorCache {
     /// Typically <100ns for small caches (<10k entries)
     pub fn get(&self, doc_id: u64) -> Option<CachedVector> {
         let cache = self.cache.read();
-        
+
         if let Some(cached) = cache.get(&doc_id) {
             // Cache hit
             *self.hits.write() += 1;
-            
+
             // Update LRU queue (move to back)
             let mut lru = self.lru_queue.write();
             if let Some(pos) = lru.iter().position(|&id| id == doc_id) {
                 lru.remove(pos);
                 lru.push_back(doc_id);
             }
-            
+
             Some(cached.clone())
         } else {
             // Cache miss
@@ -105,7 +105,7 @@ impl VectorCache {
         let doc_id = cached_vector.doc_id;
         let mut cache = self.cache.write();
         let mut lru = self.lru_queue.write();
-        
+
         // Check if already in cache (update LRU only)
         if cache.contains_key(&doc_id) {
             if let Some(pos) = lru.iter().position(|&id| id == doc_id) {
@@ -115,7 +115,7 @@ impl VectorCache {
             cache.insert(doc_id, cached_vector);
             return;
         }
-        
+
         // Evict if at capacity
         if cache.len() >= self.capacity {
             if let Some(evict_id) = lru.pop_front() {
@@ -123,7 +123,7 @@ impl VectorCache {
                 *self.evictions.write() += 1;
             }
         }
-        
+
         // Insert new entry
         cache.insert(doc_id, cached_vector);
         lru.push_back(doc_id);
@@ -135,14 +135,14 @@ impl VectorCache {
         let misses = *self.misses.read();
         let evictions = *self.evictions.read();
         let size = self.cache.read().len();
-        
+
         let total_requests = hits + misses;
         let hit_rate = if total_requests > 0 {
             hits as f64 / total_requests as f64
         } else {
             0.0
         };
-        
+
         CacheStats {
             hits,
             misses,
@@ -200,11 +200,11 @@ mod tests {
     #[test]
     fn test_cache_basic_operations() {
         let cache = VectorCache::new(10);
-        
+
         // Cache miss
         assert!(cache.get(1).is_none());
         assert_eq!(cache.stats().misses, 1);
-        
+
         // Insert and hit
         cache.insert(create_test_vector(1, 128));
         assert!(cache.get(1).is_some());
@@ -215,13 +215,13 @@ mod tests {
     #[test]
     fn test_cache_lru_eviction() {
         let cache = VectorCache::new(3);
-        
+
         // Fill cache
         cache.insert(create_test_vector(1, 128));
         cache.insert(create_test_vector(2, 128));
         cache.insert(create_test_vector(3, 128));
         assert_eq!(cache.len(), 3);
-        
+
         // Insert 4th vector, should evict doc 1 (oldest)
         cache.insert(create_test_vector(4, 128));
         assert_eq!(cache.len(), 3);
@@ -233,15 +233,15 @@ mod tests {
     #[test]
     fn test_cache_lru_update_on_access() {
         let cache = VectorCache::new(3);
-        
+
         // Fill cache
         cache.insert(create_test_vector(1, 128));
         cache.insert(create_test_vector(2, 128));
         cache.insert(create_test_vector(3, 128));
-        
+
         // Access doc 1 (moves to back of LRU queue)
         cache.get(1);
-        
+
         // Insert doc 4, should evict doc 2 (now oldest)
         cache.insert(create_test_vector(4, 128));
         assert!(cache.get(1).is_some()); // Still present (accessed recently)
@@ -253,16 +253,16 @@ mod tests {
     #[test]
     fn test_cache_hit_rate_calculation() {
         let cache = VectorCache::new(10);
-        
+
         cache.insert(create_test_vector(1, 128));
         cache.insert(create_test_vector(2, 128));
-        
+
         // 2 hits, 2 misses
         cache.get(1); // Hit
         cache.get(2); // Hit
         cache.get(3); // Miss
         cache.get(4); // Miss
-        
+
         let stats = cache.stats();
         assert_eq!(stats.hits, 2);
         assert_eq!(stats.misses, 2);
@@ -272,11 +272,11 @@ mod tests {
     #[test]
     fn test_cache_clear() {
         let cache = VectorCache::new(10);
-        
+
         cache.insert(create_test_vector(1, 128));
         cache.insert(create_test_vector(2, 128));
         assert_eq!(cache.len(), 2);
-        
+
         cache.clear();
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.stats().hits, 0);
@@ -286,16 +286,16 @@ mod tests {
     #[test]
     fn test_cache_update_existing() {
         let cache = VectorCache::new(10);
-        
+
         // Insert doc 1
         cache.insert(create_test_vector(1, 128));
         let old_embedding = cache.get(1).unwrap().embedding.clone();
-        
+
         // Update doc 1 (different embedding)
         let mut updated = create_test_vector(1, 128);
         updated.embedding = vec![0.9; 128];
         cache.insert(updated);
-        
+
         // Should have new embedding
         let new_cached = cache.get(1).unwrap();
         assert_ne!(old_embedding, new_cached.embedding);
@@ -305,10 +305,10 @@ mod tests {
     #[test]
     fn test_cache_concurrent_access() {
         use std::thread;
-        
+
         let cache = Arc::new(VectorCache::new(100));
         let mut handles = vec![];
-        
+
         // Spawn 10 threads inserting and reading concurrently
         for i in 0..10 {
             let cache_clone = Arc::clone(&cache);
@@ -321,11 +321,11 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         // All 100 vectors should be cached
         assert_eq!(cache.len(), 100);
     }
@@ -333,15 +333,15 @@ mod tests {
     #[test]
     fn test_cache_memory_efficiency() {
         let cache = VectorCache::new(1000);
-        
+
         // Insert 1000 vectors
         for i in 0..1000 {
             cache.insert(create_test_vector(i, 128));
         }
-        
+
         // Should not exceed capacity
         assert_eq!(cache.len(), 1000);
-        
+
         // Insert 1 more, should evict oldest
         cache.insert(create_test_vector(1000, 128));
         assert_eq!(cache.len(), 1000);

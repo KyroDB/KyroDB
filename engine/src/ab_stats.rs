@@ -26,7 +26,7 @@ pub struct AbTestMetric {
 ///
 /// Appends metrics to CSV file for durability across restarts.
 pub struct AbStatsPersister {
-    #[allow(dead_code)]  // Keep for future use (file rotation, path queries)
+    #[allow(dead_code)] // Keep for future use (file rotation, path queries)
     file_path: PathBuf,
     writer: RwLock<Option<csv::Writer<File>>>,
 }
@@ -37,24 +37,23 @@ impl AbStatsPersister {
     /// Creates CSV file if it doesn't exist, appends if it does.
     pub fn new<P: AsRef<Path>>(file_path: P) -> Result<Self> {
         let file_path = file_path.as_ref().to_path_buf();
-        
+
         // Create parent directory if needed
         if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create stats directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create stats directory")?;
         }
-        
+
         // Open file in append mode
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&file_path)
             .context("Failed to open stats file")?;
-        
+
         let writer = csv::WriterBuilder::new()
             .has_headers(false) // Don't write headers on every open
             .from_writer(file);
-        
+
         Ok(Self {
             file_path,
             writer: RwLock::new(Some(writer)),
@@ -84,10 +83,8 @@ impl AbStatsPersister {
         doc_id: u64,
         latency_ns: u64,
     ) -> Result<()> {
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64;
-        
+        let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+
         let metric = AbTestMetric {
             timestamp_ms,
             strategy: strategy.to_string(),
@@ -95,15 +92,15 @@ impl AbStatsPersister {
             doc_id,
             latency_ns,
         };
-        
+
         let mut writer_guard = self.writer.write().await;
         if let Some(writer) = writer_guard.as_mut() {
-            writer.serialize(&metric)
+            writer
+                .serialize(&metric)
                 .context("Failed to serialize metric")?;
-            writer.flush()
-                .context("Failed to flush CSV writer")?;
+            writer.flush().context("Failed to flush CSV writer")?;
         }
-        
+
         Ok(())
     }
 
@@ -111,8 +108,7 @@ impl AbStatsPersister {
     pub async fn flush(&self) -> Result<()> {
         let mut writer_guard = self.writer.write().await;
         if let Some(writer) = writer_guard.as_mut() {
-            writer.flush()
-                .context("Failed to flush CSV writer")?;
+            writer.flush().context("Failed to flush CSV writer")?;
         }
         Ok(())
     }
@@ -121,20 +117,19 @@ impl AbStatsPersister {
     ///
     /// Reads all metrics from CSV file. Useful for analysis and visualization.
     pub fn load_metrics<P: AsRef<Path>>(file_path: P) -> Result<Vec<AbTestMetric>> {
-        let file = File::open(file_path.as_ref())
-            .context("Failed to open stats file for reading")?;
-        
+        let file =
+            File::open(file_path.as_ref()).context("Failed to open stats file for reading")?;
+
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(false)
             .from_reader(file);
-        
+
         let mut metrics = Vec::new();
         for result in reader.deserialize() {
-            let metric: AbTestMetric = result
-                .context("Failed to deserialize metric")?;
+            let metric: AbTestMetric = result.context("Failed to deserialize metric")?;
             metrics.push(metric);
         }
-        
+
         Ok(metrics)
     }
 
@@ -144,60 +139,56 @@ impl AbStatsPersister {
         let mut lru_misses = 0u64;
         let mut learned_hits = 0u64;
         let mut learned_misses = 0u64;
-        
+
         let mut lru_latencies: Vec<u64> = Vec::new();
         let mut learned_latencies: Vec<u64> = Vec::new();
-        
+
         for metric in metrics {
             match metric.strategy.as_str() {
-                "lru_baseline" => {
-                    match metric.event_type.as_str() {
-                        "hit" => {
-                            lru_hits += 1;
-                            lru_latencies.push(metric.latency_ns);
-                        }
-                        "miss" => lru_misses += 1,
-                        _ => {}
+                "lru_baseline" => match metric.event_type.as_str() {
+                    "hit" => {
+                        lru_hits += 1;
+                        lru_latencies.push(metric.latency_ns);
                     }
-                }
-                "learned_rmi" => {
-                    match metric.event_type.as_str() {
-                        "hit" => {
-                            learned_hits += 1;
-                            learned_latencies.push(metric.latency_ns);
-                        }
-                        "miss" => learned_misses += 1,
-                        _ => {}
+                    "miss" => lru_misses += 1,
+                    _ => {}
+                },
+                "learned_rmi" => match metric.event_type.as_str() {
+                    "hit" => {
+                        learned_hits += 1;
+                        learned_latencies.push(metric.latency_ns);
                     }
-                }
+                    "miss" => learned_misses += 1,
+                    _ => {}
+                },
                 _ => {}
             }
         }
-        
+
         let lru_hit_rate = if lru_hits + lru_misses > 0 {
             lru_hits as f64 / (lru_hits + lru_misses) as f64
         } else {
             0.0
         };
-        
+
         let learned_hit_rate = if learned_hits + learned_misses > 0 {
             learned_hits as f64 / (learned_hits + learned_misses) as f64
         } else {
             0.0
         };
-        
+
         let lru_avg_latency = if !lru_latencies.is_empty() {
             lru_latencies.iter().sum::<u64>() / lru_latencies.len() as u64
         } else {
             0
         };
-        
+
         let learned_avg_latency = if !learned_latencies.is_empty() {
             learned_latencies.iter().sum::<u64>() / learned_latencies.len() as u64
         } else {
             0
         };
-        
+
         AbTestSummary {
             lru_hits,
             lru_misses,
@@ -235,17 +226,18 @@ impl AbTestSummary {
         println!("  Misses: {}", self.lru_misses);
         println!("  Hit Rate: {:.2}%", self.lru_hit_rate * 100.0);
         println!("  Avg Latency: {}ns", self.lru_avg_latency_ns);
-        
+
         println!("\nLearned Cache:");
         println!("  Hits: {}", self.learned_hits);
         println!("  Misses: {}", self.learned_misses);
         println!("  Hit Rate: {:.2}%", self.learned_hit_rate * 100.0);
         println!("  Avg Latency: {}ns", self.learned_avg_latency_ns);
-        
+
         println!("\nImprovement:");
-        let hit_rate_improvement = (self.learned_hit_rate - self.lru_hit_rate) / self.lru_hit_rate * 100.0;
+        let hit_rate_improvement =
+            (self.learned_hit_rate - self.lru_hit_rate) / self.lru_hit_rate * 100.0;
         println!("  Hit Rate: {:+.2}%", hit_rate_improvement);
-        
+
         println!("\nTotal Events: {}", self.total_events);
     }
 }
@@ -260,19 +252,19 @@ mod tests {
     async fn test_persister_basic_operations() {
         let temp_dir = TempDir::new().unwrap();
         let stats_path = temp_dir.path().join("ab_test_stats.csv");
-        
+
         let persister = AbStatsPersister::new(&stats_path).unwrap();
-        
+
         // Log some events
         persister.log_hit("lru_baseline", 1, 100).await.unwrap();
         persister.log_miss("lru_baseline", 2, 200).await.unwrap();
         persister.log_hit("learned_rmi", 3, 50).await.unwrap();
-        
+
         persister.flush().await.unwrap();
-        
+
         // Verify file exists
         assert!(stats_path.exists());
-        
+
         // Load and verify metrics
         let metrics = AbStatsPersister::load_metrics(&stats_path).unwrap();
         assert_eq!(metrics.len(), 3);
@@ -285,21 +277,21 @@ mod tests {
     async fn test_persister_survives_restart() {
         let temp_dir = TempDir::new().unwrap();
         let stats_path = temp_dir.path().join("ab_test_stats.csv");
-        
+
         // First session
         {
             let persister = AbStatsPersister::new(&stats_path).unwrap();
             persister.log_hit("lru_baseline", 1, 100).await.unwrap();
             persister.flush().await.unwrap();
         }
-        
+
         // Second session (simulates restart)
         {
             let persister = AbStatsPersister::new(&stats_path).unwrap();
             persister.log_hit("learned_rmi", 2, 50).await.unwrap();
             persister.flush().await.unwrap();
         }
-        
+
         // Load all metrics
         let metrics = AbStatsPersister::load_metrics(&stats_path).unwrap();
         assert_eq!(metrics.len(), 2);
@@ -339,17 +331,17 @@ mod tests {
                 latency_ns: 50,
             },
         ];
-        
+
         let summary = AbStatsPersister::analyze_metrics(&metrics);
-        
+
         assert_eq!(summary.lru_hits, 1);
         assert_eq!(summary.lru_misses, 1);
         assert!((summary.lru_hit_rate - 0.5).abs() < 0.01);
-        
+
         assert_eq!(summary.learned_hits, 2);
         assert_eq!(summary.learned_misses, 0);
         assert!((summary.learned_hit_rate - 1.0).abs() < 0.01);
-        
+
         assert_eq!(summary.total_events, 4);
     }
 
@@ -366,7 +358,7 @@ mod tests {
             learned_avg_latency_ns: 50,
             total_events: 200,
         };
-        
+
         // Just ensure it doesn't panic
         summary.print();
     }
@@ -375,10 +367,10 @@ mod tests {
     async fn test_concurrent_logging() {
         let temp_dir = TempDir::new().unwrap();
         let stats_path = temp_dir.path().join("ab_test_stats.csv");
-        
+
         let persister = Arc::new(AbStatsPersister::new(&stats_path).unwrap());
         let mut handles = vec![];
-        
+
         // Spawn 10 tasks logging concurrently
         for i in 0..10 {
             let persister_clone = Arc::clone(&persister);
@@ -390,13 +382,13 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         persister.flush().await.unwrap();
-        
+
         // Should have 100 events
         let metrics = AbStatsPersister::load_metrics(&stats_path).unwrap();
         assert_eq!(metrics.len(), 100);

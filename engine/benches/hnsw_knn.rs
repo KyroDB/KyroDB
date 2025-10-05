@@ -136,5 +136,10 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - (dot / (norm_a * norm_b))
 }
 
-criterion_group!(benches, bench_hnsw_insert, bench_hnsw_search, bench_hnsw_recall);
+criterion_group!(
+    benches,
+    bench_hnsw_insert,
+    bench_hnsw_search,
+    bench_hnsw_recall
+);
 criterion_main!(benches);

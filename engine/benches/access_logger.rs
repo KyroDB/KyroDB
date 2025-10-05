@@ -8,7 +8,7 @@
 //! - Memory: 240MB for 10M events (24 bytes/event)
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use kyrodb_engine::access_logger::{AccessPatternLogger, hash_embedding};
+use kyrodb_engine::access_logger::{hash_embedding, AccessPatternLogger};
 use kyrodb_engine::learned_cache::{AccessEvent, AccessType};
 use std::time::{Duration, SystemTime};
 
@@ -224,10 +224,7 @@ fn bench_high_frequency_logging(c: &mut Criterion) {
 
 /// Benchmark: Flush detection overhead
 fn bench_needs_flush_check(c: &mut Criterion) {
-    let logger = AccessPatternLogger::with_flush_interval(
-        100_000,
-        Duration::from_secs(600),
-    );
+    let logger = AccessPatternLogger::with_flush_interval(100_000, Duration::from_secs(600));
 
     c.bench_function("needs_flush_check", |b| {
         b.iter(|| black_box(logger.needs_flush()));

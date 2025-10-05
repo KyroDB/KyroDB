@@ -12,7 +12,11 @@ use kyrodb_engine::learned_cache::{AccessEvent, AccessType, LearnedCachePredicto
 use std::time::{Duration, SystemTime};
 
 /// Generate random access events for benchmarking
-fn generate_access_events(count: usize, unique_docs: usize, time_window_secs: u64) -> Vec<AccessEvent> {
+fn generate_access_events(
+    count: usize,
+    unique_docs: usize,
+    time_window_secs: u64,
+) -> Vec<AccessEvent> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let now = SystemTime::now();
@@ -31,14 +35,18 @@ fn generate_access_events(count: usize, unique_docs: usize, time_window_secs: u6
 }
 
 /// Generate Zipf-distributed access events (realistic workload)
-fn generate_zipf_accesses(count: usize, unique_docs: usize, time_window_secs: u64) -> Vec<AccessEvent> {
+fn generate_zipf_accesses(
+    count: usize,
+    unique_docs: usize,
+    time_window_secs: u64,
+) -> Vec<AccessEvent> {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     let now = SystemTime::now();
 
     // Zipf distribution: 20% of docs get 80% of accesses
     let hot_docs = unique_docs / 5; // 20% hot docs
-    let hot_probability = 0.8;      // 80% of accesses go to hot docs
+    let hot_probability = 0.8; // 80% of accesses go to hot docs
 
     (0..count)
         .map(|_| {

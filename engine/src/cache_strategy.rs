@@ -17,21 +17,21 @@ use std::sync::Arc;
 pub trait CacheStrategy: Send + Sync {
     /// Check if vector is in cache
     fn get_cached(&self, doc_id: u64) -> Option<CachedVector>;
-    
+
     /// Decide if vector should be cached
     ///
     /// Returns `true` if the vector should be admitted to cache.
     /// Strategy-specific logic (e.g., LRU always admits, learned uses RMI prediction).
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool;
-    
+
     /// Insert vector into cache
     ///
     /// Only called if `should_cache` returns true.
     fn insert_cached(&self, cached_vector: CachedVector);
-    
+
     /// Get strategy name (for metrics/logging)
     fn name(&self) -> &str;
-    
+
     /// Get cache statistics
     fn stats(&self) -> String;
 }
@@ -59,20 +59,20 @@ impl CacheStrategy for LruCacheStrategy {
     fn get_cached(&self, doc_id: u64) -> Option<CachedVector> {
         self.cache.get(doc_id)
     }
-    
+
     fn should_cache(&self, _doc_id: u64, _embedding: &[f32]) -> bool {
         // LRU always caches (admission policy is permissive)
         true
     }
-    
+
     fn insert_cached(&self, cached_vector: CachedVector) {
         self.cache.insert(cached_vector);
     }
-    
+
     fn name(&self) -> &str {
         &self.name
     }
-    
+
     fn stats(&self) -> String {
         let stats = self.cache.stats();
         format!(
@@ -120,21 +120,21 @@ impl CacheStrategy for LearnedCacheStrategy {
     fn get_cached(&self, doc_id: u64) -> Option<CachedVector> {
         self.cache.get(doc_id)
     }
-    
+
     fn should_cache(&self, doc_id: u64, _embedding: &[f32]) -> bool {
         // Use RMI predictor to decide admission
         let predictor = self.predictor.read();
         predictor.should_cache(doc_id)
     }
-    
+
     fn insert_cached(&self, cached_vector: CachedVector) {
         self.cache.insert(cached_vector);
     }
-    
+
     fn name(&self) -> &str {
         &self.name
     }
-    
+
     fn stats(&self) -> String {
         let stats = self.cache.stats();
         format!(
@@ -217,11 +217,11 @@ mod tests {
     #[test]
     fn test_lru_strategy_always_caches() {
         let strategy = LruCacheStrategy::new(10);
-        
+
         // LRU should always say yes to caching
         assert!(strategy.should_cache(1, &vec![0.5; 128]));
         assert!(strategy.should_cache(2, &vec![0.5; 128]));
-        
+
         // Insert and retrieve
         strategy.insert_cached(create_test_vector(1));
         assert!(strategy.get_cached(1).is_some());
@@ -232,7 +232,7 @@ mod tests {
     fn test_learned_strategy_selective_caching() {
         // Create predictor and train on some data
         let mut predictor = LearnedCachePredictor::new(100).unwrap();
-        
+
         // Train: doc 1 hot (100 accesses), doc 2 cold (1 access)
         let mut events = vec![];
         for _ in 0..100 {
@@ -247,20 +247,20 @@ mod tests {
             timestamp: SystemTime::now(),
             access_type: crate::learned_cache::AccessType::Read,
         });
-        
+
         predictor.train_from_accesses(&events).unwrap();
-        
+
         let strategy = LearnedCacheStrategy::new(10, predictor);
-        
+
         // Hot doc should be cached
         let should_cache_hot = strategy.should_cache(1, &vec![0.5; 128]);
-        
+
         // Cold doc might not be cached (depends on threshold)
         let should_cache_cold = strategy.should_cache(2, &vec![0.5; 128]);
-        
+
         println!("Should cache hot doc 1: {}", should_cache_hot);
         println!("Should cache cold doc 2: {}", should_cache_cold);
-        
+
         // At minimum, hot doc should have higher admission probability
         // (exact behavior depends on RMI training and threshold)
     }
@@ -270,13 +270,13 @@ mod tests {
         let lru = Arc::new(LruCacheStrategy::new(10));
         let predictor = LearnedCachePredictor::new(100).unwrap();
         let learned = Arc::new(LearnedCacheStrategy::new(10, predictor));
-        
+
         let splitter = AbTestSplitter::new(lru, learned);
-        
+
         // Test distribution over 1000 queries
         let mut lru_count = 0;
         let mut learned_count = 0;
-        
+
         for doc_id in 0..1000 {
             let strategy = splitter.get_strategy(doc_id);
             if strategy.name() == "lru_baseline" {
@@ -285,7 +285,7 @@ mod tests {
                 learned_count += 1;
             }
         }
-        
+
         // Should be roughly 50/50 (within 10% tolerance)
         println!("LRU: {}, Learned: {}", lru_count, learned_count);
         assert!((lru_count as i32 - 500).abs() < 50);
@@ -295,15 +295,15 @@ mod tests {
     #[test]
     fn test_strategy_stats() {
         let strategy = LruCacheStrategy::new(10);
-        
+
         // Generate some traffic
         strategy.insert_cached(create_test_vector(1));
         strategy.insert_cached(create_test_vector(2));
-        
+
         strategy.get_cached(1); // Hit
         strategy.get_cached(2); // Hit
         strategy.get_cached(3); // Miss
-        
+
         let stats = strategy.stats();
         assert!(stats.contains("2 hits"));
         assert!(stats.contains("1 misses"));
@@ -314,7 +314,7 @@ mod tests {
     fn test_learned_strategy_predictor_update() {
         let predictor1 = LearnedCachePredictor::new(100).unwrap();
         let strategy = LearnedCacheStrategy::new(10, predictor1);
-        
+
         // Create new predictor with different training
         let mut predictor2 = LearnedCachePredictor::new(100).unwrap();
         let events = vec![AccessEvent {
@@ -323,10 +323,10 @@ mod tests {
             access_type: crate::learned_cache::AccessType::Read,
         }];
         predictor2.train_from_accesses(&events).unwrap();
-        
+
         // Update predictor
         strategy.update_predictor(predictor2);
-        
+
         // Strategy should now use new predictor
         // (hard to test without knowing internals, but ensures no panic)
         let _ = strategy.should_cache(42, &vec![0.5; 128]);
@@ -335,10 +335,10 @@ mod tests {
     #[test]
     fn test_concurrent_strategy_access() {
         use std::thread;
-        
+
         let strategy = Arc::new(LruCacheStrategy::new(100));
         let mut handles = vec![];
-        
+
         // Spawn 10 threads accessing cache concurrently
         for i in 0..10 {
             let strategy_clone = Arc::clone(&strategy);
@@ -353,11 +353,11 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         // Should have 100 vectors cached
         let stats_str = strategy.stats();
         println!("Concurrent stats: {}", stats_str);

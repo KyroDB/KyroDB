@@ -272,7 +272,10 @@ impl LearnedCachePredictor {
         let avg_hotness = if self.hotness_scores.is_empty() {
             0.0
         } else {
-            self.hotness_scores.iter().map(|(_, score)| score).sum::<f32>()
+            self.hotness_scores
+                .iter()
+                .map(|(_, score)| score)
+                .sum::<f32>()
                 / self.hotness_scores.len() as f32
         };
 
@@ -298,9 +301,7 @@ impl LearnedCachePredictor {
         let now = SystemTime::now();
 
         // Compute cutoff timestamp (training window)
-        let cutoff = now
-            .checked_sub(self.training_window)
-            .unwrap_or(UNIX_EPOCH);
+        let cutoff = now.checked_sub(self.training_window).unwrap_or(UNIX_EPOCH);
 
         for access in accesses {
             // Skip accesses outside training window
@@ -325,10 +326,7 @@ impl LearnedCachePredictor {
 
         // Normalize to [0, 1]
         if !hotness.is_empty() {
-            let max_hotness = hotness
-                .values()
-                .cloned()
-                .fold(f32::NEG_INFINITY, f32::max);
+            let max_hotness = hotness.values().cloned().fold(f32::NEG_INFINITY, f32::max);
 
             if max_hotness > 0.0 {
                 for score in hotness.values_mut() {
@@ -523,9 +521,7 @@ mod tests {
         let mut predictor = LearnedCachePredictor::new(capacity).unwrap();
 
         // Generate accesses for 200 docs (exceeds capacity)
-        let accesses: Vec<AccessEvent> = (0..200)
-            .map(|doc_id| create_access(doc_id, 60))
-            .collect();
+        let accesses: Vec<AccessEvent> = (0..200).map(|doc_id| create_access(doc_id, 60)).collect();
 
         predictor.train_from_accesses(&accesses).unwrap();
 

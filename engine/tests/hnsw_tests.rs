@@ -208,7 +208,7 @@ proptest! {
 
         // Property 1: Index creation should not crash
         let mut index = HnswVectorIndex::new(32, normalized.len()).unwrap();
-        
+
         // Property 2: Inserting vectors should not crash
         for (id, vec) in normalized.iter().enumerate() {
             index.add_vector(id as u64, vec).unwrap();
@@ -218,10 +218,10 @@ proptest! {
         let query = &normalized[0];
         let k = 10.min(normalized.len());
         let hnsw_results = index.knn_search(query, k).unwrap();
-        
+
         // Property 4: Should return k results (or fewer if index size < k)
         prop_assert_eq!(hnsw_results.len(), k);
-        
+
         // Property 5: Results should be ordered by distance (closest first)
         for i in 1..hnsw_results.len() {
             prop_assert!(
@@ -244,7 +244,7 @@ proptest! {
         prop_assert!(index.is_ok());
 
         let mut idx = index.unwrap();
-        
+
         // Insert multiple vectors (at least 5) to avoid hnsw_rs destructor edge case
         let insert_count = 5.min(count);
         for i in 0..insert_count {
@@ -257,7 +257,7 @@ proptest! {
         let search_k = k.min(insert_count);
         let results = idx.knn_search(&query, search_k);
         prop_assert!(results.is_ok());
-        
+
         // HNSW may return fewer than k results (especially with small datasets)
         let result_vec = results.unwrap();
         prop_assert!(result_vec.len() <= search_k);

@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub struct RingBuffer<T> {
     buffer: Vec<T>,
     capacity: usize,
-    head: AtomicUsize, // Write position (wraps around)
+    head: AtomicUsize,  // Write position (wraps around)
     count: AtomicUsize, // Current count (saturates at capacity)
 }
 
@@ -519,10 +519,7 @@ mod tests {
 
     #[test]
     fn test_access_logger_flush_tracking() {
-        let mut logger = AccessPatternLogger::with_flush_interval(
-            1000,
-            Duration::from_millis(50),
-        );
+        let mut logger = AccessPatternLogger::with_flush_interval(1000, Duration::from_millis(50));
 
         // Initial state
         assert_eq!(logger.stats().total_flushes, 0);
