@@ -17,26 +17,29 @@
 //! - A/B split: 50% LRU baseline, 50% Learned cache
 //! 
 //! **Run on Azure VM**:
-//! ```bash
+//! ```
 //! cargo build --release --bin validation_24h
 //! nohup ./target/release/validation_24h > validation.log 2>&1 &
 //! ```
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use kyrodb_engine::{
     AccessPatternLogger, AbStatsPersister, AbTestSplitter, CachedVector, CacheStrategy,
     LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, TrainingConfig,
     spawn_training_task,
 };
+use rand::distributions::Distribution;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
+use zipf::ZipfDistribution;
 
 /// Validation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
-    /// Test duration in hours (default: 24)
+    /// Test duration in hours (default: 12)
     duration_hours: u64,
     
     /// Target queries per second (default: 100)
@@ -54,6 +57,9 @@ struct Config {
     /// Training interval in seconds (default: 600 = 10 minutes)
     training_interval_secs: u64,
     
+    /// Access logger window size (default: 100K events)
+    logger_window_size: usize,
+    
     /// Output files
     stats_csv: String,
     results_json: String,
@@ -68,10 +74,50 @@ impl Default for Config {
             zipf_exponent: 1.5,
             cache_capacity: 10_000,
             training_interval_secs: 600,
+            logger_window_size: 100_000,
             stats_csv: "validation_24h_stats.csv".to_string(),
             results_json: "validation_24h_results.json".to_string(),
         }
     }
+}
+
+impl Config {
+    /// Validate configuration for sanity
+    fn validate(&self) -> Result<()> {
+        if self.duration_hours == 0 {
+            bail!("duration_hours must be > 0");
+        }
+        if self.target_qps == 0 {
+            bail!("target_qps must be > 0");
+        }
+        if self.corpus_size == 0 {
+            bail!("corpus_size must be > 0");
+        }
+        if self.cache_capacity == 0 {
+            bail!("cache_capacity must be > 0");
+        }
+        if self.cache_capacity > self.corpus_size {
+            bail!("cache_capacity ({}) cannot exceed corpus_size ({})", 
+                self.cache_capacity, self.corpus_size);
+        }
+        if self.training_interval_secs == 0 {
+            bail!("training_interval_secs must be > 0");
+        }
+        if self.zipf_exponent <= 0.0 {
+            bail!("zipf_exponent must be > 0");
+        }
+        if self.logger_window_size == 0 {
+            bail!("logger_window_size must be > 0");
+        }
+        Ok(())
+    }
+}
+
+/// Strategy identifier (type-safe routing)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrategyId {
+    LruBaseline,
+    LearnedRmi,
 }
 
 /// Final validation results
@@ -98,10 +144,12 @@ struct ValidationResults {
     
     // Training stats
     expected_training_cycles: u64,
+    training_task_crashed: bool,
     
     // Memory stats
     initial_memory_mb: f64,
     final_memory_mb: f64,
+    memory_growth_mb: f64,
     memory_growth_pct: f64,
     
     // Timestamps
@@ -111,58 +159,82 @@ struct ValidationResults {
 
 /// Zipf distribution sampler for hot/cold access patterns
 struct ZipfSampler {
-    corpus_size: usize,
-    exponent: f64,
+    dist: ZipfDistribution,
 }
 
 impl ZipfSampler {
-    fn new(corpus_size: usize, exponent: f64) -> Self {
-        Self { corpus_size, exponent }
+    fn new(corpus_size: usize, exponent: f64) -> Result<Self> {
+        let dist = ZipfDistribution::new(corpus_size, exponent)
+            .context("Failed to create Zipf distribution")?;
+        Ok(Self { dist })
     }
     
     /// Sample doc_id following Zipf distribution
     /// Lower IDs are more frequent (hot documents)
     fn sample(&self) -> u64 {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
+        // ZipfDistribution returns 1-indexed, convert to 0-indexed
+        (self.dist.sample(&mut rng) - 1) as u64
+    }
+}
+
+/// Mock document storage (in real system, this would be disk/network)
+struct MockDocumentStore {
+    corpus_size: usize,
+    embedding_dim: usize,
+}
+
+impl MockDocumentStore {
+    fn new(corpus_size: usize) -> Self {
+        Self {
+            corpus_size,
+            embedding_dim: 768,
+        }
+    }
+    
+    /// Fetch document by ID (simulates disk read)
+    fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
+        if doc_id >= self.corpus_size as u64 {
+            return None;
+        }
         
-        // Simple Zipf approximation: rank ~ U^(-1/exponent)
-        let u: f64 = rng.gen_range(0.0..1.0);
-        let rank = ((self.corpus_size as f64).powf(1.0 - self.exponent) * u)
-            .powf(1.0 / (1.0 - self.exponent));
-        
-        rank.min((self.corpus_size - 1) as f64) as u64
+        // Generate deterministic embedding based on doc_id
+        Some((0..self.embedding_dim)
+            .map(|i| ((doc_id + i as u64) % 1000) as f32 / 1000.0)
+            .collect())
     }
 }
 
 /// Get process memory usage in MB (Linux only)
-fn get_memory_mb() -> f64 {
+fn get_memory_mb() -> Result<f64> {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if line.starts_with("VmRSS:") {
-                    if let Some(kb_str) = line.split_whitespace().nth(1) {
-                        if let Ok(kb) = kb_str.parse::<f64>() {
-                            return kb / 1024.0;
-                        }
-                    }
+        let status = std::fs::read_to_string("/proc/self/status")
+            .context("Failed to read /proc/self/status")?;
+        
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    let kb = kb_str.parse::<f64>()
+                        .context("Failed to parse memory value")?;
+                    return Ok(kb / 1024.0);
                 }
             }
         }
+        bail!("VmRSS not found in /proc/self/status");
     }
     
     #[cfg(not(target_os = "linux"))]
     {
-        println!("Warning: Memory tracking only supported on Linux");
+        bail!("Memory tracking only supported on Linux. Use --skip-memory-check flag.");
     }
-    
-    0.0
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load and validate config
     let config = Config::default();
+    config.validate().context("Invalid configuration")?;
     
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  KyroDB 12-Hour Validation Workload - Phase 0 Week 9-12       ║");
@@ -175,9 +247,11 @@ async fn main() -> Result<()> {
     println!("  Zipf exponent:     {} (80/20 hot/cold)", config.zipf_exponent);
     println!("  Cache capacity:    {} vectors", config.cache_capacity);
     println!("  Training interval: {} seconds", config.training_interval_secs);
+    println!("  Logger window:     {} events", config.logger_window_size);
     println!();
     println!("Expected workload:");
-    println!("  Total queries:     {} million", (config.target_qps * config.duration_hours * 3600) / 1_000_000);
+    let total_expected = config.target_qps * config.duration_hours * 3600;
+    println!("  Total queries:     {:.2} million", total_expected as f64 / 1_000_000.0);
     println!("  Training cycles:   {}", (config.duration_hours * 3600) / config.training_interval_secs);
     println!();
     println!("Output files:");
@@ -188,20 +262,27 @@ async fn main() -> Result<()> {
     // Initialize components
     println!("Initializing components...");
     
+    // Access logger with bounded circular buffer (prevents OOM)
     let access_logger = Arc::new(RwLock::new(
-        AccessPatternLogger::new(10_000_000) // 10M event capacity
+        AccessPatternLogger::new(config.logger_window_size)
     ));
     
     let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache_capacity));
     
     let learned_predictor = LearnedCachePredictor::new(config.cache_capacity)
         .context("Failed to create learned cache predictor")?;
-    let learned_strategy = Arc::new(LearnedCacheStrategy::new(config.cache_capacity, learned_predictor));
+    let learned_strategy = Arc::new(LearnedCacheStrategy::new(
+        config.cache_capacity,
+        learned_predictor,
+    ));
     
     let ab_splitter = AbTestSplitter::new(lru_strategy.clone(), learned_strategy.clone());
     
     let stats_persister = Arc::new(AbStatsPersister::new(&config.stats_csv)
         .context("Failed to create stats persister")?);
+    
+    // Mock document storage
+    let doc_store = Arc::new(MockDocumentStore::new(config.corpus_size));
     
     // Spawn background training task
     println!("Spawning background training task...");
@@ -212,7 +293,7 @@ async fn main() -> Result<()> {
         rmi_capacity: config.cache_capacity,
     };
     
-    let _training_handle = spawn_training_task(
+    let training_handle = spawn_training_task(
         access_logger.clone(),
         learned_strategy.clone(),
         training_config,
@@ -221,7 +302,7 @@ async fn main() -> Result<()> {
     println!("Training task running (retrains every {} seconds)", config.training_interval_secs);
     println!();
     
-    // Verify strategy names (defensive check)
+    // Verify strategy names
     println!("A/B Test Configuration:");
     println!("  LRU strategy name:     {}", lru_strategy.name());
     println!("  Learned strategy name: {}", learned_strategy.name());
@@ -229,7 +310,8 @@ async fn main() -> Result<()> {
     println!();
     
     // Initialize Zipf sampler
-    let zipf_sampler = ZipfSampler::new(config.corpus_size, config.zipf_exponent);
+    let zipf_sampler = ZipfSampler::new(config.corpus_size, config.zipf_exponent)
+        .context("Failed to create Zipf sampler")?;
     
     // Test parameters
     let test_duration = Duration::from_secs(config.duration_hours * 3600);
@@ -246,71 +328,103 @@ async fn main() -> Result<()> {
     let test_start = Instant::now();
     let mut next_query = Instant::now();
     
-    let initial_memory = get_memory_mb();
-    println!("Initial memory usage: {:.1} MB", initial_memory);
+    let initial_memory = get_memory_mb().unwrap_or(0.0);
+    if initial_memory > 0.0 {
+        println!("Initial memory usage: {:.1} MB", initial_memory);
+    } else {
+        println!("Warning: Memory tracking unavailable");
+    }
     println!();
     println!("Starting workload... (Press Ctrl+C to stop early)");
     println!("─────────────────────────────────────────────────────────────────");
     
+    // Graceful shutdown on Ctrl+C
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        println!("\n\nReceived Ctrl+C, shutting down gracefully...");
+        r.store(false, Ordering::SeqCst);
+    });
+    
     // Main query loop
-    while test_start.elapsed() < test_duration {
+    while test_start.elapsed() < test_duration && running.load(Ordering::SeqCst) {
         // Sample doc_id from Zipf distribution
         let doc_id = zipf_sampler.sample();
-        
-        // Generate query embedding (simple for validation)
-        let query_embedding: Vec<f32> = (0..768).map(|i| ((doc_id + i as u64) % 1000) as f32 / 1000.0).collect();
         
         // A/B test: route to LRU or Learned strategy
         let strategy = ab_splitter.get_strategy(doc_id);
         let strategy_name = strategy.name();
         
-        // Check cache
-        let cache_hit = strategy.get_cached(doc_id).is_some();
-        
-        // Record metrics
-        if strategy_name == "lru_baseline" {
-            lru_queries += 1;
-            if cache_hit {
-                lru_hits += 1;
-            }
+        // Determine strategy ID (type-safe)
+        let strategy_id = if strategy_name == "lru_baseline" {
+            StrategyId::LruBaseline
+        } else if strategy_name == "learned_rmi" {
+            StrategyId::LearnedRmi
         } else {
-            learned_queries += 1;
-            if cache_hit {
-                learned_hits += 1;
-            }
-        }
+            eprintln!("ERROR: Unknown strategy '{}', skipping query", strategy_name);
+            continue;
+        };
         
-        // If cache miss, insert with strategy-specific admission logic
-        if !cache_hit {
-            let cached = CachedVector {
-                doc_id,
-                embedding: query_embedding.clone(),
-                distance: 0.5,
-                cached_at: Instant::now(),
+        // Check cache
+        let cached_vec = strategy.get_cached(doc_id);
+        
+        let (embedding, cache_hit) = if let Some(vec) = cached_vec {
+            // Cache hit - use cached embedding
+            (vec.embedding, true)
+        } else {
+            // Cache miss - fetch from storage
+            let embedding = doc_store.fetch(doc_id)
+                .ok_or_else(|| anyhow::anyhow!("Document {} not found in store", doc_id))?;
+            
+            // Decide if we should cache based on strategy
+            let should_cache = match strategy_id {
+                StrategyId::LruBaseline => {
+                    // LRU: Always cache (permissive admission)
+                    true
+                }
+                StrategyId::LearnedRmi => {
+                    // Learned: Only cache if RMI predictor says hot
+                    strategy.should_cache(doc_id, &embedding)
+                }
             };
             
-            // Explicit strategy routing to eliminate any ambiguity
-            if strategy_name == "lru_baseline" {
-                // LRU: Always cache (permissive admission)
+            if should_cache {
+                let cached = CachedVector {
+                    doc_id,
+                    embedding: embedding.clone(),
+                    distance: 0.5,
+                    cached_at: Instant::now(),
+                };
                 strategy.insert_cached(cached);
-            } else if strategy_name == "learned_rmi" {
-                // Learned: Only cache if RMI predictor says hot
-                if strategy.should_cache(doc_id, &query_embedding) {
-                    strategy.insert_cached(cached);
+            }
+            
+            (embedding, false)
+        };
+        
+        // Record metrics (type-safe routing)
+        match strategy_id {
+            StrategyId::LruBaseline => {
+                lru_queries += 1;
+                if cache_hit {
+                    lru_hits += 1;
                 }
-            } else {
-                // Defensive: unknown strategy, skip caching
-                eprintln!("WARNING: Unknown cache strategy '{}', skipping cache insertion", strategy_name);
+            }
+            StrategyId::LearnedRmi => {
+                learned_queries += 1;
+                if cache_hit {
+                    learned_hits += 1;
+                }
             }
         }
         
         // Log access for training
         {
             let mut logger = access_logger.write().await;
-            logger.log_access(doc_id, &query_embedding);
+            logger.log_access(doc_id, &embedding);
         }
         
-        // Persist A/B test metric (async)
+        // Persist A/B test metric (async, best-effort)
         if cache_hit {
             stats_persister.log_hit(strategy_name, doc_id, 0).await.ok();
         } else {
@@ -319,13 +433,26 @@ async fn main() -> Result<()> {
         
         total_queries += 1;
         
-        // Progress reporting every 10K queries
+        // Progress reporting every 10K queries (based on query count, not time)
         if total_queries % 10_000 == 0 {
             let elapsed = test_start.elapsed();
-            let progress_pct = (elapsed.as_secs_f64() / test_duration.as_secs_f64()) * 100.0;
-            let lru_hit_rate = if lru_queries > 0 { lru_hits as f64 / lru_queries as f64 } else { 0.0 };
-            let learned_hit_rate = if learned_queries > 0 { learned_hits as f64 / learned_queries as f64 } else { 0.0 };
+            let progress_pct = (total_queries as f64 / total_expected as f64) * 100.0;
+            let lru_hit_rate = if lru_queries > 0 { 
+                lru_hits as f64 / lru_queries as f64 
+            } else { 
+                0.0 
+            };
+            let learned_hit_rate = if learned_queries > 0 { 
+                learned_hits as f64 / learned_queries as f64 
+            } else { 
+                0.0 
+            };
             let current_qps = total_queries as f64 / elapsed.as_secs_f64();
+            let improvement = if lru_hit_rate > 0.0 { 
+                learned_hit_rate / lru_hit_rate 
+            } else { 
+                0.0 
+            };
             
             println!(
                 "[{:>5.1}%] Queries: {:>8} | QPS: {:>5.0} | LRU: {:>5.1}% | Learned: {:>5.1}% | Improvement: {:>4.2}×",
@@ -334,7 +461,7 @@ async fn main() -> Result<()> {
                 current_qps,
                 lru_hit_rate * 100.0,
                 learned_hit_rate * 100.0,
-                if lru_hit_rate > 0.0 { learned_hit_rate / lru_hit_rate } else { 0.0 }
+                improvement
             );
         }
         
@@ -349,9 +476,20 @@ async fn main() -> Result<()> {
         }
     }
     
+    // Check if training task is still alive
+    let training_crashed = training_handle.is_finished();
+    if training_crashed {
+        eprintln!("WARNING: Training task crashed during test");
+    }
+    
+    // Stop training task
+    println!("\nStopping training task...");
+    training_handle.abort();
+    let _ = training_handle.await; // Ignore cancellation error
+    
     // Finalize stats
     let end_time = SystemTime::now();
-    let final_memory = get_memory_mb();
+    let final_memory = get_memory_mb().unwrap_or(0.0);
     let actual_duration = test_start.elapsed().as_secs();
     
     println!("─────────────────────────────────────────────────────────────────");
@@ -360,11 +498,24 @@ async fn main() -> Result<()> {
     println!();
     
     // Calculate final metrics
-    let lru_hit_rate = if lru_queries > 0 { lru_hits as f64 / lru_queries as f64 } else { 0.0 };
-    let learned_hit_rate = if learned_queries > 0 { learned_hits as f64 / learned_queries as f64 } else { 0.0 };
-    let improvement = if lru_hit_rate > 0.0 { learned_hit_rate / lru_hit_rate } else { 0.0 };
-    let memory_growth = if initial_memory > 0.0 {
-        ((final_memory - initial_memory) / initial_memory) * 100.0
+    let lru_hit_rate = if lru_queries > 0 { 
+        lru_hits as f64 / lru_queries as f64 
+    } else { 
+        0.0 
+    };
+    let learned_hit_rate = if learned_queries > 0 { 
+        learned_hits as f64 / learned_queries as f64 
+    } else { 
+        0.0 
+    };
+    let improvement = if lru_hit_rate > 0.0 { 
+        learned_hit_rate / lru_hit_rate 
+    } else { 
+        0.0 
+    };
+    let memory_growth_mb = final_memory - initial_memory;
+    let memory_growth_pct = if initial_memory > 0.0 {
+        (memory_growth_mb / initial_memory) * 100.0
     } else {
         0.0
     };
@@ -386,11 +537,13 @@ async fn main() -> Result<()> {
         
         hit_rate_improvement: improvement,
         
-        expected_training_cycles: (actual_duration / config.training_interval_secs),
+        expected_training_cycles: actual_duration / config.training_interval_secs,
+        training_task_crashed: training_crashed,
         
         initial_memory_mb: initial_memory,
         final_memory_mb: final_memory,
-        memory_growth_pct: memory_growth,
+        memory_growth_mb,
+        memory_growth_pct,
         
         start_time,
         end_time,
@@ -402,7 +555,8 @@ async fn main() -> Result<()> {
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Test Summary:");
-    println!("  Duration:        {} hours {} minutes", actual_duration / 3600, (actual_duration % 3600) / 60);
+    println!("  Duration:        {} hours {} minutes", 
+        actual_duration / 3600, (actual_duration % 3600) / 60);
     println!("  Total queries:   {}", total_queries);
     println!("  Avg QPS:         {:.1}", total_queries as f64 / actual_duration as f64);
     println!();
@@ -419,37 +573,60 @@ async fn main() -> Result<()> {
     println!("  Hit rate:        {:.1}%", learned_hit_rate * 100.0);
     println!();
     println!("Performance:");
-    println!("  Hit rate improvement:  {:.2}× (target: 2-3×)", improvement);
+    println!("  Hit rate improvement:  {:.2}× (target: 2.0-3.0×)", improvement);
     println!("  Status:                {}", 
         if improvement >= 2.0 && improvement <= 3.5 { "✅ PASS" } else { "❌ FAIL" });
     println!();
     println!("Training:");
     println!("  Expected cycles: {}", results.expected_training_cycles);
     println!("  Interval:        {} seconds", config.training_interval_secs);
+    println!("  Task crashed:    {}", if training_crashed { "❌ YES" } else { "✅ NO" });
     println!();
-    println!("Memory:");
-    println!("  Initial:         {:.1} MB", initial_memory);
-    println!("  Final:           {:.1} MB", final_memory);
-    println!("  Growth:          {:.1}% (target: < 5%)", memory_growth);
-    println!("  Status:          {}", 
-        if memory_growth.abs() < 5.0 { "✅ PASS" } else { "⚠️  WARN" });
+    
+    if initial_memory > 0.0 {
+        println!("Memory:");
+        println!("  Initial:         {:.1} MB", initial_memory);
+        println!("  Final:           {:.1} MB", final_memory);
+        println!("  Growth:          {:+.1} MB ({:+.1}%) (target: < 5%)", 
+            memory_growth_mb, memory_growth_pct);
+        println!("  Status:          {}", 
+            if memory_growth_pct.abs() < 5.0 { "✅ PASS" } 
+            else if memory_growth_pct.abs() < 10.0 { "⚠️  WARN" }
+            else { "❌ FAIL" });
+    } else {
+        println!("Memory:");
+        println!("  Tracking unavailable (non-Linux platform)");
+    }
     println!();
     
     // Go/No-Go decision
-    let go_decision = improvement >= 2.0 && improvement <= 3.5 && memory_growth.abs() < 10.0;
+    let hit_rate_pass = learned_hit_rate >= 0.70 && learned_hit_rate <= 0.90;
+    let improvement_pass = improvement >= 2.0 && improvement <= 3.5;
+    let memory_pass = initial_memory == 0.0 || memory_growth_pct.abs() < 5.0;
+    let training_pass = !training_crashed;
+    
+    let go_decision = hit_rate_pass && improvement_pass && memory_pass && training_pass;
+    
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║                     GO/NO-GO DECISION                          ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Criteria:");
     println!("  ✓ Learned cache hit rate 70-90%:       {}", 
-        if learned_hit_rate >= 0.70 && learned_hit_rate <= 0.90 { "✅ PASS" } else { "❌ FAIL" });
-    println!("  ✓ Improvement 2-3× over LRU:           {}", 
-        if improvement >= 2.0 && improvement <= 3.5 { "✅ PASS" } else { "❌ FAIL" });
+        if hit_rate_pass { "✅ PASS" } else { "❌ FAIL" });
+    println!("  ✓ Improvement 2.0-3.0× over LRU:       {}", 
+        if improvement_pass { "✅ PASS" } else { "❌ FAIL" });
     println!("  ✓ Memory growth < 5%:                  {}", 
-        if memory_growth.abs() < 5.0 { "✅ PASS" } else { "⚠️  WARN" });
+        if memory_pass { "✅ PASS" } else { "❌ FAIL" });
+    println!("  ✓ Training task stable:                {}", 
+        if training_pass { "✅ PASS" } else { "❌ FAIL" });
     println!();
-    println!("Decision: {}", if go_decision { "✅ GO for Week 13-16" } else { "❌ NO-GO - needs investigation" });
+    println!("Decision: {}", 
+        if go_decision { 
+            "✅ GO for Week 13-16" 
+        } else { 
+            "❌ NO-GO - needs investigation" 
+        });
     println!();
     
     // Save results to JSON
@@ -465,6 +642,10 @@ async fn main() -> Result<()> {
     println!("  - {}", config.results_json);
     println!("  - {}", config.stats_csv);
     println!();
+    
+    if !go_decision {
+        std::process::exit(1);
+    }
     
     Ok(())
 }
