@@ -47,6 +47,10 @@ harness = false
 name = "learned_cache"
 harness = false
 
+[[bench]]
+name = "access_logger"
+harness = false
+
 [dependencies.criterion]
 version = "0.5"
 optional = true

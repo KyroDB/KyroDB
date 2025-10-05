@@ -15,8 +15,11 @@ pub mod hnsw_index;
 // Week 3-8: RMI core for learned cache (predicts doc_id → hotness_score)
 pub mod rmi_core;
 
-// Week 3-4: Learned cache predictor (CURRENT - Phase 0 Week 3-4)
+// Week 3-4: Learned cache predictor (Phase 0 Week 3-4) ✅
 pub mod learned_cache;
+
+// Week 5-8: Access pattern logger (CURRENT - Phase 0 Week 5-8)
+pub mod access_logger;
 
 // Week 9-12: Document storage and persistence (to be implemented)
 // pub mod storage;
@@ -33,3 +36,6 @@ pub use rmi_core::{LocalLinearModel, RmiIndex, RmiSegment};
 pub use learned_cache::{
     AccessEvent, AccessType, CachePredictorStats, LearnedCachePredictor,
 };
+
+// Re-export access logger components (Phase 0 Week 5-8)
+pub use access_logger::{AccessLoggerStats, AccessPatternLogger, hash_embedding};

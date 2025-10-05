@@ -25,8 +25,19 @@ pub struct AccessEvent {
     pub access_type: AccessType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Default for AccessEvent {
+    fn default() -> Self {
+        Self {
+            doc_id: 0,
+            timestamp: SystemTime::UNIX_EPOCH,
+            access_type: AccessType::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccessType {
+    #[default]
     Read,
     Write,
 }
