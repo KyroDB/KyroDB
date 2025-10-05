@@ -1,20 +1,21 @@
-//! Learned Cache Predictor using RMI for cache hotness prediction
+//! Learned Cache Predictor using HashMap for cache hotness prediction
 //!
-//! Phase 0 Week 3-4: Adapt RMI for learned cache (NOT k-NN search)
+//! Phase 0 Week 3-4: Direct doc_id → hotness_score mapping
 //!
 //! This module predicts cache hotness: doc_id → P(hot | recent_accesses)
-//! RMI learns access patterns and predicts which documents should be cached.
+//! HashMap learns access patterns and predicts which documents should be cached.
 //!
 //! Architecture:
-//! - RMI predicts cache hotness (not vector positions)
+//! - HashMap stores doc_id → hotness_score (O(1) lookup)
 //! - HNSW performs k-NN search (separate concern)
-//! - Access logger feeds training data to RMI
+//! - Access logger feeds training data
 //!
-//! Target: 70-90% cache hit rate vs 30-40% LRU baseline
+//! Target: 60-80% cache hit rate vs 15-25% LRU baseline (1M corpus)
 
-use crate::rmi_core::RmiIndex;
 use anyhow::Result;
+use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Access event for training learned cache predictor
@@ -76,14 +77,12 @@ pub enum AccessType {
 /// }
 /// ```
 pub struct LearnedCachePredictor {
-    /// RMI index for hotness prediction (doc_id → position in hotness_scores)
-    /// Option because index is empty until first training
-    hotness_index: Option<RmiIndex>,
-
-    /// Current hotness scores (training data: doc_id → hotness_score)
-    hotness_scores: Vec<(u64, f32)>,
+    /// Direct mapping: doc_id → hotness_score (O(1) lookup)
+    /// Thread-safe with RwLock for concurrent reads during queries
+    hotness_map: Arc<RwLock<HashMap<u64, f32>>>,
 
     /// Hotness threshold for cache admission (tunable)
+    /// Default: 0.3 (permissive - cache anything reasonably hot)
     cache_threshold: f32,
 
     /// Training window (how far back to consider accesses)
@@ -106,18 +105,17 @@ impl LearnedCachePredictor {
     /// Create new learned cache predictor
     ///
     /// # Parameters
-    /// - `capacity`: Maximum number of doc_ids to track (e.g., 10M)
+    /// - `capacity`: Maximum number of doc_ids to track (e.g., 10K-1M)
     ///
     /// # Defaults
-    /// - Cache threshold: 0.7 (70th percentile hotness)
+    /// - Cache threshold: 0.3 (PERMISSIVE - cache anything reasonably hot)
     /// - Training window: 24 hours
     /// - Recency half-life: 1 hour
     /// - Training interval: 10 minutes
     pub fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
-            hotness_index: None, // Empty until first training
-            hotness_scores: Vec::with_capacity(capacity),
-            cache_threshold: 0.7,
+            hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
+            cache_threshold: 0.3,  // PERMISSIVE threshold
             training_window: Duration::from_secs(24 * 3600), // 24 hours
             recency_halflife: Duration::from_secs(3600),     // 1 hour
             capacity,
@@ -135,8 +133,7 @@ impl LearnedCachePredictor {
         training_interval: Duration,
     ) -> Result<Self> {
         Ok(Self {
-            hotness_index: None, // Empty until first training
-            hotness_scores: Vec::with_capacity(capacity),
+            hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
             cache_threshold,
             training_window,
             recency_halflife,
@@ -149,45 +146,32 @@ impl LearnedCachePredictor {
     /// Predict hotness score for document ID
     ///
     /// Returns value in [0.0, 1.0] where:
-    /// - 0.0 = cold (rarely accessed)
+    /// - 0.0 = cold (never seen or very rare)
     /// - 1.0 = hot (frequently accessed recently)
     ///
     /// # Performance
-    /// - O(1) RMI prediction + O(log k) bounded search
-    /// - Target: <100ns P99 latency
+    /// - O(1) HashMap lookup
+    /// - Thread-safe with RwLock (concurrent reads)
     pub fn predict_hotness(&self, doc_id: u64) -> f32 {
-        if self.hotness_scores.is_empty() {
-            return 0.0;
-        }
-
-        // Use RMI to find position of doc_id in hotness_scores
-        let index = match &self.hotness_index {
-            Some(idx) => idx,
-            None => return 0.0, // Not trained yet
-        };
-
-        match index.get(doc_id) {
-            Some(position) => {
-                // Found doc_id in training data, look up hotness score
-                let pos = position as usize;
-                if pos < self.hotness_scores.len() {
-                    self.hotness_scores[pos].1
-                } else {
-                    0.0
-                }
-            }
-            None => {
-                // Doc_id not in training data (never accessed or evicted)
-                0.0
-            }
-        }
+        let map = self.hotness_map.read();
+        *map.get(&doc_id).unwrap_or(&0.0)
     }
 
     /// Decide if document should be cached based on predicted hotness
     ///
     /// Returns `true` if predicted hotness > cache_threshold
+    /// 
+    /// PERMISSIVE by default (threshold=0.3): caches anything reasonably hot
     pub fn should_cache(&self, doc_id: u64) -> bool {
         self.predict_hotness(doc_id) > self.cache_threshold
+    }
+    
+    /// Check if predictor has been trained
+    ///
+    /// Returns false if hotness_map is empty (never trained)
+    pub fn is_trained(&self) -> bool {
+        let map = self.hotness_map.read();
+        !map.is_empty()
     }
 
     /// Train predictor from access events
@@ -197,44 +181,39 @@ impl LearnedCachePredictor {
     ///    - Hotness = frequency × recency_weight
     ///    - Recency weight = exp(-age / half_life)
     /// 2. Normalize scores to [0, 1]
-    /// 3. Build RMI index for fast lookup
+    /// 3. Update HashMap atomically (direct doc_id → hotness mapping)
     ///
     /// # Performance
-    /// - O(n log n) for sorting + O(n) for RMI training
-    /// - Target: <100ms for 10M doc_ids
+    /// - O(n log n) for sorting + O(k) for HashMap update
+    /// - Target: <5ms for 100K accesses
+    /// - Memory: 24 bytes per tracked document
     pub fn train_from_accesses(&mut self, accesses: &[AccessEvent]) -> Result<()> {
         if accesses.is_empty() {
             return Ok(());
         }
 
-        // Compute hotness scores
+        // Compute hotness scores (frequency + recency weighted)
         let hotness_map = self.compute_hotness_scores(accesses);
 
-        // Convert to sorted vec for RMI training
+        // Sort by hotness (descending) to keep hottest documents
         let mut hotness_vec: Vec<(u64, f32)> = hotness_map.into_iter().collect();
-        hotness_vec.sort_by_key(|(doc_id, _)| *doc_id);
+        hotness_vec.sort_by(|(_, score_a), (_, score_b)| {
+            score_b.partial_cmp(score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        // Truncate to capacity if needed
+        // Truncate to capacity (keep only top K hottest documents)
         if hotness_vec.len() > self.capacity {
             hotness_vec.truncate(self.capacity);
         }
 
-        // Prepare training data for RMI (doc_id → position mapping)
-        let training_data: Vec<(u64, u64)> = hotness_vec
-            .iter()
-            .enumerate()
-            .map(|(pos, (doc_id, _))| (*doc_id, pos as u64))
-            .collect();
+        // Update HashMap atomically
+        {
+            let mut map = self.hotness_map.write();
+            map.clear();
+            map.extend(hotness_vec);
+        }
 
-        // Build RMI index for fast lookup
-        // Target segment size: 100 keys per segment (good balance for <100ns lookups)
-        let target_segment_size = 100;
-        self.hotness_index = Some(RmiIndex::build(training_data, target_segment_size));
-
-        // Store hotness scores for lookup
-        self.hotness_scores = hotness_vec;
         self.last_trained = SystemTime::now();
-
         Ok(())
     }
 
@@ -258,29 +237,27 @@ impl LearnedCachePredictor {
 
     /// Get number of tracked documents
     pub fn tracked_count(&self) -> usize {
-        self.hotness_scores.len()
+        let map = self.hotness_map.read();
+        map.len()
     }
 
     /// Get statistics for monitoring
     pub fn stats(&self) -> CachePredictorStats {
-        let hot_count = self
-            .hotness_scores
-            .iter()
-            .filter(|(_, score)| *score > self.cache_threshold)
+        let map = self.hotness_map.read();
+        
+        let hot_count = map
+            .values()
+            .filter(|score| **score > self.cache_threshold)
             .count();
 
-        let avg_hotness = if self.hotness_scores.is_empty() {
+        let avg_hotness = if map.is_empty() {
             0.0
         } else {
-            self.hotness_scores
-                .iter()
-                .map(|(_, score)| score)
-                .sum::<f32>()
-                / self.hotness_scores.len() as f32
+            map.values().sum::<f32>() / map.len() as f32
         };
 
         CachePredictorStats {
-            tracked_docs: self.hotness_scores.len(),
+            tracked_docs: map.len(),
             hot_docs: hot_count,
             cache_threshold: self.cache_threshold,
             avg_hotness,

@@ -124,15 +124,16 @@ impl CacheStrategy for LearnedCacheStrategy {
     fn should_cache(&self, doc_id: u64, _embedding: &[f32]) -> bool {
         let predictor = self.predictor.read();
         
-        // CRITICAL FIX: Optimistic bootstrapping for untrained predictor
-        // When predictor has no training data (tracked_count == 0),
-        // cache everything like LRU to bootstrap the training loop.
-        // After first training cycle, switch to selective RMI-based caching.
-        if predictor.tracked_count() == 0 {
-            return true;  // Bootstrap mode: cache like LRU until first training
+        // CRITICAL FIX: Bootstrap mode until predictor is trained
+        // Always permissive during bootstrap to build training data.
+        // After training, rely on predictor's threshold (0.3).
+        
+        if !predictor.is_trained() {
+            return true;  // Bootstrap: cache everything until first training
         }
         
-        // Production mode: use RMI predictor for selective caching
+        // Predictor trained: use selective admission (threshold 0.3)
+        // Permissive policy allows cache to fill naturally
         predictor.should_cache(doc_id)
     }
 
@@ -181,11 +182,18 @@ impl AbTestSplitter {
 
     /// Get strategy for query (50/50 random split)
     ///
-    /// Uses doc_id hash for deterministic but uniform distribution.
+    /// Uses DefaultHasher for uniform distribution across doc_ids.
+    /// CRITICAL FIX: Simple modulo (doc_id % 2) creates bias on Zipf distributions
+    /// where low even IDs (0, 2, 4...) are accessed more frequently.
     pub fn get_strategy(&self, doc_id: u64) -> Arc<dyn CacheStrategy> {
-        // Use doc_id parity for deterministic 50/50 split
-        // In production, use query_id hash for better randomness
-        if doc_id % 2 == 0 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        let mut hasher = DefaultHasher::new();
+        doc_id.hash(&mut hasher);
+        let hash = hasher.finish();
+        
+        if hash % 2 == 0 {
             Arc::clone(&self.lru_strategy)
         } else {
             Arc::clone(&self.learned_strategy)
