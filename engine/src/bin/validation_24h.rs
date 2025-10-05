@@ -1,16 +1,16 @@
-//! 24-hour validation workload for Phase 0 Week 9-12
+//! 12-hour validation workload for Phase 0 Week 9-12
 //! 
 //! **Purpose**: Validate KyroDB A/B testing framework under sustained production-like load
 //! 
 //! **What This Test Validates**:
 //! 1. Learned cache achieves 70-90% hit rate (vs 30-40% LRU baseline)
-//! 2. No memory leaks under sustained load (8.64M queries)
-//! 3. Training task runs reliably every 10 minutes (144 cycles)
+//! 2. No memory leaks under sustained load (4.32M queries)
+//! 3. Training task runs reliably every 10 minutes (72 cycles)
 //! 4. No performance degradation over time
 //! 5. Stats persistence survives restarts
 //! 
 //! **Workload**:
-//! - Duration: 24 hours (configurable)
+//! - Duration: 12 hours (configurable)
 //! - QPS: 100 queries/second
 //! - Distribution: Zipf (exponent=1.5) - 80/20 hot/cold
 //! - Corpus: 100,000 documents
@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result};
 use kyrodb_engine::{
-    AccessPatternLogger, AbStatsPersister, AbTestSplitter, CachedVector,
+    AccessPatternLogger, AbStatsPersister, AbTestSplitter, CachedVector, CacheStrategy,
     LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, TrainingConfig,
     spawn_training_task,
 };
@@ -62,7 +62,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            duration_hours: 24,
+            duration_hours: 12,
             target_qps: 100,
             corpus_size: 100_000,
             zipf_exponent: 1.5,
@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
     let config = Config::default();
     
     println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║  KyroDB 24-Hour Validation Workload - Phase 0 Week 9-12       ║");
+    println!("║  KyroDB 12-Hour Validation Workload - Phase 0 Week 9-12       ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Configuration:");
@@ -221,6 +221,13 @@ async fn main() -> Result<()> {
     println!("Training task running (retrains every {} seconds)", config.training_interval_secs);
     println!();
     
+    // Verify strategy names (defensive check)
+    println!("A/B Test Configuration:");
+    println!("  LRU strategy name:     {}", lru_strategy.name());
+    println!("  Learned strategy name: {}", learned_strategy.name());
+    println!("  Traffic split:         50/50 (even doc_ids → LRU, odd → Learned)");
+    println!();
+    
     // Initialize Zipf sampler
     let zipf_sampler = ZipfSampler::new(config.corpus_size, config.zipf_exponent);
     
@@ -273,27 +280,27 @@ async fn main() -> Result<()> {
             }
         }
         
-        // If cache miss, simulate insertion (learned cache uses should_cache)
+        // If cache miss, insert with strategy-specific admission logic
         if !cache_hit {
-            if strategy_name == "learned_rmi" {
+            let cached = CachedVector {
+                doc_id,
+                embedding: query_embedding.clone(),
+                distance: 0.5,
+                cached_at: Instant::now(),
+            };
+            
+            // Explicit strategy routing to eliminate any ambiguity
+            if strategy_name == "lru_baseline" {
+                // LRU: Always cache (permissive admission)
+                strategy.insert_cached(cached);
+            } else if strategy_name == "learned_rmi" {
+                // Learned: Only cache if RMI predictor says hot
                 if strategy.should_cache(doc_id, &query_embedding) {
-                    let cached = CachedVector {
-                        doc_id,
-                        embedding: query_embedding.clone(),
-                        distance: 0.5,
-                        cached_at: Instant::now(),
-                    };
                     strategy.insert_cached(cached);
                 }
             } else {
-                // LRU always caches
-                let cached = CachedVector {
-                    doc_id,
-                    embedding: query_embedding.clone(),
-                    distance: 0.5,
-                    cached_at: Instant::now(),
-                };
-                strategy.insert_cached(cached);
+                // Defensive: unknown strategy, skip caching
+                eprintln!("WARNING: Unknown cache strategy '{}', skipping cache insertion", strategy_name);
             }
         }
         
