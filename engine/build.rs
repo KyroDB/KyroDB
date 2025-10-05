@@ -31,24 +31,7 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_BRANCH={}", branch);
 
-    // Build timestamp
-    let build_time = chrono::Utc::now().to_rfc3339();
-    println!("cargo:rustc-env=BUILD_TIME={}", build_time);
-
-    // Rust version
-    let rust_version = Command::new("rustc")
-        .args(["--version"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=RUST_VERSION={}", rust_version);
+    // Note: Removed chrono dependency - not needed for Phase 0
 
     // Target triple
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());

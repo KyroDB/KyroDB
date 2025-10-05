@@ -1,240 +1,60 @@
-name: CI
+name: Phase 0 CI
 
-# DISABLED: Temporarily disabled to fix write performance issues
-# Will be re-enabled after implementing group commit and async fsync
 on:
-  workflow_dispatch:
-    inputs:
-      force_run:
-        description: 'Force run CI (debugging only)'
-        required: false
-        default: 'false'
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  # Main test matrix - runs on every PR/push
-  test-matrix:
-    name: Test (${{ matrix.os }}, ${{ matrix.features }}, ${{ matrix.toolchain }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        toolchain: [stable]
-        features: ["default", "no-default", "http-test"]
-        include:
-          # Test nightly on Ubuntu for advanced features
-          - os: ubuntu-latest
-            toolchain: nightly
-            features: "default"
-          # Test beta on Ubuntu
-          - os: ubuntu-latest
-            toolchain: beta
-            features: "default"
-          # Test failpoints on Ubuntu
-          - os: ubuntu-latest
-            toolchain: stable
-            features: "failpoints"
-
+  test:
+    name: Test
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Debug matrix values
-        run: |
-          echo "OS: ${{ matrix.os }}"
-          echo "Toolchain: ${{ matrix.toolchain }}"
-          echo "Features: ${{ matrix.features }}"
-
-      - name: Setup Rust toolchain (${{ matrix.toolchain }})
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          components: rustfmt, clippy
-
+      
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@v4
         with:
-          key: ${{ matrix.os }}-${{ matrix.toolchain }}-${{ matrix.features }}
-
-      - name: Format check
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Run tests
+        run: cargo test --workspace --all-features
+      
+      - name: Check formatting
         run: cargo fmt --all -- --check
+      
+      - name: Run clippy
+        run: cargo clippy --workspace --all-features -- -D warnings
 
-      - name: Clippy (warnings as errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Build kyrodb-engine (${{ matrix.features }})
-        run: |
-          case "${{ matrix.features }}" in
-            "default")
-              cargo build -p kyrodb-engine --release --features learned-index --locked --verbose
-              ;;
-            "no-default")
-              cargo build -p kyrodb-engine --release --no-default-features --locked --verbose
-              ;;
-            "http-test")
-              cargo build -p kyrodb-engine --release --features "learned-index,http-test" --locked --verbose
-              ;;
-            "failpoints")
-              cargo build -p kyrodb-engine --release --features "learned-index,failpoints" --locked --verbose
-              ;;
-          esac
-
-      - name: Test kyrodb-engine (${{ matrix.features }})
-        run: |
-          case "${{ matrix.features }}" in
-            "default")
-              cargo test -p kyrodb-engine --features learned-index --all-targets --locked --verbose
-              ;;
-            "no-default")
-              cargo test -p kyrodb-engine --no-default-features --all-targets --locked --verbose
-              ;;
-            "http-test")
-              cargo test -p kyrodb-engine --features "learned-index,http-test" --all-targets --locked --verbose
-              ;;
-            "failpoints")
-              cargo test -p kyrodb-engine --features "learned-index,failpoints" --all-targets --locked --verbose
-              ;;
-          esac
-
-      - name: Test workspace crates
-        run: |
-          # Test other workspace crates if they exist
-          for crate in bench orchestrator; do
-            if [ -d "$crate" ] && [ -f "$crate/Cargo.toml" ]; then
-              echo "Testing $crate..."
-              (cd $crate && cargo test --locked --verbose) || echo "No tests in $crate"
-            fi
-          done
-
-  # Integration tests - only on Ubuntu stable
-  integration-tests:
-    name: Integration Tests
+  build:
+    name: Build
     runs-on: ubuntu-latest
-    needs: test-matrix
-    timeout-minutes: 30
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build engine & bench
-        run: |
-          cargo build -p kyrodb-engine --release --features "learned-index,http-test"
-          cargo build -p bench --release
-
-      - name: Start engine server
-        run: |
-          mkdir -p /tmp/kyrodb-test
-          ./target/release/kyrodb-engine --data-dir /tmp/kyrodb-test serve 127.0.0.1 3030 &
-          echo $! > engine.pid
-          sleep 5
-
-      - name: Test health endpoint
-        run: |
-          curl -f http://127.0.0.1:3030/health || exit 1
-
-      - name: Test build_info endpoint
-        run: |
-          curl -f http://127.0.0.1:3030/build_info || exit 1
-
-      - name: Run integration tests
-        run: |
-          cargo test -p kyrodb-engine --features "learned-index,http-test" --test http_integration -- --nocapture || echo "Some integration tests failed (may be rate limiting)"
-          cargo test -p kyrodb-engine --features "learned-index,http-test" --test http_compact_endpoint -- --nocapture
-
-      - name: Test basic API endpoints
-        run: |
-          # Test offset endpoint
-          curl -f http://127.0.0.1:3030/v1/offset || exit 1
-
-          # Test append endpoint
-          curl -X POST -H "Content-Type: application/json" \
-            -d '{"payload":"test"}' \
-            http://127.0.0.1:3030/v1/append || exit 1
-
-      - name: HTTP benchmark smoke test
-        run: |
-          ./target/release/bench --base http://127.0.0.1:3030 \
-            --load-n 1000 --read-concurrency 4 --read-seconds 3 || true
-
-      - name: Stop engine
-        if: always()
-        run: |
-          kill $(cat engine.pid) 2>/dev/null || true
-          sleep 2
-
-  # Benchmark smoke test
-  benchmark-smoke:
-    name: Benchmark Smoke Test
-    runs-on: ubuntu-latest
-    needs: test-matrix
-    timeout-minutes: 15
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run microbenchmarks (smoke)
-        run: |
-          cargo bench -p bench --bench kv_index -- --sample-size 5 || true
-
-  # Security audit
-  security-audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    needs: test-matrix
-    timeout-minutes: 10
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run security audit
-        run: cargo audit --ignore RUSTSEC-2023-0071 || true  # Allow known issues if any
-
-  # Final status check
-  ci-success:
-    name: CI Success
-    runs-on: ubuntu-latest
-    needs: [test-matrix, integration-tests, benchmark-smoke, security-audit]
-    if: always()
-
-    steps:
-      - name: Check all jobs
-        run: |
-          if [[ "${{ needs.test-matrix.result }}" != "success" ]]; then
-            echo "❌ Test matrix failed"
-            exit 1
-          fi
-          if [[ "${{ needs.integration-tests.result }}" != "success" ]]; then
-            echo "❌ Integration tests failed"
-            exit 1
-          fi
-          if [[ "${{ needs.benchmark-smoke.result }}" != "success" ]]; then
-            echo "❌ Benchmark smoke test failed"
-            exit 1
-          fi
-          if [[ "${{ needs.security-audit.result }}" != "success" ]]; then
-            echo "❌ Security audit failed"
-            exit 1
-          fi
-          echo "✅ All CI checks passed!"
+      
+      - name: Build
+        run: cargo build --workspace --all-features --release
