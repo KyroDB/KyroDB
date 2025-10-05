@@ -1,10 +1,12 @@
 name: Phase 0 CI
 
+# CI DISABLED during Phase 0 development - will re-enable at deployment
 on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:  # Manual trigger only
+  # push:
+  #   branches: [ main, develop ]
+  # pull_request:
+  #   branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always

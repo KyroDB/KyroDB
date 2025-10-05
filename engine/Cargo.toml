@@ -43,6 +43,10 @@ rand = "0.8"
 name = "hnsw_knn"
 harness = false
 
+[[bench]]
+name = "learned_cache"
+harness = false
+
 [dependencies.criterion]
 version = "0.5"
 optional = true

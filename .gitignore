@@ -102,8 +102,6 @@ go.work.sum
 *.cer
 
 # Documentation scratch and experimental
-docs/TODO.md
-experimental.local.md
 .github/copilot-instructions.md
 
 # Fuzzing artifacts
@@ -130,3 +128,4 @@ bench_server.log
 .github/copilot-instructions.md
 .cursor/rules/rules.mdc
 Implementation.md
+PHASE0_WEEK3-4_RESULTS.md
