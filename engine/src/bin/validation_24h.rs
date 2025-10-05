@@ -340,6 +340,31 @@ async fn main() -> Result<()> {
     let zipf_sampler = ZipfSampler::new(config.corpus_size, config.zipf_exponent)
         .context("Failed to create Zipf sampler")?;
 
+    // Validate Zipf distribution (sample 10K docs to verify distribution)
+    println!("Validating Zipf distribution...");
+    {
+        let mut doc_counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for _ in 0..10_000 {
+            let doc_id = zipf_sampler.sample();
+            *doc_counts.entry(doc_id).or_insert(0) += 1;
+        }
+        
+        let mut sorted_docs: Vec<_> = doc_counts.iter().collect();
+        sorted_docs.sort_by(|a, b| b.1.cmp(a.1));
+        
+        let top_20_docs: usize = sorted_docs.iter().take(20).map(|(_, count)| **count).sum();
+        let top_20_pct = top_20_docs as f64 / 10_000.0;
+        
+        println!("  Top 20 docs: {:.1}% of accesses (expected: 20-30%)", top_20_pct * 100.0);
+        
+        if top_20_pct < 0.15 || top_20_pct > 0.35 {
+            bail!("Zipf distribution validation failed: top 20 docs should capture 15-35% of accesses, got {:.1}%", top_20_pct * 100.0);
+        }
+        
+        println!("  ✓ Zipf distribution validated");
+    }
+    println!();
+
     // Test parameters
     let test_duration = Duration::from_secs(config.duration_hours * 3600);
     let target_interval = Duration::from_nanos(1_000_000_000 / config.target_qps);
@@ -467,7 +492,7 @@ async fn main() -> Result<()> {
 
         total_queries += 1;
 
-        // Progress reporting every 10K queries (based on query count, not time)
+        // Progress reporting every 10K queries with detailed diagnostics
         if total_queries % 10_000 == 0 {
             let elapsed = test_start.elapsed();
             let progress_pct = (total_queries as f64 / total_expected as f64) * 100.0;
@@ -488,13 +513,38 @@ async fn main() -> Result<()> {
                 0.0
             };
 
+            // Get cache diagnostics
+            let lru_stats = lru_strategy.cache.stats();
+            let learned_stats = learned_strategy.cache.stats();
+            let learned_tracked = {
+                let pred = learned_strategy.predictor.read();
+                pred.tracked_count()
+            };
+            
+            // Calculate traffic split percentages
+            let lru_pct = if total_queries > 0 {
+                (lru_queries as f64 / total_queries as f64) * 100.0
+            } else {
+                0.0
+            };
+            let learned_pct = if total_queries > 0 {
+                (learned_queries as f64 / total_queries as f64) * 100.0
+            } else {
+                0.0
+            };
+
             println!(
-                "[{:>5.1}%] Queries: {:>8} | QPS: {:>5.0} | LRU: {:>5.1}% | Learned: {:>5.1}% | Improvement: {:>4.2}×",
+                "[{:>5.1}%] Q: {:>7} | QPS: {:>3.0} | LRU: {:>5.1}% ({:>4} cached, {:>5.1}% traffic) | Learned: {:>5.1}% ({:>4} cached, {:>5} tracked, {:>5.1}% traffic) | Improvement: {:>4.2}×",
                 progress_pct,
                 total_queries,
                 current_qps,
                 lru_hit_rate * 100.0,
+                lru_stats.size,
+                lru_pct,
                 learned_hit_rate * 100.0,
+                learned_stats.size,
+                learned_tracked,
+                learned_pct,
                 improvement
             );
         }

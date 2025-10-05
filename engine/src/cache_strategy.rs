@@ -41,7 +41,7 @@ pub trait CacheStrategy: Send + Sync {
 /// Always caches accessed vectors, evicts least recently used when full.
 /// This is the baseline for A/B testing (30-40% expected hit rate).
 pub struct LruCacheStrategy {
-    cache: Arc<VectorCache>,
+    pub cache: Arc<VectorCache>,
     name: String,
 }
 
@@ -91,8 +91,8 @@ impl CacheStrategy for LruCacheStrategy {
 /// Only caches vectors predicted to be hot (>threshold).
 /// Expected hit rate: 70-90% (significantly better than LRU).
 pub struct LearnedCacheStrategy {
-    cache: Arc<VectorCache>,
-    predictor: Arc<parking_lot::RwLock<LearnedCachePredictor>>,
+    pub cache: Arc<VectorCache>,
+    pub predictor: Arc<parking_lot::RwLock<LearnedCachePredictor>>,
     name: String,
 }
 
@@ -122,8 +122,17 @@ impl CacheStrategy for LearnedCacheStrategy {
     }
 
     fn should_cache(&self, doc_id: u64, _embedding: &[f32]) -> bool {
-        // Use RMI predictor to decide admission
         let predictor = self.predictor.read();
+        
+        // CRITICAL FIX: Optimistic bootstrapping for untrained predictor
+        // When predictor has no training data (tracked_count == 0),
+        // cache everything like LRU to bootstrap the training loop.
+        // After first training cycle, switch to selective RMI-based caching.
+        if predictor.tracked_count() == 0 {
+            return true;  // Bootstrap mode: cache like LRU until first training
+        }
+        
+        // Production mode: use RMI predictor for selective caching
         predictor.should_cache(doc_id)
     }
 
@@ -137,12 +146,14 @@ impl CacheStrategy for LearnedCacheStrategy {
 
     fn stats(&self) -> String {
         let stats = self.cache.stats();
+        let predictor = self.predictor.read();
         format!(
-            "Learned: {} hits, {} misses, {:.2}% hit rate, {} evictions",
+            "Learned: {} hits, {} misses, {:.2}% hit rate, {} evictions, {} tracked docs",
             stats.hits,
             stats.misses,
             stats.hit_rate * 100.0,
-            stats.evictions
+            stats.evictions,
+            predictor.tracked_count()
         )
     }
 }
