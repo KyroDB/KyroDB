@@ -28,9 +28,13 @@ anyhow = "1.0"
 
 # Phase 0 Week 3-8: RMI for learned cache (no external deps, pure Rust)
 
-# Phase 0 Week 9-12: Persistence (will add when needed)
-# tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util"] }
-# serde = { version = "1.0", features = ["derive"] }
+# Phase 0 Week 9-12: A/B testing framework + minimal persistence
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util"] }
+serde = { version = "1.0", features = ["derive"] }
+csv = "1.3"
+parking_lot = "0.12"  # Fast RwLock for cache
+
+# Phase 0 Week 13-16: Full persistence (will add when needed)
 # bincode = "1.3"
 # memmap2 = "0.9"
 
@@ -38,6 +42,7 @@ anyhow = "1.0"
 # Phase 0 Week 1-2: Testing HNSW recall guarantees
 proptest = "1.0"
 rand = "0.8"
+tempfile = "3.8"  # For testing file persistence
 
 [[bench]]
 name = "hnsw_knn"

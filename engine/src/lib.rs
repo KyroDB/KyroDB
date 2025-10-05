@@ -18,11 +18,14 @@ pub mod rmi_core;
 // Week 3-4: Learned cache predictor (Phase 0 Week 3-4) ✅
 pub mod learned_cache;
 
-// Week 5-8: Access pattern logger (CURRENT - Phase 0 Week 5-8)
+// Week 5-8: Access pattern logger (Phase 0 Week 5-8) ✅
 pub mod access_logger;
 
-// Week 9-12: Document storage and persistence (to be implemented)
-// pub mod storage;
+// Phase 0 Week 9-12: A/B Testing Framework (CURRENT)
+pub mod vector_cache;    // In-memory vector cache with LRU eviction
+pub mod cache_strategy;  // CacheStrategy trait + LRU/Learned implementations + A/B splitter
+pub mod ab_stats;        // A/B test metrics persistence (CSV format)
+pub mod training_task;   // Background RMI training task (tokio::spawn, 10-minute interval)
 
 // ===== Public API =====
 
@@ -39,3 +42,9 @@ pub use learned_cache::{
 
 // Re-export access logger components (Phase 0 Week 5-8)
 pub use access_logger::{AccessLoggerStats, AccessPatternLogger, hash_embedding};
+
+// Re-export A/B testing components (Phase 0 Week 9-12)
+pub use vector_cache::{CachedVector, CacheStats, VectorCache};
+pub use cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy};
+pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
+pub use training_task::{spawn_training_task, TrainingConfig};
