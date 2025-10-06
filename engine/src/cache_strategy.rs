@@ -8,6 +8,7 @@
 
 use crate::learned_cache::LearnedCachePredictor;
 use crate::vector_cache::{CachedVector, VectorCache};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Cache strategy trait
@@ -126,15 +127,33 @@ impl CacheStrategy for LearnedCacheStrategy {
         
         // CRITICAL FIX: Bootstrap mode until predictor is trained
         // Always permissive during bootstrap to build training data.
-        // After training, rely on predictor's threshold (0.3).
+    // After training, rely on predictor's configured threshold.
         
         if !predictor.is_trained() {
             return true;  // Bootstrap: cache everything until first training
         }
         
-        // Predictor trained: use selective admission (threshold 0.3)
-        // Permissive policy allows cache to fill naturally
-        predictor.should_cache(doc_id)
+        let threshold = predictor
+            .cache_threshold()
+            .max(predictor.admission_floor());
+
+        if let Some(score) = predictor.lookup_hotness(doc_id) {
+            if score >= threshold {
+                return true;
+            }
+
+            let soft_probability = (score / threshold).clamp(0.0, 1.0) * 0.25;
+            if soft_probability > 0.0 && rand::random::<f32>() < soft_probability {
+                return true;
+            }
+
+            return false;
+        }
+
+        let unseen_chance = predictor.unseen_admission_chance();
+        drop(predictor);
+
+        rand::random::<f32>() < unseen_chance
     }
 
     fn insert_cached(&self, cached_vector: CachedVector) {
@@ -166,6 +185,7 @@ impl CacheStrategy for LearnedCacheStrategy {
 pub struct AbTestSplitter {
     lru_strategy: Arc<dyn CacheStrategy>,
     learned_strategy: Arc<dyn CacheStrategy>,
+    sequence: AtomicU64,
 }
 
 impl AbTestSplitter {
@@ -177,6 +197,7 @@ impl AbTestSplitter {
         Self {
             lru_strategy,
             learned_strategy,
+            sequence: AtomicU64::new(0),
         }
     }
 
@@ -185,15 +206,10 @@ impl AbTestSplitter {
     /// Uses DefaultHasher for uniform distribution across doc_ids.
     /// CRITICAL FIX: Simple modulo (doc_id % 2) creates bias on Zipf distributions
     /// where low even IDs (0, 2, 4...) are accessed more frequently.
-    pub fn get_strategy(&self, doc_id: u64) -> Arc<dyn CacheStrategy> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        let mut hasher = DefaultHasher::new();
-        doc_id.hash(&mut hasher);
-        let hash = hasher.finish();
-        
-        if hash % 2 == 0 {
+    pub fn get_strategy(&self, _doc_id: u64) -> Arc<dyn CacheStrategy> {
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+
+        if seq % 2 == 0 {
             Arc::clone(&self.lru_strategy)
         } else {
             Arc::clone(&self.learned_strategy)

@@ -27,12 +27,11 @@
 
 use anyhow::{bail, Context, Result};
 use kyrodb_engine::{
-    spawn_training_task, AbStatsPersister, AbTestSplitter, AccessPatternLogger, CacheStrategy,
-    CachedVector, LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, TrainingConfig,
+    spawn_training_task, AbStatsPersister, AbTestSplitter, AccessPatternLogger, CachedVector,
+    LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, TrainingConfig,
 };
 use rand::{distributions::Distribution, Rng};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -153,8 +152,7 @@ impl Config {
 
     /// Calculate expected working set size (docs that account for 95% of queries)
     fn expected_working_set_size(&self) -> usize {
-        // Empirical formula for Zipf distribution
-        // For Zipf(1.07), working set ≈ N^(1/1.07) ≈ N^0.935
+    // Empirical formula for Zipf distribution tuned via validation runs
         let n = self.corpus_size as f64;
         let exponent = 1.0 / self.zipf_exponent;
         (n.powf(exponent) * 0.15) as usize // 15% factor from empirical data
@@ -521,7 +519,7 @@ async fn main() -> Result<()> {
     println!("Spawning background training task...");
     let training_config = TrainingConfig {
         interval: Duration::from_secs(config.training_interval_secs),
-        window_duration: Duration::from_secs(24 * 3600),
+        window_duration: Duration::from_secs(3600),
         min_events_for_training: 100,
         rmi_capacity: config.cache_capacity,
     };

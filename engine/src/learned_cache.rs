@@ -82,8 +82,15 @@ pub struct LearnedCachePredictor {
     hotness_map: Arc<RwLock<HashMap<u64, f32>>>,
 
     /// Hotness threshold for cache admission (tunable)
-    /// Default: 0.3 (permissive - cache anything reasonably hot)
+    /// Default: 0.2 (aligned with sqrt-scaled hotness scores)
     cache_threshold: f32,
+
+    /// Minimum admission floor regardless of configured threshold
+    /// Prevents overly conservative tuning from starving the cache.
+    admission_floor: f32,
+
+    /// Probability of admitting unseen documents to avoid cache starvation
+    unseen_admission_chance: f32,
 
     /// Training window (how far back to consider accesses)
     training_window: Duration,
@@ -108,14 +115,16 @@ impl LearnedCachePredictor {
     /// - `capacity`: Maximum number of doc_ids to track (e.g., 10K-1M)
     ///
     /// # Defaults
-    /// - Cache threshold: 0.3 (PERMISSIVE - cache anything reasonably hot)
+    /// - Cache threshold: 0.2 (calibrated with sqrt scaling)
     /// - Training window: 24 hours
     /// - Recency half-life: 1 hour
     /// - Training interval: 10 minutes
     pub fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
-            cache_threshold: 0.3,  // PERMISSIVE threshold
+            cache_threshold: 0.2,  // Calibrated for sqrt-scaled hotness scores
+            admission_floor: 0.05,
+            unseen_admission_chance: 0.10,
             training_window: Duration::from_secs(24 * 3600), // 24 hours
             recency_halflife: Duration::from_secs(3600),     // 1 hour
             capacity,
@@ -132,9 +141,12 @@ impl LearnedCachePredictor {
         recency_halflife: Duration,
         training_interval: Duration,
     ) -> Result<Self> {
+        let admission_floor = 0.05;
         Ok(Self {
             hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
-            cache_threshold,
+            cache_threshold: cache_threshold.clamp(admission_floor, 1.0),
+            admission_floor,
+            unseen_admission_chance: 0.10,
             training_window,
             recency_halflife,
             capacity,
@@ -153,8 +165,13 @@ impl LearnedCachePredictor {
     /// - O(1) HashMap lookup
     /// - Thread-safe with RwLock (concurrent reads)
     pub fn predict_hotness(&self, doc_id: u64) -> f32 {
+        self.lookup_hotness(doc_id).unwrap_or(0.0)
+    }
+
+    /// Lookup raw hotness score without default fallback
+    pub fn lookup_hotness(&self, doc_id: u64) -> Option<f32> {
         let map = self.hotness_map.read();
-        *map.get(&doc_id).unwrap_or(&0.0)
+        map.get(&doc_id).copied()
     }
 
     /// Decide if document should be cached based on predicted hotness
@@ -230,9 +247,19 @@ impl LearnedCachePredictor {
         self.cache_threshold
     }
 
+    /// Get minimum admission floor
+    pub fn admission_floor(&self) -> f32 {
+        self.admission_floor
+    }
+
+    /// Probability of admitting unseen documents during learned mode
+    pub fn unseen_admission_chance(&self) -> f32 {
+        self.unseen_admission_chance
+    }
+
     /// Update cache admission threshold (for tuning)
     pub fn set_cache_threshold(&mut self, threshold: f32) {
-        self.cache_threshold = threshold.clamp(0.0, 1.0);
+        self.cache_threshold = threshold.clamp(self.admission_floor, 1.0);
     }
 
     /// Get number of tracked documents
@@ -307,7 +334,8 @@ impl LearnedCachePredictor {
 
             if max_hotness > 0.0 {
                 for score in hotness.values_mut() {
-                    *score /= max_hotness;
+                    let normalized = (*score / max_hotness).clamp(0.0, 1.0);
+                    *score = normalized.sqrt();
                 }
             }
         }
@@ -342,7 +370,7 @@ mod tests {
     fn test_learned_cache_basic() {
         let predictor = LearnedCachePredictor::new(1000).unwrap();
         assert_eq!(predictor.tracked_count(), 0);
-        assert_eq!(predictor.cache_threshold(), 0.7);
+        assert!((predictor.cache_threshold() - 0.2).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -454,12 +482,12 @@ mod tests {
 
         predictor.train_from_accesses(&accesses).unwrap();
 
-        // With threshold 0.7, only hottest docs cached
+        // With higher threshold, only hottest docs cached
         predictor.set_cache_threshold(0.7);
         let hot_count_high = predictor.stats().hot_docs;
 
         // With threshold 0.3, more docs cached
-        predictor.set_cache_threshold(0.3);
+    predictor.set_cache_threshold(0.3);
         let hot_count_low = predictor.stats().hot_docs;
 
         // Lower threshold → more docs considered hot
@@ -547,7 +575,7 @@ mod tests {
         let stats = predictor.stats();
         assert_eq!(stats.tracked_docs, 2);
         assert!(stats.hot_docs > 0);
-        assert_eq!(stats.cache_threshold, 0.7);
+        assert!((stats.cache_threshold - 0.2).abs() < f32::EPSILON);
         assert!(stats.avg_hotness > 0.0 && stats.avg_hotness <= 1.0);
     }
 }

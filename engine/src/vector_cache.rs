@@ -171,6 +171,11 @@ impl VectorCache {
     pub fn is_empty(&self) -> bool {
         self.cache.read().is_empty()
     }
+
+    /// Get maximum capacity
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 /// Cache statistics
