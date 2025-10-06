@@ -6,8 +6,8 @@
 //! 3. Memory leak (101% growth) - unbounded buffer or broken eviction
 
 use kyrodb_engine::{
-    AbTestSplitter, AccessEvent, AccessPatternLogger, AccessType, CachedVector,
-    CacheStrategy, LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy,
+    AbTestSplitter, AccessEvent, AccessPatternLogger, AccessType, CacheStrategy, CachedVector,
+    LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -145,10 +145,7 @@ fn test_ab_splitter_even_distribution() {
     );
 
     // Should be exactly 50/50 (within 1% tolerance for even-numbered test)
-    assert_eq!(
-        lru_count, 5000,
-        "LRU should get exactly 5000 queries (50%)"
-    );
+    assert_eq!(lru_count, 5000, "LRU should get exactly 5000 queries (50%)");
     assert_eq!(
         learned_count, 5000,
         "Learned should get exactly 5000 queries (50%)"
@@ -215,11 +212,11 @@ fn test_lru_hit_rate_realistic_on_zipf() {
     // LRU can achieve very high hit rates because hot set fits in cache.
     // The key is that it should be STABLE (not showing the >98% from the bug).
     // The bug was 98% with capacity=10K, corpus=100K - impossible.
-    
+
     // Realistic bounds for this specific test setup:
     // - Lower bound: 60% (cache is big enough to hold hot set)
     // - Upper bound: 99% (allow for very skewed Zipf distribution)
-    
+
     assert!(
         hit_rate >= 0.60,
         "LRU hit rate too low: {:.1}% (expected >= 60% for this workload)",
@@ -230,7 +227,7 @@ fn test_lru_hit_rate_realistic_on_zipf() {
         "LRU hit rate at 100% ({:.1}%) suggests caching everything (bug)",
         hit_rate * 100.0
     );
-    
+
     // The real bug was 98% hit rate with 10K cache on 100K corpus.
     // This test has 1K cache on 10K corpus, so high hit rate is expected.
 }
@@ -337,7 +334,7 @@ fn test_cache_memory_bounded() {
     // Verify cache stayed bounded
     let stats_str = strategy.stats();
     println!("After 100K queries: {}", stats_str);
-    
+
     // Verify evictions occurred (proof capacity is enforced)
     assert!(
         stats_str.contains("evictions"),
@@ -489,8 +486,16 @@ fn test_strategy_names_correct() {
     let predictor = LearnedCachePredictor::new(100).unwrap();
     let learned = Arc::new(LearnedCacheStrategy::new(100, predictor));
 
-    assert_eq!(lru.name(), "lru_baseline", "LRU strategy name must be 'lru_baseline'");
-    assert_eq!(learned.name(), "learned_rmi", "Learned strategy name must be 'learned_rmi'");
+    assert_eq!(
+        lru.name(),
+        "lru_baseline",
+        "LRU strategy name must be 'lru_baseline'"
+    );
+    assert_eq!(
+        learned.name(),
+        "learned_rmi",
+        "Learned strategy name must be 'learned_rmi'"
+    );
 }
 
 /// DIAGNOSTIC TEST: Verify cache capacity is enforced

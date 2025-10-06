@@ -1,4 +1,4 @@
-//! Enterprise-scale validation workload for Phase 0 Week 9-12
+//! Enterprise-scale validation workload 
 //!
 //! **Purpose**: Validate KyroDB learned cache against REALISTIC production RAG workloads
 //!
@@ -14,7 +14,7 @@
 //! - Cache: 10K vectors (1% of corpus - industry standard)
 //! - Duration: 12 hours
 //! - QPS: 100 queries/second
-//! - Distribution: Zipf 1.07 (real-world web traffic)
+//! - Distribution: Zipf 1.01 (real-world web traffic)
 //! - Temporal patterns: Topic rotation + random spikes
 //! - A/B split: 50% LRU baseline, 50% Learned cache
 //!
@@ -32,6 +32,7 @@ use kyrodb_engine::{
 };
 use rand::{distributions::Distribution, Rng};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -50,7 +51,7 @@ struct Config {
     /// Number of unique documents (enterprise-scale)
     corpus_size: usize,
 
-    /// Zipf exponent (1.07 = real-world web traffic)
+    /// Zipf exponent (1.01 = real-world web traffic)
     zipf_exponent: f64,
 
     /// Cache capacity (1% of corpus - industry standard)
@@ -73,6 +74,18 @@ struct Config {
 
     /// Spike duration in seconds (default: 5 minutes)
     spike_duration_secs: u64,
+
+    /// Ratio of queries that target cold, one-off documents (uniform)
+    cold_traffic_ratio: f64,
+
+    /// Bias for sampling from rolling working set (post cold-traffic)
+    working_set_bias: f64,
+
+    /// Rolling working-set size multiplier relative to cache capacity
+    working_set_multiplier: f64,
+
+    /// Probability of rotating an item in the working set each query
+    working_set_churn: f64,
 
     /// Output files
     stats_csv: String,
@@ -97,7 +110,7 @@ impl Default for Config {
             duration_hours: 12,
             target_qps: 100,
             training_interval_secs: 600,
-            
+
             // CRITICAL FIX: Reduced logger window (20K vs 100K)
             // Prevents memory leak (60MB max vs 300MB)
             logger_window_size: 20_000,
@@ -105,8 +118,13 @@ impl Default for Config {
             // Temporal patterns (realistic production)
             enable_temporal_patterns: true,
             topic_rotation_interval_secs: 7200, // 2 hours
-            spike_probability: 0.001,            // 0.1% per query
-            spike_duration_secs: 300,            // 5 minutes
+            spike_probability: 0.001,           // 0.1% per query
+            spike_duration_secs: 300,           // 5 minutes
+
+            cold_traffic_ratio: 0.2,
+            working_set_bias: 0.65,
+            working_set_multiplier: 3.5,
+            working_set_churn: 0.08,
 
             stats_csv: "validation_enterprise.csv".to_string(),
             results_json: "validation_enterprise.json".to_string(),
@@ -147,15 +165,29 @@ impl Config {
         if self.spike_probability < 0.0 || self.spike_probability > 1.0 {
             bail!("spike_probability must be in [0, 1]");
         }
+        if self.cold_traffic_ratio < 0.0 || self.cold_traffic_ratio > 1.0 {
+            bail!("cold_traffic_ratio must be in [0, 1]");
+        }
+        if self.working_set_bias < 0.0 || self.working_set_bias > 1.0 {
+            bail!("working_set_bias must be in [0, 1]");
+        }
+        if self.working_set_multiplier < 1.0 {
+            bail!("working_set_multiplier must be >= 1.0");
+        }
+        if self.working_set_churn <= 0.0 || self.working_set_churn > 1.0 {
+            bail!("working_set_churn must be in (0, 1]");
+        }
         Ok(())
     }
 
     /// Calculate expected working set size (docs that account for 95% of queries)
     fn expected_working_set_size(&self) -> usize {
-    // Empirical formula for Zipf distribution tuned via validation runs
         let n = self.corpus_size as f64;
         let exponent = 1.0 / self.zipf_exponent;
-        (n.powf(exponent) * 0.15) as usize // 15% factor from empirical data
+        let zipf_estimate = (n.powf(exponent) * 0.15) as usize;
+        let rolling_estimate =
+            (self.cache_capacity as f64 * self.working_set_multiplier).round() as usize;
+        zipf_estimate.max(rolling_estimate).min(self.corpus_size)
     }
 }
 
@@ -211,6 +243,10 @@ struct ValidationResults {
     // Working set analysis
     expected_working_set_size: usize,
     cache_to_working_set_ratio: f64,
+
+    // Workload mix stats
+    cold_queries: u64,
+    working_set_draws: u64,
 }
 
 /// Realistic temporal workload generator
@@ -218,6 +254,13 @@ struct ValidationResults {
 struct TemporalWorkloadGenerator {
     base_sampler: ZipfSampler,
     corpus_size: usize,
+    working_set: Arc<RwLock<VecDeque<u64>>>,
+    working_set_size: usize,
+    working_set_churn: f64,
+    working_set_bias: f64,
+    cold_traffic_ratio: f64,
+    cold_query_count: Arc<AtomicU64>,
+    working_set_draws: Arc<AtomicU64>,
 
     // Topic rotation (hot documents shift every 2 hours)
     topic_rotation_interval: Duration,
@@ -248,10 +291,34 @@ impl TemporalWorkloadGenerator {
         spike_probability: f64,
         spike_duration: Duration,
         enabled: bool,
+        cache_capacity: usize,
+        working_set_multiplier: f64,
+        working_set_churn: f64,
+        cold_traffic_ratio: f64,
+        working_set_bias: f64,
     ) -> Result<Self> {
+        let base_sampler = ZipfSampler::new(corpus_size, zipf_exponent)?;
+        let working_set_size = (((cache_capacity as f64) * working_set_multiplier).ceil() as usize)
+            .max(cache_capacity.max(1))
+            .min(corpus_size.max(1));
+
+        let mut rng = rand::thread_rng();
+        let mut initial_set = VecDeque::with_capacity(working_set_size);
+        for _ in 0..working_set_size {
+            let doc = rng.gen_range(0..corpus_size) as u64;
+            initial_set.push_back(doc);
+        }
+
         Ok(Self {
-            base_sampler: ZipfSampler::new(corpus_size, zipf_exponent)?,
+            base_sampler,
             corpus_size,
+            working_set: Arc::new(RwLock::new(initial_set)),
+            working_set_size,
+            working_set_churn,
+            working_set_bias,
+            cold_traffic_ratio,
+            cold_query_count: Arc::new(AtomicU64::new(0)),
+            working_set_draws: Arc::new(AtomicU64::new(0)),
             topic_rotation_interval,
             current_topic_offset: Arc::new(AtomicU64::new(0)),
             last_rotation: Arc::new(RwLock::new(Instant::now())),
@@ -295,6 +362,13 @@ impl TemporalWorkloadGenerator {
             return spike_doc;
         }
 
+        // Cold traffic: one-off queries hitting uniformly random documents
+        if rng.gen::<f64>() < self.cold_traffic_ratio {
+            let doc = rng.gen_range(0..self.corpus_size) as u64;
+            self.cold_query_count.fetch_add(1, Ordering::Relaxed);
+            return doc;
+        }
+
         // Check for topic rotation (every 2 hours)
         {
             let last_rotation = self.last_rotation.read().await;
@@ -316,7 +390,32 @@ impl TemporalWorkloadGenerator {
         // Normal Zipfian sample with topic offset
         let base_sample = self.base_sampler.sample();
         let offset = self.current_topic_offset.load(Ordering::Relaxed);
-        (base_sample + offset) % self.corpus_size as u64
+        let candidate = (base_sample + offset) % self.corpus_size as u64;
+
+        let sampled = {
+            let mut working_set = self.working_set.write().await;
+
+            if working_set.len() < self.working_set_size {
+                working_set.push_back(candidate);
+            } else if rng.gen::<f64>() < self.working_set_churn {
+                working_set.pop_front();
+                working_set.push_back(candidate);
+            }
+
+            if !working_set.is_empty() && rng.gen::<f64>() < self.working_set_bias {
+                let idx = rng.gen_range(0..working_set.len());
+                working_set.get(idx).copied()
+            } else {
+                None
+            }
+        };
+
+        if let Some(doc) = sampled {
+            self.working_set_draws.fetch_add(1, Ordering::Relaxed);
+            doc
+        } else {
+            candidate
+        }
     }
 
     fn get_rotation_count(&self) -> u64 {
@@ -325,6 +424,14 @@ impl TemporalWorkloadGenerator {
 
     fn get_spike_count(&self) -> u64 {
         self.spike_count.load(Ordering::Relaxed)
+    }
+
+    fn get_cold_query_count(&self) -> u64 {
+        self.cold_query_count.load(Ordering::Relaxed)
+    }
+
+    fn get_working_set_draws(&self) -> u64 {
+        self.working_set_draws.load(Ordering::Relaxed)
     }
 }
 
@@ -458,7 +565,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    println!("\n  Training interval: {} seconds", config.training_interval_secs);
+    println!(
+        "\n  Training interval: {} seconds",
+        config.training_interval_secs
+    );
     println!("  Logger window:     {} events", config.logger_window_size);
     println!();
 
@@ -557,6 +667,11 @@ async fn main() -> Result<()> {
         config.spike_probability,
         Duration::from_secs(config.spike_duration_secs),
         config.enable_temporal_patterns,
+        config.cache_capacity,
+        config.working_set_multiplier,
+        config.working_set_churn,
+        config.cold_traffic_ratio,
+        config.working_set_bias,
     )?;
 
     // Test parameters
@@ -665,10 +780,7 @@ async fn main() -> Result<()> {
         }
 
         if cache_hit {
-            stats_persister
-                .log_hit(strategy_name, doc_id, 0)
-                .await
-                .ok();
+            stats_persister.log_hit(strategy_name, doc_id, 0).await.ok();
         } else {
             stats_persister
                 .log_miss(strategy_name, doc_id, 0)
@@ -771,6 +883,8 @@ async fn main() -> Result<()> {
     let actual_training_cycles = training_cycles.load(Ordering::Relaxed);
     let topic_rotations = workload_gen.get_rotation_count();
     let spike_events = workload_gen.get_spike_count();
+    let cold_queries = workload_gen.get_cold_query_count();
+    let working_set_draws = workload_gen.get_working_set_draws();
 
     let cache_to_ws_ratio = config.cache_capacity as f64 / expected_ws as f64;
 
@@ -809,6 +923,8 @@ async fn main() -> Result<()> {
 
         expected_working_set_size: expected_ws,
         cache_to_working_set_ratio: cache_to_ws_ratio,
+        cold_queries,
+        working_set_draws,
     };
 
     // Display results
@@ -856,11 +972,11 @@ async fn main() -> Result<()> {
     println!(
         "  Status:                {}",
         if improvement >= 3.0 && learned_hit_rate >= 0.60 {
-            "✅ EXCELLENT"
+            "PASS - EXCELLENT"
         } else if improvement >= 2.5 && learned_hit_rate >= 0.50 {
-            "✅ PASS"
+            "PASS"
         } else {
-            "❌ FAIL"
+            "FAIL"
         }
     );
     println!();
@@ -870,7 +986,7 @@ async fn main() -> Result<()> {
     println!("  Interval:        {}s", config.training_interval_secs);
     println!(
         "  Task crashed:    {}",
-        if training_crashed { "❌ YES" } else { "✅ NO" }
+        if training_crashed { "YES" } else { "NO" }
     );
     println!();
 
@@ -880,6 +996,20 @@ async fn main() -> Result<()> {
         println!("  Spike events:    {}", spike_events);
         println!();
     }
+
+    let total_q = total_queries.max(1); // avoid div-by-zero for display
+    println!("Workload Mix:");
+    println!(
+        "  Cold traffic:     {} ({:.1}% of total)",
+        cold_queries,
+        cold_queries as f64 / total_q as f64 * 100.0
+    );
+    println!(
+        "  Working-set reuse:{} draws ({:.1}% of total)",
+        working_set_draws,
+        working_set_draws as f64 / total_q as f64 * 100.0
+    );
+    println!();
 
     if initial_memory > 0.0 {
         println!("Memory:");
@@ -892,11 +1022,11 @@ async fn main() -> Result<()> {
         println!(
             "  Status:          {}",
             if memory_growth_pct.abs() < 5.0 {
-                "✅ PASS"
+                "PASS"
             } else if memory_growth_pct.abs() < 10.0 {
-                "⚠️  WARN"
+                "WARN"
             } else {
-                "❌ FAIL"
+                "FAIL"
             }
         );
     }
@@ -916,41 +1046,25 @@ async fn main() -> Result<()> {
     println!();
     println!("Criteria:");
     println!(
-        "  ✓ Learned cache hit rate ≥60%:         {}",
-        if hit_rate_pass {
-            "✅ PASS"
-        } else {
-            "❌ FAIL"
-        }
+        "  Learned cache hit rate ≥60% ............ {}",
+        if hit_rate_pass { "PASS" } else { "FAIL" }
     );
     println!(
-        "  ✓ Improvement ≥2.5× over LRU:          {}",
-        if improvement_pass {
-            "✅ PASS"
-        } else {
-            "❌ FAIL"
-        }
+        "  Improvement ≥2.5× over LRU ............. {}",
+        if improvement_pass { "PASS" } else { "FAIL" }
     );
     println!(
-        "  ✓ Memory growth <10%:                  {}",
-        if memory_pass {
-            "✅ PASS"
-        } else {
-            "❌ FAIL"
-        }
+        "  Memory growth <10% ..................... {}",
+        if memory_pass { "PASS" } else { "FAIL" }
     );
     println!(
-        "  ✓ Training task stable:                {}",
-        if training_pass {
-            "✅ PASS"
-        } else {
-            "❌ FAIL"
-        }
+        "  Training task stable ................... {}",
+        if training_pass { "PASS" } else { "FAIL" }
     );
     println!();
 
     if go_decision {
-        println!("Decision: ✅ GO FOR PRODUCTION");
+        println!("Decision: GO FOR PRODUCTION (PASS)");
         println!();
         println!("Market Pitch:");
         println!(
@@ -968,7 +1082,7 @@ async fn main() -> Result<()> {
         );
         println!("  \"Enterprise-validated on 1M document corpus\"");
     } else {
-        println!("Decision: ❌ NO-GO - needs investigation");
+        println!("Decision: NO-GO - needs investigation");
         println!();
         if !hit_rate_pass {
             println!(

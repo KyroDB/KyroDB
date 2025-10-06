@@ -8,7 +8,6 @@
 
 use crate::learned_cache::LearnedCachePredictor;
 use crate::vector_cache::{CachedVector, VectorCache};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Cache strategy trait
@@ -103,7 +102,10 @@ impl LearnedCacheStrategy {
     /// # Parameters
     /// - `capacity`: Cache capacity
     /// - `predictor`: Trained learned cache predictor
-    pub fn new(capacity: usize, predictor: LearnedCachePredictor) -> Self {
+    pub fn new(capacity: usize, mut predictor: LearnedCachePredictor) -> Self {
+        predictor.set_target_hot_entries(capacity);
+        predictor.set_threshold_smoothing(0.6);
+
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
@@ -113,7 +115,10 @@ impl LearnedCacheStrategy {
 
     /// Update predictor (for periodic retraining)
     pub fn update_predictor(&self, new_predictor: LearnedCachePredictor) {
-        *self.predictor.write() = new_predictor;
+        let mut predictor = new_predictor;
+        predictor.set_target_hot_entries(self.cache.capacity());
+        predictor.set_threshold_smoothing(0.6);
+        *self.predictor.write() = predictor;
     }
 }
 
@@ -123,19 +128,22 @@ impl CacheStrategy for LearnedCacheStrategy {
     }
 
     fn should_cache(&self, doc_id: u64, _embedding: &[f32]) -> bool {
+        let current_len = self.cache.len();
+        if current_len < self.cache.capacity() {
+            return true;
+        }
+
         let predictor = self.predictor.read();
-        
+
         // CRITICAL FIX: Bootstrap mode until predictor is trained
         // Always permissive during bootstrap to build training data.
-    // After training, rely on predictor's configured threshold.
-        
+        // After training, rely on predictor's configured threshold.
+
         if !predictor.is_trained() {
-            return true;  // Bootstrap: cache everything until first training
+            return true; // Bootstrap: cache everything until first training
         }
-        
-        let threshold = predictor
-            .cache_threshold()
-            .max(predictor.admission_floor());
+
+        let threshold = predictor.cache_threshold().max(predictor.admission_floor());
 
         if let Some(score) = predictor.lookup_hotness(doc_id) {
             if score >= threshold {
@@ -150,7 +158,9 @@ impl CacheStrategy for LearnedCacheStrategy {
             return false;
         }
 
-        let unseen_chance = predictor.unseen_admission_chance();
+        let fill_ratio = current_len as f32 / self.cache.capacity() as f32;
+        let unseen_chance =
+            predictor.unseen_admission_chance() * (1.0 - fill_ratio).clamp(0.1, 1.0);
         drop(predictor);
 
         rand::random::<f32>() < unseen_chance
@@ -185,7 +195,6 @@ impl CacheStrategy for LearnedCacheStrategy {
 pub struct AbTestSplitter {
     lru_strategy: Arc<dyn CacheStrategy>,
     learned_strategy: Arc<dyn CacheStrategy>,
-    sequence: AtomicU64,
 }
 
 impl AbTestSplitter {
@@ -197,19 +206,12 @@ impl AbTestSplitter {
         Self {
             lru_strategy,
             learned_strategy,
-            sequence: AtomicU64::new(0),
         }
     }
 
-    /// Get strategy for query (50/50 random split)
-    ///
-    /// Uses DefaultHasher for uniform distribution across doc_ids.
-    /// CRITICAL FIX: Simple modulo (doc_id % 2) creates bias on Zipf distributions
-    /// where low even IDs (0, 2, 4...) are accessed more frequently.
-    pub fn get_strategy(&self, _doc_id: u64) -> Arc<dyn CacheStrategy> {
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-
-        if seq % 2 == 0 {
+    /// Get strategy for doc_id based on deterministic 50/50 split
+    pub fn get_strategy(&self, doc_id: u64) -> Arc<dyn CacheStrategy> {
+        if doc_id % 2 == 0 {
             Arc::clone(&self.lru_strategy)
         } else {
             Arc::clone(&self.learned_strategy)

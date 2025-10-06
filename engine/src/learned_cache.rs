@@ -92,6 +92,13 @@ pub struct LearnedCachePredictor {
     /// Probability of admitting unseen documents to avoid cache starvation
     unseen_admission_chance: f32,
 
+    /// Target number of documents classified as hot after training
+    /// Defaults to cache capacity; tuned by cache strategy at runtime.
+    target_hot_entries: usize,
+
+    /// Exponential moving average factor for threshold calibration (0 = no smoothing)
+    threshold_smoothing: f32,
+
     /// Training window (how far back to consider accesses)
     training_window: Duration,
 
@@ -122,9 +129,11 @@ impl LearnedCachePredictor {
     pub fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
-            cache_threshold: 0.2,  // Calibrated for sqrt-scaled hotness scores
+            cache_threshold: 0.2, // Calibrated for sqrt-scaled hotness scores
             admission_floor: 0.05,
             unseen_admission_chance: 0.10,
+            target_hot_entries: capacity,
+            threshold_smoothing: 0.6,
             training_window: Duration::from_secs(24 * 3600), // 24 hours
             recency_halflife: Duration::from_secs(3600),     // 1 hour
             capacity,
@@ -147,6 +156,8 @@ impl LearnedCachePredictor {
             cache_threshold: cache_threshold.clamp(admission_floor, 1.0),
             admission_floor,
             unseen_admission_chance: 0.10,
+            target_hot_entries: capacity,
+            threshold_smoothing: 0.6,
             training_window,
             recency_halflife,
             capacity,
@@ -177,12 +188,12 @@ impl LearnedCachePredictor {
     /// Decide if document should be cached based on predicted hotness
     ///
     /// Returns `true` if predicted hotness > cache_threshold
-    /// 
+    ///
     /// PERMISSIVE by default (threshold=0.3): caches anything reasonably hot
     pub fn should_cache(&self, doc_id: u64) -> bool {
         self.predict_hotness(doc_id) > self.cache_threshold
     }
-    
+
     /// Check if predictor has been trained
     ///
     /// Returns false if hotness_map is empty (never trained)
@@ -215,13 +226,17 @@ impl LearnedCachePredictor {
         // Sort by hotness (descending) to keep hottest documents
         let mut hotness_vec: Vec<(u64, f32)> = hotness_map.into_iter().collect();
         hotness_vec.sort_by(|(_, score_a), (_, score_b)| {
-            score_b.partial_cmp(score_a).unwrap_or(std::cmp::Ordering::Equal)
+            score_b
+                .partial_cmp(score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Truncate to capacity (keep only top K hottest documents)
         if hotness_vec.len() > self.capacity {
             hotness_vec.truncate(self.capacity);
         }
+
+        self.recalibrate_threshold(&hotness_vec);
 
         // Update HashMap atomically
         {
@@ -262,6 +277,16 @@ impl LearnedCachePredictor {
         self.cache_threshold = threshold.clamp(self.admission_floor, 1.0);
     }
 
+    /// Configure desired number of documents classified as hot
+    pub fn set_target_hot_entries(&mut self, target: usize) {
+        self.target_hot_entries = target.max(1);
+    }
+
+    /// Configure threshold smoothing factor (0 = no smoothing, 1 = frozen)
+    pub fn set_threshold_smoothing(&mut self, smoothing: f32) {
+        self.threshold_smoothing = smoothing.clamp(0.0, 0.95);
+    }
+
     /// Get number of tracked documents
     pub fn tracked_count(&self) -> usize {
         let map = self.hotness_map.read();
@@ -271,7 +296,7 @@ impl LearnedCachePredictor {
     /// Get statistics for monitoring
     pub fn stats(&self) -> CachePredictorStats {
         let map = self.hotness_map.read();
-        
+
         let hot_count = map
             .values()
             .filter(|score| **score > self.cache_threshold)
@@ -341,6 +366,32 @@ impl LearnedCachePredictor {
         }
 
         hotness
+    }
+
+    fn recalibrate_threshold(&mut self, sorted_hotness: &[(u64, f32)]) {
+        if sorted_hotness.is_empty() {
+            self.cache_threshold = self.cache_threshold.max(self.admission_floor);
+            return;
+        }
+
+        let desired = self.target_hot_entries.min(sorted_hotness.len());
+        if desired == 0 {
+            self.cache_threshold = self.admission_floor;
+            return;
+        }
+
+        let index = desired.saturating_sub(1);
+        let mut target_threshold = sorted_hotness[index].1;
+        target_threshold = target_threshold.clamp(self.admission_floor, 1.0);
+
+        if self.threshold_smoothing <= f32::EPSILON {
+            self.cache_threshold = target_threshold;
+            return;
+        }
+
+        let smoothed = self.cache_threshold * self.threshold_smoothing
+            + target_threshold * (1.0 - self.threshold_smoothing);
+        self.cache_threshold = smoothed.clamp(self.admission_floor, 1.0);
     }
 }
 
@@ -487,11 +538,38 @@ mod tests {
         let hot_count_high = predictor.stats().hot_docs;
 
         // With threshold 0.3, more docs cached
-    predictor.set_cache_threshold(0.3);
+        predictor.set_cache_threshold(0.3);
         let hot_count_low = predictor.stats().hot_docs;
 
         // Lower threshold → more docs considered hot
         assert!(hot_count_low >= hot_count_high);
+    }
+
+    #[test]
+    fn test_threshold_auto_calibration_matches_target() {
+        let mut predictor = LearnedCachePredictor::new(128).unwrap();
+        predictor.set_target_hot_entries(5);
+        predictor.set_threshold_smoothing(0.0);
+
+        let mut accesses = Vec::new();
+        for doc in 0..20usize {
+            let doc_id = doc as u64;
+            for _ in 0..(20 - doc) {
+                accesses.push(create_access(doc_id, 30));
+            }
+        }
+
+        predictor.train_from_accesses(&accesses).unwrap();
+
+        let threshold = predictor.cache_threshold();
+        let mut hot_docs = 0;
+        for doc in 0..20u64 {
+            if predictor.predict_hotness(doc) >= threshold {
+                hot_docs += 1;
+            }
+        }
+
+        assert_eq!(hot_docs, 5);
     }
 
     #[test]
@@ -575,7 +653,8 @@ mod tests {
         let stats = predictor.stats();
         assert_eq!(stats.tracked_docs, 2);
         assert!(stats.hot_docs > 0);
-        assert!((stats.cache_threshold - 0.2).abs() < f32::EPSILON);
+        assert!(stats.cache_threshold >= predictor.admission_floor());
+        assert!(stats.cache_threshold <= 1.0);
         assert!(stats.avg_hotness > 0.0 && stats.avg_hotness <= 1.0);
     }
 }

@@ -280,6 +280,17 @@ async fn test_learned_predictor_influences_admission() {
     // Test admission policy
     let dummy_embedding = vec![0.0; 128];
 
+    // Prefill cache to capacity so admission relies on predictor
+    for idx in 0..50u64 {
+        let cached = CachedVector {
+            doc_id: 1_000 + idx,
+            embedding: vec![0.0; 8],
+            distance: 0.0,
+            cached_at: Instant::now(),
+        };
+        strategy.insert_cached(cached);
+    }
+
     // Hot documents (0-9) should be cached
     let mut hot_cached = 0;
     for doc_id in 0..10 {

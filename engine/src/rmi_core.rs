@@ -1,9 +1,7 @@
-//! RMI Core - Minimal extraction for Phase 0 Week 3-8 learned cache
 //!
 //! This file contains ONLY the essential RMI algorithm components needed for
-//! learned cache prediction. All KV store bloat has been removed.
+//! learned cache prediction.
 //!
-//! Extracted from adaptive_rmi.rs (4,454 lines) → 250 lines (95% reduction)
 
 use std::sync::Arc;
 
