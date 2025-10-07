@@ -1,12 +1,12 @@
 //! Enterprise-scale validation workload 
 //!
-//! **Purpose**: Validate KyroDB learned cache against REALISTIC production RAG workloads
+//! **Purpose**: Validate KyroDB hybrid semantic-learned cache against REALISTIC production RAG workloads
 //!
 //! **What This Test Validates**:
-//! 1. Learned cache achieves 60-80% hit rate vs LRU 15-25% (4× improvement)
+//! 1. Hybrid cache achieves 55-70% hit rate vs LRU 35-45% (1.5-2× improvement)
 //! 2. No memory leaks under sustained load (4.32M queries)
 //! 3. Training task runs reliably every 10 minutes (72 cycles)
-//! 4. Handles temporal patterns (topic shifts, spikes)
+//! 4. Handles temporal patterns (topic shifts, spikes) + 60% cold traffic
 //! 5. Stats persistence survives restarts
 //!
 //! **Realistic Workload**:
@@ -27,8 +27,13 @@
 
 use anyhow::{bail, Context, Result};
 use kyrodb_engine::{
-    spawn_training_task, AbStatsPersister, AbTestSplitter, AccessPatternLogger, CachedVector,
-    LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, TrainingConfig,
+    ab_stats::AbStatsPersister,
+    access_logger::{hash_embedding, AccessPatternLogger},
+    cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy},
+    learned_cache::{AccessEvent, AccessType, LearnedCachePredictor},
+    semantic_adapter::SemanticAdapter,
+    training_task::{spawn_training_task, TrainingConfig},
+    vector_cache::CachedVector,
 };
 use rand::{distributions::Distribution, Rng};
 use serde::{Deserialize, Serialize};
@@ -596,8 +601,8 @@ async fn main() -> Result<()> {
         );
     }
     println!();
-    println!("Expected LRU hit rate: 15-25% (realistic baseline)");
-    println!("Target learned hit rate: 60-80% (4× improvement)");
+    println!("Expected LRU hit rate: 35-45% (realistic baseline with 60% cold traffic)");
+    println!("Target hybrid cache hit rate: 55-70% (1.5-2× improvement via semantic + frequency)");
     println!();
     println!("Output files:");
     println!("  Stats CSV:         {}", config.stats_csv);
@@ -615,9 +620,11 @@ async fn main() -> Result<()> {
 
     let learned_predictor = LearnedCachePredictor::new(config.cache_capacity)
         .context("Failed to create learned cache predictor")?;
-    let learned_strategy = Arc::new(LearnedCacheStrategy::new(
+    let semantic_adapter = SemanticAdapter::new();
+    let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
         config.cache_capacity,
         learned_predictor,
+        semantic_adapter,
     ));
 
     let ab_splitter = AbTestSplitter::new(lru_strategy.clone(), learned_strategy.clone());

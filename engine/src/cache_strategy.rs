@@ -138,7 +138,7 @@ impl LearnedCacheStrategy {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
             semantic_adapter: Arc::new(parking_lot::RwLock::new(Some(semantic_adapter))),
-            name: "learned_semantic".to_string(),
+            name: "learned_rmi".to_string(),
         }
     }
 

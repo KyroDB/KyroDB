@@ -106,27 +106,55 @@ impl VectorCache {
         let mut cache = self.cache.write();
         let mut lru = self.lru_queue.write();
 
-        // Check if already in cache (update LRU only)
+        // Check if already in cache
         if cache.contains_key(&doc_id) {
+            // Update existing entry
+            cache.insert(doc_id, cached_vector);
+            
+            // Update LRU position
             if let Some(pos) = lru.iter().position(|&id| id == doc_id) {
                 lru.remove(pos);
                 lru.push_back(doc_id);
+            } else {
+                // CRITICAL FIX: doc_id in cache but not in LRU queue
+                // This can happen if state is corrupted - add it now
+                lru.push_back(doc_id);
             }
-            cache.insert(doc_id, cached_vector);
+            
+            // CRITICAL FIX: Check capacity even on update
+            // Handles case where lru_queue grew unbounded
+            while lru.len() > self.capacity {
+                if let Some(evict_id) = lru.pop_front() {
+                    cache.remove(&evict_id);
+                    *self.evictions.write() += 1;
+                }
+            }
+            
             return;
         }
 
-        // Evict if at capacity
-        if cache.len() >= self.capacity {
+        // Evict if at capacity BEFORE inserting
+        while cache.len() >= self.capacity {
             if let Some(evict_id) = lru.pop_front() {
                 cache.remove(&evict_id);
                 *self.evictions.write() += 1;
+            } else {
+                break; // Queue empty but cache full (should not happen)
             }
         }
 
         // Insert new entry
         cache.insert(doc_id, cached_vector);
         lru.push_back(doc_id);
+        
+        // DEFENSIVE: Final capacity check
+        debug_assert_eq!(
+            cache.len(),
+            lru.len(),
+            "Cache/LRU size mismatch: cache={}, lru={}",
+            cache.len(),
+            lru.len()
+        );
     }
 
     /// Get cache statistics
