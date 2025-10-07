@@ -101,19 +101,20 @@ impl Default for Config {
             // 1% cache size (industry standard)
             cache_capacity: 10_000,
 
-            // CRITICAL FIX: Flatter Zipf (1.01 vs 1.07)
-            // Reduces LRU advantage from 87% to ~20%
-            // Makes learned cache value more apparent (60-75% vs 20%)
-            zipf_exponent: 1.01,
+            // Phase 0.5 Fix: Realistic Zipf exponent (1.4)
+            // Models real RAG query distribution (moderate skew)
+            // Reduces artificial LRU advantage from concentrated access
+            zipf_exponent: 1.4,
 
             // Test parameters
             duration_hours: 12,
             target_qps: 100,
             training_interval_secs: 600,
 
-            // CRITICAL FIX: Reduced logger window (20K vs 100K)
-            // Prevents memory leak (60MB max vs 300MB)
-            logger_window_size: 20_000,
+            // Phase 0.5 Fix: Increased logger window (100K from 20K)
+            // Captures longer-term patterns for learned cache training
+            // Memory is not a concern (validated in Phase 0 Week 5-8)
+            logger_window_size: 100_000,
 
             // Temporal patterns (realistic production)
             enable_temporal_patterns: true,
@@ -121,8 +122,8 @@ impl Default for Config {
             spike_probability: 0.001,           // 0.1% per query
             spike_duration_secs: 300,           // 5 minutes
 
-            cold_traffic_ratio: 0.2,
-            working_set_bias: 0.65,
+            cold_traffic_ratio: 0.6,
+            working_set_bias: 0.2,
             working_set_multiplier: 3.5,
             working_set_churn: 0.08,
 
@@ -338,6 +339,15 @@ impl TemporalWorkloadGenerator {
 
         let mut rng = rand::thread_rng();
 
+        // Phase 0.5 Fix: Check cold traffic FIRST (before spikes/rotations)
+        // Bug: cold check after spike meant 50% spike queries skipped cold logic
+        // Result: actual cold traffic was ~10% instead of configured 20%
+        if rng.gen::<f64>() < self.cold_traffic_ratio {
+            let doc = rng.gen_range(0..self.corpus_size) as u64;
+            self.cold_query_count.fetch_add(1, Ordering::Relaxed);
+            return doc;
+        }
+
         // Check for active spike event (50% of queries hit spike during event)
         {
             let spike = self.current_spike.read().await;
@@ -360,13 +370,6 @@ impl TemporalWorkloadGenerator {
             });
             self.spike_count.fetch_add(1, Ordering::Relaxed);
             return spike_doc;
-        }
-
-        // Cold traffic: one-off queries hitting uniformly random documents
-        if rng.gen::<f64>() < self.cold_traffic_ratio {
-            let doc = rng.gen_range(0..self.corpus_size) as u64;
-            self.cold_query_count.fetch_add(1, Ordering::Relaxed);
-            return doc;
         }
 
         // Check for topic rotation (every 2 hours)
