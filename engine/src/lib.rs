@@ -21,11 +21,14 @@ pub mod learned_cache;
 // Week 5-8: Access pattern logger (Phase 0 Week 5-8) ✅
 pub mod access_logger;
 
-// Phase 0 Week 9-12: A/B Testing Framework (CURRENT)
+// Phase 0 Week 9-12: A/B Testing Framework ✅
 pub mod ab_stats; // A/B test metrics persistence (CSV format)
 pub mod cache_strategy; // CacheStrategy trait + LRU/Learned implementations + A/B splitter
-pub mod training_task;
-pub mod vector_cache; // In-memory vector cache with LRU eviction // Background RMI training task (tokio::spawn, 10-minute interval)
+pub mod training_task; // Background RMI training task (tokio::spawn, 10-minute interval)
+pub mod vector_cache; // In-memory vector cache with LRU eviction
+
+// Phase 1: Semantic-aware learned cache (hybrid frequency + semantic similarity)
+pub mod semantic_adapter; // Semantic layer for hybrid cache decisions
 
 // ===== Public API =====
 
@@ -46,3 +49,6 @@ pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
 pub use cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy};
 pub use training_task::{spawn_training_task, TrainingConfig};
 pub use vector_cache::{CacheStats, CachedVector, VectorCache};
+
+// Re-export Phase 1 semantic components
+pub use semantic_adapter::{SemanticAdapter, SemanticConfig, SemanticStats};
