@@ -162,13 +162,8 @@ impl CacheStrategy for LearnedCacheStrategy {
     }
 
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
-        let semantics_guard = self.semantic_adapter.read();
-
         let current_len = self.cache.len();
         if current_len < self.cache.capacity() {
-            if let Some(adapter) = semantics_guard.as_ref() {
-                adapter.cache_embedding(doc_id, embedding.to_vec());
-            }
             return true;
         }
 
@@ -176,9 +171,6 @@ impl CacheStrategy for LearnedCacheStrategy {
 
         // Bootstrap mode until predictor is trained
         if !predictor.is_trained() {
-            if let Some(adapter) = semantics_guard.as_ref() {
-                adapter.cache_embedding(doc_id, embedding.to_vec());
-            }
             return true;
         }
 
@@ -198,7 +190,8 @@ impl CacheStrategy for LearnedCacheStrategy {
         drop(predictor);
 
         // Check if semantic adapter is enabled
-        if let Some(semantic_adapter) = semantics_guard.as_ref() {
+        let semantic_adapter_guard = self.semantic_adapter.read();
+        if let Some(semantic_adapter) = semantic_adapter_guard.as_ref() {
             // Phase 1: Hybrid decision (frequency + semantic)
             let should_cache = semantic_adapter.should_cache(freq_score, embedding);
 
@@ -209,7 +202,7 @@ impl CacheStrategy for LearnedCacheStrategy {
 
             return should_cache;
         }
-        drop(semantics_guard);
+        drop(semantic_adapter_guard);
 
         // Phase 0: Frequency-only decision (original logic)
         if freq_score >= threshold {

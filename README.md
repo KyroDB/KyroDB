@@ -135,22 +135,6 @@ let results = db.search_filtered(
 
 ---
 
-    ## ✅ Validation quick runs
-
-    Short-run validation harness configs live at the repository root so anyone can reproduce the learned-vs-LRU comparison without a 12-hour soak.
-
-    ```bash
-    cargo build --release --bin validation_enterprise
-
-    # 10-minute smoke run (basic signal check)
-    ./target/release/validation_enterprise validation_10min_config.json
-
-    # 1-hour soak (stability gate before tuning changes)
-    ./target/release/validation_enterprise validation_1h_config.json
-    ```
-
-    Each run writes its metrics to the CSV/JSON files referenced in the config (for example `validation_10min_stats.csv`, `validation_1h_results.json`). Attach those artifacts to validation reports alongside the console verdict.
-
 ## 🏛️ Architecture Deep Dive
 
 ### Query Execution Flow (Target Design)

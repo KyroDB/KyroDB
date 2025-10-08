@@ -49,13 +49,8 @@ use zipf::ZipfDistribution;
 /// Enterprise validation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
-    /// Test duration in hours (default: 12). Overridden if `duration_minutes` is provided.
+    /// Test duration in hours (default: 12)
     duration_hours: u64,
-
-    /// Optional override for duration in minutes (e.g., smoke tests). When present, takes
-    /// precedence over `duration_hours`.
-    #[serde(default)]
-    duration_minutes: Option<u64>,
 
     /// Target queries per second (default: 100)
     target_qps: u64,
@@ -102,6 +97,15 @@ struct Config {
     /// Output files
     stats_csv: String,
     results_json: String,
+
+    /// Path to MS MARCO embeddings (optional, falls back to mock)
+    /// Phase 0.5.1: Support real embeddings for semantic validation
+    #[serde(default)]
+    ms_marco_embeddings_path: Option<String>,
+
+    /// Path to MS MARCO passages (optional)
+    #[serde(default)]
+    ms_marco_passages_path: Option<String>,
 }
 
 impl Default for Config {
@@ -120,7 +124,6 @@ impl Default for Config {
 
             // Test parameters
             duration_hours: 12,
-            duration_minutes: None,
             target_qps: 100,
             training_interval_secs: 600,
 
@@ -142,17 +145,17 @@ impl Default for Config {
 
             stats_csv: "validation_enterprise.csv".to_string(),
             results_json: "validation_enterprise.json".to_string(),
+
+            // Phase 0.5.1: MS MARCO dataset paths (optional)
+            ms_marco_embeddings_path: None,
+            ms_marco_passages_path: None,
         }
     }
 }
 
 impl Config {
     fn validate(&self) -> Result<()> {
-        if let Some(minutes) = self.duration_minutes {
-            if minutes == 0 {
-                bail!("duration_minutes must be > 0 when provided");
-            }
-        } else if self.duration_hours == 0 {
+        if self.duration_hours == 0 {
             bail!("duration_hours must be > 0");
         }
         if self.target_qps == 0 {
@@ -196,12 +199,6 @@ impl Config {
             bail!("working_set_churn must be in (0, 1]");
         }
         Ok(())
-    }
-
-    fn total_duration_secs(&self) -> u64 {
-        self.duration_minutes
-            .map(|minutes| minutes * 60)
-            .unwrap_or(self.duration_hours * 3600)
     }
 
     /// Calculate expected working set size (docs that account for 95% of queries)
@@ -484,12 +481,164 @@ impl ZipfSampler {
     }
 }
 
-/// Mock document storage
+/// Document store trait for unified access to embeddings
+trait DocumentStore: Send + Sync {
+    fn fetch(&self, doc_id: u64) -> Option<Vec<f32>>;
+    fn corpus_size(&self) -> usize;
+}
+
+/// Real document store backed by MS MARCO embeddings
+/// Phase 0.5.1: Load pre-computed embeddings from numpy files
+struct RealDocumentStore {
+    embeddings: Arc<Vec<Vec<f32>>>,
+    passages: Arc<Vec<String>>,
+    embedding_dim: usize,
+}
+
+impl DocumentStore for RealDocumentStore {
+    fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
+        self.embeddings.get(doc_id as usize).cloned()
+    }
+
+    fn corpus_size(&self) -> usize {
+        self.embeddings.len()
+    }
+}
+
+impl RealDocumentStore {
+    fn new(embeddings_path: &str, passages_path: &str) -> Result<Self> {
+        println!("Loading MS MARCO data...");
+        println!("  Embeddings: {}", embeddings_path);
+        println!("  Passages: {}", passages_path);
+
+        let embeddings_data =
+            std::fs::read(embeddings_path).context("Failed to read embeddings file")?;
+
+        let embeddings = Self::parse_numpy_embeddings(&embeddings_data, 384)
+            .context("Failed to parse numpy embeddings")?;
+
+        let passages_text =
+            std::fs::read_to_string(passages_path).context("Failed to read passages file")?;
+        let passages: Vec<String> = passages_text.lines().map(|s| s.to_string()).collect();
+
+        if embeddings.len() != passages.len() {
+            bail!(
+                "Mismatch: {} embeddings but {} passages",
+                embeddings.len(),
+                passages.len()
+            );
+        }
+
+        println!(
+            "Loaded {} embeddings ({}×{}-dim), {:.1} MB",
+            embeddings.len(),
+            embeddings.len(),
+            384,
+            (embeddings.len() * 384 * 4) as f64 / 1024.0 / 1024.0
+        );
+
+        Ok(Self {
+            embeddings: Arc::new(embeddings),
+            passages: Arc::new(passages),
+            embedding_dim: 384,
+        })
+    }
+
+    fn get_passage(&self, doc_id: u64) -> Option<&str> {
+        self.passages.get(doc_id as usize).map(|s| s.as_str())
+    }
+
+    fn parse_numpy_embeddings(data: &[u8], expected_dim: usize) -> Result<Vec<Vec<f32>>> {
+        if data.len() < 128 {
+            bail!("Invalid numpy file: too small ({}  bytes)", data.len());
+        }
+
+        let header_end = data
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| anyhow::anyhow!("Invalid numpy header: no newline found"))?;
+
+        if header_end > 1024 {
+            bail!("Invalid numpy header: too long ({} bytes)", header_end);
+        }
+
+        let data_start = header_end + 1;
+
+        if data_start >= data.len() {
+            bail!("Invalid numpy file: no data after header");
+        }
+
+        let float_data = &data[data_start..];
+        let num_floats = float_data.len() / 4;
+        let num_vectors = num_floats / expected_dim;
+
+        if num_floats % expected_dim != 0 {
+            bail!(
+                "Invalid numpy file: {} floats not divisible by expected_dim={}",
+                num_floats,
+                expected_dim
+            );
+        }
+
+        let mut embeddings = Vec::with_capacity(num_vectors);
+
+        for i in 0..num_vectors {
+            let mut embedding = Vec::with_capacity(expected_dim);
+            for j in 0..expected_dim {
+                let offset = (i * expected_dim + j) * 4;
+
+                if offset + 4 > float_data.len() {
+                    bail!("Invalid numpy file: unexpected EOF at vector {}", i);
+                }
+
+                let bytes = &float_data[offset..offset + 4];
+                let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                embedding.push(value);
+            }
+            embeddings.push(embedding);
+        }
+
+        println!(
+            "Parsed {} vectors of {}-dim from numpy file",
+            embeddings.len(),
+            expected_dim
+        );
+
+        Ok(embeddings)
+    }
+}
+
+/// Mock document storage (fallback when MS MARCO not available)
 struct MockDocumentStore {
     corpus_size: usize,
     embedding_dim: usize,
     topic_bases: Vec<Vec<f32>>,
     noise_stddev: f32,
+}
+
+impl DocumentStore for MockDocumentStore {
+    fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
+        if doc_id >= self.corpus_size as u64 {
+            return None;
+        }
+
+        let topic_index = (doc_id as usize) % self.topic_bases.len();
+        let mut embedding = self.topic_bases[topic_index].clone();
+        debug_assert_eq!(embedding.len(), self.embedding_dim);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(doc_id);
+        let noise = Normal::new(0.0, self.noise_stddev as f64).expect("valid noise distribution");
+        for value in embedding.iter_mut() {
+            *value += noise.sample(&mut rng) as f32;
+        }
+
+        normalize_embedding(&mut embedding);
+        Some(embedding)
+    }
+
+    fn corpus_size(&self) -> usize {
+        self.corpus_size
+    }
 }
 
 impl MockDocumentStore {
@@ -516,25 +665,6 @@ impl MockDocumentStore {
             topic_bases,
             noise_stddev: 0.05,
         }
-    }
-
-    fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
-        if doc_id >= self.corpus_size as u64 {
-            return None;
-        }
-
-        let topic_index = (doc_id as usize) % self.topic_bases.len();
-        let mut embedding = self.topic_bases[topic_index].clone();
-        debug_assert_eq!(embedding.len(), self.embedding_dim);
-
-        let mut rng = ChaCha8Rng::seed_from_u64(doc_id);
-        let noise = Normal::new(0.0, self.noise_stddev as f64).expect("valid noise distribution");
-        for value in embedding.iter_mut() {
-            *value += noise.sample(&mut rng) as f32;
-        }
-
-        normalize_embedding(&mut embedding);
-        Some(embedding)
     }
 }
 
@@ -638,19 +768,12 @@ async fn main() -> Result<()> {
 
     config.validate().context("Invalid configuration")?;
 
-    let total_duration_secs = config.total_duration_secs();
-    let duration_hours_part = total_duration_secs / 3600;
-    let duration_minutes_part = (total_duration_secs % 3600) / 60;
-
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  KyroDB Enterprise Validation - Phase 0 Week 9-12             ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Configuration:");
-    println!(
-        "  Duration:          {} hours {} min",
-        duration_hours_part, duration_minutes_part
-    );
+    println!("  Duration:          {} hours", config.duration_hours);
     println!("  Target QPS:        {}", config.target_qps);
     println!(
         "  Corpus size:       {} documents (enterprise-scale)",
@@ -700,7 +823,7 @@ async fn main() -> Result<()> {
     println!("  Logger window:     {} events", config.logger_window_size);
     println!();
 
-    let total_expected = config.target_qps * total_duration_secs;
+    let total_expected = config.target_qps * config.duration_hours * 3600;
     println!("Expected workload:");
     println!(
         "  Total queries:     {:.2} million",
@@ -708,12 +831,12 @@ async fn main() -> Result<()> {
     );
     println!(
         "  Training cycles:   {}",
-        total_duration_secs / config.training_interval_secs
+        (config.duration_hours * 3600) / config.training_interval_secs
     );
     if config.enable_temporal_patterns {
         println!(
             "  Topic rotations:   ~{}",
-            total_duration_secs / config.topic_rotation_interval_secs
+            (config.duration_hours * 3600) / config.topic_rotation_interval_secs
         );
         println!(
             "  Expected spikes:   ~{}",
@@ -753,7 +876,31 @@ async fn main() -> Result<()> {
         AbStatsPersister::new(&config.stats_csv).context("Failed to create stats persister")?,
     );
 
-    let doc_store = Arc::new(MockDocumentStore::new(config.corpus_size));
+    // Phase 0.5.1: Try to load real MS MARCO embeddings, fallback to mock
+    let doc_store: Arc<dyn DocumentStore> = match (
+        &config.ms_marco_embeddings_path,
+        &config.ms_marco_passages_path,
+    ) {
+        (Some(embeddings_path), Some(passages_path))
+            if std::path::Path::new(embeddings_path).exists()
+                && std::path::Path::new(passages_path).exists() =>
+        {
+            println!("Using real MS MARCO embeddings (Phase 0.5.1)");
+            Arc::new(
+                RealDocumentStore::new(embeddings_path, passages_path)
+                    .context("Failed to load MS MARCO data")?,
+            )
+        }
+        (Some(_), Some(_)) => {
+            println!("WARNING: MS MARCO paths configured but files not found");
+            println!("Falling back to mock clustered embeddings");
+            Arc::new(MockDocumentStore::new(config.corpus_size))
+        }
+        _ => {
+            println!("Using mock clustered embeddings (no MS MARCO data configured)");
+            Arc::new(MockDocumentStore::new(config.corpus_size))
+        }
+    };
 
     // Spawn background training task
     println!("Spawning background training task...");
@@ -796,7 +943,7 @@ async fn main() -> Result<()> {
     )?;
 
     // Test parameters
-    let test_duration = Duration::from_secs(total_duration_secs);
+    let test_duration = Duration::from_secs(config.duration_hours * 3600);
     let target_interval = Duration::from_nanos(1_000_000_000 / config.target_qps);
 
     let mut total_queries = 0u64;
@@ -1027,7 +1174,7 @@ async fn main() -> Result<()> {
         hit_rate_improvement: improvement,
         absolute_improvement,
 
-        expected_training_cycles: total_duration_secs / config.training_interval_secs,
+        expected_training_cycles: actual_duration / config.training_interval_secs,
         actual_training_cycles,
         training_task_crashed: training_crashed,
 

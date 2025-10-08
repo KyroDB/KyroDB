@@ -205,13 +205,14 @@ impl AccessPatternLogger {
     ///
     /// # Parameters
     /// - `doc_id`: Document ID that was accessed
-    /// - `query_embedding`: Query embedding (hashed for correlation)
+    /// - `query_embedding`: Query embedding for semantic cache (Phase 0.5.1+)
     #[inline]
-    pub fn log_access(&mut self, doc_id: u64, _query_embedding: &[f32]) {
+    pub fn log_access(&mut self, doc_id: u64, query_embedding: &[f32]) {
         let event = AccessEvent {
             doc_id,
             timestamp: SystemTime::now(),
             access_type: crate::learned_cache::AccessType::Read,
+            embedding: query_embedding.to_vec(),
         };
 
         self.events.push(event);

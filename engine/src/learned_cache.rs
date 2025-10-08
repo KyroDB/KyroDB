@@ -19,11 +19,16 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Access event for training learned cache predictor
-#[derive(Debug, Clone, Copy)]
+///
+/// Phase 0.5.1: Added embedding field for semantic similarity computation
+#[derive(Debug, Clone)]
 pub struct AccessEvent {
     pub doc_id: u64,
     pub timestamp: SystemTime,
     pub access_type: AccessType,
+    /// Query embedding (384-dim for MS MARCO, or configured embedding_dim)
+    /// Used for semantic similarity-based cache admission in hybrid predictor
+    pub embedding: Vec<f32>,
 }
 
 impl Default for AccessEvent {
@@ -32,6 +37,7 @@ impl Default for AccessEvent {
             doc_id: 0,
             timestamp: SystemTime::UNIX_EPOCH,
             access_type: AccessType::default(),
+            embedding: Vec::new(),
         }
     }
 }
