@@ -5,7 +5,10 @@ use crate::access_logger::AccessPatternLogger;
 use crate::cache_strategy::LearnedCacheStrategy;
 use crate::learned_cache::LearnedCachePredictor;
 use anyhow::Result;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -66,7 +69,7 @@ impl Default for TrainingConfig {
 ///     let strategy = Arc::new(LearnedCacheStrategy::new(10_000, predictor));
 ///     
 ///     let config = TrainingConfig::default();
-///     let handle = spawn_training_task(logger, strategy, config).await;
+///     let handle = spawn_training_task(logger, strategy, config, None).await;
 ///     
 ///     // Task runs in background...
 ///     handle.abort(); // Cancel when done
@@ -76,6 +79,7 @@ pub async fn spawn_training_task(
     access_logger: Arc<RwLock<AccessPatternLogger>>,
     learned_strategy: Arc<LearnedCacheStrategy>,
     config: TrainingConfig,
+    cycle_counter: Option<Arc<AtomicU64>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.interval);
@@ -99,6 +103,10 @@ pub async fn spawn_training_task(
                 Ok(new_predictor) => {
                     // Update learned strategy atomically
                     learned_strategy.update_predictor(new_predictor);
+
+                    if let Some(counter) = &cycle_counter {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Err(e) => {
                     eprintln!("Training task error: {}", e);
@@ -150,7 +158,7 @@ mod tests {
             rmi_capacity: 100,
         };
 
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config).await;
+        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None).await;
 
         // Wait for multiple training cycles
         sleep(Duration::from_secs(3)).await;
@@ -185,7 +193,7 @@ mod tests {
             rmi_capacity: 100,
         };
 
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config).await;
+        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None).await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -219,7 +227,7 @@ mod tests {
             rmi_capacity: 100,
         };
 
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config).await;
+        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None).await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -278,7 +286,7 @@ mod tests {
         let strategy = Arc::new(LearnedCacheStrategy::new(100, predictor));
 
         let config = TrainingConfig::default();
-        let handle = spawn_training_task(logger, strategy, config).await;
+        let handle = spawn_training_task(logger, strategy, config, None).await;
 
         // Task should be cancellable
         handle.abort();

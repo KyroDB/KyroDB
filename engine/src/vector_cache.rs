@@ -110,7 +110,7 @@ impl VectorCache {
         if cache.contains_key(&doc_id) {
             // Update existing entry
             cache.insert(doc_id, cached_vector);
-            
+
             // Update LRU position
             if let Some(pos) = lru.iter().position(|&id| id == doc_id) {
                 lru.remove(pos);
@@ -120,7 +120,7 @@ impl VectorCache {
                 // This can happen if state is corrupted - add it now
                 lru.push_back(doc_id);
             }
-            
+
             // CRITICAL FIX: Check capacity even on update
             // Handles case where lru_queue grew unbounded
             while lru.len() > self.capacity {
@@ -129,7 +129,7 @@ impl VectorCache {
                     *self.evictions.write() += 1;
                 }
             }
-            
+
             return;
         }
 
@@ -146,7 +146,7 @@ impl VectorCache {
         // Insert new entry
         cache.insert(doc_id, cached_vector);
         lru.push_back(doc_id);
-        
+
         // DEFENSIVE: Final capacity check
         debug_assert_eq!(
             cache.len(),

@@ -41,9 +41,9 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            high_confidence_threshold: 0.8,
-            low_confidence_threshold: 0.3,
-            semantic_similarity_threshold: 0.85,
+            high_confidence_threshold: 0.7,
+            low_confidence_threshold: 0.2,
+            semantic_similarity_threshold: 0.75,
             max_cached_embeddings: 100_000,
             similarity_scan_limit: 1000,
         }
@@ -135,7 +135,7 @@ impl SemanticAdapter {
         let semantic_score = self.compute_semantic_score(embedding);
 
         // Hybrid decision: average of frequency (70%) and semantic (30%)
-        let hybrid_score = freq_score * 0.7 + semantic_score * 0.3;
+        let hybrid_score = freq_score * 0.45 + semantic_score * 0.55;
         hybrid_score > 0.6
     }
 
@@ -157,7 +157,9 @@ impl SemanticAdapter {
         }
 
         // Scan recent embeddings (limit to avoid expensive full scan)
-        let scan_start = cache.len().saturating_sub(self.config.similarity_scan_limit);
+        let scan_start = cache
+            .len()
+            .saturating_sub(self.config.similarity_scan_limit);
         let mut max_similarity = 0.0f32;
 
         for (_, cached_embedding) in cache.iter().skip(scan_start) {

@@ -27,7 +27,9 @@ use kyrodb_engine::{
     spawn_training_task, AbStatsPersister, AbTestSplitter, AccessPatternLogger, CacheStrategy,
     CachedVector, LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, TrainingConfig,
 };
-use rand::distributions::Distribution;
+use rand::{distributions::Distribution, Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use rand_distr::Normal;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -71,7 +73,7 @@ impl Default for Config {
             duration_hours: 12,
             target_qps: 100,
             corpus_size: 100_000,
-            zipf_exponent: 1.07,  // Realistic 80/20 distribution (1.5 was too extreme)
+            zipf_exponent: 1.07, // Realistic 80/20 distribution (1.5 was too extreme)
             cache_capacity: 10_000,
             training_interval_secs: 600,
             logger_window_size: 100_000,
@@ -190,13 +192,33 @@ impl ZipfSampler {
 struct MockDocumentStore {
     corpus_size: usize,
     embedding_dim: usize,
+    topic_bases: Vec<Vec<f32>>,
+    noise_stddev: f32,
 }
 
 impl MockDocumentStore {
     fn new(corpus_size: usize) -> Self {
+        let embedding_dim = 768;
+        let mut topics = std::cmp::max(16, corpus_size / 1000);
+        topics = topics.min(256);
+        topics = topics.max(1).min(corpus_size.max(1));
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5EEDFACE);
+        let mut topic_bases = Vec::with_capacity(topics);
+        for _ in 0..topics {
+            let mut base = vec![0.0f32; embedding_dim];
+            for value in base.iter_mut() {
+                *value = rng.gen::<f32>() * 2.0 - 1.0;
+            }
+            normalize_embedding(&mut base);
+            topic_bases.push(base);
+        }
+
         Self {
             corpus_size,
-            embedding_dim: 768,
+            embedding_dim,
+            topic_bases,
+            noise_stddev: 0.05,
         }
     }
 
@@ -206,12 +228,32 @@ impl MockDocumentStore {
             return None;
         }
 
-        // Generate deterministic embedding based on doc_id
-        Some(
-            (0..self.embedding_dim)
-                .map(|i| ((doc_id + i as u64) % 1000) as f32 / 1000.0)
-                .collect(),
-        )
+        let topic_index = (doc_id as usize) % self.topic_bases.len();
+        let mut embedding = self.topic_bases[topic_index].clone();
+        debug_assert_eq!(embedding.len(), self.embedding_dim);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(doc_id);
+        let noise = Normal::new(0.0, self.noise_stddev as f64).expect("valid noise distribution");
+        for value in embedding.iter_mut() {
+            *value += noise.sample(&mut rng) as f32;
+        }
+
+        normalize_embedding(&mut embedding);
+        Some(embedding)
+    }
+}
+
+fn normalize_embedding(embedding: &mut [f32]) {
+    let norm = embedding
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt() as f32;
+
+    if norm > 1e-6 {
+        for value in embedding.iter_mut() {
+            *value /= norm;
+        }
     }
 }
 
@@ -321,6 +363,7 @@ async fn main() -> Result<()> {
         access_logger.clone(),
         learned_strategy.clone(),
         training_config,
+        None,
     )
     .await;
 
@@ -344,26 +387,30 @@ async fn main() -> Result<()> {
     // Validate Zipf distribution (sample 10K docs to verify distribution)
     println!("Validating Zipf distribution...");
     {
-        let mut doc_counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        let mut doc_counts: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
         for _ in 0..10_000 {
             let doc_id = zipf_sampler.sample();
             *doc_counts.entry(doc_id).or_insert(0) += 1;
         }
-        
+
         let mut sorted_docs: Vec<_> = doc_counts.iter().collect();
         sorted_docs.sort_by(|a, b| b.1.cmp(a.1));
-        
+
         let top_20_docs: usize = sorted_docs.iter().take(20).map(|(_, count)| **count).sum();
         let top_20_pct = top_20_docs as f64 / 10_000.0;
-        
-        println!("  Top 20 docs: {:.1}% of accesses (expected: 10-40%)", top_20_pct * 100.0);
-        
+
+        println!(
+            "  Top 20 docs: {:.1}% of accesses (expected: 10-40%)",
+            top_20_pct * 100.0
+        );
+
         // With Zipf(1.1), expect top 20 docs to capture 10-40% of accesses
         // With Zipf(1.5), this would be 80%+ (too skewed for realistic workload)
         if top_20_pct < 0.08 || top_20_pct > 0.50 {
             bail!("Zipf distribution validation failed: top 20 docs should capture 8-50% of accesses, got {:.1}%", top_20_pct * 100.0);
         }
-        
+
         println!("  ✓ Zipf distribution validated");
     }
     println!();
@@ -523,7 +570,7 @@ async fn main() -> Result<()> {
                 let pred = learned_strategy.predictor.read();
                 pred.tracked_count()
             };
-            
+
             // Calculate traffic split percentages
             let lru_pct = if total_queries > 0 {
                 (lru_queries as f64 / total_queries as f64) * 100.0

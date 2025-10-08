@@ -146,7 +146,10 @@ fn test_frequency_only_strategy_without_semantic() {
     // Should work with frequency-only logic
     let embedding = vec![1.0; 384];
     let should_cache = strategy.should_cache(1, &embedding);
-    assert!(should_cache, "Hot document should be cached (frequency-only)");
+    assert!(
+        should_cache,
+        "Hot document should be cached (frequency-only)"
+    );
 
     // Stats should not include semantic info
     let stats = strategy.stats();
@@ -204,10 +207,7 @@ fn test_semantic_config_customization() {
     };
 
     let semantic_adapter = SemanticAdapter::with_config(config.clone());
-    assert_eq!(
-        semantic_adapter.config().high_confidence_threshold,
-        0.9
-    );
+    assert_eq!(semantic_adapter.config().high_confidence_threshold, 0.9);
     assert_eq!(semantic_adapter.config().max_cached_embeddings, 50_000);
 }
 

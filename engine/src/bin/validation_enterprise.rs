@@ -1,4 +1,4 @@
-//! Enterprise-scale validation workload 
+//! Enterprise-scale validation workload
 //!
 //! **Purpose**: Validate KyroDB hybrid semantic-learned cache against REALISTIC production RAG workloads
 //!
@@ -28,27 +28,34 @@
 use anyhow::{bail, Context, Result};
 use kyrodb_engine::{
     ab_stats::AbStatsPersister,
-    access_logger::{hash_embedding, AccessPatternLogger},
-    cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy},
-    learned_cache::{AccessEvent, AccessType, LearnedCachePredictor},
+    access_logger::AccessPatternLogger,
+    cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
+    learned_cache::LearnedCachePredictor,
     semantic_adapter::SemanticAdapter,
     training_task::{spawn_training_task, TrainingConfig},
     vector_cache::CachedVector,
 };
-use rand::{distributions::Distribution, Rng};
+use rand::{distributions::Distribution, Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use rand_distr::Normal;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::RwLock;
+use tokio::{fs, sync::RwLock};
 use zipf::ZipfDistribution;
 
 /// Enterprise validation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
-    /// Test duration in hours (default: 12)
+    /// Test duration in hours (default: 12). Overridden if `duration_minutes` is provided.
     duration_hours: u64,
+
+    /// Optional override for duration in minutes (e.g., smoke tests). When present, takes
+    /// precedence over `duration_hours`.
+    #[serde(default)]
+    duration_minutes: Option<u64>,
 
     /// Target queries per second (default: 100)
     target_qps: u64,
@@ -113,6 +120,7 @@ impl Default for Config {
 
             // Test parameters
             duration_hours: 12,
+            duration_minutes: None,
             target_qps: 100,
             training_interval_secs: 600,
 
@@ -140,7 +148,11 @@ impl Default for Config {
 
 impl Config {
     fn validate(&self) -> Result<()> {
-        if self.duration_hours == 0 {
+        if let Some(minutes) = self.duration_minutes {
+            if minutes == 0 {
+                bail!("duration_minutes must be > 0 when provided");
+            }
+        } else if self.duration_hours == 0 {
             bail!("duration_hours must be > 0");
         }
         if self.target_qps == 0 {
@@ -184,6 +196,12 @@ impl Config {
             bail!("working_set_churn must be in (0, 1]");
         }
         Ok(())
+    }
+
+    fn total_duration_secs(&self) -> u64 {
+        self.duration_minutes
+            .map(|minutes| minutes * 60)
+            .unwrap_or(self.duration_hours * 3600)
     }
 
     /// Calculate expected working set size (docs that account for 95% of queries)
@@ -470,13 +488,33 @@ impl ZipfSampler {
 struct MockDocumentStore {
     corpus_size: usize,
     embedding_dim: usize,
+    topic_bases: Vec<Vec<f32>>,
+    noise_stddev: f32,
 }
 
 impl MockDocumentStore {
     fn new(corpus_size: usize) -> Self {
+        let embedding_dim = 768;
+        let mut topics = std::cmp::max(16, corpus_size / 1000);
+        topics = topics.min(256);
+        topics = topics.max(1).min(corpus_size.max(1));
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5EEDFACE);
+        let mut topic_bases = Vec::with_capacity(topics);
+        for _ in 0..topics {
+            let mut base = vec![0.0f32; embedding_dim];
+            for value in base.iter_mut() {
+                *value = rng.gen::<f32>() * 2.0 - 1.0;
+            }
+            normalize_embedding(&mut base);
+            topic_bases.push(base);
+        }
+
         Self {
             corpus_size,
-            embedding_dim: 768,
+            embedding_dim,
+            topic_bases,
+            noise_stddev: 0.05,
         }
     }
 
@@ -485,13 +523,52 @@ impl MockDocumentStore {
             return None;
         }
 
-        // Generate deterministic embedding
-        Some(
-            (0..self.embedding_dim)
-                .map(|i| ((doc_id + i as u64) % 1000) as f32 / 1000.0)
-                .collect(),
-        )
+        let topic_index = (doc_id as usize) % self.topic_bases.len();
+        let mut embedding = self.topic_bases[topic_index].clone();
+        debug_assert_eq!(embedding.len(), self.embedding_dim);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(doc_id);
+        let noise = Normal::new(0.0, self.noise_stddev as f64).expect("valid noise distribution");
+        for value in embedding.iter_mut() {
+            *value += noise.sample(&mut rng) as f32;
+        }
+
+        normalize_embedding(&mut embedding);
+        Some(embedding)
     }
+}
+
+fn normalize_embedding(embedding: &mut [f32]) {
+    let norm = embedding
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt() as f32;
+
+    if norm > 1e-6 {
+        for value in embedding.iter_mut() {
+            *value /= norm;
+        }
+    }
+}
+
+async fn load_config_from_path(path: &str) -> Result<Config> {
+    let contents = fs::read_to_string(path)
+        .await
+        .with_context(|| format!("Failed to read config file '{}':", path))?;
+
+    let config: Config = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse config file '{}'", path))?;
+
+    Ok(config)
+}
+
+fn print_usage(program_name: &str) {
+    println!("Usage: {program_name} [config.json]");
+    println!("       {program_name} --config <config.json>");
+    println!("       {program_name} --help");
+    println!();
+    println!("When no configuration file is provided, the built-in enterprise workload defaults are used.");
 }
 
 /// Get process memory usage in MB (Linux only)
@@ -522,15 +599,58 @@ fn get_memory_mb() -> Result<f64> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::default();
+    let mut raw_args = std::env::args();
+    let program_name = raw_args
+        .next()
+        .unwrap_or_else(|| "validation_enterprise".to_string());
+    let mut args = raw_args;
+
+    let config = match args.next() {
+        Some(arg) if arg == "--help" || arg == "-h" => {
+            print_usage(&program_name);
+            return Ok(());
+        }
+        Some(flag) if flag == "--config" || flag == "-c" => {
+            let path = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("Missing configuration path after '{}'", flag))?;
+            let config = load_config_from_path(&path).await?;
+            println!("Loaded configuration from {}", path);
+            config
+        }
+        Some(path) => {
+            let config = load_config_from_path(&path).await?;
+            println!("Loaded configuration from {}", path);
+            config
+        }
+        None => {
+            println!("Using built-in default configuration (enterprise-scale workload).");
+            Config::default()
+        }
+    };
+
+    if args.next().is_some() {
+        eprintln!(
+            "Warning: extra arguments detected. Run '{} --help' for usage information.",
+            program_name
+        );
+    }
+
     config.validate().context("Invalid configuration")?;
+
+    let total_duration_secs = config.total_duration_secs();
+    let duration_hours_part = total_duration_secs / 3600;
+    let duration_minutes_part = (total_duration_secs % 3600) / 60;
 
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("║  KyroDB Enterprise Validation - Phase 0 Week 9-12             ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Configuration:");
-    println!("  Duration:          {} hours", config.duration_hours);
+    println!(
+        "  Duration:          {} hours {} min",
+        duration_hours_part, duration_minutes_part
+    );
     println!("  Target QPS:        {}", config.target_qps);
     println!(
         "  Corpus size:       {} documents (enterprise-scale)",
@@ -580,7 +700,7 @@ async fn main() -> Result<()> {
     println!("  Logger window:     {} events", config.logger_window_size);
     println!();
 
-    let total_expected = config.target_qps * config.duration_hours * 3600;
+    let total_expected = config.target_qps * total_duration_secs;
     println!("Expected workload:");
     println!(
         "  Total queries:     {:.2} million",
@@ -588,12 +708,12 @@ async fn main() -> Result<()> {
     );
     println!(
         "  Training cycles:   {}",
-        (config.duration_hours * 3600) / config.training_interval_secs
+        total_duration_secs / config.training_interval_secs
     );
     if config.enable_temporal_patterns {
         println!(
             "  Topic rotations:   ~{}",
-            (config.duration_hours * 3600) / config.topic_rotation_interval_secs
+            total_duration_secs / config.topic_rotation_interval_secs
         );
         println!(
             "  Expected spikes:   ~{}",
@@ -644,24 +764,15 @@ async fn main() -> Result<()> {
         rmi_capacity: config.cache_capacity,
     };
 
+    let training_cycles = Arc::new(AtomicU64::new(0));
+
     let training_handle = spawn_training_task(
         access_logger.clone(),
         learned_strategy.clone(),
         training_config,
+        Some(training_cycles.clone()),
     )
     .await;
-
-    // Track training cycles
-    let training_cycles = Arc::new(AtomicU64::new(0));
-    let tc_clone = training_cycles.clone();
-    let training_interval = config.training_interval_secs;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(training_interval));
-        loop {
-            interval.tick().await;
-            tc_clone.fetch_add(1, Ordering::Relaxed);
-        }
-    });
 
     println!(
         "Training task running (retrains every {} seconds)",
@@ -685,7 +796,7 @@ async fn main() -> Result<()> {
     )?;
 
     // Test parameters
-    let test_duration = Duration::from_secs(config.duration_hours * 3600);
+    let test_duration = Duration::from_secs(total_duration_secs);
     let target_interval = Duration::from_nanos(1_000_000_000 / config.target_qps);
 
     let mut total_queries = 0u64;
@@ -916,7 +1027,7 @@ async fn main() -> Result<()> {
         hit_rate_improvement: improvement,
         absolute_improvement,
 
-        expected_training_cycles: actual_duration / config.training_interval_secs,
+        expected_training_cycles: total_duration_secs / config.training_interval_secs,
         actual_training_cycles,
         training_task_crashed: training_crashed,
 
