@@ -56,8 +56,10 @@ def generate_synthetic_queries(passages, queries_per_doc=5, seed=0xFACE):
         topic = " ".join(words)
         
         # Generate queries_per_doc paraphrases
-        num_queries = rng.integers(3, queries_per_doc + 1)  # 3 to queries_per_doc
-        selected_templates = rng.choice(templates, size=num_queries, replace=False)
+        # Allow template reuse when queries_per_doc > len(templates)
+        num_queries = queries_per_doc
+        allow_replace = num_queries > len(templates)
+        selected_templates = rng.choice(templates, size=num_queries, replace=allow_replace)
         
         for template in selected_templates:
             query = template.replace("{topic}", topic)

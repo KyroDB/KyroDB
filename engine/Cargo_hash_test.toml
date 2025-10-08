@@ -1,0 +1,3 @@
+[[bin]]
+name = "test_hash_diversity"
+path = "src/bin/test_hash_diversity.rs"

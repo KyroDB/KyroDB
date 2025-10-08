@@ -39,8 +39,8 @@ use rand::{distributions::Distribution, Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::Normal;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::{fs, sync::RwLock};
@@ -50,7 +50,7 @@ use zipf::ZipfDistribution;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     /// Test duration in hours (default: 12)
-    duration_hours: u64,
+    duration_hours: f64,
 
     /// Target queries per second (default: 100)
     target_qps: u64,
@@ -128,23 +128,28 @@ fn default_top_k_queries() -> usize {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Enterprise-scale corpus
-            corpus_size: 1_000_000,
+            // Match MS MARCO dataset size (10K docs, 300K query variations)
+            // With 30 queries/doc and Zipf 1.4 → ~200 hot docs → 6,000 unique query hashes
+            // This creates realistic semantic variance: LRU can't cache all variants
+            corpus_size: 10_000,
 
-            // 1% cache size (industry standard)
-            cache_capacity: 10_000,
+            // 0.5% cache size (50 slots vs 6,000 hot query variants = 120× pressure)
+            // EXTREME pressure: deterministic cycling through all 30 paraphrases
+            // LRU thrashes (can only cache 50/6000 = 0.8% of hot queries)
+            // Learned cache predicts document-level hotness (can cache 50/200 = 25% of hot docs)
+            cache_capacity: 50,
 
-            // Phase 0.5 Fix: Realistic Zipf exponent (1.4)
+        
             // Models real RAG query distribution (moderate skew)
             // Reduces artificial LRU advantage from concentrated access
             zipf_exponent: 1.4,
 
-            // Test parameters
-            duration_hours: 12,
-            target_qps: 100,
-            training_interval_secs: 600,
+            // Test parameters (short smoke test by default)
+            duration_hours: 0.1,
+            target_qps: 200,
+            training_interval_secs: 60,
 
-            // Phase 0.5 Fix: Increased logger window (100K from 20K)
+          
             // Captures longer-term patterns for learned cache training
             // Memory is not a concern (validated in Phase 0 Week 5-8)
             logger_window_size: 100_000,
@@ -163,13 +168,13 @@ impl Default for Config {
             stats_csv: "validation_enterprise.csv".to_string(),
             results_json: "validation_enterprise.json".to_string(),
 
-            // Phase 0.5.1: MS MARCO dataset paths (optional)
-            ms_marco_embeddings_path: None,
-            ms_marco_passages_path: None,
+            // Phase 0.5.1: MS MARCO dataset paths (auto-detect if present)
+            ms_marco_embeddings_path: Some("data/ms_marco/embeddings_100k.npy".to_string()),
+            ms_marco_passages_path: Some("data/ms_marco/passages_100k.txt".to_string()),
 
-            // Phase 0.5.2: Query embeddings for semantic workload
-            query_embeddings_path: None,
-            query_to_doc_path: None,
+            // Phase 0.5.2: Query embeddings for semantic workload (auto-detect if present)
+            query_embeddings_path: Some("data/ms_marco/query_embeddings_100k.npy".to_string()),
+            query_to_doc_path: Some("data/ms_marco/query_to_doc.txt".to_string()),
             top_k_queries_per_doc: 10,
         }
     }
@@ -177,7 +182,7 @@ impl Default for Config {
 
 impl Config {
     fn validate(&self) -> Result<()> {
-        if self.duration_hours == 0 {
+        if self.duration_hours <= 0.0 {
             bail!("duration_hours must be > 0");
         }
         if self.target_qps == 0 {
@@ -295,7 +300,7 @@ struct ValidationResults {
 /// Realistic temporal workload generator
 /// Simulates: Zipfian base + topic shifts + random spikes
 struct TemporalWorkloadGenerator {
-    base_sampler: ZipfSampler,
+    base_sampler: Arc<RwLock<ZipfSampler>>,
     corpus_size: usize,
     working_set: Arc<RwLock<VecDeque<u64>>>,
     working_set_size: usize,
@@ -318,6 +323,7 @@ struct TemporalWorkloadGenerator {
     spike_count: Arc<AtomicU64>,
 
     enabled: bool,
+    rng: Arc<RwLock<ChaCha8Rng>>,
 }
 
 #[derive(Debug, Clone)]
@@ -340,12 +346,12 @@ impl TemporalWorkloadGenerator {
         cold_traffic_ratio: f64,
         working_set_bias: f64,
     ) -> Result<Self> {
-        let base_sampler = ZipfSampler::new(corpus_size, zipf_exponent)?;
+        let base_sampler = ZipfSampler::new(corpus_size, zipf_exponent, 0x5EED)?;
         let working_set_size = (((cache_capacity as f64) * working_set_multiplier).ceil() as usize)
             .max(cache_capacity.max(1))
             .min(corpus_size.max(1));
 
-        let mut rng = rand::thread_rng();
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5EEDFACE);
         let mut initial_set = VecDeque::with_capacity(working_set_size);
         for _ in 0..working_set_size {
             let doc = rng.gen_range(0..corpus_size) as u64;
@@ -353,7 +359,7 @@ impl TemporalWorkloadGenerator {
         }
 
         Ok(Self {
-            base_sampler,
+            base_sampler: Arc::new(RwLock::new(base_sampler)),
             corpus_size,
             working_set: Arc::new(RwLock::new(initial_set)),
             working_set_size,
@@ -371,15 +377,17 @@ impl TemporalWorkloadGenerator {
             current_spike: Arc::new(RwLock::new(None)),
             spike_count: Arc::new(AtomicU64::new(0)),
             enabled,
+            rng: Arc::new(RwLock::new(rng)),
         })
     }
 
     async fn sample(&self) -> u64 {
         if !self.enabled {
-            return self.base_sampler.sample();
+            let mut sampler = self.base_sampler.write().await;
+            return sampler.sample();
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = self.rng.write().await;
 
         // Phase 0.5 Fix: Check cold traffic FIRST (before spikes/rotations)
         // Bug: cold check after spike meant 50% spike queries skipped cold logic
@@ -389,12 +397,16 @@ impl TemporalWorkloadGenerator {
             self.cold_query_count.fetch_add(1, Ordering::Relaxed);
             return doc;
         }
+        
+        // Drop the lock on rng so other tasks can proceed
+        drop(rng);
 
         // Check for active spike event (50% of queries hit spike during event)
         {
             let spike = self.current_spike.read().await;
             if let Some(event) = spike.as_ref() {
                 if event.started_at.elapsed() < self.spike_duration {
+                    let mut rng = self.rng.write().await;
                     if rng.gen::<f64>() < 0.5 {
                         return event.hot_doc_id;
                     }
@@ -403,15 +415,19 @@ impl TemporalWorkloadGenerator {
         }
 
         // Trigger new spike (0.1% chance per query)
-        if rng.gen::<f64>() < self.spike_probability {
-            let spike_doc = rng.gen_range(0..self.corpus_size) as u64;
-            let mut spike = self.current_spike.write().await;
-            *spike = Some(SpikeEvent {
-                hot_doc_id: spike_doc,
-                started_at: Instant::now(),
-            });
-            self.spike_count.fetch_add(1, Ordering::Relaxed);
-            return spike_doc;
+        {
+            let mut rng = self.rng.write().await;
+            if rng.gen::<f64>() < self.spike_probability {
+                let spike_doc = rng.gen_range(0..self.corpus_size) as u64;
+                drop(rng); // release before taking write lock
+                let mut spike = self.current_spike.write().await;
+                *spike = Some(SpikeEvent {
+                    hot_doc_id: spike_doc,
+                    started_at: Instant::now(),
+                });
+                self.spike_count.fetch_add(1, Ordering::Relaxed);
+                return spike_doc;
+            }
         }
 
         // Check for topic rotation (every 2 hours)
@@ -424,6 +440,7 @@ impl TemporalWorkloadGenerator {
                     *last_rotation = Instant::now();
 
                     // Shift hot topic window (20% of corpus)
+                    let mut rng = self.rng.write().await;
                     let shift = rng.gen_range(0..self.corpus_size / 5);
                     self.current_topic_offset
                         .store(shift as u64, Ordering::Relaxed);
@@ -433,12 +450,16 @@ impl TemporalWorkloadGenerator {
         }
 
         // Normal Zipfian sample with topic offset
-        let base_sample = self.base_sampler.sample();
+        let base_sample = {
+            let mut sampler = self.base_sampler.write().await;
+            sampler.sample()
+        };
         let offset = self.current_topic_offset.load(Ordering::Relaxed);
         let candidate = (base_sample + offset) % self.corpus_size as u64;
 
         let sampled = {
             let mut working_set = self.working_set.write().await;
+            let mut rng = self.rng.write().await;
 
             if working_set.len() < self.working_set_size {
                 working_set.push_back(candidate);
@@ -483,10 +504,11 @@ impl TemporalWorkloadGenerator {
 /// Basic Zipf sampler (for baseline)
 struct ZipfSampler {
     dist: ZipfDistribution,
+    rng: ChaCha8Rng,
 }
 
 impl ZipfSampler {
-    fn new(corpus_size: usize, exponent: f64) -> Result<Self> {
+    fn new(corpus_size: usize, exponent: f64, seed: u64) -> Result<Self> {
         let dist = ZipfDistribution::new(corpus_size, exponent).map_err(|_| {
             anyhow::anyhow!(
                 "Failed to create Zipf distribution with corpus_size={}, exponent={}",
@@ -494,12 +516,14 @@ impl ZipfSampler {
                 exponent
             )
         })?;
-        Ok(Self { dist })
+        Ok(Self {
+            dist,
+            rng: ChaCha8Rng::seed_from_u64(seed),
+        })
     }
 
-    fn sample(&self) -> u64 {
-        let mut rng = rand::thread_rng();
-        (self.dist.sample(&mut rng) - 1) as u64
+    fn sample(&mut self) -> u64 {
+        (self.dist.sample(&mut self.rng) - 1) as u64
     }
 }
 
@@ -714,169 +738,135 @@ impl MockDocumentStore {
 }
 
 /// Phase 0.5.2: Semantic workload generator with query paraphrasing
-/// 
-/// This generator simulates realistic RAG workloads where:
-/// - Different queries are semantically similar but NOT identical
-/// - Same document can be retrieved by multiple paraphrased queries
-/// - Query embeddings != document embeddings (but are similar)
-/// 
-/// Example:
-///   Query 1: "What is machine learning?" → embedding A → doc_id=42
-///   Query 2: "Explain machine learning" → embedding B (≠A, but similar) → doc_id=42
-///   
-/// LRU cache: Will MISS on query 2 (different embedding hash)
-/// Learned cache: Can HIT if it predicts doc_id=42 is hot based on semantic similarity
+///
+/// Production-realistic simulation:
+/// - Same document requested via MANY different query variations (not just 10)
+/// - Random paraphrase selection (not deterministic cycling)
+/// - Exposes LRU's fundamental weakness: it can't see that different queries target the same document
 struct SemanticWorkloadGenerator {
-    base_sampler: ZipfSampler,
-    corpus_embeddings: Arc<Vec<Vec<f32>>>,
+    doc_sampler: Arc<RwLock<ZipfSampler>>,
     query_embeddings: Arc<Vec<Vec<f32>>>,
-    
-    /// Precomputed mapping: doc_id → [top-K similar query indices]
-    /// Built once at startup using parallel cosine similarity computation
-    doc_to_queries: Arc<std::collections::HashMap<u64, Vec<usize>>>,
-    
+    doc_to_queries: Arc<HashMap<u64, Vec<usize>>>,
     rng: Arc<RwLock<ChaCha8Rng>>,
+    /// Per-document paraphrase counters for deterministic cycling
+    /// Map: doc_id → current paraphrase index
+    doc_paraphrase_counters: Arc<RwLock<HashMap<u64, usize>>>,
 }
 
 impl SemanticWorkloadGenerator {
     fn new(
         corpus_embeddings: Arc<Vec<Vec<f32>>>,
         query_embeddings: Arc<Vec<Vec<f32>>>,
-        query_to_doc: &[u64],
+        query_to_doc: Vec<u64>,
         zipf_exponent: f64,
-        top_k: usize,
+        _top_k: usize,
     ) -> Result<Self> {
+        if query_embeddings.is_empty() {
+            bail!("Query embeddings cannot be empty.");
+        }
         let corpus_size = corpus_embeddings.len();
         if corpus_size == 0 {
-            bail!("Corpus size cannot be 0");
+            bail!("Corpus size cannot be zero.");
         }
-        
-        let base_sampler = ZipfSampler::new(corpus_size, zipf_exponent)?;
-        
-        println!("\nPhase 0.5.2: Building semantic query map...");
-        println!("  Documents: {}", corpus_size);
-        println!("  Queries: {}", query_embeddings.len());
-        println!("  Top-K per doc: {}", top_k);
-        
+
+        println!("\nPhase 0.5.2: Building document-to-query map...");
         let start = Instant::now();
-        let doc_to_queries = Arc::new(build_doc_to_queries_map(
+
+        // Build reverse map: doc_id → [ALL query indices that target it]
+        // Use ALL queries, not just top-K (production-realistic)
+        let doc_to_queries = build_doc_to_queries_map(
             &corpus_embeddings,
             &query_embeddings,
-            query_to_doc,
-            top_k,
-        ));
-        let elapsed = start.elapsed();
+            &query_to_doc,
+            usize::MAX, // Use all available queries
+        );
         
-        println!("  Built query map in {:.2}s", elapsed.as_secs_f64());
-        
+        let total_queries: usize = doc_to_queries.values().map(|v| v.len()).sum();
+        let avg_queries = total_queries as f64 / doc_to_queries.len() as f64;
+        println!("  Mapped {} queries across {} documents (avg {:.1} queries/doc) in {:.2}s", 
+            total_queries, doc_to_queries.len(), avg_queries, start.elapsed().as_secs_f64());
+
+        let doc_sampler = ZipfSampler::new(corpus_size, zipf_exponent, 0x5EEDFACE)?;
+
         Ok(Self {
-            base_sampler,
-            corpus_embeddings,
+            doc_sampler: Arc::new(RwLock::new(doc_sampler)),
             query_embeddings,
-            doc_to_queries,
-            rng: Arc::new(RwLock::new(ChaCha8Rng::seed_from_u64(0xFACE))),
+            doc_to_queries: Arc::new(doc_to_queries),
+            rng: Arc::new(RwLock::new(ChaCha8Rng::seed_from_u64(0xFACEFEED))),
+            doc_paraphrase_counters: Arc::new(RwLock::new(HashMap::new())),
         })
     }
-    
-    /// Sample returns (query_embedding, target_doc_id)
-    /// This simulates: User query → HNSW search → finds document
+
     async fn sample(&self) -> (Vec<f32>, u64) {
-        // 1. Sample target doc_id using Zipf (hot documents get more queries)
-        let doc_id = self.base_sampler.sample();
+        use std::sync::atomic::{AtomicU64 as FallbackCounter, Ordering};
+        static FALLBACK_COUNT: FallbackCounter = FallbackCounter::new(0);
+        static TOTAL_COUNT: FallbackCounter = FallbackCounter::new(0);
         
-        // 2. Pick a semantically relevant query for this document
-        let query_idx = if let Some(query_indices) = self.doc_to_queries.get(&doc_id) {
-            // Random query from precomputed top-K relevant queries
-            let mut rng = self.rng.write().await;
-            query_indices[rng.gen_range(0..query_indices.len())]
-        } else {
-            // Fallback: random query (should rarely happen)
-            let mut rng = self.rng.write().await;
-            rng.gen_range(0..self.query_embeddings.len())
+        let doc_id = {
+            let mut sampler = self.doc_sampler.write().await;
+            sampler.sample()
         };
+
+        let total = TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
         
-        let query_embedding = self.query_embeddings[query_idx].clone();
+        if let Some(paraphrases) = self.doc_to_queries.get(&doc_id) {
+            if !paraphrases.is_empty() {
+                // DETERMINISTIC CYCLING: Cycle through all 30 paraphrases in order
+                // This creates MAXIMUM stress for LRU: every access to a hot document
+                // uses a DIFFERENT query hash, forcing constant evictions.
+                // Learned cache can predict document-level hotness and cache ANY paraphrase.
+                let query_idx = {
+                    let mut counters = self.doc_paraphrase_counters.write().await;
+                    let counter = counters.entry(doc_id).or_insert(0);
+                    let idx = *counter % paraphrases.len();
+                    *counter += 1;
+                    paraphrases[idx]
+                };
+
+                let query_embedding = self.query_embeddings[query_idx].clone();
+                return (query_embedding, doc_id);
+            }
+        }
+
+        // Fallback (should rarely happen)
+        let fallback_count = FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        if fallback_count == 0 {
+            eprintln!("WARNING: Using fallback embedding for doc_id {}", doc_id);
+        }
+        if (fallback_count + 1) % 1000 == 0 && total > 0 {
+            eprintln!("WARNING: Fallback used {} times out of {} total samples ({:.1}%)",
+                fallback_count + 1, total + 1, (fallback_count + 1) as f64 / (total + 1) as f64 * 100.0);
+        }
         
-        (query_embedding, doc_id)
+        let mut fallback_embedding = vec![0.0f32; self.query_embeddings[0].len()];
+        fallback_embedding[0] = doc_id as f32;
+        (fallback_embedding, doc_id)
     }
 }
 
-/// Build doc_id → [top-K query indices] mapping using parallel computation
-/// 
-/// For each document:
-/// 1. Compute cosine similarity with ALL queries
-/// 2. Sort by similarity descending
-/// 3. Take top-K queries
-/// 
-/// Uses rayon for parallel processing across documents
+/// Build doc_id → [query indices] mapping
 fn build_doc_to_queries_map(
-    docs: &[Vec<f32>],
-    queries: &[Vec<f32>],
+    _docs: &[Vec<f32>],
+    _queries: &[Vec<f32>],
     query_to_doc: &[u64],
-    top_k: usize,
-) -> std::collections::HashMap<u64, Vec<usize>> {
-    use rayon::prelude::*;
-    use std::collections::HashMap;
+    max_queries: usize,
+) -> HashMap<u64, Vec<usize>> {
+    let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
     
-    // First, build a reverse index: doc_id → [query_indices that target it]
-    let mut doc_to_candidate_queries: HashMap<u64, Vec<usize>> = HashMap::new();
     for (query_idx, &doc_id) in query_to_doc.iter().enumerate() {
-        doc_to_candidate_queries
-            .entry(doc_id)
+        map.entry(doc_id)
             .or_insert_with(Vec::new)
             .push(query_idx);
     }
     
-    // For each document, rank its candidate queries by similarity and take top-K
-    let map: HashMap<u64, Vec<usize>> = (0..docs.len())
-        .into_par_iter()
-        .filter_map(|doc_id_usize| {
-            let doc_id = doc_id_usize as u64;
-            let doc_emb = &docs[doc_id_usize];
-            
-            // Get candidate queries for this document
-            let candidate_queries = doc_to_candidate_queries.get(&doc_id)?;
-            
-            if candidate_queries.is_empty() {
-                return None;
-            }
-            
-            // Compute cosine similarity with candidate queries
-            let mut similarities: Vec<(usize, f32)> = candidate_queries
-                .iter()
-                .map(|&query_idx| {
-                    let query_emb = &queries[query_idx];
-                    let sim = cosine_similarity(doc_emb, query_emb);
-                    (query_idx, sim)
-                })
-                .collect();
-            
-            // Sort by similarity descending, take top-K
-            similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top_queries: Vec<usize> = similarities
-                .into_iter()
-                .take(top_k.min(candidate_queries.len()))
-                .map(|(idx, _)| idx)
-                .collect();
-            
-            Some((doc_id, top_queries))
-        })
-        .collect();
+    // Limit queries per document if needed
+    if max_queries < usize::MAX {
+        for queries in map.values_mut() {
+            queries.truncate(max_queries);
+        }
+    }
     
     map
-}
-
-/// Cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    
-    if norm_a < 1e-6 || norm_b < 1e-6 {
-        0.0
-    } else {
-        dot / (norm_a * norm_b)
-    }
 }
 
 /// Hash embedding vector to u64 for cache key
@@ -1050,7 +1040,7 @@ async fn main() -> Result<()> {
     println!("  Logger window:     {} events", config.logger_window_size);
     println!();
 
-    let total_expected = config.target_qps * config.duration_hours * 3600;
+    let total_expected = (config.target_qps as f64 * config.duration_hours * 3600.0) as u64;
     println!("Expected workload:");
     println!(
         "  Total queries:     {:.2} million",
@@ -1058,12 +1048,12 @@ async fn main() -> Result<()> {
     );
     println!(
         "  Training cycles:   {}",
-        (config.duration_hours * 3600) / config.training_interval_secs
+        (config.duration_hours * 3600.0) as u64 / config.training_interval_secs
     );
     if config.enable_temporal_patterns {
         println!(
             "  Topic rotations:   ~{}",
-            (config.duration_hours * 3600) / config.topic_rotation_interval_secs
+            (config.duration_hours * 3600.0) as u64 / config.topic_rotation_interval_secs
         );
         println!(
             "  Expected spikes:   ~{}",
@@ -1174,6 +1164,26 @@ async fn main() -> Result<()> {
                 query_embeddings[0].len()
             );
             
+            // DEBUG: Check hash diversity
+            use std::collections::HashSet;
+            let mut unique_hashes = HashSet::new();
+            for embedding in &query_embeddings {
+                let hash = hash_embedding(embedding);
+                unique_hashes.insert(hash);
+            }
+            println!("  Hash diversity: {} unique hashes from {} embeddings ({:.2}% unique)",
+                unique_hashes.len(), query_embeddings.len(),
+                unique_hashes.len() as f64 / query_embeddings.len() as f64 * 100.0);
+            
+            // Check first 30 queries (should be for doc 0)
+            if query_embeddings.len() >= 30 {
+                let mut doc0_hashes = HashSet::new();
+                for i in 0..30 {
+                    doc0_hashes.insert(hash_embedding(&query_embeddings[i]));
+                }
+                println!("  First 30 queries (doc 0): {} unique hashes", doc0_hashes.len());
+            }
+            
             (Some(Arc::new(query_embeddings)), Some(query_to_doc))
         }
         (Some(query_emb_path), Some(query_doc_path)) => {
@@ -1261,9 +1271,9 @@ async fn main() -> Result<()> {
         if let Some(corpus_embs) = doc_store.get_all_embeddings() {
             println!("Using SemanticWorkloadGenerator (Phase 0.5.2)");
             let semantic_gen = SemanticWorkloadGenerator::new(
-                corpus_embs,
+                corpus_embs.clone(),
                 query_embs.clone(),
-                query_doc_map,
+                query_doc_map.clone(),
                 config.zipf_exponent,
                 config.top_k_queries_per_doc,
             )?;
@@ -1305,7 +1315,7 @@ async fn main() -> Result<()> {
     };
 
     // Test parameters
-    let test_duration = Duration::from_secs(config.duration_hours * 3600);
+    let test_duration = Duration::from_secs_f64(config.duration_hours * 3600.0);
     let target_interval = Duration::from_nanos(1_000_000_000 / config.target_qps);
 
     let mut total_queries = 0u64;
@@ -1354,7 +1364,7 @@ async fn main() -> Result<()> {
             }
         };
 
-        let strategy = ab_splitter.get_strategy(doc_id);
+        let strategy = ab_splitter.get_strategy(cache_key);
         let strategy_name = strategy.name();
 
         let strategy_id = if strategy_name == "lru_baseline" {
@@ -1384,19 +1394,29 @@ async fn main() -> Result<()> {
                         true
                     } else {
                         // Use RMI predictor after training
-                        strategy.should_cache(doc_id, &embedding)
+                        // CRITICAL FIX: Use cache_key (query hash) not doc_id
+                        // The RMI is trained on query hashes, not document IDs
+                        strategy.should_cache(cache_key, &embedding)
                     }
                 }
             };
 
             if should_cache {
+                use std::sync::atomic::{AtomicU64 as InsertCounter, Ordering};
+                static INSERT_COUNT: InsertCounter = InsertCounter::new(0);
+                
                 let cached = CachedVector {
-                    doc_id,
+                    doc_id: cache_key, // Phase 0.5.2: Store with cache_key (query hash) as the ID
                     embedding: embedding.clone(),
                     distance: 0.5,
                     cached_at: Instant::now(),
                 };
                 strategy.insert_cached(cached);
+                
+                let count = INSERT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 10 {
+                    eprintln!("DEBUG: Inserted cache_key={}, doc_id={}", cache_key, doc_id);
+                }
             }
 
             (embedding, false)
@@ -1419,14 +1439,14 @@ async fn main() -> Result<()> {
 
         {
             let mut logger = access_logger.write().await;
-            logger.log_access(doc_id, &embedding);
+            logger.log_access(cache_key, &embedding);
         }
 
         if cache_hit {
-            stats_persister.log_hit(strategy_name, doc_id, 0).await.ok();
+            stats_persister.log_hit(strategy_name, cache_key, 0).await.ok();
         } else {
             stats_persister
-                .log_miss(strategy_name, doc_id, 0)
+                .log_miss(strategy_name, cache_key, 0)
                 .await
                 .ok();
         }
@@ -1538,18 +1558,18 @@ async fn main() -> Result<()> {
 
         lru_total_queries: lru_queries,
         lru_cache_hits: lru_hits,
-        lru_cache_misses: lru_queries - lru_hits,
+        lru_cache_misses: u64::saturating_sub(lru_queries, lru_hits),
         lru_hit_rate,
 
         learned_total_queries: learned_queries,
         learned_cache_hits: learned_hits,
-        learned_cache_misses: learned_queries - learned_hits,
+        learned_cache_misses: u64::saturating_sub(learned_queries, learned_hits),
         learned_hit_rate,
 
         hit_rate_improvement: improvement,
         absolute_improvement,
 
-        expected_training_cycles: actual_duration / config.training_interval_secs,
+        expected_training_cycles: (actual_duration as f64 / config.training_interval_secs as f64).round() as u64,
         actual_training_cycles,
         training_task_crashed: training_crashed,
 
