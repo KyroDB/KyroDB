@@ -1176,8 +1176,16 @@ async fn main() -> Result<()> {
             
             (Some(Arc::new(query_embeddings)), Some(query_to_doc))
         }
-        (Some(_), Some(_)) => {
+        (Some(query_emb_path), Some(query_doc_path)) => {
             println!("WARNING: Query embedding paths configured but files not found");
+            println!("  Expected: {}", query_emb_path);
+            println!("  Exists: {}", std::path::Path::new(query_emb_path).exists());
+            println!("  Expected: {}", query_doc_path);
+            println!("  Exists: {}", std::path::Path::new(query_doc_path).exists());
+            println!();
+            println!("To generate query embeddings:");
+            println!("  python3 scripts/generate_query_embeddings.py --size 10000 --queries-per-doc 5 --noise 0.02");
+            println!();
             println!("Falling back to ID-based sampling (no semantic variance)");
             (None, None)
         }
