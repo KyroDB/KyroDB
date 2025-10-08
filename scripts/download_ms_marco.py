@@ -35,28 +35,41 @@ def download_passages(output_dir: Path, num_passages: int = 100_000):
     print(f"Downloading {num_passages:,} passages from MS MARCO v1.1...")
     
     try:
-        # Load dataset from Hugging Face
-        ds = load_dataset('microsoft/ms_marco', 'v1.1', split=f'train[:{num_passages}]')
+        # Load dataset from Hugging Face (use 'corpus' split for passages)
+        ds = load_dataset('microsoft/ms_marco', 'v1.1', split='corpus')
         
-        # Extract passages and IDs
+        # MS MARCO v1.1 corpus structure:
+        # {'docid': str, 'text': str}
         passages = []
         doc_ids = []
         
-        for row in ds:
-            # MS MARCO v1.1 has 'passage' field
-            passage_text = row.get('passage', row.get('passage_text', ''))
-            if not passage_text:
+        print(f"Total passages available: {len(ds):,}")
+        
+        # Take first num_passages
+        for i, row in enumerate(ds):
+            if i >= num_passages:
+                break
+            
+            # Extract passage text (field is 'text' in corpus split)
+            passage_text = row.get('text', '')
+            if not passage_text or len(passage_text.strip()) == 0:
                 continue
                 
             passages.append(passage_text)
             
-            # Use index as doc_id if not available
-            passage_id = row.get('passage_id', len(doc_ids))
-            doc_ids.append(passage_id)
+            # Use docid from dataset
+            doc_id = row.get('docid', str(i))
+            doc_ids.append(doc_id)
         
-        print(f"Downloaded {len(passages):,} passages")
+        print(f"Downloaded {len(passages):,} valid passages")
         
-        # Save passages
+        if len(passages) == 0:
+            print("Error: No passages extracted from dataset")
+            print("Dataset structure:")
+            print(ds[0] if len(ds) > 0 else "Empty dataset")
+            sys.exit(1)
+        
+        # Save passages (one per line)
         passages_file = output_dir / 'passages_100k.txt'
         with open(passages_file, 'w', encoding='utf-8') as f:
             for passage in passages:
@@ -81,7 +94,8 @@ def download_passages(output_dir: Path, num_passages: int = 100_000):
         print("\nTroubleshooting:")
         print("  1. Check internet connection")
         print("  2. Verify Hugging Face datasets library is installed")
-        print("  3. Try a smaller dataset size with --size 10000")
+        print("  3. Try: pip install --upgrade datasets")
+        print(f"  4. Try smaller size: --size 10000")
         sys.exit(1)
 
 
@@ -146,16 +160,26 @@ def verify_data(output_dir: Path):
     
     # Load and verify
     with open(passages_file, 'r', encoding='utf-8') as f:
-        num_passages = sum(1 for _ in f)
+        num_passages = sum(1 for line in f if line.strip())
     
     with open(doc_ids_file, 'r', encoding='utf-8') as f:
-        num_doc_ids = sum(1 for _ in f)
+        num_doc_ids = sum(1 for line in f if line.strip())
     
     embeddings = np.load(embeddings_file)
+    
+    # Handle empty embeddings case
+    if embeddings.ndim == 1:
+        print("Error: Embeddings array is 1-dimensional (likely empty)")
+        print(f"Shape: {embeddings.shape}")
+        return False
     
     print(f"Passages: {num_passages:,}")
     print(f"Doc IDs: {num_doc_ids:,}")
     print(f"Embeddings: {embeddings.shape[0]:,} × {embeddings.shape[1]}-dim")
+    
+    if num_passages == 0:
+        print("Error: No passages found")
+        return False
     
     if num_passages != num_doc_ids or num_passages != embeddings.shape[0]:
         print("Error: Mismatch in data counts")
