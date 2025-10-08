@@ -106,6 +106,23 @@ struct Config {
     /// Path to MS MARCO passages (optional)
     #[serde(default)]
     ms_marco_passages_path: Option<String>,
+
+    /// Path to query embeddings (optional)
+    /// Phase 0.5.2: Support semantic query generation for realistic RAG workloads
+    #[serde(default)]
+    query_embeddings_path: Option<String>,
+
+    /// Path to query→doc mapping (optional)
+    #[serde(default)]
+    query_to_doc_path: Option<String>,
+
+    /// Top-K queries per document for semantic sampling (default: 10)
+    #[serde(default = "default_top_k_queries")]
+    top_k_queries_per_doc: usize,
+}
+
+fn default_top_k_queries() -> usize {
+    10
 }
 
 impl Default for Config {
@@ -149,6 +166,11 @@ impl Default for Config {
             // Phase 0.5.1: MS MARCO dataset paths (optional)
             ms_marco_embeddings_path: None,
             ms_marco_passages_path: None,
+
+            // Phase 0.5.2: Query embeddings for semantic workload
+            query_embeddings_path: None,
+            query_to_doc_path: None,
+            top_k_queries_per_doc: 10,
         }
     }
 }
@@ -485,6 +507,10 @@ impl ZipfSampler {
 trait DocumentStore: Send + Sync {
     fn fetch(&self, doc_id: u64) -> Option<Vec<f32>>;
     fn corpus_size(&self) -> usize;
+    
+    /// Phase 0.5.2: Get all embeddings for semantic workload generator
+    /// Returns None if store doesn't support bulk access (e.g., remote store)
+    fn get_all_embeddings(&self) -> Option<Arc<Vec<Vec<f32>>>>;
 }
 
 /// Real document store backed by MS MARCO embeddings
@@ -503,6 +529,10 @@ impl DocumentStore for RealDocumentStore {
     fn corpus_size(&self) -> usize {
         self.embeddings.len()
     }
+    
+    fn get_all_embeddings(&self) -> Option<Arc<Vec<Vec<f32>>>> {
+        Some(self.embeddings.clone())
+    }
 }
 
 impl RealDocumentStore {
@@ -514,7 +544,7 @@ impl RealDocumentStore {
         let embeddings_data =
             std::fs::read(embeddings_path).context("Failed to read embeddings file")?;
 
-        let embeddings = Self::parse_numpy_embeddings(&embeddings_data, 384)
+        let embeddings = Self::parse_numpy_embeddings(&embeddings_data)
             .context("Failed to parse numpy embeddings")?;
 
         let passages_text =
@@ -548,7 +578,7 @@ impl RealDocumentStore {
         self.passages.get(doc_id as usize).map(|s| s.as_str())
     }
 
-    fn parse_numpy_embeddings(data: &[u8], expected_dim: usize) -> Result<Vec<Vec<f32>>> {
+    pub fn parse_numpy_embeddings(data: &[u8]) -> Result<Vec<Vec<f32>>> {
         if data.len() < 128 {
             bail!("Invalid numpy file: too small ({}  bytes)", data.len());
         }
@@ -570,11 +600,22 @@ impl RealDocumentStore {
 
         let float_data = &data[data_start..];
         let num_floats = float_data.len() / 4;
+        
+        // Try common dimensions (384 for all-MiniLM-L6-v2, 768 for others)
+        let expected_dim = if num_floats % 384 == 0 {
+            384
+        } else if num_floats % 768 == 0 {
+            768
+        } else {
+            // Fallback: try to infer from first 10K floats
+            384 // Default to 384
+        };
+        
         let num_vectors = num_floats / expected_dim;
 
         if num_floats % expected_dim != 0 {
             bail!(
-                "Invalid numpy file: {} floats not divisible by expected_dim={}",
+                "Invalid numpy file: {} floats not divisible by detected dim={}",
                 num_floats,
                 expected_dim
             );
@@ -639,6 +680,10 @@ impl DocumentStore for MockDocumentStore {
     fn corpus_size(&self) -> usize {
         self.corpus_size
     }
+    
+    fn get_all_embeddings(&self) -> Option<Arc<Vec<Vec<f32>>>> {
+        None // MockDocumentStore doesn't pre-store embeddings
+    }
 }
 
 impl MockDocumentStore {
@@ -666,6 +711,188 @@ impl MockDocumentStore {
             noise_stddev: 0.05,
         }
     }
+}
+
+/// Phase 0.5.2: Semantic workload generator with query paraphrasing
+/// 
+/// This generator simulates realistic RAG workloads where:
+/// - Different queries are semantically similar but NOT identical
+/// - Same document can be retrieved by multiple paraphrased queries
+/// - Query embeddings != document embeddings (but are similar)
+/// 
+/// Example:
+///   Query 1: "What is machine learning?" → embedding A → doc_id=42
+///   Query 2: "Explain machine learning" → embedding B (≠A, but similar) → doc_id=42
+///   
+/// LRU cache: Will MISS on query 2 (different embedding hash)
+/// Learned cache: Can HIT if it predicts doc_id=42 is hot based on semantic similarity
+struct SemanticWorkloadGenerator {
+    base_sampler: ZipfSampler,
+    corpus_embeddings: Arc<Vec<Vec<f32>>>,
+    query_embeddings: Arc<Vec<Vec<f32>>>,
+    
+    /// Precomputed mapping: doc_id → [top-K similar query indices]
+    /// Built once at startup using parallel cosine similarity computation
+    doc_to_queries: Arc<std::collections::HashMap<u64, Vec<usize>>>,
+    
+    rng: Arc<RwLock<ChaCha8Rng>>,
+}
+
+impl SemanticWorkloadGenerator {
+    fn new(
+        corpus_embeddings: Arc<Vec<Vec<f32>>>,
+        query_embeddings: Arc<Vec<Vec<f32>>>,
+        query_to_doc: &[u64],
+        zipf_exponent: f64,
+        top_k: usize,
+    ) -> Result<Self> {
+        let corpus_size = corpus_embeddings.len();
+        if corpus_size == 0 {
+            bail!("Corpus size cannot be 0");
+        }
+        
+        let base_sampler = ZipfSampler::new(corpus_size, zipf_exponent)?;
+        
+        println!("\nPhase 0.5.2: Building semantic query map...");
+        println!("  Documents: {}", corpus_size);
+        println!("  Queries: {}", query_embeddings.len());
+        println!("  Top-K per doc: {}", top_k);
+        
+        let start = Instant::now();
+        let doc_to_queries = Arc::new(build_doc_to_queries_map(
+            &corpus_embeddings,
+            &query_embeddings,
+            query_to_doc,
+            top_k,
+        ));
+        let elapsed = start.elapsed();
+        
+        println!("  Built query map in {:.2}s", elapsed.as_secs_f64());
+        
+        Ok(Self {
+            base_sampler,
+            corpus_embeddings,
+            query_embeddings,
+            doc_to_queries,
+            rng: Arc::new(RwLock::new(ChaCha8Rng::seed_from_u64(0xFACE))),
+        })
+    }
+    
+    /// Sample returns (query_embedding, target_doc_id)
+    /// This simulates: User query → HNSW search → finds document
+    async fn sample(&self) -> (Vec<f32>, u64) {
+        // 1. Sample target doc_id using Zipf (hot documents get more queries)
+        let doc_id = self.base_sampler.sample();
+        
+        // 2. Pick a semantically relevant query for this document
+        let query_idx = if let Some(query_indices) = self.doc_to_queries.get(&doc_id) {
+            // Random query from precomputed top-K relevant queries
+            let mut rng = self.rng.write().await;
+            query_indices[rng.gen_range(0..query_indices.len())]
+        } else {
+            // Fallback: random query (should rarely happen)
+            let mut rng = self.rng.write().await;
+            rng.gen_range(0..self.query_embeddings.len())
+        };
+        
+        let query_embedding = self.query_embeddings[query_idx].clone();
+        
+        (query_embedding, doc_id)
+    }
+}
+
+/// Build doc_id → [top-K query indices] mapping using parallel computation
+/// 
+/// For each document:
+/// 1. Compute cosine similarity with ALL queries
+/// 2. Sort by similarity descending
+/// 3. Take top-K queries
+/// 
+/// Uses rayon for parallel processing across documents
+fn build_doc_to_queries_map(
+    docs: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    query_to_doc: &[u64],
+    top_k: usize,
+) -> std::collections::HashMap<u64, Vec<usize>> {
+    use rayon::prelude::*;
+    use std::collections::HashMap;
+    
+    // First, build a reverse index: doc_id → [query_indices that target it]
+    let mut doc_to_candidate_queries: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (query_idx, &doc_id) in query_to_doc.iter().enumerate() {
+        doc_to_candidate_queries
+            .entry(doc_id)
+            .or_insert_with(Vec::new)
+            .push(query_idx);
+    }
+    
+    // For each document, rank its candidate queries by similarity and take top-K
+    let map: HashMap<u64, Vec<usize>> = (0..docs.len())
+        .into_par_iter()
+        .filter_map(|doc_id_usize| {
+            let doc_id = doc_id_usize as u64;
+            let doc_emb = &docs[doc_id_usize];
+            
+            // Get candidate queries for this document
+            let candidate_queries = doc_to_candidate_queries.get(&doc_id)?;
+            
+            if candidate_queries.is_empty() {
+                return None;
+            }
+            
+            // Compute cosine similarity with candidate queries
+            let mut similarities: Vec<(usize, f32)> = candidate_queries
+                .iter()
+                .map(|&query_idx| {
+                    let query_emb = &queries[query_idx];
+                    let sim = cosine_similarity(doc_emb, query_emb);
+                    (query_idx, sim)
+                })
+                .collect();
+            
+            // Sort by similarity descending, take top-K
+            similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top_queries: Vec<usize> = similarities
+                .into_iter()
+                .take(top_k.min(candidate_queries.len()))
+                .map(|(idx, _)| idx)
+                .collect();
+            
+            Some((doc_id, top_queries))
+        })
+        .collect();
+    
+    map
+}
+
+/// Cosine similarity between two vectors
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    
+    if norm_a < 1e-6 || norm_b < 1e-6 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
+}
+
+/// Hash embedding vector to u64 for cache key
+/// Uses first 8 float32 values XOR'd together
+fn hash_embedding(embedding: &[f32]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let mut hasher = DefaultHasher::new();
+    
+    // Hash first 8 floats (or all if fewer than 8)
+    for &value in embedding.iter().take(8) {
+        value.to_bits().hash(&mut hasher);
+    }
+    
+    hasher.finish()
 }
 
 fn normalize_embedding(embedding: &mut [f32]) {
@@ -902,6 +1129,64 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Phase 0.5.2: Load query embeddings for semantic workload generation
+    let (query_embeddings, query_to_doc) = match (
+        &config.query_embeddings_path,
+        &config.query_to_doc_path,
+    ) {
+        (Some(query_emb_path), Some(query_doc_path))
+            if std::path::Path::new(query_emb_path).exists()
+                && std::path::Path::new(query_doc_path).exists() =>
+        {
+            println!("Phase 0.5.2: Loading query embeddings for semantic workload...");
+            
+            // Load query embeddings (numpy format)
+            let query_emb_data = std::fs::read(query_emb_path)
+                .context("Failed to read query embeddings file")?;
+            let query_embeddings = RealDocumentStore::parse_numpy_embeddings(&query_emb_data)?;
+            
+            // Load query→doc mapping
+            let query_doc_text = std::fs::read_to_string(query_doc_path)
+                .context("Failed to read query_to_doc file")?;
+            let query_to_doc: Vec<u64> = query_doc_text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .enumerate()
+                .map(|(idx, line)| {
+                    line.trim().parse::<u64>().with_context(|| {
+                        format!("Failed to parse doc_id at line {}: '{}'", idx + 1, line)
+                    })
+                })
+                .collect::<Result<Vec<u64>>>()?;
+            
+            if query_embeddings.len() != query_to_doc.len() {
+                bail!(
+                    "Query embedding count ({}) != query_to_doc count ({})",
+                    query_embeddings.len(),
+                    query_to_doc.len()
+                );
+            }
+            
+            println!(
+                "  Loaded {} query embeddings ({}×{}-dim)",
+                query_embeddings.len(),
+                query_embeddings.len(),
+                query_embeddings[0].len()
+            );
+            
+            (Some(Arc::new(query_embeddings)), Some(query_to_doc))
+        }
+        (Some(_), Some(_)) => {
+            println!("WARNING: Query embedding paths configured but files not found");
+            println!("Falling back to ID-based sampling (no semantic variance)");
+            (None, None)
+        }
+        _ => {
+            println!("Phase 0.5.2: Query embeddings not configured, using ID-based sampling");
+            (None, None)
+        }
+    };
+
     // Spawn background training task
     println!("Spawning background training task...");
     let training_config = TrainingConfig {
@@ -927,20 +1212,89 @@ async fn main() -> Result<()> {
     );
     println!();
 
-    // Initialize workload generator
-    let workload_gen = TemporalWorkloadGenerator::new(
-        config.corpus_size,
-        config.zipf_exponent,
-        Duration::from_secs(config.topic_rotation_interval_secs),
-        config.spike_probability,
-        Duration::from_secs(config.spike_duration_secs),
-        config.enable_temporal_patterns,
-        config.cache_capacity,
-        config.working_set_multiplier,
-        config.working_set_churn,
-        config.cold_traffic_ratio,
-        config.working_set_bias,
-    )?;
+    // Phase 0.5.2: Initialize workload generator (semantic if query embeddings available)
+    enum WorkloadGenerator {
+        Temporal(TemporalWorkloadGenerator),
+        Semantic(SemanticWorkloadGenerator),
+    }
+    
+    impl WorkloadGenerator {
+        fn get_rotation_count(&self) -> u64 {
+            match self {
+                WorkloadGenerator::Temporal(gen) => gen.get_rotation_count(),
+                WorkloadGenerator::Semantic(_) => 0, // Semantic gen doesn't have rotations
+            }
+        }
+        
+        fn get_spike_count(&self) -> u64 {
+            match self {
+                WorkloadGenerator::Temporal(gen) => gen.get_spike_count(),
+                WorkloadGenerator::Semantic(_) => 0, // Semantic gen doesn't have spikes
+            }
+        }
+        
+        fn get_cold_query_count(&self) -> u64 {
+            match self {
+                WorkloadGenerator::Temporal(gen) => gen.get_cold_query_count(),
+                WorkloadGenerator::Semantic(_) => 0, // Semantic gen doesn't track cold queries
+            }
+        }
+        
+        fn get_working_set_draws(&self) -> u64 {
+            match self {
+                WorkloadGenerator::Temporal(gen) => gen.get_working_set_draws(),
+                WorkloadGenerator::Semantic(_) => 0, // Semantic gen doesn't have working set
+            }
+        }
+    }
+    
+    let workload_gen = if let (Some(query_embs), Some(query_doc_map)) = (&query_embeddings, &query_to_doc) {
+        // Get corpus embeddings for semantic workload
+        if let Some(corpus_embs) = doc_store.get_all_embeddings() {
+            println!("Using SemanticWorkloadGenerator (Phase 0.5.2)");
+            let semantic_gen = SemanticWorkloadGenerator::new(
+                corpus_embs,
+                query_embs.clone(),
+                query_doc_map,
+                config.zipf_exponent,
+                config.top_k_queries_per_doc,
+            )?;
+            WorkloadGenerator::Semantic(semantic_gen)
+        } else {
+            println!("WARNING: Query embeddings available but corpus embeddings not accessible");
+            println!("Falling back to TemporalWorkloadGenerator");
+            let temporal_gen = TemporalWorkloadGenerator::new(
+                config.corpus_size,
+                config.zipf_exponent,
+                Duration::from_secs(config.topic_rotation_interval_secs),
+                config.spike_probability,
+                Duration::from_secs(config.spike_duration_secs),
+                config.enable_temporal_patterns,
+                config.cache_capacity,
+                config.working_set_multiplier,
+                config.working_set_churn,
+                config.cold_traffic_ratio,
+                config.working_set_bias,
+            )?;
+            WorkloadGenerator::Temporal(temporal_gen)
+        }
+    } else {
+        println!("Using TemporalWorkloadGenerator (ID-based sampling)");
+        let temporal_gen = TemporalWorkloadGenerator::new(
+            config.corpus_size,
+            config.zipf_exponent,
+            Duration::from_secs(config.topic_rotation_interval_secs),
+            config.spike_probability,
+            Duration::from_secs(config.spike_duration_secs),
+            config.enable_temporal_patterns,
+            config.cache_capacity,
+            config.working_set_multiplier,
+            config.working_set_churn,
+            config.cold_traffic_ratio,
+            config.working_set_bias,
+        )?;
+        WorkloadGenerator::Temporal(temporal_gen)
+    };
 
     // Test parameters
     let test_duration = Duration::from_secs(config.duration_hours * 3600);
@@ -977,7 +1331,20 @@ async fn main() -> Result<()> {
 
     // Main query loop
     while test_start.elapsed() < test_duration && running.load(Ordering::SeqCst) {
-        let doc_id = workload_gen.sample().await;
+        // Phase 0.5.2: Sample either (doc_id) or (query_embedding, doc_id)
+        let (cache_key, doc_id) = match &workload_gen {
+            WorkloadGenerator::Temporal(gen) => {
+                let doc_id = gen.sample().await;
+                (doc_id, doc_id) // Cache by doc_id for ID-based sampling
+            }
+            WorkloadGenerator::Semantic(gen) => {
+                let (query_embedding, doc_id) = gen.sample().await;
+                // Phase 0.5.2: Cache by query embedding hash (not doc_id!)
+                // This simulates real RAG: "What is ML?" and "Explain ML" have DIFFERENT cache keys
+                let cache_key = hash_embedding(&query_embedding);
+                (cache_key, doc_id)
+            }
+        };
 
         let strategy = ab_splitter.get_strategy(doc_id);
         let strategy_name = strategy.name();
@@ -991,7 +1358,7 @@ async fn main() -> Result<()> {
             continue;
         };
 
-        let cached_vec = strategy.get_cached(doc_id);
+        let cached_vec = strategy.get_cached(cache_key);
 
         let (embedding, cache_hit) = if let Some(vec) = cached_vec {
             (vec.embedding, true)

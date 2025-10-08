@@ -38,6 +38,7 @@ rand = "0.8"  # For Zipf distribution sampling
 rand_chacha = "0.3"  # Deterministic per-doc embeddings
 rand_distr = "0.4"  # Gaussian noise for semantic clusters
 zipf = "7.0"  # Proper Zipf distribution for validation tests
+rayon = "1.10"  # Phase 0.5.2: Parallel doc-to-queries map building
 
 # Phase 0 Week 13-16: Full persistence (will add when needed)
 # bincode = "1.3"
