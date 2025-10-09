@@ -13,7 +13,7 @@ Output:
 - data/ms_marco/query_to_doc.txt: Query index → doc_id mapping
 
 Usage:
-    python3 scripts/generate_query_embeddings.py --size 10000 --queries-per-doc 5
+    python3 scripts/generate_query_embeddings.py --size 100000 --queries-per-doc 5
 """
 
 import argparse
@@ -104,7 +104,7 @@ def generate_query_embeddings(queries, doc_embeddings, query_to_doc, noise_stdde
 
 def main():
     parser = argparse.ArgumentParser(description="Generate synthetic query embeddings")
-    parser.add_argument("--size", type=int, default=10000,
+    parser.add_argument("--size", type=int, default=100000,
                       help="Number of documents (must match embeddings_100k.npy)")
     parser.add_argument("--queries-per-doc", type=int, default=5,
                       help="Max queries per document (actual: 3 to queries-per-doc)")
@@ -123,7 +123,7 @@ def main():
     # Check input files exist
     if not os.path.exists(embeddings_file):
         print(f"ERROR: {embeddings_file} not found", file=sys.stderr)
-        print("Run: python3 scripts/generate_mock_embeddings.py --size 10000 first", file=sys.stderr)
+        print("Run: python3 scripts/generate_mock_embeddings.py --size 1000000 first", file=sys.stderr)
         sys.exit(1)
     
     if not os.path.exists(passages_file):
