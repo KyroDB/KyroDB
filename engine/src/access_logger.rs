@@ -1,7 +1,8 @@
 //! Access Pattern Logger for Learned Cache Training
 //!
-//! Phase 0 Week 5-8: Log document accesses to train learned cache predictor
-//! Phase 0 Week 9-12: Memory leak fix with ringbuf crate
+//! Access pattern logger: Ring buffer for training data collection
+//!
+//! Fixed-capacity lock-free ring buffer (ringbuf crate) - no memory leaks
 //!
 //! Architecture:
 //! - Ring buffer: Lock-free ringbuf crate (SPSC, zero-copy)

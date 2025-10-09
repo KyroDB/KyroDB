@@ -1,6 +1,6 @@
 //! HNSW vector index implementation for k-NN search
 //!
-//! Phase 0 Week 1-2: Integrate hnsw_rs for k-NN search
+//! HNSW k-NN vector search index (hnswlib-rs wrapper)
 //!
 //! This module wraps hnsw_rs with a clean Rust API optimized for RAG workloads.
 //! HNSW (Hierarchical Navigable Small World) provides approximate nearest neighbor search

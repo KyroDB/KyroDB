@@ -1,6 +1,6 @@
 //! Vector Cache Storage Layer
 //!
-//! Phase 0 Week 9-12: HashMap-based cache with LRU eviction
+//! Vector cache storage: In-memory cache with LRU eviction policy
 //!
 //! Provides fast in-memory storage for frequently accessed vectors.
 //! Supports both LRU baseline and learned cache admission policies.

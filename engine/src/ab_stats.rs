@@ -1,6 +1,6 @@
 //! A/B Test Statistics Persistence
 //!
-//! Phase 0 Week 9-12: Minimal persistence for A/B test metrics
+//! A/B test metrics persistence: CSV-based stats for experiment tracking
 //!
 //! Persists cache hit/miss stats to CSV file, allowing server restarts
 //! without losing evaluation data.

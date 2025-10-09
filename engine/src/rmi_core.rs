@@ -210,7 +210,7 @@ impl SegmentRouter {
 /// Multi-segment RMI index
 ///
 /// Complete RMI with routing + segments.
-/// This is the base for learned cache predictor (Phase 0 Week 3-8).
+/// Learned index for cache predictor: Recursive Model Index (RMI).
 pub struct RmiIndex {
     segments: Vec<RmiSegment>,
     router: SegmentRouter,

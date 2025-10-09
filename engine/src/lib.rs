@@ -1,40 +1,38 @@
 //! KyroDB - High-performance vector database for RAG workloads
 //!
-//! Phase 0 roadmap:
-//! - Week 1-2: HNSW vector search prototype (hnswlib-rs wrapper)
-//! - Week 3-8: Learned cache with RMI (predicts cache hotness)
-//! - Week 9-12: Basic persistence (WAL + snapshots for vectors)
+//! **Hybrid Semantic Cache**: Combines RMI-based frequency prediction with semantic similarity
+//! for intelligent cache admission decisions in RAG workloads.
 //!
-//! This is a clean slate - building vector DB from scratch, NOT porting KV store.
+//! See Implementation.md for roadmap and IMPLEMENTATION_UPDATE_ANALYSIS.md for current status.
 
-// ===== Phase 0 modules =====
+// ===== Core modules =====
 
-// Week 1-2: HNSW vector search (CURRENT - Phase 0 Week 1-2)
+// Vector search: HNSW k-NN index
 pub mod hnsw_index;
 
-// Week 3-8: RMI core for learned cache (predicts doc_id → hotness_score)
+// Learned index: RMI (Recursive Model Index) for cache prediction
 pub mod rmi_core;
 
-// Week 3-4: Learned cache predictor (Phase 0 Week 3-4) ✅
+// Cache prediction: Hybrid frequency + semantic similarity
 pub mod learned_cache;
 
-// Week 5-8: Access pattern logger (Phase 0 Week 5-8) ✅
+// Access logging: Ring buffer for training data collection
 pub mod access_logger;
 
-// Phase 0 Week 9-12: A/B Testing Framework ✅
-pub mod ab_stats; // A/B test metrics persistence (CSV format)
+// A/B testing: Framework for cache strategy comparison
+pub mod ab_stats; // Metrics persistence (CSV format)
 pub mod cache_strategy; // CacheStrategy trait + LRU/Learned implementations + A/B splitter
-pub mod training_task; // Background RMI training task (tokio::spawn, 10-minute interval)
+pub mod training_task; // Background RMI training task (tokio::spawn, 60-second interval)
 pub mod vector_cache; // In-memory vector cache with LRU eviction
 
-// Phase 1: Semantic-aware learned cache (hybrid frequency + semantic similarity)
-pub mod semantic_adapter; // Semantic layer for hybrid cache decisions
+// Semantic layer: Hybrid cache decisions (frequency + similarity)
+pub mod semantic_adapter;
 
-// Phase 0.5.2: NDCG quality metrics for cache and search validation
-pub mod ndcg; // NDCG@10, MRR, Recall@k for ranking quality
+// Quality metrics: NDCG@10, MRR, Recall@k for ranking validation
+pub mod ndcg;
 
-// Phase 0 Week 9-12: Memory profiling with jemalloc (optional feature)
-pub mod memory_profiler; // Memory leak detection and profiling
+// Memory profiling: jemalloc-based cross-platform profiler
+pub mod memory_profiler;
 
 // ===== Global Allocator (jemalloc-profiling feature) =====
 
@@ -44,35 +42,35 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // ===== Public API =====
 
-// Re-export HNSW components (Phase 0 Week 1-2)
+// Vector search components
 pub use hnsw_index::{HnswVectorIndex, SearchResult};
 
-// Re-export RMI core components for learned cache (Phase 0 Week 3-8)
+// Learned index components (RMI for cache prediction)
 pub use rmi_core::{LocalLinearModel, RmiIndex, RmiSegment};
 
-// Re-export learned cache components (Phase 0 Week 3-4)
+// Cache predictor components
 pub use learned_cache::{AccessEvent, AccessType, CachePredictorStats, LearnedCachePredictor};
 
-// Re-export access logger components (Phase 0 Week 5-8)
+// Access logger components
 pub use access_logger::{hash_embedding, AccessLoggerStats, AccessPatternLogger};
 
-// Re-export A/B testing components (Phase 0 Week 9-12)
+// A/B testing components
 pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
 pub use cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy};
 pub use training_task::{spawn_training_task, TrainingConfig};
 pub use vector_cache::{CacheStats, CachedVector, VectorCache};
 
-// Re-export NDCG components (Phase 0.5.2)
+// Quality metrics components
 pub use ndcg::{
     calculate_dcg, calculate_idcg, calculate_mean_ndcg, calculate_mrr, calculate_ndcg,
     calculate_recall_at_k, CacheQualityMetrics, RankingResult,
 };
 
-// Re-export memory profiling components (Phase 0 Week 9-12)
+// Memory profiling components
 pub use memory_profiler::{
     detect_memory_leak, dump_heap_profile, get_memory_stats, MemoryProfiler, MemoryStats,
     MemoryStatsDelta,
 };
 
-// Re-export Phase 1 semantic components
+// Semantic adapter components (hybrid cache: frequency + similarity)
 pub use semantic_adapter::{SemanticAdapter, SemanticConfig, SemanticStats};

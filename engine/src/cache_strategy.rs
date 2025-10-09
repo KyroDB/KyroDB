@@ -1,6 +1,6 @@
 //! Cache Strategy Trait and Implementations
 //!
-//! Phase 0 Week 9-12: A/B testing framework for cache admission policies
+//! Cache strategy framework: A/B testing for LRU vs. Hybrid Semantic Cache
 //! Phase 1: Semantic-aware learned cache (hybrid frequency + semantic similarity)
 //!
 //! Provides pluggable cache strategies:
@@ -365,13 +365,11 @@ mod tests {
         let should_cache_hot = strategy.should_cache(1, &vec![0.5; 128]);
 
         // Cold doc might not be cached (depends on threshold)
-        let should_cache_cold = strategy.should_cache(2, &vec![0.5; 128]);
-
-        println!("Should cache hot doc 1: {}", should_cache_hot);
-        println!("Should cache cold doc 2: {}", should_cache_cold);
+        let _should_cache_cold = strategy.should_cache(2, &vec![0.5; 128]);
 
         // At minimum, hot doc should have higher admission probability
         // (exact behavior depends on RMI training and threshold)
+        assert!(should_cache_hot); // Hot doc should be cached
     }
 
     #[test]
@@ -396,9 +394,8 @@ mod tests {
         }
 
         // Should be roughly 50/50 (within 10% tolerance)
-        println!("LRU: {}, Learned: {}", lru_count, learned_count);
-        assert!((lru_count as i32 - 500).abs() < 50);
-        assert!((learned_count as i32 - 500).abs() < 50);
+        assert!((lru_count as i32 - 500).abs() < 50, "LRU count: {}", lru_count);
+        assert!((learned_count as i32 - 500).abs() < 50, "Learned count: {}", learned_count);
     }
 
     #[test]
@@ -470,6 +467,6 @@ mod tests {
 
         // Should have 100 vectors cached
         let stats_str = strategy.stats();
-        println!("Concurrent stats: {}", stats_str);
+        assert!(stats_str.contains("size"), "Stats should contain 'size': {}", stats_str);
     }
 }

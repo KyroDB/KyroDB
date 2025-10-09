@@ -1,6 +1,6 @@
 //! Learned Cache Predictor using HashMap for cache hotness prediction
 //!
-//! Phase 0 Week 3-4: Direct doc_id → hotness_score mapping
+//! Hybrid Semantic Cache: RMI-based cache predictor (doc_id → hotness_score)
 //!
 //! This module predicts cache hotness: doc_id → P(hot | recent_accesses)
 //! HashMap learns access patterns and predicts which documents should be cached.

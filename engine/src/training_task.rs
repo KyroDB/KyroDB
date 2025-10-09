@@ -1,4 +1,4 @@
-// Phase 0 Week 9-12: Background training task for learned cache
+// Background training task: Periodic RMI retraining for cache predictor
 // Periodically retrains RMI predictor using access logs
 
 use crate::access_logger::AccessPatternLogger;

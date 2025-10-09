@@ -41,7 +41,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::Normal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::{fs, sync::RwLock};
@@ -145,8 +145,8 @@ impl Default for Config {
             // Reduces artificial LRU advantage from concentrated access
             zipf_exponent: 1.4,
 
-            // Test parameters (short smoke test by default)
-            duration_hours: 0.1,
+            // Test parameters (1-hour production-scale validation)
+            duration_hours: 1.0,
             target_qps: 200,
             training_interval_secs: 60,
 
