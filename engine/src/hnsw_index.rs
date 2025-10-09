@@ -175,6 +175,41 @@ impl HnswVectorIndex {
     pub fn capacity(&self) -> usize {
         self.max_elements
     }
+
+    /// Estimate memory usage in bytes
+    ///
+    /// # Components
+    /// - Vector data: current_count × dimension × sizeof(f32)
+    /// - Graph structure: current_count × max_nb_connection × 2 × sizeof(usize)
+    ///   (Each node has ~16 neighbors per layer, 2 layers average)
+    /// - Metadata overhead: ~10% of total
+    ///
+    /// # Note
+    /// This is an estimate. Actual memory may be higher due to:
+    /// - hnsw_rs internal allocations
+    /// - Rust collection overhead (Vec capacity != length)
+    /// - Memory fragmentation
+    pub fn estimate_memory_bytes(&self) -> usize {
+        if self.current_count == 0 {
+            return 0;
+        }
+
+        // Vector data storage
+        let vector_data_bytes = self.current_count * self.dimension * std::mem::size_of::<f32>();
+
+        // Graph structure (neighbors + edge weights)
+        // Assuming max_nb_connection=16, average 2 layers per node
+        let max_nb_connection = 16;
+        let avg_layers = 2;
+        let graph_bytes =
+            self.current_count * max_nb_connection * avg_layers * std::mem::size_of::<usize>();
+
+        // Metadata overhead (10% estimate)
+        let total_without_overhead = vector_data_bytes + graph_bytes;
+        let overhead = total_without_overhead / 10;
+
+        total_without_overhead + overhead
+    }
 }
 
 #[cfg(test)]

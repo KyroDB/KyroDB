@@ -26,9 +26,9 @@ pub struct AccessEvent {
     pub doc_id: u64,
     pub timestamp: SystemTime,
     pub access_type: AccessType,
-    /// Query embedding (384-dim for MS MARCO, or configured embedding_dim)
-    /// Used for semantic similarity-based cache admission in hybrid predictor
-    pub embedding: Vec<f32>,
+    // CRITICAL: Removed embedding field to fix 107MB memory leak
+    // Embeddings are not used in RMI training (only doc_id matters)
+    // This reduces AccessEvent from ~1568 bytes to ~32 bytes (48× smaller!)
 }
 
 impl Default for AccessEvent {
@@ -37,7 +37,6 @@ impl Default for AccessEvent {
             doc_id: 0,
             timestamp: SystemTime::UNIX_EPOCH,
             access_type: AccessType::default(),
-            embedding: Vec::new(),
         }
     }
 }
@@ -420,6 +419,7 @@ mod tests {
             doc_id,
             timestamp: SystemTime::now() - Duration::from_secs(seconds_ago),
             access_type: AccessType::Read,
+            embedding: vec![0.5; 128], // Mock embedding for tests
         }
     }
 

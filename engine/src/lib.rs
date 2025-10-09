@@ -30,6 +30,18 @@ pub mod vector_cache; // In-memory vector cache with LRU eviction
 // Phase 1: Semantic-aware learned cache (hybrid frequency + semantic similarity)
 pub mod semantic_adapter; // Semantic layer for hybrid cache decisions
 
+// Phase 0.5.2: NDCG quality metrics for cache and search validation
+pub mod ndcg; // NDCG@10, MRR, Recall@k for ranking quality
+
+// Phase 0 Week 9-12: Memory profiling with jemalloc (optional feature)
+pub mod memory_profiler; // Memory leak detection and profiling
+
+// ===== Global Allocator (jemalloc-profiling feature) =====
+
+#[cfg(feature = "jemalloc-profiling")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // ===== Public API =====
 
 // Re-export HNSW components (Phase 0 Week 1-2)
@@ -49,6 +61,18 @@ pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
 pub use cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy};
 pub use training_task::{spawn_training_task, TrainingConfig};
 pub use vector_cache::{CacheStats, CachedVector, VectorCache};
+
+// Re-export NDCG components (Phase 0.5.2)
+pub use ndcg::{
+    calculate_dcg, calculate_idcg, calculate_mean_ndcg, calculate_mrr, calculate_ndcg,
+    calculate_recall_at_k, CacheQualityMetrics, RankingResult,
+};
+
+// Re-export memory profiling components (Phase 0 Week 9-12)
+pub use memory_profiler::{
+    detect_memory_leak, dump_heap_profile, get_memory_stats, MemoryProfiler, MemoryStats,
+    MemoryStatsDelta,
+};
 
 // Re-export Phase 1 semantic components
 pub use semantic_adapter::{SemanticAdapter, SemanticConfig, SemanticStats};

@@ -246,6 +246,7 @@ mod tests {
                 doc_id: i % 10,
                 timestamp: SystemTime::now(),
                 access_type: crate::learned_cache::AccessType::Read,
+                embedding: vec![0.5; 128], // Mock embedding
             };
             events.push(event);
         }

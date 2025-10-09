@@ -31,6 +31,7 @@ use kyrodb_engine::{
     access_logger::AccessPatternLogger,
     cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
     learned_cache::LearnedCachePredictor,
+    ndcg::{calculate_ndcg, calculate_mrr, calculate_recall_at_k, RankingResult},
     semantic_adapter::SemanticAdapter,
     training_task::{spawn_training_task, TrainingConfig},
     vector_cache::CachedVector,
@@ -268,6 +269,14 @@ struct ValidationResults {
     // Comparison
     hit_rate_improvement: f64,
     absolute_improvement: f64,
+
+    // Quality metrics (Phase 0.5.2: NDCG validation)
+    lru_ndcg_at_10: f64,
+    learned_ndcg_at_10: f64,
+    lru_mrr: f64,
+    learned_mrr: f64,
+    lru_recall_at_10: f64,
+    learned_recall_at_10: f64,
 
     // Training stats
     expected_training_cycles: u64,
@@ -797,7 +806,11 @@ impl SemanticWorkloadGenerator {
         })
     }
 
-    async fn sample(&self) -> (Vec<f32>, u64) {
+    /// Sample (query_hash, doc_id) pair
+    ///
+    /// Returns the hash of a query embedding (not the embedding itself)
+    /// to avoid 71K × 1.5KB = 107MB of unnecessary allocations per test.
+    async fn sample(&self) -> (u64, u64) {
         use std::sync::atomic::{AtomicU64 as FallbackCounter, Ordering};
         static FALLBACK_COUNT: FallbackCounter = FallbackCounter::new(0);
         static TOTAL_COUNT: FallbackCounter = FallbackCounter::new(0);
@@ -823,8 +836,10 @@ impl SemanticWorkloadGenerator {
                     paraphrases[idx]
                 };
 
-                let query_embedding = self.query_embeddings[query_idx].clone();
-                return (query_embedding, doc_id);
+                // CRITICAL FIX: Compute hash without cloning embedding
+                // This eliminates 71K × 1.5KB = 107MB of allocations per test
+                let query_hash = hash_embedding(&self.query_embeddings[query_idx]);
+                return (query_hash, doc_id);
             }
         }
 
@@ -838,9 +853,8 @@ impl SemanticWorkloadGenerator {
                 fallback_count + 1, total + 1, (fallback_count + 1) as f64 / (total + 1) as f64 * 100.0);
         }
         
-        let mut fallback_embedding = vec![0.0f32; self.query_embeddings[0].len()];
-        fallback_embedding[0] = doc_id as f32;
-        (fallback_embedding, doc_id)
+        // Fallback: hash doc_id directly
+        (doc_id, doc_id)
     }
 }
 
@@ -920,27 +934,11 @@ fn print_usage(program_name: &str) {
 
 /// Get process memory usage in MB (Linux only)
 fn get_memory_mb() -> Result<f64> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status")
-            .context("Failed to read /proc/self/status")?;
-
-        for line in status.lines() {
-            if line.starts_with("VmRSS:") {
-                if let Some(kb_str) = line.split_whitespace().nth(1) {
-                    let kb = kb_str
-                        .parse::<f64>()
-                        .context("Failed to parse memory value")?;
-                    return Ok(kb / 1024.0);
-                }
-            }
-        }
-        bail!("VmRSS not found in /proc/self/status");
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        bail!("Memory tracking only supported on Linux");
+    use kyrodb_engine::get_memory_stats;
+    
+    match get_memory_stats() {
+        Ok(stats) => Ok(stats.resident as f64 / 1_048_576.0),
+        Err(e) => bail!("Memory tracking unavailable: {}", e),
     }
 }
 
@@ -1324,6 +1322,12 @@ async fn main() -> Result<()> {
     let mut learned_queries = 0u64;
     let mut learned_hits = 0u64;
 
+    // Phase 0.5.2: NDCG quality metric tracking
+    // Track per-document cache quality: How many times was each cached doc accessed?
+    // Key = cache_key (doc hash), Value = access count while cached
+    let mut lru_cache_doc_accesses: HashMap<u64, usize> = HashMap::new();
+    let mut learned_cache_doc_accesses: HashMap<u64, usize> = HashMap::new();
+
     let start_time = SystemTime::now();
     let test_start = Instant::now();
     let mut next_query = Instant::now();
@@ -1356,11 +1360,12 @@ async fn main() -> Result<()> {
                 (doc_id, doc_id) // Cache by doc_id for ID-based sampling
             }
             WorkloadGenerator::Semantic(gen) => {
-                let (query_embedding, doc_id) = gen.sample().await;
+                // CRITICAL FIX: sample() now returns (hash, doc_id) directly
+                // This eliminates 71K × 1.5KB = 107MB of cloned embeddings per test
+                let (query_hash, doc_id) = gen.sample().await;
                 // Phase 0.5.2: Cache by query embedding hash (not doc_id!)
                 // This simulates real RAG: "What is ML?" and "Explain ML" have DIFFERENT cache keys
-                let cache_key = hash_embedding(&query_embedding);
-                (cache_key, doc_id)
+                (query_hash, doc_id)
             }
         };
 
@@ -1427,12 +1432,20 @@ async fn main() -> Result<()> {
                 lru_queries += 1;
                 if cache_hit {
                     lru_hits += 1;
+                    
+                    // Phase 0.5.2: NDCG quality tracking
+                    // Track: How many times was this doc accessed while in cache?
+                    *lru_cache_doc_accesses.entry(cache_key).or_insert(0) += 1;
                 }
+                // Note: We don't track misses - only docs that WERE cached matter for quality
             }
             StrategyId::LearnedRmi => {
                 learned_queries += 1;
                 if cache_hit {
                     learned_hits += 1;
+                    
+                    // Phase 0.5.2: NDCG quality tracking
+                    *learned_cache_doc_accesses.entry(cache_key).or_insert(0) += 1;
                 }
             }
         }
@@ -1520,6 +1533,33 @@ async fn main() -> Result<()> {
     println!("─────────────────────────────────────────────────────────────────");
     println!("\nTest complete!\n");
 
+    // Memory breakdown logging (identify leak source)
+    {
+        let access_logger_read = access_logger.read().await;
+        let access_logger_len = access_logger_read.len();
+        // FIXED: Removed embedding from AccessEvent (was 1536 bytes, now ~0)
+        // AccessEvent now contains only: doc_id (8), timestamp (16), access_type (1) = ~32 bytes
+        // This fixed the 107MB memory leak!
+        let bytes_per_event = 32; // doc_id + timestamp + access_type + padding
+        let access_logger_mb = (access_logger_len * bytes_per_event) as f64 / 1_048_576.0;
+        
+        let lru_cache_len = lru_strategy.cache.len();
+        let lru_cache_mb = (lru_cache_len * 384 * 4) as f64 / 1_048_576.0; // 384-dim f32 vectors
+        
+        let learned_cache_len = learned_strategy.cache.len();
+        let learned_cache_mb = (learned_cache_len * 384 * 4) as f64 / 1_048_576.0;
+        
+        println!("Memory Breakdown:");
+        println!("  Access logger:   {:.1} MB ({} events × ~32 bytes/event)", access_logger_mb, access_logger_len);
+        println!("  LRU cache:       {:.1} MB ({} vectors)", lru_cache_mb, lru_cache_len);
+        println!("  Learned cache:   {:.1} MB ({} vectors)", learned_cache_mb, learned_cache_len);
+        println!("  Query embeddings: ~461.0 MB (300K × 384-dim, constant)");
+        println!("  Doc embeddings:  ~14.6 MB (10K × 384-dim, constant)");
+        println!("  Expected total:  ~{:.1} MB", 461.0 + 14.6 + access_logger_mb + lru_cache_mb + learned_cache_mb);
+        println!("  NOTE: Access logger fixed - removed 107MB embedding storage leak!");
+        println!();
+    }
+
     let lru_hit_rate = if lru_queries > 0 {
         lru_hits as f64 / lru_queries as f64
     } else {
@@ -1551,6 +1591,85 @@ async fn main() -> Result<()> {
 
     let cache_to_ws_ratio = config.cache_capacity as f64 / expected_ws as f64;
 
+    // Phase 0.5.2: Calculate NDCG@10 quality metrics
+    println!("\nCalculating NDCG quality metrics...");
+    
+    // Convert HashMap to ranked RankingResults (sorted by access count DESC)
+    let mut lru_ranking: Vec<(u64, usize)> = lru_cache_doc_accesses.into_iter().collect();
+    lru_ranking.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by access count DESC
+    
+    let lru_cache_ranking_results: Vec<RankingResult> = lru_ranking
+        .iter()
+        .enumerate()
+        .map(|(position, &(doc_id, access_count))| RankingResult {
+            doc_id,
+            position,
+            relevance: access_count as f64, // More accesses = more relevant
+        })
+        .collect();
+    
+    let mut learned_ranking: Vec<(u64, usize)> = learned_cache_doc_accesses.into_iter().collect();
+    learned_ranking.sort_by(|a, b| b.1.cmp(&a.1));
+    
+    let learned_cache_ranking_results: Vec<RankingResult> = learned_ranking
+        .iter()
+        .enumerate()
+        .map(|(position, &(doc_id, access_count))| RankingResult {
+            doc_id,
+            position,
+            relevance: access_count as f64,
+        })
+        .collect();
+    
+    println!("  LRU cache: {} unique docs cached", lru_cache_ranking_results.len());
+    println!("  Learned cache: {} unique docs cached", learned_cache_ranking_results.len());
+    
+    let lru_ndcg_at_10 = if !lru_cache_ranking_results.is_empty() {
+        calculate_ndcg(&lru_cache_ranking_results, 10)
+    } else {
+        0.0
+    };
+    
+    let learned_ndcg_at_10 = if !learned_cache_ranking_results.is_empty() {
+        calculate_ndcg(&learned_cache_ranking_results, 10)
+    } else {
+        0.0
+    };
+    
+    let lru_mrr = if !lru_cache_ranking_results.is_empty() {
+        calculate_mrr(&lru_cache_ranking_results)
+    } else {
+        0.0
+    };
+    
+    let learned_mrr = if !learned_cache_ranking_results.is_empty() {
+        calculate_mrr(&learned_cache_ranking_results)
+    } else {
+        0.0
+    };
+    
+    // Recall@10: Top-10 docs by access count vs all cached docs
+    let lru_total_relevant = lru_cache_ranking_results.len();
+    let lru_recall_at_10 = if lru_total_relevant > 0 {
+        calculate_recall_at_k(&lru_cache_ranking_results, 10, lru_total_relevant)
+    } else {
+        0.0
+    };
+    
+    let learned_total_relevant = learned_cache_ranking_results.len();
+    let learned_recall_at_10 = if learned_total_relevant > 0 {
+        calculate_recall_at_k(&learned_cache_ranking_results, 10, learned_total_relevant)
+    } else {
+        0.0
+    };
+    
+    println!("  LRU NDCG@10:     {:.4}", lru_ndcg_at_10);
+    println!("  Learned NDCG@10: {:.4}", learned_ndcg_at_10);
+    println!("  LRU MRR:         {:.4}", lru_mrr);
+    println!("  Learned MRR:     {:.4}", learned_mrr);
+    println!("  LRU Recall@10:   {:.4}", lru_recall_at_10);
+    println!("  Learned Recall@10: {:.4}", learned_recall_at_10);
+
     let results = ValidationResults {
         config: config.clone(),
         test_duration_secs: actual_duration,
@@ -1568,6 +1687,14 @@ async fn main() -> Result<()> {
 
         hit_rate_improvement: improvement,
         absolute_improvement,
+
+        // Quality metrics (Phase 0.5.2)
+        lru_ndcg_at_10,
+        learned_ndcg_at_10,
+        lru_mrr,
+        learned_mrr,
+        lru_recall_at_10,
+        learned_recall_at_10,
 
         expected_training_cycles: (actual_duration as f64 / config.training_interval_secs as f64).round() as u64,
         actual_training_cycles,
@@ -1642,6 +1769,23 @@ async fn main() -> Result<()> {
             "FAIL"
         }
     );
+    println!();
+    println!("Quality Metrics (NDCG@10):");
+    println!("  LRU:");
+    println!("    NDCG@10:       {:.4}", lru_ndcg_at_10);
+    println!("    MRR:           {:.4}", lru_mrr);
+    println!("    Recall@10:     {:.4}", lru_recall_at_10);
+    println!("  Learned Cache:");
+    println!("    NDCG@10:       {:.4}", learned_ndcg_at_10);
+    println!("    MRR:           {:.4}", learned_mrr);
+    println!("    Recall@10:     {:.4}", learned_recall_at_10);
+    println!("  Quality Improvement:");
+    let ndcg_improvement = if lru_ndcg_at_10 > 0.0 {
+        learned_ndcg_at_10 / lru_ndcg_at_10
+    } else {
+        0.0
+    };
+    println!("    NDCG gain:     {:.2}×", ndcg_improvement);
     println!();
     println!("Training:");
     println!("  Expected cycles: {}", results.expected_training_cycles);

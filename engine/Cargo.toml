@@ -20,6 +20,8 @@ default = []
 learned-cache = []
 # Benchmarking: disable metrics for zero-overhead measurements
 bench-no-metrics = []
+# Memory profiling: jemalloc allocator with profiling support
+jemalloc-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 
 [dependencies]
 # Phase 0 Week 1-2: HNSW vector search
@@ -43,6 +45,13 @@ rayon = "1.10"  # Phase 0.5.2: Parallel doc-to-queries map building
 # Phase 0 Week 13-16: Full persistence (will add when needed)
 # bincode = "1.3"
 # memmap2 = "0.9"
+
+# Memory profiling: jemalloc allocator with profiling support (optional)
+tikv-jemallocator = { version = "0.6", optional = true, features = ["profiling", "stats"] }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["use_std", "stats"] }
+
+# Lock-free ring buffer: ringbuf crate (replaces custom RingBuffer)
+ringbuf = "0.4"
 
 [dev-dependencies]
 # Phase 0 Week 1-2: Testing HNSW recall guarantees

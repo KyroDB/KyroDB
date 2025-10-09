@@ -347,12 +347,14 @@ mod tests {
                 doc_id: 1,
                 timestamp: SystemTime::now(),
                 access_type: crate::learned_cache::AccessType::Read,
+                embedding: vec![0.5; 128], // Mock embedding
             });
         }
         events.push(AccessEvent {
             doc_id: 2,
             timestamp: SystemTime::now(),
             access_type: crate::learned_cache::AccessType::Read,
+            embedding: vec![0.6; 128], // Mock embedding
         });
 
         predictor.train_from_accesses(&events).unwrap();
@@ -428,6 +430,7 @@ mod tests {
             doc_id: 42,
             timestamp: SystemTime::now(),
             access_type: crate::learned_cache::AccessType::Read,
+            embedding: vec![0.7; 128], // Mock embedding
         }];
         predictor2.train_from_accesses(&events).unwrap();
 
