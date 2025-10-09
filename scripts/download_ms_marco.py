@@ -3,7 +3,7 @@
 Download and prepare MS MARCO dataset for KyroDB validation.
 
 Phase 0.5.1: Dataset Integration
-- Downloads 100K passages from MS MARCO v1.1
+- Downloads 100K passages from MS MARCO v2.1 (passage ranking)
 - Generates embeddings using Sentence-BERT (all-MiniLM-L6-v2)
 - Saves passages, doc IDs, and embeddings for validation tests
 
@@ -32,41 +32,51 @@ except ImportError as e:
 
 def download_passages(output_dir: Path, num_passages: int = 100_000):
     """Download MS MARCO passages and save to text files."""
-    print(f"Downloading {num_passages:,} passages from MS MARCO v1.1...")
+    print(f"Downloading {num_passages:,} passages from MS MARCO v2.1...")
     
     try:
-        # Load dataset from Hugging Face (use 'corpus' split for passages)
-        ds = load_dataset('microsoft/ms_marco', 'v1.1', split='corpus')
+        # Load MS MARCO v2.1 passage ranking dataset
+        # This version has the actual passage corpus
+        print("Loading dataset (this may take a few minutes)...")
+        ds = load_dataset('microsoft/ms_marco', 'v2.1', split='train')
         
-        # MS MARCO v1.1 corpus structure:
-        # {'docid': str, 'text': str}
+        # MS MARCO v2.1 structure:
+        # {'query': str, 'passages': [{'is_selected': int, 'passage_text': str, 'url': str}]}
         passages = []
         doc_ids = []
+        seen_passages = set()  # Deduplicate passages
         
-        print(f"Total passages available: {len(ds):,}")
+        print(f"Total samples available: {len(ds):,}")
+        print("Extracting unique passages...")
         
-        # Take first num_passages
+        # Extract passages from training data
         for i, row in enumerate(ds):
-            if i >= num_passages:
+            if len(passages) >= num_passages:
                 break
             
-            # Extract passage text (field is 'text' in corpus split)
-            passage_text = row.get('text', '')
-            if not passage_text or len(passage_text.strip()) == 0:
-                continue
+            # Each row has multiple passages
+            for passage_dict in row.get('passages', []):
+                if len(passages) >= num_passages:
+                    break
                 
-            passages.append(passage_text)
+                passage_text = passage_dict.get('passage_text', '').strip()
+                
+                # Skip empty or duplicate passages
+                if not passage_text or passage_text in seen_passages:
+                    continue
+                
+                seen_passages.add(passage_text)
+                passages.append(passage_text)
+                doc_ids.append(str(len(passages) - 1))  # Use index as doc_id
             
-            # Use docid from dataset
-            doc_id = row.get('docid', str(i))
-            doc_ids.append(doc_id)
+            # Progress indicator
+            if (i + 1) % 1000 == 0:
+                print(f"  Processed {i + 1:,} samples, found {len(passages):,} unique passages...")
         
-        print(f"Downloaded {len(passages):,} valid passages")
+        print(f"Extracted {len(passages):,} unique passages")
         
         if len(passages) == 0:
             print("Error: No passages extracted from dataset")
-            print("Dataset structure:")
-            print(ds[0] if len(ds) > 0 else "Empty dataset")
             sys.exit(1)
         
         # Save passages (one per line)
@@ -95,7 +105,9 @@ def download_passages(output_dir: Path, num_passages: int = 100_000):
         print("  1. Check internet connection")
         print("  2. Verify Hugging Face datasets library is installed")
         print("  3. Try: pip install --upgrade datasets")
-        print(f"  4. Try smaller size: --size 10000")
+        print("  4. Try smaller size: --size 10000")
+        print("\nAlternative: Use mock embeddings instead:")
+        print("  python3 scripts/generate_mock_embeddings.py --size 100000")
         sys.exit(1)
 
 
@@ -232,11 +244,13 @@ def main():
             print("\n" + "=" * 70)
             print("SUCCESS: Dataset ready for validation")
             print("=" * 70)
-            print(f"\nNext steps:")
-            print(f"  1. Build validation binary:")
-            print(f"     cargo build --release --bin validation_enterprise")
-            print(f"  2. Run validation:")
-            print(f"     ./target/release/validation_enterprise validation_semantic_smoke.json")
+            print("\nNext steps:")
+            print("  1. Generate query embeddings:")
+            print("     python3 scripts/generate_query_embeddings.py --size", num_passages, "--queries-per-doc 5")
+            print("  2. Build validation binary:")
+            print("     cargo build --release --bin validation_enterprise")
+            print("  3. Run validation:")
+            print("     ./target/release/validation_enterprise validation_enterprise.json")
         else:
             print("\nWarning: Data verification failed")
             sys.exit(1)
