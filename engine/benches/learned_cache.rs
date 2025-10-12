@@ -1,6 +1,5 @@
 //! Benchmarks for Learned Cache Predictor
 //!
-//! Phase 0 Week 3-4: Measure hotness prediction latency and training time
 //!
 //! Targets:
 //! - Hotness prediction: <100ns P99

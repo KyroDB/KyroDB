@@ -1,4 +1,3 @@
-//! 12-hour validation workload for Phase 0 Week 9-12
 //!
 //! **Purpose**: Validate KyroDB A/B testing framework under sustained production-like load
 //!
@@ -290,7 +289,6 @@ async fn main() -> Result<()> {
     config.validate().context("Invalid configuration")?;
 
     println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║  KyroDB 12-Hour Validation Workload - Phase 0 Week 9-12       ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Configuration:");

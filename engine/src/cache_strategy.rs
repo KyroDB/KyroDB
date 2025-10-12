@@ -1,7 +1,6 @@
 //! Cache Strategy Trait and Implementations
 //!
 //! Cache strategy framework: A/B testing for LRU vs. Hybrid Semantic Cache
-//! Phase 1: Semantic-aware learned cache (hybrid frequency + semantic similarity)
 //!
 //! Provides pluggable cache strategies:
 //! - LRU baseline: Always cache, LRU eviction
@@ -93,8 +92,6 @@ impl CacheStrategy for LruCacheStrategy {
 /// Uses RMI predictor to decide cache admission based on predicted hotness.
 /// Optionally integrates semantic adapter for hybrid decision-making.
 ///
-/// Without semantic: ID-based frequency prediction (Phase 0)
-/// With semantic: Hybrid frequency + semantic similarity (Phase 1)
 pub struct LearnedCacheStrategy {
     pub cache: Arc<VectorCache>,
     pub predictor: Arc<parking_lot::RwLock<LearnedCachePredictor>>,
@@ -192,7 +189,6 @@ impl CacheStrategy for LearnedCacheStrategy {
         // Check if semantic adapter is enabled
         let semantic_adapter_guard = self.semantic_adapter.read();
         if let Some(semantic_adapter) = semantic_adapter_guard.as_ref() {
-            // Phase 1: Hybrid decision (frequency + semantic)
             let should_cache = semantic_adapter.should_cache(freq_score, embedding);
 
             // Cache embedding for future similarity checks if admitted
@@ -204,7 +200,6 @@ impl CacheStrategy for LearnedCacheStrategy {
         }
         drop(semantic_adapter_guard);
 
-        // Phase 0: Frequency-only decision (original logic)
         if freq_score >= threshold {
             return true;
         }

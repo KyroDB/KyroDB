@@ -231,8 +231,6 @@ Our learned cache predicts hot documents **before** you query them:
 
 - [`STATUS.md`](STATUS.md) - **Start here** - Current state summary for stakeholders
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Current vs target architecture
-- [`Implementation.md`](Implementation.md) - Detailed execution plan
-- [`other_docs/IMPLEMENTATION_UPDATE_ANALYSIS.md`](other_docs/IMPLEMENTATION_UPDATE_ANALYSIS.md) - Progress analysis
 - [`docs/visiondocument.md`](docs/visiondocument.md) - Long-term vision
 
 ---

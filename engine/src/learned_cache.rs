@@ -20,7 +20,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Access event for training learned cache predictor
 ///
-/// Phase 0.5.1: Added embedding field for semantic similarity computation
 #[derive(Debug, Clone)]
 pub struct AccessEvent {
     pub doc_id: u64,

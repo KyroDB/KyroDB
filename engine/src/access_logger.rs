@@ -116,7 +116,6 @@ impl AccessPatternLogger {
     ///
     /// # Parameters
     /// - `doc_id`: Document ID that was accessed
-    /// - `query_embedding`: Query embedding for semantic cache (Phase 0.5.1+)
     #[inline]
     pub fn log_access(&self, doc_id: u64, _query_embedding: &[f32]) {
         // CRITICAL FIX: Removed embedding storage to fix 107MB memory leak

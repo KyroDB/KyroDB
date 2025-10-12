@@ -1,6 +1,5 @@
 //! HNSW k-NN search benchmarks
 //!
-//! Phase 0 Week 1-2: Validate P99 < 1ms on 10M vectors target
 //!
 //! Run with: cargo bench --bench hnsw_knn
 

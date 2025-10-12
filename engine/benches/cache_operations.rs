@@ -1,4 +1,3 @@
-//! Cache operation benchmarks - Phase 0 Week 9-12
 //!
 //! Validates cache performance targets:
 //! - Cache lookup: < 50ns (hash table O(1))

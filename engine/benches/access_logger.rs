@@ -1,6 +1,5 @@
 //! Benchmarks for Access Pattern Logger
 //!
-//! Phase 0 Week 5-8: Measure logging overhead and flush performance
 //!
 //! Targets:
 //! - Log overhead: <10ns per access

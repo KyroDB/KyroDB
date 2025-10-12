@@ -1,6 +1,5 @@
 //! Semantic Adapter for Learned Cache
 //!
-//! Phase 1: Lightweight semantic layer over ID-based learned cache
 //!
 //! Adds semantic awareness to frequency-based prediction:
 //! - Cosine similarity for semantic matching

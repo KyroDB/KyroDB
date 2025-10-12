@@ -101,7 +101,6 @@ struct Config {
     results_json: String,
 
     /// Path to MS MARCO embeddings (optional, falls back to mock)
-    /// Phase 0.5.1: Support real embeddings for semantic validation
     #[serde(default)]
     ms_marco_embeddings_path: Option<String>,
 
@@ -109,8 +108,7 @@ struct Config {
     #[serde(default)]
     ms_marco_passages_path: Option<String>,
 
-    /// Path to query embeddings (optional)
-    /// Phase 0.5.2: Support semantic query generation for realistic RAG workloads
+    /// Path to query embeddings for semantic workload generation
     #[serde(default)]
     query_embeddings_path: Option<String>,
 
@@ -153,7 +151,6 @@ impl Default for Config {
 
           
             // Captures longer-term patterns for learned cache training
-            // Memory is not a concern (validated in Phase 0 Week 5-8)
             logger_window_size: 100_000,
 
             // Temporal patterns (realistic production)
@@ -170,11 +167,9 @@ impl Default for Config {
             stats_csv: "validation_enterprise.csv".to_string(),
             results_json: "validation_enterprise.json".to_string(),
 
-            // Phase 0.5.1: MS MARCO dataset paths (auto-detect if present)
             ms_marco_embeddings_path: Some("data/ms_marco/embeddings_100k.npy".to_string()),
             ms_marco_passages_path: Some("data/ms_marco/passages_100k.txt".to_string()),
 
-            // Phase 0.5.2: Query embeddings for semantic workload (auto-detect if present)
             query_embeddings_path: Some("data/ms_marco/query_embeddings_100k.npy".to_string()),
             query_to_doc_path: Some("data/ms_marco/query_to_doc.txt".to_string()),
             top_k_queries_per_doc: 10,
@@ -271,7 +266,6 @@ struct ValidationResults {
     hit_rate_improvement: f64,
     absolute_improvement: f64,
 
-    // Quality metrics (Phase 0.5.2: NDCG validation)
     lru_ndcg_at_10: f64,
     learned_ndcg_at_10: f64,
     lru_mrr: f64,
@@ -399,7 +393,6 @@ impl TemporalWorkloadGenerator {
 
         let mut rng = self.rng.write().await;
 
-        // Phase 0.5 Fix: Check cold traffic FIRST (before spikes/rotations)
         // Bug: cold check after spike meant 50% spike queries skipped cold logic
         // Result: actual cold traffic was ~10% instead of configured 20%
         if rng.gen::<f64>() < self.cold_traffic_ratio {
@@ -537,91 +530,44 @@ impl ZipfSampler {
     }
 }
 
-// ============================================================================
-// DEPRECATED: DocumentStore trait and implementations
-// Replaced by HnswBackend (engine/src/hnsw_backend.rs) in Phase 1 integration
-// Kept temporarily for numpy parsing utility (parse_numpy_embeddings)
-// TODO: Move parse_numpy_embeddings to a data loading utility module
-// ============================================================================
 
-/// DEPRECATED: Use HnswBackend instead
-#[allow(dead_code)]
-trait DocumentStore: Send + Sync {
-    fn fetch(&self, doc_id: u64) -> Option<Vec<f32>>;
-    fn corpus_size(&self) -> usize;
-    fn get_all_embeddings(&self) -> Option<Arc<Vec<Vec<f32>>>>;
-}
 
-/// DEPRECATED: Only used for parse_numpy_embeddings utility
-#[allow(dead_code)]
-struct RealDocumentStore {
-    embeddings: Arc<Vec<Vec<f32>>>,
-    passages: Arc<Vec<String>>,
-    embedding_dim: usize,
-}
+fn generate_mock_embeddings(corpus_size: usize, embedding_dim: usize) -> Vec<Vec<f32>> {
+    let mut topics = std::cmp::max(16, corpus_size / 1000);
+    topics = topics.min(256);
+    topics = topics.max(1).min(corpus_size.max(1));
 
-#[allow(dead_code)]
-impl DocumentStore for RealDocumentStore {
-    fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
-        self.embeddings.get(doc_id as usize).cloned()
-    }
-
-    fn corpus_size(&self) -> usize {
-        self.embeddings.len()
-    }
-    
-    fn get_all_embeddings(&self) -> Option<Arc<Vec<Vec<f32>>>> {
-        Some(self.embeddings.clone())
-    }
-}
-
-#[allow(dead_code)]
-impl RealDocumentStore {
-    #[allow(dead_code)]
-    fn new(embeddings_path: &str, passages_path: &str) -> Result<Self> {
-        println!("Loading MS MARCO data...");
-        println!("  Embeddings: {}", embeddings_path);
-        println!("  Passages: {}", passages_path);
-
-        let embeddings_data =
-            std::fs::read(embeddings_path).context("Failed to read embeddings file")?;
-
-        let embeddings = Self::parse_numpy_embeddings(&embeddings_data)
-            .context("Failed to parse numpy embeddings")?;
-
-        let passages_text =
-            std::fs::read_to_string(passages_path).context("Failed to read passages file")?;
-        let passages: Vec<String> = passages_text.lines().map(|s| s.to_string()).collect();
-
-        if embeddings.len() != passages.len() {
-            bail!(
-                "Mismatch: {} embeddings but {} passages",
-                embeddings.len(),
-                passages.len()
-            );
+    let mut rng = ChaCha8Rng::seed_from_u64(0x5EEDFACE);
+    let mut topic_bases = Vec::with_capacity(topics);
+    for _ in 0..topics {
+        let mut base = vec![0.0f32; embedding_dim];
+        for value in base.iter_mut() {
+            *value = rng.gen::<f32>() * 2.0 - 1.0;
         }
+        normalize_embedding(&mut base);
+        topic_bases.push(base);
+    }
 
-        println!(
-            "Loaded {} embeddings ({}×{}-dim), {:.1} MB",
-            embeddings.len(),
-            embeddings.len(),
-            384,
-            (embeddings.len() * 384 * 4) as f64 / 1024.0 / 1024.0
-        );
+    let noise_stddev = 0.05;
+    let noise = Normal::new(0.0, noise_stddev as f64).expect("valid noise distribution");
 
-        Ok(Self {
-            embeddings: Arc::new(embeddings),
-            passages: Arc::new(passages),
-            embedding_dim: 384,
+    (0..corpus_size)
+        .map(|doc_id| {
+            let topic_index = doc_id % topic_bases.len();
+            let mut embedding = topic_bases[topic_index].clone();
+            
+            let mut doc_rng = ChaCha8Rng::seed_from_u64(doc_id as u64);
+            for value in embedding.iter_mut() {
+                *value += noise.sample(&mut doc_rng) as f32;
+            }
+            
+            normalize_embedding(&mut embedding);
+            embedding
         })
-    }
+        .collect()
+}
 
-    #[allow(dead_code)]
-    fn get_passage(&self, doc_id: u64) -> Option<&str> {
-        self.passages.get(doc_id as usize).map(|s| s.as_str())
-    }
-
-    pub fn parse_numpy_embeddings(data: &[u8]) -> Result<Vec<Vec<f32>>> {
+fn parse_numpy_embeddings(data: &[u8]) -> Result<Vec<Vec<f32>>> {
         if data.len() < 128 {
             bail!("Invalid numpy file: too small ({}  bytes)", data.len());
         }
@@ -689,81 +635,8 @@ impl RealDocumentStore {
         );
 
         Ok(embeddings)
-    }
 }
 
-/// DEPRECATED: Only used to generate mock embeddings for HNSW backend
-#[allow(dead_code)]
-struct MockDocumentStore {
-    corpus_size: usize,
-    embedding_dim: usize,
-    topic_bases: Vec<Vec<f32>>,
-    noise_stddev: f32,
-}
-
-#[allow(dead_code)]
-impl DocumentStore for MockDocumentStore {
-    fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
-        if doc_id >= self.corpus_size as u64 {
-            return None;
-        }
-
-        let topic_index = (doc_id as usize) % self.topic_bases.len();
-        let mut embedding = self.topic_bases[topic_index].clone();
-        debug_assert_eq!(embedding.len(), self.embedding_dim);
-
-        let mut rng = ChaCha8Rng::seed_from_u64(doc_id);
-        let noise = Normal::new(0.0, self.noise_stddev as f64).expect("valid noise distribution");
-        for value in embedding.iter_mut() {
-            *value += noise.sample(&mut rng) as f32;
-        }
-
-        normalize_embedding(&mut embedding);
-        Some(embedding)
-    }
-
-    fn corpus_size(&self) -> usize {
-        self.corpus_size
-    }
-    
-    fn get_all_embeddings(&self) -> Option<Arc<Vec<Vec<f32>>>> {
-        None // MockDocumentStore doesn't pre-store embeddings
-    }
-}
-
-impl MockDocumentStore {
-    fn new(corpus_size: usize) -> Self {
-        let embedding_dim = 768;
-        let mut topics = std::cmp::max(16, corpus_size / 1000);
-        topics = topics.min(256);
-        topics = topics.max(1).min(corpus_size.max(1));
-
-        let mut rng = ChaCha8Rng::seed_from_u64(0x5EEDFACE);
-        let mut topic_bases = Vec::with_capacity(topics);
-        for _ in 0..topics {
-            let mut base = vec![0.0f32; embedding_dim];
-            for value in base.iter_mut() {
-                *value = rng.gen::<f32>() * 2.0 - 1.0;
-            }
-            normalize_embedding(&mut base);
-            topic_bases.push(base);
-        }
-
-        Self {
-            corpus_size,
-            embedding_dim,
-            topic_bases,
-            noise_stddev: 0.05,
-        }
-    }
-}
-
-/// Phase 0.5.2: Semantic workload generator with query paraphrasing
-///
-/// Production-realistic simulation:
-/// - Same document requested via MANY different query variations (not just 10)
-/// - Random paraphrase selection (not deterministic cycling)
-/// - Exposes LRU's fundamental weakness: it can't see that different queries target the same document
 struct SemanticWorkloadGenerator {
     doc_sampler: Arc<RwLock<ZipfSampler>>,
     query_embeddings: Arc<Vec<Vec<f32>>>,
@@ -791,7 +664,6 @@ impl SemanticWorkloadGenerator {
             bail!("Corpus size cannot be zero.");
         }
 
-        println!("\nPhase 0.5.2: Building document-to-query map...");
         let start = Instant::now();
 
         // Build reverse map: doc_id → [ALL query indices that target it]
@@ -997,7 +869,6 @@ async fn main() -> Result<()> {
     config.validate().context("Invalid configuration")?;
 
     println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║  KyroDB Enterprise Validation - Phase 0 Week 9-12             ║");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Configuration:");
@@ -1104,7 +975,6 @@ async fn main() -> Result<()> {
         AbStatsPersister::new(&config.stats_csv).context("Failed to create stats persister")?,
     );
 
-    // Phase 1: Load embeddings and build HNSW backend (replaces DocumentStore trait)
     println!("\n🔧 Building HNSW backend...");
     let hnsw_backend: Arc<HnswBackend> = match (
         &config.ms_marco_embeddings_path,
@@ -1119,7 +989,7 @@ async fn main() -> Result<()> {
             // Load embeddings
             let embeddings_data = std::fs::read(embeddings_path)
                 .context("Failed to read embeddings file")?;
-            let embeddings = RealDocumentStore::parse_numpy_embeddings(&embeddings_data)?;
+            let embeddings = parse_numpy_embeddings(&embeddings_data)?;
             
             // Build HNSW backend
             let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
@@ -1131,11 +1001,7 @@ async fn main() -> Result<()> {
             println!("WARNING: MS MARCO paths configured but files not found");
             println!("Falling back to mock clustered embeddings");
             
-            // Generate mock embeddings
-            let mock_store = MockDocumentStore::new(config.corpus_size);
-            let embeddings: Vec<Vec<f32>> = (0..config.corpus_size)
-                .map(|doc_id| mock_store.fetch(doc_id as u64).unwrap())
-                .collect();
+            let embeddings = generate_mock_embeddings(config.corpus_size, 768);
             
             let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
                 .context("Failed to create HNSW backend")?;
@@ -1145,10 +1011,7 @@ async fn main() -> Result<()> {
         _ => {
             println!("Using mock clustered embeddings (no MS MARCO data configured)");
             
-            let mock_store = MockDocumentStore::new(config.corpus_size);
-            let embeddings: Vec<Vec<f32>> = (0..config.corpus_size)
-                .map(|doc_id| mock_store.fetch(doc_id as u64).unwrap())
-                .collect();
+            let embeddings = generate_mock_embeddings(config.corpus_size, 768);
             
             let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
                 .context("Failed to create HNSW backend")?;
@@ -1158,7 +1021,6 @@ async fn main() -> Result<()> {
     };
     println!("✅ HNSW backend ready ({} documents)", hnsw_backend.len());
 
-    // Phase 0.5.2: Load query embeddings for semantic workload generation
     let (query_embeddings, query_to_doc) = match (
         &config.query_embeddings_path,
         &config.query_to_doc_path,
@@ -1167,12 +1029,11 @@ async fn main() -> Result<()> {
             if std::path::Path::new(query_emb_path).exists()
                 && std::path::Path::new(query_doc_path).exists() =>
         {
-            println!("Phase 0.5.2: Loading query embeddings for semantic workload...");
             
             // Load query embeddings (numpy format)
             let query_emb_data = std::fs::read(query_emb_path)
                 .context("Failed to read query embeddings file")?;
-            let query_embeddings = RealDocumentStore::parse_numpy_embeddings(&query_emb_data)?;
+            let query_embeddings = parse_numpy_embeddings(&query_emb_data)?;
             
             // Load query→doc mapping
             let query_doc_text = std::fs::read_to_string(query_doc_path)
@@ -1239,7 +1100,6 @@ async fn main() -> Result<()> {
             (None, None)
         }
         _ => {
-            println!("Phase 0.5.2: Query embeddings not configured, using ID-based sampling");
             (None, None)
         }
     };
@@ -1269,7 +1129,6 @@ async fn main() -> Result<()> {
     );
     println!();
 
-    // Phase 0.5.2: Initialize workload generator (semantic if query embeddings available)
     enum WorkloadGenerator {
         Temporal(TemporalWorkloadGenerator),
         Semantic(SemanticWorkloadGenerator),
@@ -1308,7 +1167,6 @@ async fn main() -> Result<()> {
     let workload_gen = if let (Some(query_embs), Some(query_doc_map)) = (&query_embeddings, &query_to_doc) {
         // Get corpus embeddings from HNSW backend
         let corpus_embs = hnsw_backend.get_all_embeddings();
-        println!("Using SemanticWorkloadGenerator (Phase 0.5.2)");
         let semantic_gen = SemanticWorkloadGenerator::new(
             corpus_embs.clone(),
             query_embs.clone(),
@@ -1345,7 +1203,6 @@ async fn main() -> Result<()> {
     let mut learned_queries = 0u64;
     let mut learned_hits = 0u64;
 
-    // Phase 0.5.2: NDCG quality metric tracking
     // Track per-document cache quality: How many times was each cached doc accessed?
     // Key = cache_key (doc hash), Value = access count while cached
     let mut lru_cache_doc_accesses: HashMap<u64, usize> = HashMap::new();
@@ -1376,7 +1233,6 @@ async fn main() -> Result<()> {
 
     // Main query loop
     while test_start.elapsed() < test_duration && running.load(Ordering::SeqCst) {
-        // Phase 0.5.2: Sample either (doc_id) or (query_embedding, doc_id)
         let (cache_key, doc_id) = match &workload_gen {
             WorkloadGenerator::Temporal(gen) => {
                 let doc_id = gen.sample().await;
@@ -1386,7 +1242,6 @@ async fn main() -> Result<()> {
                 // CRITICAL FIX: sample() now returns (hash, doc_id) directly
                 // This eliminates 71K × 1.5KB = 107MB of cloned embeddings per test
                 let (query_hash, doc_id) = gen.sample().await;
-                // Phase 0.5.2: Cache by query embedding hash (not doc_id!)
                 // This simulates real RAG: "What is ML?" and "Explain ML" have DIFFERENT cache keys
                 (query_hash, doc_id)
             }
@@ -1435,7 +1290,7 @@ async fn main() -> Result<()> {
                 static INSERT_COUNT: InsertCounter = InsertCounter::new(0);
                 
                 let cached = CachedVector {
-                    doc_id: cache_key, // Phase 0.5.2: Store with cache_key (query hash) as the ID
+                    doc_id: cache_key,
                     embedding: embedding.clone(),
                     distance: 0.5,
                     cached_at: Instant::now(),
@@ -1457,7 +1312,6 @@ async fn main() -> Result<()> {
                 if cache_hit {
                     lru_hits += 1;
                     
-                    // Phase 0.5.2: NDCG quality tracking
                     // Track: How many times was this doc accessed while in cache?
                     *lru_cache_doc_accesses.entry(cache_key).or_insert(0) += 1;
                 }
@@ -1468,7 +1322,6 @@ async fn main() -> Result<()> {
                 if cache_hit {
                     learned_hits += 1;
                     
-                    // Phase 0.5.2: NDCG quality tracking
                     *learned_cache_doc_accesses.entry(cache_key).or_insert(0) += 1;
                 }
             }
@@ -1615,7 +1468,6 @@ async fn main() -> Result<()> {
 
     let cache_to_ws_ratio = config.cache_capacity as f64 / expected_ws as f64;
 
-    // Phase 0.5.2: Calculate NDCG@10 quality metrics
     println!("\nCalculating NDCG quality metrics...");
     
     // Convert HashMap to ranked RankingResults (sorted by access count DESC)
@@ -1712,7 +1564,6 @@ async fn main() -> Result<()> {
         hit_rate_improvement: improvement,
         absolute_improvement,
 
-        // Quality metrics (Phase 0.5.2)
         lru_ndcg_at_10,
         learned_ndcg_at_10,
         lru_mrr,
