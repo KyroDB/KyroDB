@@ -10,6 +10,9 @@
 // Vector search: HNSW k-NN index
 pub mod hnsw_index;
 
+// HNSW backend: Integration layer for cache + HNSW
+pub mod hnsw_backend;
+
 // Learned index: RMI (Recursive Model Index) for cache prediction
 pub mod rmi_core;
 
@@ -44,6 +47,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // Vector search components
 pub use hnsw_index::{HnswVectorIndex, SearchResult};
+
+// HNSW backend (cache integration)
+pub use hnsw_backend::HnswBackend;
 
 // Learned index components (RMI for cache prediction)
 pub use rmi_core::{LocalLinearModel, RmiIndex, RmiSegment};

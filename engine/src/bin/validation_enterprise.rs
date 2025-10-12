@@ -30,6 +30,7 @@ use kyrodb_engine::{
     ab_stats::AbStatsPersister,
     access_logger::AccessPatternLogger,
     cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
+    hnsw_backend::HnswBackend,
     learned_cache::LearnedCachePredictor,
     ndcg::{calculate_ndcg, calculate_mrr, calculate_recall_at_k, RankingResult},
     semantic_adapter::SemanticAdapter,
@@ -536,24 +537,30 @@ impl ZipfSampler {
     }
 }
 
-/// Document store trait for unified access to embeddings
+// ============================================================================
+// DEPRECATED: DocumentStore trait and implementations
+// Replaced by HnswBackend (engine/src/hnsw_backend.rs) in Phase 1 integration
+// Kept temporarily for numpy parsing utility (parse_numpy_embeddings)
+// TODO: Move parse_numpy_embeddings to a data loading utility module
+// ============================================================================
+
+/// DEPRECATED: Use HnswBackend instead
+#[allow(dead_code)]
 trait DocumentStore: Send + Sync {
     fn fetch(&self, doc_id: u64) -> Option<Vec<f32>>;
     fn corpus_size(&self) -> usize;
-    
-    /// Phase 0.5.2: Get all embeddings for semantic workload generator
-    /// Returns None if store doesn't support bulk access (e.g., remote store)
     fn get_all_embeddings(&self) -> Option<Arc<Vec<Vec<f32>>>>;
 }
 
-/// Real document store backed by MS MARCO embeddings
-/// Phase 0.5.1: Load pre-computed embeddings from numpy files
+/// DEPRECATED: Only used for parse_numpy_embeddings utility
+#[allow(dead_code)]
 struct RealDocumentStore {
     embeddings: Arc<Vec<Vec<f32>>>,
     passages: Arc<Vec<String>>,
     embedding_dim: usize,
 }
 
+#[allow(dead_code)]
 impl DocumentStore for RealDocumentStore {
     fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
         self.embeddings.get(doc_id as usize).cloned()
@@ -568,7 +575,9 @@ impl DocumentStore for RealDocumentStore {
     }
 }
 
+#[allow(dead_code)]
 impl RealDocumentStore {
+    #[allow(dead_code)]
     fn new(embeddings_path: &str, passages_path: &str) -> Result<Self> {
         println!("Loading MS MARCO data...");
         println!("  Embeddings: {}", embeddings_path);
@@ -607,6 +616,7 @@ impl RealDocumentStore {
         })
     }
 
+    #[allow(dead_code)]
     fn get_passage(&self, doc_id: u64) -> Option<&str> {
         self.passages.get(doc_id as usize).map(|s| s.as_str())
     }
@@ -682,7 +692,8 @@ impl RealDocumentStore {
     }
 }
 
-/// Mock document storage (fallback when MS MARCO not available)
+/// DEPRECATED: Only used to generate mock embeddings for HNSW backend
+#[allow(dead_code)]
 struct MockDocumentStore {
     corpus_size: usize,
     embedding_dim: usize,
@@ -690,6 +701,7 @@ struct MockDocumentStore {
     noise_stddev: f32,
 }
 
+#[allow(dead_code)]
 impl DocumentStore for MockDocumentStore {
     fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
         if doc_id >= self.corpus_size as u64 {
@@ -756,6 +768,7 @@ struct SemanticWorkloadGenerator {
     doc_sampler: Arc<RwLock<ZipfSampler>>,
     query_embeddings: Arc<Vec<Vec<f32>>>,
     doc_to_queries: Arc<HashMap<u64, Vec<usize>>>,
+    #[allow(dead_code)]
     rng: Arc<RwLock<ChaCha8Rng>>,
     /// Per-document paraphrase counters for deterministic cycling
     /// Map: doc_id → current paraphrase index
@@ -1091,8 +1104,9 @@ async fn main() -> Result<()> {
         AbStatsPersister::new(&config.stats_csv).context("Failed to create stats persister")?,
     );
 
-    // Phase 0.5.1: Try to load real MS MARCO embeddings, fallback to mock
-    let doc_store: Arc<dyn DocumentStore> = match (
+    // Phase 1: Load embeddings and build HNSW backend (replaces DocumentStore trait)
+    println!("\n🔧 Building HNSW backend...");
+    let hnsw_backend: Arc<HnswBackend> = match (
         &config.ms_marco_embeddings_path,
         &config.ms_marco_passages_path,
     ) {
@@ -1100,22 +1114,49 @@ async fn main() -> Result<()> {
             if std::path::Path::new(embeddings_path).exists()
                 && std::path::Path::new(passages_path).exists() =>
         {
-            println!("Using real MS MARCO embeddings (Phase 0.5.1)");
-            Arc::new(
-                RealDocumentStore::new(embeddings_path, passages_path)
-                    .context("Failed to load MS MARCO data")?,
-            )
+            println!("Using real MS MARCO embeddings");
+            
+            // Load embeddings
+            let embeddings_data = std::fs::read(embeddings_path)
+                .context("Failed to read embeddings file")?;
+            let embeddings = RealDocumentStore::parse_numpy_embeddings(&embeddings_data)?;
+            
+            // Build HNSW backend
+            let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
+                .context("Failed to create HNSW backend")?;
+            
+            Arc::new(backend)
         }
         (Some(_), Some(_)) => {
             println!("WARNING: MS MARCO paths configured but files not found");
             println!("Falling back to mock clustered embeddings");
-            Arc::new(MockDocumentStore::new(config.corpus_size))
+            
+            // Generate mock embeddings
+            let mock_store = MockDocumentStore::new(config.corpus_size);
+            let embeddings: Vec<Vec<f32>> = (0..config.corpus_size)
+                .map(|doc_id| mock_store.fetch(doc_id as u64).unwrap())
+                .collect();
+            
+            let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
+                .context("Failed to create HNSW backend")?;
+            
+            Arc::new(backend)
         }
         _ => {
             println!("Using mock clustered embeddings (no MS MARCO data configured)");
-            Arc::new(MockDocumentStore::new(config.corpus_size))
+            
+            let mock_store = MockDocumentStore::new(config.corpus_size);
+            let embeddings: Vec<Vec<f32>> = (0..config.corpus_size)
+                .map(|doc_id| mock_store.fetch(doc_id as u64).unwrap())
+                .collect();
+            
+            let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
+                .context("Failed to create HNSW backend")?;
+            
+            Arc::new(backend)
         }
     };
+    println!("✅ HNSW backend ready ({} documents)", hnsw_backend.len());
 
     // Phase 0.5.2: Load query embeddings for semantic workload generation
     let (query_embeddings, query_to_doc) = match (
@@ -1265,35 +1306,17 @@ async fn main() -> Result<()> {
     }
     
     let workload_gen = if let (Some(query_embs), Some(query_doc_map)) = (&query_embeddings, &query_to_doc) {
-        // Get corpus embeddings for semantic workload
-        if let Some(corpus_embs) = doc_store.get_all_embeddings() {
-            println!("Using SemanticWorkloadGenerator (Phase 0.5.2)");
-            let semantic_gen = SemanticWorkloadGenerator::new(
-                corpus_embs.clone(),
-                query_embs.clone(),
-                query_doc_map.clone(),
-                config.zipf_exponent,
-                config.top_k_queries_per_doc,
-            )?;
-            WorkloadGenerator::Semantic(semantic_gen)
-        } else {
-            println!("WARNING: Query embeddings available but corpus embeddings not accessible");
-            println!("Falling back to TemporalWorkloadGenerator");
-            let temporal_gen = TemporalWorkloadGenerator::new(
-                config.corpus_size,
-                config.zipf_exponent,
-                Duration::from_secs(config.topic_rotation_interval_secs),
-                config.spike_probability,
-                Duration::from_secs(config.spike_duration_secs),
-                config.enable_temporal_patterns,
-                config.cache_capacity,
-                config.working_set_multiplier,
-                config.working_set_churn,
-                config.cold_traffic_ratio,
-                config.working_set_bias,
-            )?;
-            WorkloadGenerator::Temporal(temporal_gen)
-        }
+        // Get corpus embeddings from HNSW backend
+        let corpus_embs = hnsw_backend.get_all_embeddings();
+        println!("Using SemanticWorkloadGenerator (Phase 0.5.2)");
+        let semantic_gen = SemanticWorkloadGenerator::new(
+            corpus_embs.clone(),
+            query_embs.clone(),
+            query_doc_map.clone(),
+            config.zipf_exponent,
+            config.top_k_queries_per_doc,
+        )?;
+        WorkloadGenerator::Semantic(semantic_gen)
     } else {
         println!("Using TemporalWorkloadGenerator (ID-based sampling)");
         let temporal_gen = TemporalWorkloadGenerator::new(
@@ -1386,8 +1409,9 @@ async fn main() -> Result<()> {
         let (embedding, cache_hit) = if let Some(vec) = cached_vec {
             (vec.embedding, true)
         } else {
-            let embedding = doc_store
-                .fetch(doc_id)
+            // Cache miss: fetch from HNSW backend
+            let embedding = hnsw_backend
+                .fetch_document(doc_id)
                 .ok_or_else(|| anyhow::anyhow!("Document {} not found", doc_id))?;
 
             let should_cache = match strategy_id {
@@ -1451,7 +1475,7 @@ async fn main() -> Result<()> {
         }
 
         {
-            let mut logger = access_logger.write().await;
+            let logger = access_logger.write().await;
             logger.log_access(cache_key, &embedding);
         }
 
