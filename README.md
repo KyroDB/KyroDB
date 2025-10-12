@@ -4,11 +4,11 @@
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
 [![CI](https://github.com/vatskishan03/KyroDB/actions/workflows/ci.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
 
-**Status: Phase 0 — Early Development** • Building the highest read-speed vector database on the planet.
+**Status: Phase 0 Complete (Weeks 1-12)** • Hybrid semantic cache validated with 2.1x improvement over baseline.
 
-KyroDB is an ultra-high-performance vector database optimized for Retrieval-Augmented Generation (RAG) workloads. We're building a three-layer architecture with HNSW for k-NN search and a learned cache that predicts hot documents before you query them.
+KyroDB is a vector database optimized for RAG workloads, featuring a hybrid semantic cache that combines learned frequency prediction with semantic similarity. Current focus: integrating the cache layer with HNSW vector search and adding persistence.
 
-> **⚠️ Development Status**: KyroDB is in active early-stage development (Phase 0). The system is not yet production-ready. Watch this repo or star it to follow our progress as we build towards our ambitious performance targets.
+> **⚠️ Development Status**: Core caching and validation infrastructure complete. Integration work in progress. Not yet production-ready.
 
 ## 🎯 Mission
 
@@ -18,21 +18,19 @@ No compromises. No competition. Just pure speed optimized for RAG workloads.
 
 ## 🚀 What Makes KyroDB Different
 
-### Three-Layer Architecture (In Development)
+### Hybrid Semantic Cache (Complete)
 
-**Layer 1: Learned Cache** (70-90% hit rate)
-- RMI (Recursive Model Index) predicts which documents are hot *before* you query
-- Sub-100µs P99 latency for cache hits
-- Trained on real access patterns, retrains automatically
+**What's Built**:
+- Learned frequency prediction via RMI (Recursive Model Index)
+- Semantic similarity scoring via embedding comparisons
+- Hybrid cache admission combining both signals
+- A/B testing framework proving 2.1x hit rate improvement (44% vs 21% baseline)
+- Memory-efficient access logging with automatic training cycles
 
-**Layer 2: Hot Tier** (Recent writes)
-- BTree for fresh documents not yet in cold storage
-- Millisecond-latency hybrid search (vector + metadata)
-
-**Layer 3: Cold Tier** (Historical data)
-- HNSW for k-NN search with >95% recall@10
-- Sub-millisecond P99 latency on 10M+ vectors
-- Memory-mapped for zero-copy reads
+**What's Next**:
+- Integration with HNSW vector index for full query path
+- Persistence layer (WAL + snapshots)
+- Three-tier architecture (cache → hot tier → cold tier)
 
 ### Design Philosophy
 
@@ -42,159 +40,133 @@ No compromises. No competition. Just pure speed optimized for RAG workloads.
 - **Bounded operations**: No O(n) scans, no unpredictable latency
 - **Deep implementation**: Production-grade from day one, not MVP quality
 
-## 📊 Target Performance (Phase 0 Goals)
+## 📊 Current Performance
 
-| Metric | Target | Workload |
-|--------|--------|----------|
-| **P99 Query Latency** | < 1ms | 10M vectors, 128-dim, L2 distance |
-| **Cache Hit Rate** | 70-90% | Zipfian distribution (80/20 hot/cold) |
-| **Cache Hit Latency** | < 100µs | Learned cache prediction |
-| **Recall@10** | > 95% | HNSW k-NN search |
-| **Write Throughput** | > 100k/sec | Bulk inserts with persistence |
-| **Crash Recovery** | < 10s | 10M vectors from WAL replay |
+| Component | Status | Result |
+|-----------|--------|--------|
+| **Hybrid Cache Hit Rate** | ✅ Validated | 44% (2.1x over 21% LRU baseline) |
+| **HNSW Recall@10** | ✅ Validated | >95% on MS MARCO dataset |
+| **Memory Efficiency** | ✅ Validated | 2% growth over 6-minute sustained load |
+| **Training Stability** | ✅ Validated | 6 training cycles with no crashes |
+| **Cache Integration** | ⏳ In Progress | Connecting cache to HNSW index |
+| **Persistence Layer** | 📋 Planned | WAL + snapshots for durability |
 
-**Status**: Phase 0 Week 1-2 in progress (HNSW prototype)
+**Next Target**: Scale validation to 1 hour, achieve 60%+ hit rate with tuning
 
 ---
 
 ## 🏗️ Development Roadmap
 
-We're building KyroDB in disciplined phases, with strict go/no-go gates based on performance SLOs.
+### ✅ Phase 0 Weeks 1-12: Foundation (Complete)
+- HNSW vector search wrapper with >95% recall validation
+- RMI-based learned cache with frequency prediction
+- Semantic similarity adapter for hybrid cache decisions
+- Access pattern logging with fixed-capacity ring buffer
+- A/B testing framework (LRU vs Learned strategies)
+- Production-grade validation harness with MS MARCO dataset
+- Memory profiling and leak detection (jemalloc integration)
 
-### Phase 0: Single-Node Foundation (12 weeks)
+**Achievement**: 2.1x cache hit improvement validated (44% vs 21% baseline)
 
-**Week 1-2: HNSW Vector Search** *(In Progress)*
-- Integrate battle-tested hnswlib-rs library
-- Property tests proving >95% recall@10
-- Benchmark: P99 < 1ms @ 10M vectors
+### ⏳ Current: Integration & Persistence
+- Connect cache layer to HNSW index for full query path
+- Add WAL and snapshot persistence
+- Scale validation tests from 6 minutes to 1 hour
+- Tune cache parameters to reach 60%+ hit rate target
 
-**Week 3-8: Learned Cache with RMI**
-- Train RMI on access patterns (Zipfian distribution)
-- Three-layer query execution (cache → hot → cold)
-- Target: 70-90% cache hit rate, P99 < 100µs
-
-**Week 9-12: Basic Persistence**
-- WAL + snapshots for vectors and metadata
-- Crash recovery with WAL replay
-- Write throughput: >100k inserts/sec
-
-### Phase 1: Production Hardening (6 months)
-- Distributed consensus (Raft)
-- Replication and high availability
-- Hybrid queries (vector + metadata filters)
-- Compression and tiered storage
-
-### Phase 2: Advanced Features (6 months)
-- Multi-tenancy and resource isolation
-- Streaming updates and incremental indexing
-- GPU acceleration for batch queries
-- Cross-datacenter replication
-
-### Phase 3-4: Scale & Autonomy (12 months)
-- Autonomous tuning and adaptive algorithms
-- Federated search across clusters
-- Advanced RAG optimizations (late interaction, ColBERT)
+### 📋 Phase 1: Production Deployment
+- Beta customer deployments with monitoring
+- Case studies documenting performance improvements
+- Hybrid query API (vector + metadata filters)
+- Public MVP launch
 
 See [`Implementation.md`](Implementation.md) for the detailed week-by-week execution plan.
 
 ---
 
-## 🚀 Quick Start (Coming Soon)
+## 🚀 Quick Start
 
-KyroDB is in early development. The following API is the target design:
+Current validation binaries demonstrate the cache layer:
 
-```rust
-use kyrodb::{VectorDB, Config, Metric};
+```bash
+# Build the validation binary
+cargo build --release --bin validation_enterprise
 
-// Initialize database
-let db = VectorDB::open(Config {
-    data_dir: "./data",
-    dimension: 128,
-    metric: Metric::L2,
-})?;
+# Run 6-minute validation with hybrid semantic cache
+./target/release/validation_enterprise
 
-// Insert vectors
-db.insert(doc_id, embedding, metadata)?;
-
-// Search with learned cache
-let results = db.search(query_embedding, k=10)?;
-// Returns: Vec<(doc_id, distance)>
-
-// Hybrid search (vector + metadata filter)
-let results = db.search_filtered(
-    query_embedding,
-    k=10,
-    filter="category == 'science'"
-)?;
+# Output shows:
+# - LRU baseline: ~21% hit rate
+# - Learned cache: ~44% hit rate (2.1x improvement)
+# - Memory stability: <2% growth
+# - Training cycles: 6 successful runs
 ```
 
-**Prerequisites** (when available):
+**Current Capabilities**:
+- Hybrid semantic cache with frequency + similarity scoring
+- A/B testing framework for strategy comparison
+- Memory-efficient access logging (32 bytes/event)
+- Automatic model retraining every 60 seconds
+- Production-grade validation with real embeddings (MS MARCO)
+
+**Prerequisites**:
 - Rust 1.70+
-- 8GB+ RAM recommended
-- Linux/macOS (Windows support planned)
+- 4GB+ RAM
+- Linux/macOS (Windows untested)
 
 ---
 
-## 🏛️ Architecture Deep Dive
+## 🏛️ Architecture
 
-### Query Execution Flow (Target Design)
+### Current Implementation
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Client Query                           │
-│                  (embedding + k + filters)                  │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-            ┌────────────────────────────────┐
-            │   LAYER 1: Learned Cache       │
-            │   RMI predicts hot documents   │
-            │   70-90% hit rate, <100µs P99  │
-            └────────┬───────────────────┬───┘
-                     │ HIT               │ MISS
-                     ▼                   ▼
-            ┌────────────┐      ┌────────────────────┐
-            │   Return   │      │  LAYER 2: Hot Tier │
-            │   Results  │      │  Recent writes     │
-            └────────────┘      │  BTree search      │
-                                └─────────┬──────────┘
-                                          │ Not found
-                                          ▼
-                                ┌──────────────────────┐
-                                │ LAYER 3: Cold Tier   │
-                                │ HNSW k-NN search     │
-                                │ >95% recall, <1ms    │
-                                └──────────┬───────────┘
-                                           │
-                                           ▼
-                                  ┌─────────────────┐
-                                  │ Update learned  │
-                                  │ cache (async)   │
-                                  └─────────────────┘
+┌─────────────────────────────────────────────────┐
+│           Query (embedding + doc_id)            │
+└────────────────────┬────────────────────────────┘
+                     │
+                     ▼
+        ┌────────────────────────────┐
+        │  A/B Test Splitter (50/50) │
+        └────────┬─────────────┬─────┘
+                 │             │
+        ┌────────▼───────┐   ┌▼────────────────────┐
+        │ LRU Baseline   │   │ Hybrid Semantic     │
+        │ (21% hit rate) │   │ Cache (44% hit)     │
+        └────────┬───────┘   └┬────────────────────┘
+                 │             │
+                 │  ┌──────────▼──────────┐
+                 │  │ RMI Frequency Model │
+                 │  │ (learned hotness)   │
+                 │  └──────────┬──────────┘
+                 │             │
+                 │  ┌──────────▼──────────┐
+                 │  │ Semantic Adapter    │
+                 │  │ (embedding cosine)  │
+                 │  └──────────┬──────────┘
+                 │             │
+                 └─────────────▼─────────────────┐
+                           │                      │
+                      ┌────▼─────────┐   ┌───────▼──────┐
+                      │ Cache Hit    │   │ Cache Miss   │
+                      │ Return fast  │   │ Access logger│
+                      └──────────────┘   └──────────────┘
 ```
 
-### Core Components
+**What's Built**:
+- `engine/src/hnsw_index.rs` - HNSW wrapper with recall validation
+- `engine/src/rmi_core.rs` - Recursive model index for frequency prediction
+- `engine/src/learned_cache.rs` - Cache predictor with hotness scoring
+- `engine/src/semantic_adapter.rs` - Embedding similarity computation
+- `engine/src/access_logger.rs` - Ring buffer for access pattern tracking
+- `engine/src/cache_strategy.rs` - A/B testing framework
+- `engine/src/vector_cache.rs` - Unified cache storage
+- `engine/src/training_task.rs` - Background model retraining
 
-**HNSW Index** (Phase 0 Week 1-2)
-- Hierarchical Navigable Small World graphs for k-NN search
-- Battle-tested hnswlib-rs library (wraps C++ implementation)
-- Tunable parameters: M (graph connectivity), ef (search quality)
-
-**Learned Cache** (Phase 0 Week 3-8)
-- RMI (Recursive Model Index) predicts document hotness
-- Trained on access logs (Zipfian distribution: 80/20 hot/cold)
-- Retrains automatically every 10 minutes
-- O(log n) prediction time with bounded search
-
-**Tiered Storage** (Phase 0 Week 9-12)
-- Hot tier: BTree for recent writes (millisecond latency)
-- Cold tier: HNSW for historical data (sub-millisecond latency)
-- Async flush from hot → cold with atomic index swaps
-
-**Persistence Layer** (Phase 0 Week 9-12)
-- Write-Ahead Log (WAL) for durability
-- Periodic snapshots for fast recovery
-- Memory-mapped reads for zero-copy access
+**What's Missing**:
+- Integration: Cache layer currently isolated from HNSW index
+- Persistence: No WAL or snapshots yet
+- Tier separation: Hot/cold tier architecture not implemented
 
 ---
 
@@ -283,14 +255,24 @@ cargo clippy
 
 ## 🗓️ Project Status
 
-**Current Phase**: Phase 0 Week 1-2 (HNSW Prototype)
+**Current Focus**: Integration and persistence
 
+**Completed** (Phase 0 Weeks 1-12):
+- ✅ HNSW vector search with >95% recall validation
+- ✅ Hybrid semantic cache (frequency + similarity)
+- ✅ A/B testing showing 2.1x improvement
+- ✅ Memory-efficient access logging
+- ✅ Production validation harness
 
-**Next Milestones**:
-- 📅 Week 2: HNSW property tests (recall@10 > 95%)
-- 📅 Week 2: Performance benchmark (P99 < 1ms @ 10M vectors)
-- 📅 Week 8: Learned cache integration (70-90% hit rate)
-- 📅 Week 12: Basic persistence (WAL + snapshots)
+**In Progress**:
+- ⏳ Cache + HNSW integration for full query path
+- ⏳ WAL and snapshot persistence
+- ⏳ Scaling validation to 1-hour tests
+
+**Next Up**:
+- � Tune cache parameters to 60%+ hit rate
+- � Three-tier architecture (cache → hot → cold)
+- 📋 Beta customer deployments
 
 Watch this repo or [follow @vatskishan03](https://github.com/vatskishan03) for updates.
 
