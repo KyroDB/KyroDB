@@ -37,6 +37,9 @@ pub mod ndcg;
 // Memory profiling: jemalloc-based cross-platform profiler
 pub mod memory_profiler;
 
+// Persistence: WAL + snapshots for durability
+pub mod persistence;
+
 // ===== Global Allocator (jemalloc-profiling feature) =====
 
 #[cfg(feature = "jemalloc-profiling")]
@@ -80,3 +83,6 @@ pub use memory_profiler::{
 
 // Semantic adapter components (hybrid cache: frequency + similarity)
 pub use semantic_adapter::{SemanticAdapter, SemanticConfig, SemanticStats};
+
+// Persistence components (WAL + snapshots)
+pub use persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
