@@ -1,6 +1,6 @@
 //! Enterprise-scale validation workload
 //!
-//! **Purpose**: Validate KyroDB hybrid semantic-learned cache against REALISTIC production RAG workloads
+//! **Purpose**: Validate KyroDB hybrid semantic-Hybrid Semantic Cache against REALISTIC production RAG workloads
 //!
 //! **What This Test Validates**:
 //! 1. Hybrid cache achieves 55-70% hit rate vs LRU 35-45% (1.5-2× improvement)
@@ -16,7 +16,7 @@
 //! - QPS: 100 queries/second
 //! - Distribution: Zipf 1.01 (real-world web traffic)
 //! - Temporal patterns: Topic rotation + random spikes
-//! - A/B split: 50% LRU baseline, 50% Learned cache
+//! - A/B split: 50% LRU baseline, 50% Hybrid Semantic Cache
 //!
 //! **Run on Azure VM**:
 //! ```
@@ -136,7 +136,7 @@ impl Default for Config {
             // 0.5% cache size (50 slots vs 6,000 hot query variants = 120× pressure)
             // EXTREME pressure: deterministic cycling through all 30 paraphrases
             // LRU thrashes (can only cache 50/6000 = 0.8% of hot queries)
-            // Learned cache predicts document-level hotness (can cache 50/200 = 25% of hot docs)
+            // Hybrid Semantic Cache predicts document-level hotness (can cache 50/200 = 25% of hot docs)
             cache_capacity: 50,
 
         
@@ -150,7 +150,7 @@ impl Default for Config {
             training_interval_secs: 60,
 
           
-            // Captures longer-term patterns for learned cache training
+            // Captures longer-term patterns for Hybrid Semantic Cache training
             logger_window_size: 100_000,
 
             // Temporal patterns (realistic production)
@@ -256,7 +256,7 @@ struct ValidationResults {
     lru_cache_misses: u64,
     lru_hit_rate: f64,
 
-    // Learned cache stats
+    // Hybrid Semantic Cache stats
     learned_total_queries: u64,
     learned_cache_hits: u64,
     learned_cache_misses: u64,
@@ -712,7 +712,7 @@ impl SemanticWorkloadGenerator {
                 // DETERMINISTIC CYCLING: Cycle through all 30 paraphrases in order
                 // This creates MAXIMUM stress for LRU: every access to a hot document
                 // uses a DIFFERENT query hash, forcing constant evictions.
-                // Learned cache can predict document-level hotness and cache ANY paraphrase.
+                // Hybrid Semantic Cache can predict document-level hotness and cache ANY paraphrase.
                 let query_idx = {
                     let mut counters = self.doc_paraphrase_counters.write().await;
                     let counter = counters.entry(doc_id).or_insert(0);
@@ -961,7 +961,7 @@ async fn main() -> Result<()> {
     let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache_capacity));
 
     let learned_predictor = LearnedCachePredictor::new(config.cache_capacity)
-        .context("Failed to create learned cache predictor")?;
+        .context("Failed to create Hybrid Semantic Cache predictor")?;
     let semantic_adapter = SemanticAdapter::new();
     let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
         config.cache_capacity,
@@ -1429,7 +1429,7 @@ async fn main() -> Result<()> {
         println!("Memory Breakdown:");
         println!("  Access logger:   {:.1} MB ({} events × ~32 bytes/event)", access_logger_mb, access_logger_len);
         println!("  LRU cache:       {:.1} MB ({} vectors)", lru_cache_mb, lru_cache_len);
-        println!("  Learned cache:   {:.1} MB ({} vectors)", learned_cache_mb, learned_cache_len);
+        println!("  Hybrid Semantic Cache:   {:.1} MB ({} vectors)", learned_cache_mb, learned_cache_len);
         println!("  Query embeddings: ~461.0 MB (300K × 384-dim, constant)");
         println!("  Doc embeddings:  ~14.6 MB (10K × 384-dim, constant)");
         println!("  Expected total:  ~{:.1} MB", 461.0 + 14.6 + access_logger_mb + lru_cache_mb + learned_cache_mb);
@@ -1498,7 +1498,7 @@ async fn main() -> Result<()> {
         .collect();
     
     println!("  LRU cache: {} unique docs cached", lru_cache_ranking_results.len());
-    println!("  Learned cache: {} unique docs cached", learned_cache_ranking_results.len());
+    println!("  Hybrid Semantic Cache: {} unique docs cached", learned_cache_ranking_results.len());
     
     let lru_ndcg_at_10 = if !lru_cache_ranking_results.is_empty() {
         calculate_ndcg(&lru_cache_ranking_results, 10)
@@ -1619,7 +1619,7 @@ async fn main() -> Result<()> {
     println!("  Cache misses:    {}", lru_queries - lru_hits);
     println!("  Hit rate:        {:.1}%", lru_hit_rate * 100.0);
     println!();
-    println!("Learned Cache (RMI):");
+    println!("Hybrid Semantic Cache (RMI):");
     println!("  Queries:         {}", learned_queries);
     println!("  Cache hits:      {}", learned_hits);
     println!("  Cache misses:    {}", learned_queries - learned_hits);
@@ -1650,7 +1650,7 @@ async fn main() -> Result<()> {
     println!("    NDCG@10:       {:.4}", lru_ndcg_at_10);
     println!("    MRR:           {:.4}", lru_mrr);
     println!("    Recall@10:     {:.4}", lru_recall_at_10);
-    println!("  Learned Cache:");
+    println!("  Hybrid Semantic Cache:");
     println!("    NDCG@10:       {:.4}", learned_ndcg_at_10);
     println!("    MRR:           {:.4}", learned_mrr);
     println!("    Recall@10:     {:.4}", learned_recall_at_10);
@@ -1728,7 +1728,7 @@ async fn main() -> Result<()> {
     println!();
     println!("Criteria:");
     println!(
-        "  Learned cache hit rate ≥60% ............ {}",
+        "  Hybrid Semantic Cache hit rate ≥60% ............ {}",
         if hit_rate_pass { "PASS" } else { "FAIL" }
     );
     println!(
@@ -1750,7 +1750,7 @@ async fn main() -> Result<()> {
         println!();
         println!("Market Pitch:");
         println!(
-            "  \"KyroDB learned cache achieves {:.0}% hit rate\"",
+            "  \"KyroDB Hybrid Semantic Cache achieves {:.0}% hit rate\"",
             learned_hit_rate * 100.0
         );
         println!(

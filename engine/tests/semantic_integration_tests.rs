@@ -1,6 +1,6 @@
 //! Integration tests for semantic adapter with cache strategy
 //!
-//! Tests Phase 1 semantic-aware learned cache
+//! Tests Phase 1 semantic-aware Hybrid Semantic Cache
 
 use kyrodb_engine::{
     AccessEvent, AccessPatternLogger, AccessType, CacheStrategy, CachedVector,

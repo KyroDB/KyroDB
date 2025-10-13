@@ -255,7 +255,7 @@ async fn test_background_training_updates_predictor() {
     handle.abort();
 }
 
-/// Test learned cache predictor influences cache admission
+/// Test Hybrid Semantic Cache predictor influences cache admission
 #[tokio::test]
 async fn test_learned_predictor_influences_admission() {
     // Create predictor and train on hot documents
@@ -307,7 +307,7 @@ async fn test_learned_predictor_influences_admission() {
         }
     }
 
-    // Learned cache should prefer hot documents
+    // Hybrid Semantic Cache should prefer hot documents
     assert!(
         hot_cached > cold_cached,
         "Hot cached: {}, Cold cached: {}",

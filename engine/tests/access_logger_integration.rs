@@ -1,4 +1,4 @@
-//! Integration tests for Access Pattern Logger and Learned Cache Pipeline
+//! Integration tests for Access Pattern Logger and Hybrid Semantic Cache Pipeline
 //!
 //! Phase 0 Week 5-8: Validate end-to-end flow from access logging to cache prediction
 //!

@@ -3,7 +3,7 @@
 //! Vector cache storage: In-memory cache with LRU eviction policy
 //!
 //! Provides fast in-memory storage for frequently accessed vectors.
-//! Supports both LRU baseline and learned cache admission policies.
+//! Supports both LRU baseline and Hybrid Semantic Cache admission policies.
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};

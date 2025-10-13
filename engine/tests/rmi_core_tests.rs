@@ -1,6 +1,6 @@
 //! RMI Core Tests
 //!
-//! Phase 0 Week 3-8: Tests for learned cache RMI components
+//! Phase 0 Week 3-8: Tests for Hybrid Semantic Cache RMI components
 
 use kyrodb_engine::rmi_core::{LocalLinearModel, RmiIndex, RmiSegment};
 
@@ -74,7 +74,7 @@ fn test_rmi_index_single_element() {
 #[test]
 fn test_rmi_with_zipfian_like_data() {
     // Simulate Zipfian access pattern: 20% of keys get 80% of accesses
-    // In learned cache, this would be (doc_id, hotness_score)
+    // In Hybrid Semantic Cache, this would be (doc_id, hotness_score)
     let mut data: Vec<(u64, u64)> = Vec::new();
 
     // Hot documents (high hotness scores)

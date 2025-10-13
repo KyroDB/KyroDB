@@ -1,4 +1,4 @@
-//! Benchmarks for Learned Cache Predictor
+//! Benchmarks for Hybrid Semantic Cache Predictor
 //!
 //!
 //! Targets:
@@ -67,7 +67,7 @@ fn generate_zipf_accesses(
         .collect()
 }
 
-/// Benchmark: Training learned cache predictor
+/// Benchmark: Training Hybrid Semantic Cache predictor
 fn bench_learned_cache_training(c: &mut Criterion) {
     let mut group = c.benchmark_group("learned_cache_training");
 

@@ -1,6 +1,6 @@
 //!
 //! This file contains ONLY the essential RMI algorithm components needed for
-//! learned cache prediction.
+//! Hybrid Semantic Cache prediction.
 //!
 
 use std::sync::Arc;
@@ -11,7 +11,7 @@ const MAX_SEARCH_WINDOW: usize = 16;
 /// Local linear model for position prediction
 ///
 /// Core RMI component: predicts position in sorted array using linear regression.
-/// Reusable for learned cache: predicts doc_id → hotness_score lookup position.
+/// Reusable for Hybrid Semantic Cache: predicts doc_id → hotness_score lookup position.
 #[derive(Debug, Clone)]
 pub struct LocalLinearModel {
     slope: f64,
@@ -102,7 +102,7 @@ impl LocalLinearModel {
 /// Segment of sorted data with local learned model
 ///
 /// Core RMI component: each segment learns a local linear model for its key range.
-/// Reusable for learned cache: segment stores (doc_id, hotness_score) pairs.
+/// Reusable for Hybrid Semantic Cache: segment stores (doc_id, hotness_score) pairs.
 pub struct RmiSegment {
     local_model: LocalLinearModel,
     data: Arc<Vec<(u64, u64)>>,
@@ -159,7 +159,7 @@ impl RmiSegment {
 /// Segment router: maps key → segment index
 ///
 /// Core RMI component: top-level model that routes keys to segments.
-/// Reusable for learned cache: routes doc_id to appropriate cache segment.
+/// Reusable for Hybrid Semantic Cache: routes doc_id to appropriate cache segment.
 pub struct SegmentRouter {
     key_ranges: Vec<(u64, u64)>,
     segment_count: usize,

@@ -1,4 +1,4 @@
-//! Semantic Adapter for Learned Cache
+//! Semantic Adapter for Hybrid Semantic Cache
 //!
 //!
 //! Adds semantic awareness to frequency-based prediction:
@@ -68,7 +68,7 @@ pub struct SemanticStats {
     pub cached_embeddings: usize,
 }
 
-/// Lightweight semantic layer over frequency-based learned cache
+/// Lightweight semantic layer over frequency-based RMI predictor (forms Hybrid Semantic Cache)
 ///
 /// Strategy:
 /// 1. Check frequency-based prediction (4-8ns)

@@ -2,7 +2,7 @@
 //! **Purpose**: Validate KyroDB A/B testing framework under sustained production-like load
 //!
 //! **What This Test Validates**:
-//! 1. Learned cache achieves 70-90% hit rate (vs 30-40% LRU baseline)
+//! 1. Hybrid Semantic Cache achieves 70-90% hit rate (vs 30-40% LRU baseline)
 //! 2. No memory leaks under sustained load (4.32M queries)
 //! 3. Training task runs reliably every 10 minutes (72 cycles)
 //! 4. No performance degradation over time
@@ -13,7 +13,7 @@
 //! - QPS: 100 queries/second
 //! - Distribution: Zipf (exponent=1.5) - 80/20 hot/cold
 //! - Corpus: 100,000 documents
-//! - A/B split: 50% LRU baseline, 50% Learned cache
+//! - A/B split: 50% LRU baseline, 50% Hybrid Semantic Cache
 //!
 //! **Run on Azure VM**:
 //! ```
@@ -137,7 +137,7 @@ struct ValidationResults {
     lru_cache_misses: u64,
     lru_hit_rate: f64,
 
-    // Learned cache stats
+    // Hybrid Semantic Cache stats
     learned_total_queries: u64,
     learned_cache_hits: u64,
     learned_cache_misses: u64,
@@ -333,7 +333,7 @@ async fn main() -> Result<()> {
     let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache_capacity));
 
     let learned_predictor = LearnedCachePredictor::new(config.cache_capacity)
-        .context("Failed to create learned cache predictor")?;
+        .context("Failed to create Hybrid Semantic Cache predictor")?;
     let learned_strategy = Arc::new(LearnedCacheStrategy::new(
         config.cache_capacity,
         learned_predictor,
@@ -704,7 +704,7 @@ async fn main() -> Result<()> {
     println!("  Cache misses:    {}", lru_queries - lru_hits);
     println!("  Hit rate:        {:.1}%", lru_hit_rate * 100.0);
     println!();
-    println!("Learned Cache (RMI):");
+    println!("Hybrid Semantic Cache (RMI):");
     println!("  Queries:         {}", learned_queries);
     println!("  Cache hits:      {}", learned_hits);
     println!("  Cache misses:    {}", learned_queries - learned_hits);
@@ -778,7 +778,7 @@ async fn main() -> Result<()> {
     println!();
     println!("Criteria:");
     println!(
-        "  ✓ Learned cache hit rate 70-90%:       {}",
+        "  ✓ Hybrid Semantic Cache hit rate 70-90%:       {}",
         if hit_rate_pass {
             "✅ PASS"
         } else {

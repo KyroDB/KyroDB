@@ -40,16 +40,16 @@ impl Default for TrainingConfig {
     }
 }
 
-/// Spawns a background task that periodically retrains the learned cache predictor
+/// Spawns a background task that periodically retrains the Hybrid Semantic Cache predictor
 ///
 /// The task runs every `config.interval` seconds and:
 /// 1. Fetches recent access events from the logger
 /// 2. Trains a new RMI predictor on those events
-/// 3. Updates the learned cache strategy with the new predictor
+/// 3. Updates the Hybrid Semantic Cache strategy with the new predictor
 ///
 /// # Arguments
 /// * `access_logger` - Shared access pattern logger (tracks query accesses)
-/// * `learned_strategy` - Shared learned cache strategy (will be updated with new predictor)
+/// * `learned_strategy` - Shared Hybrid Semantic Cache strategy (will be updated with new predictor)
 /// * `config` - Training configuration (interval, window, capacity)
 ///
 /// # Returns

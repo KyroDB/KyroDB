@@ -115,7 +115,7 @@ fn bench_lru_eviction(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: Learned cache prediction - target < 50ns
+/// Benchmark: Hybrid Semantic Cache prediction - target < 50ns
 fn bench_learned_cache_prediction(c: &mut Criterion) {
     let mut group = c.benchmark_group("learned_cache_prediction");
     group.throughput(Throughput::Elements(1));

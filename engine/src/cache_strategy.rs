@@ -87,10 +87,10 @@ impl CacheStrategy for LruCacheStrategy {
     }
 }
 
-/// Learned cache strategy
+/// Hybrid Semantic Cache strategy
 ///
-/// Uses RMI predictor to decide cache admission based on predicted hotness.
-/// Optionally integrates semantic adapter for hybrid decision-making.
+/// Uses RMI predictor (frequency) + optional semantic adapter (similarity)
+/// to decide cache admission based on hybrid scoring.
 ///
 pub struct LearnedCacheStrategy {
     pub cache: Arc<VectorCache>,
@@ -100,11 +100,11 @@ pub struct LearnedCacheStrategy {
 }
 
 impl LearnedCacheStrategy {
-    /// Create new learned cache strategy (frequency-only)
+    /// Create new Hybrid Semantic Cache strategy (frequency-only mode)
     ///
     /// # Parameters
     /// - `capacity`: Cache capacity
-    /// - `predictor`: Trained learned cache predictor
+    /// - `predictor`: Trained RMI frequency predictor
     pub fn new(capacity: usize, mut predictor: LearnedCachePredictor) -> Self {
         predictor.set_target_hot_entries(capacity);
         predictor.set_threshold_smoothing(0.6);
@@ -117,11 +117,11 @@ impl LearnedCacheStrategy {
         }
     }
 
-    /// Create new learned cache strategy with semantic adapter (hybrid)
+    /// Create new Hybrid Semantic Cache strategy (full hybrid mode)
     ///
     /// # Parameters
     /// - `capacity`: Cache capacity
-    /// - `predictor`: Trained learned cache predictor
+    /// - `predictor`: Trained RMI frequency predictor
     /// - `semantic_adapter`: Semantic adapter for hybrid decisions
     pub fn new_with_semantic(
         capacity: usize,

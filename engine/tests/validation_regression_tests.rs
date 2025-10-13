@@ -1,7 +1,7 @@
 //! Regression tests for Phase 0 Week 9-12 validation bugs
 //!
 //! These tests prevent recurrence of critical bugs discovered during validation:
-//! 1. Learned cache never caching (0% hit rate) - predictor untrained
+//! 1. Hybrid Semantic Cache never caching (0% hit rate) - predictor untrained
 //! 2. LRU hit rate impossibly high (98%) - uneven traffic split or Zipf broken
 //! 3. Memory leak (101% growth) - unbounded buffer or broken eviction
 
@@ -31,9 +31,9 @@ fn create_access(doc_id: u64, seconds_ago: u64) -> AccessEvent {
     }
 }
 
-/// BUG 1 REGRESSION TEST: Learned cache must bootstrap before training
+/// BUG 1 REGRESSION TEST: Hybrid Semantic Cache must bootstrap before training
 ///
-/// Previously: Learned cache's should_cache() returned false when predictor
+/// Previously: Hybrid Semantic Cache's should_cache() returned false when predictor
 /// was untrained, causing chicken-and-egg deadlock (no caching → no training data).
 ///
 /// Fix: should_cache() returns true when tracked_count() == 0 (bootstrap mode)
@@ -45,15 +45,15 @@ fn test_learned_cache_bootstraps_before_training() {
     // CRITICAL: Before training, should cache everything (bootstrap mode)
     assert!(
         strategy.should_cache(1, &vec![0.5; 128]),
-        "Untrained learned cache must cache doc 1 (bootstrap mode)"
+        "Untrained Hybrid Semantic Cache must cache doc 1 (bootstrap mode)"
     );
     assert!(
         strategy.should_cache(2, &vec![0.5; 128]),
-        "Untrained learned cache must cache doc 2 (bootstrap mode)"
+        "Untrained Hybrid Semantic Cache must cache doc 2 (bootstrap mode)"
     );
     assert!(
         strategy.should_cache(99, &vec![0.5; 128]),
-        "Untrained learned cache must cache doc 99 (bootstrap mode)"
+        "Untrained Hybrid Semantic Cache must cache doc 99 (bootstrap mode)"
     );
 
     // Verify tracked_count is 0 (untrained)
@@ -65,7 +65,7 @@ fn test_learned_cache_bootstraps_before_training() {
     );
 }
 
-/// BUG 1 FOLLOW-UP: Learned cache becomes selective after training
+/// BUG 1 FOLLOW-UP: Hybrid Semantic Cache becomes selective after training
 #[test]
 fn test_learned_cache_selective_after_training() {
     let mut predictor = LearnedCachePredictor::new(100).unwrap();
@@ -346,8 +346,8 @@ fn test_cache_memory_bounded() {
 ///
 /// This test simulates the full validation workload in miniature:
 /// - A/B split traffic
-/// - Train learned cache periodically
-/// - Verify learned cache outperforms LRU
+/// - Train Hybrid Semantic Cache periodically
+/// - Verify Hybrid Semantic Cache outperforms LRU
 #[test]
 fn test_full_ab_validation_simulation() {
     let cache_capacity = 1000;
@@ -412,7 +412,7 @@ fn test_full_ab_validation_simulation() {
             }
         }
 
-        // Train learned cache every 10K queries
+        // Train Hybrid Semantic Cache every 10K queries
         if i > 0 && i % 10_000 == 0 {
             let recent = logger.get_recent_window(Duration::from_secs(3600));
             if !recent.is_empty() {
@@ -470,11 +470,11 @@ fn test_full_ab_validation_simulation() {
         learned_hit_rate * 100.0
     );
 
-    // Learned cache should outperform LRU (at least after training)
+    // Hybrid Semantic Cache should outperform LRU (at least after training)
     // Allow for bootstrap period where learned might be lower
     assert!(
         improvement >= 0.8,
-        "Learned cache should be at least 80% as good as LRU (got {:.2}×)",
+        "Hybrid Semantic Cache should be at least 80% as good as LRU (got {:.2}×)",
         improvement
     );
 }

@@ -1,7 +1,7 @@
 //! Tiered Engine - Three-layer architecture orchestrator
 //!
 //! Coordinates all three tiers:
-//! - **Layer 1 (Cache)**: Hot documents predicted by learned cache (RMI + semantic)
+//! //! - **Layer 1 (Cache)**: Hybrid Semantic Cache (RMI frequency + semantic similarity)
 //! - **Layer 2 (Hot Tier)**: Recent writes buffer (fast writes, periodic flush)
 //! - **Layer 3 (Cold Tier)**: HNSW index (all documents, approximate k-NN search)
 //!
@@ -94,7 +94,7 @@ impl Default for TieredEngineConfig {
 
 /// Tiered Engine - Three-layer vector database
 pub struct TieredEngine {
-    /// Layer 1: Learned cache (hot documents)
+    /// Layer 1: Hybrid Semantic Cache (hot documents predicted by RMI + semantic)
     cache_strategy: Arc<RwLock<Box<dyn CacheStrategy>>>,
     
     /// Layer 2: Hot tier (recent writes)

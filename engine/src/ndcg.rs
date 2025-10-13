@@ -1,7 +1,7 @@
 //! NDCG (Normalized Discounted Cumulative Gain) Quality Metrics
 //!
 //! Measures ranking quality for search and cache prediction.
-//! Critical for validating that learned cache caches the RIGHT documents,
+//! Critical for validating that Hybrid Semantic Cache caches the RIGHT documents,
 //! not just popular ones.
 //!
 //! # Formulas

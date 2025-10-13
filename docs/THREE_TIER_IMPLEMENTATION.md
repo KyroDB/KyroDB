@@ -60,13 +60,13 @@ pub fn query(&self, doc_id: u64, query_embedding: Option<&[f32]>) -> Option<Vec<
 
 ### 5. Cache Admission Decision
 - **Strategy-specific**: LRU always admits, Learned uses RMI prediction
-- **Threshold**: Learned cache admits if `predict_hotness() > cache_threshold`
+- **Threshold**: Hybrid Semantic Cache admits if `predict_hotness() > cache_threshold`
 - **Action**: Insert `CachedVector` into cache if admitted
 
 ### 6. Access Logging
 - **When**: On every query (if access logger enabled)
 - **What**: Log `AccessEvent { doc_id, timestamp, access_type }`
-- **Purpose**: Training data for learned cache RMI
+- **Purpose**: Training data for Hybrid Semantic Cache RMI
 - **Performance**: 17.6ns overhead (ring buffer)
 
 ## Insert Path (Write Flow)
@@ -181,7 +181,7 @@ pub struct TieredEngineConfig {
 
 ### Cache Hit Rate
 - **LRU Baseline**: 30-40% (A/B test baseline)
-- **Learned Cache**: 70-90% target (RMI + semantic prediction)
+- **Hybrid Semantic Cache**: 70-90% target (RMI + semantic prediction)
 
 ### Write Throughput
 - **Hot Tier Insert**: ~200ns per document

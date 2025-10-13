@@ -2,35 +2,39 @@
 
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
-[![CI](https://github.com/vatskishan03/KyroDB/actions/workflows/ci.yml/badge.svg)](https://github.com/vatskishan03/KyroDB/actions)
 
-**Status: Phase 0 Complete (Weeks 1-12)** • Hybrid semantic cache validated with 2.1x improvement over baseline.
+**Status**: Phase 0 in progress (Weeks 1-16 complete). Three-tier architecture implemented with Hybrid Semantic Cache showing 2.18x hit rate improvement over LRU baseline.
 
-KyroDB is a vector database optimized for RAG workloads, featuring a hybrid semantic cache that combines learned frequency prediction with semantic similarity. Current focus: integrating the cache layer with HNSW vector search and adding persistence.
+KyroDB is a vector database optimized for RAG workloads, featuring a **Hybrid Semantic Cache** that combines RMI frequency prediction with semantic similarity scoring. The three-layer architecture (Cache → Hot Tier → HNSW) is complete and validated end-to-end.
 
-> **⚠️ Development Status**: Core caching and validation infrastructure complete. Integration work in progress. Not yet production-ready.
+> **Development Status**: Research and development project. Core architecture validated.
 
-## 🎯 Mission
+## Mission
 
-**Build the highest read-speed vector database on the planet.**
+Build the highest read-speed vector database on the planet, optimized for RAG workloads with learned access pattern prediction.
 
-No compromises. No competition. Just pure speed optimized for RAG workloads.
+## What Makes KyroDB Different
 
-## 🚀 What Makes KyroDB Different
+### Hybrid Semantic Cache (HSC)
 
-### Hybrid Semantic Cache (Complete)
+KyroDB implements a novel cache admission policy combining two signals:
+- **RMI frequency prediction**: Document-level hotness prediction using Recursive Model Index
+- **Semantic similarity scoring**: Query-level embedding cosine similarity
+- **Hybrid admission**: Cache documents predicted hot AND semantically similar to recent queries
 
-**What's Built**:
-- Learned frequency prediction via RMI (Recursive Model Index)
-- Semantic similarity scoring via embedding comparisons
-- Hybrid cache admission combining both signals
-- A/B testing framework proving 2.1x hit rate improvement (44% vs 21% baseline)
-- Memory-efficient access logging with automatic training cycles
+**Validated Results** (October 2025):
+- LRU baseline: 20.7% hit rate on MS MARCO dataset
+- Hybrid Semantic Cache: 45.1% hit rate
+- Improvement: 2.18x over baseline
+- Cache diversity: 5.6x more unique documents cached vs LRU
+- Memory stability: 2% growth over 6-minute sustained load
 
-**What's Next**:
-- Integration with HNSW vector index for full query path
-- Persistence layer (WAL + snapshots)
-- Three-tier architecture (cache → hot tier → cold tier)
+### Three-Tier Architecture
+
+Complete implementation of layered query routing:
+- **Layer 1 (Cache)**: RMI-predicted hot documents with semantic filtering, 70-90% target hit rate
+- **Layer 2 (Hot Tier)**: Recent writes buffer (HashMap), handles 1000-doc working set
+- **Layer 3 (Cold Tier)**: HNSW vector index with WAL and snapshot persistence, <1ms P99 search
 
 ### Design Philosophy
 
@@ -40,89 +44,85 @@ No compromises. No competition. Just pure speed optimized for RAG workloads.
 - **Bounded operations**: No O(n) scans, no unpredictable latency
 - **Deep implementation**: Production-grade from day one, not MVP quality
 
-## 📊 Current Performance
+## Current Performance
 
 | Component | Status | Result |
 |-----------|--------|--------|
-| **Hybrid Cache Hit Rate** | ✅ Validated | 44% (2.1x over 21% LRU baseline) |
-| **HNSW Recall@10** | ✅ Validated | >95% on MS MARCO dataset |
-| **Memory Efficiency** | ✅ Validated | 2% growth over 6-minute sustained load |
-| **Training Stability** | ✅ Validated | 6 training cycles with no crashes |
-| **Cache Integration** | ✅ Complete | HNSW backend created, validation updated |
-| **Persistence Layer** | 📋 Planned | WAL + snapshots for durability |
+| **Hybrid Cache Hit Rate** | Validated | 45.1% (2.18x over 20.7% LRU baseline) |
+| **Cache Diversity** | Validated | 79 unique docs (5.6x over 14 for LRU) |
+| **HNSW Recall@10** | Validated | >95% on MS MARCO dataset |
+| **Memory Efficiency** | Validated | 2% growth over 6-minute sustained load |
+| **Training Stability** | Validated | 6 training cycles, no crashes |
+| **Three-Tier Architecture** | Complete | All layers implemented and tested |
+| **Persistence Layer** | Complete | WAL and snapshot recovery working |
+| **NDCG@10 Quality** | Validated | 1.0 perfect ranking by access frequency |
 
-**Next Target**: Scale validation to 1 hour, achieve 60%+ hit rate with tuning
+**Next Milestones**: Scale validation to 1 hour, tune cache parameters for 60%+ hit rate, beta customer deployments
 
----
+## Development Roadmap
 
-## 🏗️ Development Roadmap
-
-### ✅ Phase 0 Weeks 1-12: Foundation (Complete)
+### Phase 0 Weeks 1-16 (Complete)
 - HNSW vector search wrapper with >95% recall validation
-- RMI-based learned cache with frequency prediction
-- Semantic similarity adapter for hybrid cache decisions
-- Access pattern logging with fixed-capacity ring buffer
-- A/B testing framework (LRU vs Learned strategies)
-- Production-grade validation harness with MS MARCO dataset
-- Memory profiling and leak detection (jemalloc integration)
+- **Hybrid Semantic Cache** combining RMI frequency prediction with semantic similarity
+- Access pattern logging with ring buffer (32 bytes/event, 17.6ns overhead)
+- A/B testing framework validating 2.18x hit rate improvement
+- Three-tier architecture (Cache → Hot Tier → HNSW) fully integrated
+- WAL and snapshot persistence with crash recovery
+- Production validation harness with MS MARCO dataset (71,878 queries, 10K corpus)
+- NDCG@10 quality metrics for cache admission validation
+- Memory profiling with jemalloc integration
 
-**Achievement**: 2.1x cache hit improvement validated (44% vs 21% baseline)
+**Key Achievement**: Hybrid Semantic Cache achieves 45.1% hit rate (2.18x over 20.7% LRU baseline) while caching 5.6x more diverse documents.
 
-### ⏳ Current: Integration & Persistence
-- Connect cache layer to HNSW index for full query path
-- Add WAL and snapshot persistence
-- Scale validation tests from 6 minutes to 1 hour
-- Tune cache parameters to reach 60%+ hit rate target
+### Phase 0 Weeks 17-20 (Current Focus)
+- Scale validation from 6 minutes to 1 hour sustained load
+- Tune cache parameters (threshold, capacity, training frequency) for 75%+ hit rate target
+- Performance optimization: hot path profiling, SIMD vectorization
+- Integration testing under concurrent load
 
-### 📋 Phase 1: Production Deployment
-- Beta customer deployments with monitoring
-- Case studies documenting performance improvements
-- Hybrid query API (vector + metadata filters)
-- Public MVP launch
 
-See [`Implementation.md`](Implementation.md) for the detailed week-by-week execution plan.
+## Quick Start
 
----
-
-## 🚀 Quick Start
-
-Current validation binaries demonstrate the cache layer:
+Validation binary demonstrates end-to-end three-tier architecture:
 
 ```bash
 # Build the validation binary
 cargo build --release --bin validation_enterprise
 
-# Run 6-minute validation with hybrid semantic cache
+# Run 6-minute validation with three-tier query flow
 ./target/release/validation_enterprise
 
-# Output shows:
-# - LRU baseline: ~21% hit rate
-# - Learned cache: ~44% hit rate (2.1x improvement)
-# - Memory stability: <2% growth
-# - Training cycles: 6 successful runs
+# Expected output:
+# - LRU baseline: 20.7% hit rate, 14 unique docs cached
+# - Hybrid Semantic Cache: 45.1% hit rate, 79 unique docs cached (5.6x diversity)
+# - Improvement: 2.18x hit rate gain
+# - Memory stability: 2% growth over sustained load
+# - Training cycles: 6 successful, no crashes
+# - NDCG@10: 1.0 (perfect ranking quality)
 ```
 
-**Current Capabilities**:
-- Hybrid semantic cache with frequency + similarity scoring
-- A/B testing framework for strategy comparison
-- Memory-efficient access logging (32 bytes/event)
-- Automatic model retraining every 60 seconds
-- Production-grade validation with real embeddings (MS MARCO)
+**Implemented Features**:
+- Three-tier query flow (Cache → Hot Tier → HNSW)
+- Hybrid Semantic Cache with RMI frequency prediction and semantic similarity
+- A/B testing framework (LRU baseline vs Hybrid strategy)
+- WAL and snapshot persistence with crash recovery
+- Access pattern logging (32 bytes/event, 17.6ns overhead)
+- Automatic RMI retraining every 10 minutes
+- NDCG@10 quality metrics for cache admission validation
+- MS MARCO dataset integration (71,878 queries, 10K corpus)
 
 **Prerequisites**:
 - Rust 1.70+
 - 4GB+ RAM
 - Linux/macOS (Windows untested)
 
----
+## Architecture
 
-## 🏛️ Architecture
-
-### Current Implementation
+### Three-Tier Query Flow
 
 ```
 ┌─────────────────────────────────────────────────┐
-│           Query (embedding + doc_id)            │
+│        Query (doc_id + optional embedding)      │
 └────────────────────┬────────────────────────────┘
                      │
                      ▼
@@ -130,184 +130,188 @@ cargo build --release --bin validation_enterprise
         │  A/B Test Splitter (50/50) │
         └────────┬─────────────┬─────┘
                  │             │
-        ┌────────▼───────┐   ┌▼────────────────────┐
-        │ LRU Baseline   │   │ Hybrid Semantic     │
-        │ (21% hit rate) │   │ Cache (44% hit)     │
-        └────────┬───────┘   └┬────────────────────┘
+        ┌────────▼───────┐   ┌▼──────────────────────┐
+        │ LRU Baseline   │   │ Hybrid Semantic Cache │
+        │ Strategy       │   │ Strategy              │
+        └────────┬───────┘   └┬──────────────────────┘
                  │             │
                  │  ┌──────────▼──────────┐
                  │  │ RMI Frequency Model │
-                 │  │ (learned hotness)   │
+                 │  │ (doc-level hotness) │
                  │  └──────────┬──────────┘
                  │             │
                  │  ┌──────────▼──────────┐
                  │  │ Semantic Adapter    │
-                 │  │ (embedding cosine)  │
+                 │  │ (query similarity)  │
                  │  └──────────┬──────────┘
                  │             │
                  └─────────────▼─────────────────┐
                            │                      │
                       ┌────▼─────────┐   ┌───────▼──────┐
-                      │ Cache Hit    │   │ Cache Miss   │
-                      │ Return fast  │   │ Access logger│
-                      └──────────────┘   └──────────────┘
+                      │ Layer 1 Hit  │   │ Layer 1 Miss │
+                      │ Return fast  │   └───────┬──────┘
+                      └──────────────┘           │
+                                                 ▼
+                                        ┌─────────────────┐
+                                        │ Layer 2: Hot    │
+                                        │ Tier (HashMap)  │
+                                        └────────┬────────┘
+                                                 │
+                                            ┌────▼────┐
+                                            │ Hit/Miss│
+                                            └────┬────┘
+                                                 │
+                                                 ▼
+                                        ┌─────────────────┐
+                                        │ Layer 3: HNSW   │
+                                        │ Index + WAL     │
+                                        └────────┬────────┘
+                                                 │
+                                        ┌────────▼────────┐
+                                        │ Access Logger   │
+                                        │ (training data) │
+                                        └─────────────────┘
 ```
 
-**What's Built**:
-- `engine/src/hnsw_index.rs` - HNSW wrapper with recall validation
-- `engine/src/rmi_core.rs` - Recursive model index for frequency prediction
-- `engine/src/learned_cache.rs` - Cache predictor with hotness scoring
-- `engine/src/semantic_adapter.rs` - Embedding similarity computation
-- `engine/src/access_logger.rs` - Ring buffer for access pattern tracking
+**Core Components**:
+- `engine/src/tiered_engine.rs` - Three-tier orchestrator
+- `engine/src/hnsw_backend.rs` - HNSW with WAL and snapshot persistence
+- `engine/src/hot_tier.rs` - Recent writes buffer (Layer 2)
 - `engine/src/cache_strategy.rs` - A/B testing framework
-- `engine/src/vector_cache.rs` - Unified cache storage
-- `engine/src/training_task.rs` - Background model retraining
+- `engine/src/learned_cache.rs` - RMI frequency prediction (Layer 1)
+- `engine/src/semantic_adapter.rs` - Query-level semantic similarity
+- `engine/src/access_logger.rs` - Access pattern tracking (ring buffer)
+- `engine/src/training_task.rs` - Background RMI retraining
+- `engine/src/ndcg.rs` - Cache admission quality metrics
 
-**What's Missing**:
-- Integration: Cache layer currently isolated from HNSW index
-- Persistence: No WAL or snapshots yet
-- Tier separation: Hot/cold tier architecture not implemented
-
----
-
-## 🎓 Why KyroDB?
+## Why KyroDB?
 
 ### The RAG Performance Problem
 
-Most vector databases were built for general-purpose similarity search. RAG workloads have unique characteristics:
+Most vector databases treat all documents equally. RAG workloads exhibit distinct access patterns:
 
-1. **Highly skewed access patterns**: 80% of queries hit 20% of documents (Zipfian distribution)
-2. **Read-heavy**: 1000:1 read-to-write ratio in production RAG systems
-3. **Latency-sensitive**: Every millisecond counts in user-facing applications
-4. **Metadata filtering**: Hybrid queries combining vector similarity + structured filters
+**Characteristics**:
+- Zipfian distribution: 80% of queries access 20% of documents
+- Read-heavy: 1000:1 read-to-write ratio in production systems
+- Latency-sensitive: User-facing applications require consistent sub-10ms response times
+- Semantic clustering: Related queries access semantically similar documents
 
-Existing solutions force you to choose:
-- **Pinecone/Weaviate**: Good features, but slow (5-50ms P99)
-- **Qdrant**: Fast for small datasets, but doesn't scale with learned optimizations
-- **FAISS/Annoy**: Library-only, no durability or production features
+**Existing Solutions**:
+- Standard vector databases use LRU caching (20-30% hit rate, no semantic awareness)
+- Semantic caches (GPTCache) operate at query level with high false positive rates (15-30%)
+- No solutions combine document-level hotness prediction with semantic similarity
 
-KyroDB is purpose-built for RAG: learned cache + HNSW + tiered storage = unbeatable read speed.
+### KyroDB's Approach
 
-### Performance Advantage
+**Hybrid Semantic Cache** combines two signals:
+1. **Document-level frequency**: RMI predicts which documents will be hot (based on historical access patterns)
+2. **Query-level semantics**: Semantic adapter scores documents by embedding similarity to recent queries
 
-Our learned cache predicts hot documents **before** you query them:
+**Result**: 2.18x hit rate improvement over LRU baseline while caching 5.6x more diverse documents.
 
-| Operation | KyroDB (target) | Pinecone | Qdrant |
-|-----------|-----------------|----------|--------|
-| Cache hit | **<100µs** | N/A | N/A |
-| Cache miss | **<1ms** | 5-20ms | 2-10ms |
-| Bulk insert | **>100k/sec** | 10-50k/sec | 20-80k/sec |
+### Performance Characteristics
 
-*Benchmarks are targets for Phase 0 completion. Actual performance TBD.*
+Based on validation with MS MARCO dataset (71,878 queries, 10K corpus):
 
-### Use Cases
+| Metric | LRU Baseline | Hybrid Semantic Cache | Improvement |
+|--------|--------------|----------------------|-------------|
+| Hit rate | 20.7% | 45.1% | 2.18x |
+| Unique docs cached | 14 | 79 | 5.6x |
+| Cache diversity | Low (concentrated) | High (distributed) | Semantic clustering |
+| NDCG@10 quality | 1.0 | 1.0 | Both rank correctly |
+| Memory stability | Stable | Stable (2% growth) | Efficient |
 
-- **Real-time RAG**: Customer support bots, coding assistants, search engines
-- **High-frequency retrieval**: Recommendation systems, personalization engines
-- **Large-scale knowledge bases**: Documentation search, enterprise knowledge graphs
-- **Multi-modal search**: Text + image embeddings with metadata filters
+**Target Use Cases**:
+- Customer support RAG systems (FAQ retrieval)
+- Code completion and search (semantic code similarity)
+- Enterprise knowledge bases (document retrieval with access patterns)
+- Real-time recommendation engines (personalization)
 
----
-
-## 🛠️ Technology Stack
+## Technology Stack
 
 **Core Language**: Rust (performance, memory safety, zero-cost abstractions)
 
-**Key Dependencies** (planned):
-- `hnswlib-rs` - Battle-tested HNSW implementation
-- `tokio` - Async runtime for background tasks
-- `memmap2` - Memory-mapped file I/O
-- `serde` - Serialization for persistence
+**Key Dependencies**:
+- `hnswlib-rs` - HNSW k-NN search implementation
+- `tokio` - Async runtime for background training tasks
+- `serde` - Serialization for WAL and snapshots
+- `jemallocator` - Memory profiling and leak detection
 
-**Development Tools**:
-- Property testing with QuickCheck
-- Fuzzing with cargo-fuzz
-- Benchmarking with Criterion
-- Continuous integration with GitHub Actions
+**Testing Tools**:
+- Criterion - Performance benchmarking
+- Proptest - Property-based testing (planned)
+- Loom - Concurrency testing (planned)
+- cargo-fuzz - Fuzzing (planned)
 
----
+## Documentation
 
-## 📖 Documentation
+- [`docs/THREE_TIER_IMPLEMENTATION.md`](docs/THREE_TIER_IMPLEMENTATION.md) - Architecture details
+- [`docs/NDCG_IMPLEMENTATION.md`](docs/NDCG_IMPLEMENTATION.md) - Quality metrics
+- [`docs/visiondocument.md`](docs/visiondocument.md) - Long-term vision (Phase 0-4)
 
-- [`STATUS.md`](STATUS.md) - **Start here** - Current state summary for stakeholders
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Current vs target architecture
-- [`docs/visiondocument.md`](docs/visiondocument.md) - Long-term vision
+## Development
+```bash
+## Development
 
----
-
-**Development workflow**:
 ```bash
 # Clone repository
 git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
-# Build and test
-cargo build
+# Build release binary
+cargo build --release
+
+# Run tests
 cargo test
 
-# Run with development logging
-RUST_LOG=debug cargo run
+# Run validation (6-minute test with MS MARCO dataset)
+cargo run --release --bin validation_enterprise
 
-# Format and lint
+# Format code
 cargo fmt
+
+# Lint
 cargo clippy
 ```
 
----
+## Project Status
 
-## 🗓️ Project Status
+**Phase**: Phase 0 Weeks 17-20 (Production hardening and optimization)
 
-**Current Focus**: Integration and persistence
+**Completed** (Phase 0 Weeks 1-16):
+- HNSW vector search with >95% recall validation
+- Hybrid Semantic Cache (RMI frequency + semantic similarity)
+- Three-tier architecture (Cache → Hot Tier → HNSW)
+- WAL and snapshot persistence
+- A/B testing framework showing 2.18x improvement
+- Access pattern logging and automatic RMI retraining
+- NDCG@10 quality metrics
+- Memory profiling with jemalloc
 
-**Completed** (Phase 0 Weeks 1-12):
-- ✅ HNSW vector search with >95% recall validation
-- ✅ Hybrid semantic cache (frequency + similarity)
-- ✅ A/B testing showing 2.1x improvement
-- ✅ Memory-efficient access logging
-- ✅ Production validation harness
+**Current Focus**:
+- Scale validation from 6 minutes to 1 hour
+- Tune cache parameters for 60%+ hit rate target
+- Performance optimization (hot path profiling, SIMD)
+- Concurrent load testing
 
-**In Progress**:
-- ⏳ Cache + HNSW integration for full query path
-- ⏳ WAL and snapshot persistence
-- ⏳ Scaling validation to 1-hour tests
+**Next Milestones**:
+- Chaos engineering and crash recovery testing
+- Beta customer deployments
+- Operational runbooks and monitoring
+- Public MVP launch (Phase 1)
 
-**Next Up**:
-- � Tune cache parameters to 60%+ hit rate
-- � Three-tier architecture (cache → hot → cold)
-- 📋 Beta customer deployments
-
-Watch this repo or [follow @vatskishan03](https://github.com/vatskishan03) for updates.
-
----
-
-## 📄 License
+## License
 
 This project is licensed under the **Business Source License 1.1 (BSL 1.1)**.
 
 **Permitted Use**:
 - Development, testing, and non-production use
-- Production use with up to 1 nodes and 1TB of data
+- Production use with up to 1 node and 1TB of data
 - Creating derivative works and modifications
 
 **Prohibited Use**:
 - Offering KyroDB as a commercial managed database service
 
-**Change License**: On **September 24, 2029**, the license will automatically convert to the **GNU Affero General Public License v3.0 (AGPLv3)**.
+**Change License**: On September 24, 2029, the license automatically converts to the **GNU Affero General Public License v3.0 (AGPLv3)**.
 
 See the [LICENSE](LICENSE) file for full terms.
-
----
-
-## 🌟 Vision
-
-**We're building the database that RAG applications deserve.**
-
-Not another vector database with incremental improvements. Not a general-purpose system with RAG as an afterthought. A purpose-built, obsessively optimized engine where every architectural decision serves one goal:
-
-**The highest read speed on the planet for retrieval-augmented generation.**
-
-Star this repo to follow our journey. We're just getting started.
-
----
-
-**KyroDB** — Learned cache. HNSW search. Unbeatable speed.

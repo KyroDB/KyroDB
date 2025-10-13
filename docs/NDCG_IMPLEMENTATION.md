@@ -11,7 +11,7 @@
 
 **Test Configuration**: 71,878 queries, 10K corpus, 6-minute validation run
 
-| Metric | LRU Baseline | Learned Cache | Insight |
+| Metric | LRU Baseline | Hybrid Semantic Cache | Insight |
 |--------|--------------|---------------|---------|
 | **Unique docs cached** | 14 | 79 | Learned explores **5.6× more** |
 | **NDCG@10** | 1.0000 | 1.0000 | Perfect ranking by access count |
@@ -19,13 +19,13 @@
 | **Recall@10** | 0.7143 | 0.1266 | LRU concentrated, Learned distributed |
 | **Hit rate** | 20.7% | 45.1% | **2.18× improvement** |
 
-**Key Finding**: Learned cache caches **5.6× more unique documents** but still achieves **2.18× better hit rate**. This proves **semantic clustering works** - the system is caching related documents based on embeddings, not just popular ones.
+**Key Finding**: Hybrid Semantic Cache caches **5.6× more unique documents** but still achieves **2.18× better hit rate**. This proves **semantic clustering works** - the system is caching related documents based on embeddings, not just popular ones.
 
 ---
 
 ## Executive Summary
 
-Successfully implemented comprehensive NDCG@10 quality metrics across the entire codebase. The implementation measures **cache admission quality** - whether the learned cache and LRU baseline are caching documents that will actually be queried again.
+Successfully implemented comprehensive NDCG@10 quality metrics across the entire codebase. The implementation measures **cache admission quality** - whether the Hybrid Semantic Cache and LRU baseline are caching documents that will actually be queried again.
 
 ### Key Metrics Added
 
@@ -150,7 +150,7 @@ match strategy_id {
         }
     }
     StrategyId::LearnedRmi => {
-        // Same logic for learned cache
+        // Same logic for Hybrid Semantic Cache
     }
 }
 ```
@@ -175,7 +175,7 @@ Quality Metrics (NDCG@10):
     NDCG@10:       0.XXXX
     MRR:           0.XXXX
     Recall@10:     0.XXXX
-  Learned Cache:
+  Hybrid Semantic Cache:
     NDCG@10:       0.XXXX
     MRR:           0.XXXX
     Recall@10:     0.XXXX
@@ -221,7 +221,7 @@ With the current implementation, we expect:
 - Recall@10: ~0.2-0.4
 - **Why low**: LRU caches based on recency, not future access patterns
 
-**Learned Cache (RMI)**:
+**Hybrid Semantic Cache (RMI)**:
 - NDCG@10: ~0.6-0.8 (good quality)
 - MRR: ~0.7-0.9
 - Recall@10: ~0.5-0.7
@@ -299,7 +299,7 @@ Quality Metrics (NDCG@10):
     NDCG@10:       0.XXXX
     MRR:           0.XXXX
     Recall@10:     0.XXXX
-  Learned Cache:
+  Hybrid Semantic Cache:
     NDCG@10:       0.XXXX
     MRR:           0.XXXX
     Recall@10:     0.XXXX
@@ -363,9 +363,9 @@ Quality Metrics (NDCG@10):
 
 ## Conclusion
 
-NDCG@10 quality metrics are now **fully implemented** and integrated across the codebase. This validates that the learned cache doesn't just achieve high hit rates, but caches the **correct** documents - those that will actually be queried in the near future.
+NDCG@10 quality metrics are now **fully implemented** and integrated across the codebase. This validates that the Hybrid Semantic Cache doesn't just achieve high hit rates, but caches the **correct** documents - those that will actually be queried in the near future.
 
-**Impact**: We can now prove that learned cache has superior **predictive quality**, not just higher hit rates. This is critical for production deployments where caching the wrong popular documents wastes memory and degrades user experience.
+**Impact**: We can now prove that Hybrid Semantic Cache has superior **predictive quality**, not just higher hit rates. This is critical for production deployments where caching the wrong popular documents wastes memory and degrades user experience.
 
 **Status**: ✅ **PRODUCTION-READY**
 

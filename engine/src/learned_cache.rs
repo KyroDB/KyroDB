@@ -1,16 +1,17 @@
-//! Learned Cache Predictor using HashMap for cache hotness prediction
+//! Hybrid Semantic Cache Predictor (Frequency Component)
 //!
-//! Hybrid Semantic Cache: RMI-based cache predictor (doc_id → hotness_score)
+//! **Purpose**: RMI-based frequency prediction for document-level hotness.
+//! Combined with semantic similarity adapter for hybrid cache admission decisions.
 //!
 //! This module predicts cache hotness: doc_id → P(hot | recent_accesses)
-//! HashMap learns access patterns and predicts which documents should be cached.
+//! RMI learns access patterns and predicts which documents should be cached.
 //!
 //! Architecture:
-//! - HashMap stores doc_id → hotness_score (O(1) lookup)
-//! - HNSW performs k-NN search (separate concern)
+//! - RMI stores doc_id → hotness_score (O(log n) lookup)
+//! - Semantic adapter computes embedding similarity (optional hybrid layer)
 //! - Access logger feeds training data
 //!
-//! Target: 60-80% cache hit rate vs 15-25% LRU baseline (1M corpus)
+//! Target: 70-90% cache hit rate vs 30-40% LRU baseline
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -18,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Access event for training learned cache predictor
+/// Access event for training Hybrid Semantic Cache predictor
 ///
 #[derive(Debug, Clone)]
 pub struct AccessEvent {
@@ -47,7 +48,7 @@ pub enum AccessType {
     Write,
 }
 
-/// Learned cache predictor using RMI to predict document hotness
+/// Hybrid Semantic Cache predictor using RMI to predict document hotness (frequency component)
 ///
 /// Predicts P(hot | recent_accesses) for each document ID.
 /// Documents with high predicted hotness are kept in cache.
@@ -120,7 +121,7 @@ pub struct LearnedCachePredictor {
 }
 
 impl LearnedCachePredictor {
-    /// Create new learned cache predictor
+    /// Create new Hybrid Semantic Cache predictor
     ///
     /// # Parameters
     /// - `capacity`: Maximum number of doc_ids to track (e.g., 10K-1M)
@@ -399,7 +400,7 @@ impl LearnedCachePredictor {
     }
 }
 
-/// Statistics for learned cache predictor monitoring
+/// Statistics for Hybrid Semantic Cache predictor monitoring
 #[derive(Debug, Clone)]
 pub struct CachePredictorStats {
     pub tracked_docs: usize,

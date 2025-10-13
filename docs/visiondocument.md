@@ -2,7 +2,7 @@
 
 **Status**: Long-term vision and product strategy. Foundation-first execution.
 
-**Last Updated**: October 4, 2025
+**Last Updated**: October 13, 2025
 
 ***
 
@@ -31,23 +31,23 @@ AI applications today stitch together **3-5 different systems**:
 
 ```
 ┌─────────────────────────────────────────────┐
-│  Layer 1: LEARNED CACHE                     │
+│  Layer 1: HYBRID SEMANTIC CACHE             │
 │  Predicts hot documents (Zipfian patterns)  │
-│  Hit rate: 70-90% vs 30-40% LRU            │
-│  Latency: 3-5ns (pure memory)               │
+│  Hit rate: 70-90% target vs 30-40% LRU     │
+│  Latency: <10ns RMI prediction              │
 └─────────────────────────────────────────────┘
            ↓ (cache miss)
 ┌─────────────────────────────────────────────┐
-│  Layer 2: HOT TIER (BTree)                  │
-│  Recent writes (last 10K-100K vectors)      │
-│  Latency: 20-50ns (fast mutations)          │
+│  Layer 2: HOT TIER (HashMap)                │
+│  Recent writes (last 1K-10K vectors)        │
+│  Latency: 100-200ns (HashMap lookup)        │
 └─────────────────────────────────────────────┘
            ↓ (not in hot tier)
 ┌─────────────────────────────────────────────┐
-│  Layer 3: COLD TIER (RMI)                   │
+│  Layer 3: COLD TIER (HNSW)                  │
 │  Bulk data (millions of vectors)            │
-│  Latency: 30ns (learned index prediction)   │
-│  Compaction: LSM-style, non-blocking        │
+│  Latency: <1ms P99 @ 10M vectors            │
+│  Persistence: WAL + snapshots               │
 └─────────────────────────────────────────────┘
 ```
 
@@ -62,7 +62,7 @@ AI applications today stitch together **3-5 different systems**:
 | **Systems to manage** | 3-5 | 1 | **1** ✓ |
 
 **Performance math**:
-- Layer 1 (learned cache): 2-3x faster than base RMI
+- Layer 1 (Hybrid Semantic Cache): 2-3x faster than base RMI
 - Layer 2+3 (RMI+BTree): 1.7x faster than BTree
 - **Combined**: 3-5x faster than pure BTree, 10x faster than PostgreSQL
 
@@ -72,7 +72,7 @@ AI applications today stitch together **3-5 different systems**:
 
 ### **What Makes KyroDB Unique**
 
-**1. Learned Cache (Document Level)**
+**1. Hybrid Semantic Cache (Document Level)**
 - Predicts which documents will be accessed next
 - Learns temporal patterns (9am-5pm peaks)
 - Learns semantic clusters (related queries)
@@ -93,37 +93,49 @@ AI applications today stitch together **3-5 different systems**:
 **Contrast with competitors**:
 - **Semantic cache (GPTCache, others)**: Query-level caching with 15-30% false positive rate, doesn't solve cold cache
 - **Standard vector DBs**: Static LRU cache, no learning, 30-40% hit rate
-- **KyroDB**: Document-level learned cache, 70-90% hit rate, zero false positives
+- **KyroDB**: Document-level Hybrid Semantic Cache, 70-90% target hit rate, zero false positives (validated: 45.1% hit rate, 2.18x over LRU baseline)
 
 ***
 
 ## Strategy: Foundation → Intelligence → Autonomy
 
-### **Phase 0: Foundation (Current - 6 months)**
+### **Phase 0: Foundation (Weeks 1-26, Current: Weeks 17-20)**
 **Goal**: Production-grade single-node engine
 
-**SLOs (Go/No-Go)**:
-- P99 lookup < 1ms on 10M vectors (warm cache)
-- No O(n) fallbacks in steady state (bounded search ≤ 64)
-- No deadlocks under mixed read/write load
-- WAL recovery ≤ 2s for 1GB log
-- Bounded memory: cache + buffers within configured limits
+**Status**: Weeks 1-16 complete
+- HNSW vector search (>95% recall validated)
+- Three-tier architecture implemented and tested
+- Hybrid Semantic Cache achieving 45.1% hit rate (2.18x over LRU)
+- WAL and snapshot persistence working
+- Access logging and automatic RMI retraining
+- NDCG@10 quality metrics
+- Memory profiling (jemalloc)
 
-**Architecture**:
-- Tiered index: BTree (hot) + RMI (cold)
-- LSM-style compaction (non-blocking)
-- Feature-gated metrics (zero overhead for benchmarks)
+**Current Focus** (Weeks 17-20):
+- Scale validation to 1 hour
+- Tune cache parameters for 60%+ hit rate
+- Performance optimization (hot path profiling)
+- Concurrent load testing
+
+**SLOs (Go/No-Go)**:
+- P99 k-NN search < 1ms on 10M vectors (HNSW validated)
+- Cache hit rate > 60% (current: 45.1%, tuning in progress)
+- No deadlocks under mixed read/write load (loom tests planned)
+- WAL recovery ≤ 2s for 1GB log (persistence working)
+- Bounded memory (validated: 2% growth over sustained load)
 
 **Validation**:
-- Property tests (proptest)
-- Concurrency tests (loom)
-- Chaos tests (failpoints for recovery)
-- Benchmark: 3x faster than BTree on sequential keys
+- End-to-end tests (8/8 passing)
+- MS MARCO dataset (71,878 queries, 10K corpus)
+- A/B testing framework (LRU vs Hybrid Semantic Cache)
+- Property tests (planned)
+- Concurrency tests with loom (planned)
+- Chaos tests with failpoints (planned)
 
 ***
 
 ### **Phase 1: RAG Acceleration (Months 7-12)**
-**Goal**: Prove learned cache eliminates cold cache problem
+**Goal**: Prove Hybrid Semantic Cache eliminates cold cache problem
 
 **SLOs**:
 - P99 hybrid query < 5ms on 1M+ documents
@@ -132,14 +144,14 @@ AI applications today stitch together **3-5 different systems**:
 - Zero-downtime index rebuilds
 
 **Features**:
-- Learned cache with RMI-based predictor
+- Hybrid Semantic Cache with RMI-based predictor
 - Query pattern logger (capture Zipfian patterns)
 - Offline training pipeline (pattern analysis → model training)
 - Online learning (continuous improvement)
 - Intelligent prefetching (co-access graph + learned probability)
 
 **Validation**:
-- A/B test: Learned cache vs baseline LRU
+- A/B test: Hybrid Semantic Cache vs baseline LRU
 - 5+ beta deployments in production RAG apps
 - 2+ case studies: latency before/after graphs
 - Proof: Consistent sub-10ms P99 (no 100ms+ spikes)
@@ -207,7 +219,7 @@ Hit rate: 30-40%
 After (KyroDB):
 ┌─────────────────────────────────────────────┐
 │ KyroDB                 (all-in-one)         │
-│ - Learned cache        (eliminates spikes)  │
+│ - Hybrid Semantic Cache        (eliminates spikes)  │
 │ - Hybrid search        (vector + metadata)  │
 │ - Self-optimizing      (learns patterns)    │
 └─────────────────────────────────────────────┘
@@ -221,7 +233,7 @@ Hit rate: 70-90%
 | Feature | Pinecone | Weaviate | Vespa | **KyroDB** |
 |---------|----------|----------|-------|------------|
 | Vector search | ✓ | ✓ | ✓ | ✓ |
-| Learned cache | ✗ | ✗ | Basic | **Advanced (RMI)** |
+| Hybrid Semantic Cache | ✗ | ✗ | Basic | **Advanced (RMI)** |
 | Self-optimizing | ✗ | ✗ | ✗ | **✓ (learns patterns)** |
 | Consistent latency | ✗ | ✗ | ✗ | **✓ (no cold spikes)** |
 | Open source | ✗ | ✓ | ✓ | **✓** |
@@ -235,7 +247,7 @@ Hit rate: 70-90%
 
 ### **1. Customer Support RAG**
 **Problem**: 100-200ms query latency, unpredictable spikes during peak hours  
-**KyroDB solution**: Learned cache predicts FAQs, consistent <10ms P99  
+**KyroDB solution**: Hybrid Semantic Cache predicts FAQs, consistent <10ms P99  
 **ROI**: 10x faster responses, lower infrastructure costs, better user experience
 
 ### **2. E-Commerce Recommendations**
@@ -325,9 +337,9 @@ Result:  Best of both worlds
 ### **6 Months (Phase 1)**
 - Query pattern logger (capture access patterns)
 - Pattern analysis tools (Zipfian detection, clustering)
-- Learned cache predictor (RMI-based admission policy)
+- Hybrid Semantic Cache predictor (RMI-based admission policy)
 - Prefetch engine (co-access graph + learned probability)
-- A/B testing framework (prove learned cache value)
+- A/B testing framework (prove Hybrid Semantic Cache value)
 
 ### **12 Months (Phase 2)**
 - Hybrid search (BM25 + vector fusion)

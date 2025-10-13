@@ -227,7 +227,7 @@ impl AbTestSummary {
         println!("  Hit Rate: {:.2}%", self.lru_hit_rate * 100.0);
         println!("  Avg Latency: {}ns", self.lru_avg_latency_ns);
 
-        println!("\nLearned Cache:");
+        println!("\nHybrid Semantic Cache:");
         println!("  Hits: {}", self.learned_hits);
         println!("  Misses: {}", self.learned_misses);
         println!("  Hit Rate: {:.2}%", self.learned_hit_rate * 100.0);

@@ -1,4 +1,4 @@
-//! Access Pattern Logger for Learned Cache Training
+//! Access Pattern Logger for Hybrid Semantic Cache Training
 //!
 //! Access pattern logger: Ring buffer for training data collection
 //!

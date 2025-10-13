@@ -3,7 +3,7 @@
 Generate mock semantic embeddings for KyroDB validation testing.
 
 This creates a realistic dataset with semantic clusters for testing
-the hybrid semantic-learned cache without requiring MS MARCO download.
+the Hybrid Semantic Cache without requiring MS MARCO download.
 
 Usage:
     python3 scripts/generate_mock_embeddings.py
