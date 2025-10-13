@@ -418,7 +418,6 @@ mod tests {
             doc_id,
             timestamp: SystemTime::now() - Duration::from_secs(seconds_ago),
             access_type: AccessType::Read,
-            embedding: vec![0.5; 128], // Mock embedding for tests
         }
     }
 

@@ -40,6 +40,12 @@ pub mod memory_profiler;
 // Persistence: WAL + snapshots for durability
 pub mod persistence;
 
+// Hot tier: Recent writes buffer (Layer 2)
+pub mod hot_tier;
+
+// Tiered engine: Three-layer architecture orchestrator
+pub mod tiered_engine;
+
 // ===== Global Allocator (jemalloc-profiling feature) =====
 
 #[cfg(feature = "jemalloc-profiling")]
@@ -86,3 +92,9 @@ pub use semantic_adapter::{SemanticAdapter, SemanticConfig, SemanticStats};
 
 // Persistence components (WAL + snapshots)
 pub use persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
+
+// Hot tier components (Layer 2)
+pub use hot_tier::{HotTier, HotTierStats};
+
+// Tiered engine components (three-layer architecture)
+pub use tiered_engine::{TieredEngine, TieredEngineConfig, TieredEngineStats};

@@ -239,14 +239,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_train_predictor_success() {
-        // Create access events
+        // Create access events (embedding field removed to fix memory leak)
         let mut events = Vec::new();
         for i in 0..200 {
             let event = crate::learned_cache::AccessEvent {
                 doc_id: i % 10,
                 timestamp: SystemTime::now(),
                 access_type: crate::learned_cache::AccessType::Read,
-                embedding: vec![0.5; 128], // Mock embedding
             };
             events.push(event);
         }
