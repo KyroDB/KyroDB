@@ -21,6 +21,7 @@ use crate::{
     HnswBackend, CacheStrategy, HotTier, SearchResult, AccessPatternLogger,
     FsyncPolicy, CachedVector,
 };
+use tracing::{trace, debug, info, warn, error, instrument};
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use std::path::Path;

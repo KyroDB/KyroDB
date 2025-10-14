@@ -40,9 +40,9 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            high_confidence_threshold: 0.7,
-            low_confidence_threshold: 0.2,
-            semantic_similarity_threshold: 0.75,
+            high_confidence_threshold: 0.8,
+            low_confidence_threshold: 0.3,
+            semantic_similarity_threshold: 0.85,
             max_cached_embeddings: 100_000,
             similarity_scan_limit: 1000,
         }

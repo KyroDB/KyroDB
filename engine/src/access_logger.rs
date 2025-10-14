@@ -97,9 +97,11 @@ impl AccessPatternLogger {
 
     /// Create logger with custom flush interval (for testing)
     pub fn with_flush_interval(capacity: usize, flush_interval: Duration) -> Self {
+        // Initialize last_flush sufficiently in the past so needs_flush() is true immediately.
+        let past = Instant::now() - flush_interval - Duration::from_millis(1);
         Self {
             events: Arc::new(RwLock::new(HeapRb::new(capacity))),
-            last_flush: Arc::new(RwLock::new(Instant::now())),
+            last_flush: Arc::new(RwLock::new(past)),
             flush_interval,
             total_accesses: Arc::new(AtomicU64::new(0)),
             total_flushes: Arc::new(AtomicU64::new(0)),

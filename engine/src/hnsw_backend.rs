@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, info, trace, warn, instrument};
 
 /// HNSW-backed document store for cache integration
 ///
@@ -50,6 +51,7 @@ impl HnswBackend {
     /// # Note
     /// This builds the HNSW index immediately, which may take time for large corpora.
     /// For production with persistence, use `with_persistence` or `recover`.
+    #[instrument(level = "debug", skip(embeddings), fields(num_docs = embeddings.len(), max_elements))]
     pub fn new(embeddings: Vec<Vec<f32>>, max_elements: usize) -> Result<Self> {
         if embeddings.is_empty() {
             anyhow::bail!("Cannot create HnswBackend with empty embeddings");
@@ -59,11 +61,11 @@ impl HnswBackend {
         let mut index = HnswVectorIndex::new(dimension, max_elements)?;
 
         // Build HNSW index from embeddings
-        println!("Building HNSW index for {} documents...", embeddings.len());
+        info!(documents = embeddings.len(), dimension, "building HNSW index");
         for (doc_id, embedding) in embeddings.iter().enumerate() {
             index.add_vector(doc_id as u64, embedding)?;
         }
-        println!("HNSW index built successfully");
+        info!("HNSW index built");
 
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
@@ -80,6 +82,7 @@ impl HnswBackend {
     /// - `data_dir`: Directory for WAL and snapshots
     /// - `fsync_policy`: Durability guarantee (Always, Periodic, Never)
     /// - `snapshot_interval`: Create snapshot every N inserts
+    #[instrument(level = "debug", skip(embeddings, data_dir), fields(num_docs = embeddings.len(), max_elements, snapshot_interval))]
     pub fn with_persistence(
         embeddings: Vec<Vec<f32>>,
         max_elements: usize,
@@ -99,11 +102,11 @@ impl HnswBackend {
         let mut index = HnswVectorIndex::new(dimension, max_elements)?;
 
         // Build HNSW index
-        println!("Building HNSW index for {} documents...", embeddings.len());
+        info!(documents = embeddings.len(), dimension, "building HNSW index (persistence)");
         for (doc_id, embedding) in embeddings.iter().enumerate() {
             index.add_vector(doc_id as u64, embedding)?;
         }
-        println!("HNSW index built successfully");
+        info!("HNSW index built (persistence)");
 
         // Create initial WAL
         let wal_path = data_dir.join(format!("wal_{}.wal", Self::timestamp()));
@@ -137,6 +140,7 @@ impl HnswBackend {
     /// 3. Replay WAL entries since snapshot
     /// 4. Rebuild HNSW index
     /// 5. Create new active WAL
+    #[instrument(level = "info", skip(data_dir), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval))]
     pub fn recover(
         data_dir: impl AsRef<Path>,
         max_elements: usize,
@@ -144,8 +148,7 @@ impl HnswBackend {
         snapshot_interval: usize,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        
-        println!("Recovering HnswBackend from {}...", data_dir.display());
+        info!("recovering HnswBackend");
         
         // Load manifest
         let manifest_path = data_dir.join("MANIFEST");
@@ -161,24 +164,23 @@ impl HnswBackend {
         
         if let Some(snapshot_name) = &manifest.latest_snapshot {
             let snapshot_path = data_dir.join(snapshot_name);
-            println!("Loading snapshot from {}...", snapshot_path.display());
+            info!(snapshot = %snapshot_path.display(), "loading snapshot");
             
             let snapshot = Snapshot::load(&snapshot_path)?;
             dimension = snapshot.dimension;
             embeddings = snapshot.documents.into_iter().map(|(_, emb)| emb).collect();
             
-            println!("Loaded {} documents from snapshot", embeddings.len());
+            info!(documents = embeddings.len(), "snapshot loaded");
         }
         
         // Replay WAL segments
         for wal_name in &manifest.wal_segments {
             let wal_path = data_dir.join(wal_name);
             if !wal_path.exists() {
-                eprintln!("WARNING: WAL segment {} not found, skipping", wal_name);
+                warn!(wal_segment = wal_name, "WAL segment missing; skipping");
                 continue;
             }
-            
-            println!("Replaying WAL {}...", wal_name);
+            info!(wal_segment = wal_name, "replaying WAL");
             let mut reader = WalReader::open(&wal_path)?;
             let entries = reader.read_all()?;
             
@@ -206,8 +208,7 @@ impl HnswBackend {
                 }
             }
             
-            println!("Replayed {} valid entries ({} corrupted)", 
-                     reader.valid_entries(), reader.corrupted_entries());
+            info!(valid = reader.valid_entries(), corrupted = reader.corrupted_entries(), wal_segment = wal_name, "wal replay complete");
         }
         
         if embeddings.is_empty() {
@@ -216,7 +217,7 @@ impl HnswBackend {
         
         // Rebuild HNSW index
         let mut index = HnswVectorIndex::new(dimension, max_elements)?;
-        println!("Rebuilding HNSW index from {} documents...", embeddings.len());
+    info!(documents = embeddings.len(), dimension, "rebuilding HNSW index after recovery");
         
         for (doc_id, embedding) in embeddings.iter().enumerate() {
             // Skip tombstones (all zeros)
@@ -226,7 +227,7 @@ impl HnswBackend {
             index.add_vector(doc_id as u64, embedding)?;
         }
         
-        println!("HNSW index rebuilt successfully");
+    info!("HNSW index rebuilt");
         
         // Create new active WAL
         let wal_path = data_dir.join(format!("wal_{}.wal", Self::timestamp()));
@@ -245,7 +246,7 @@ impl HnswBackend {
             snapshot_interval,
         };
         
-        println!("Recovery complete: {} documents", embeddings.len());
+        info!(documents = embeddings.len(), "recovery complete");
         
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
@@ -270,6 +271,7 @@ impl HnswBackend {
     /// # Durability
     /// - If persistence enabled: Append to WAL → Update in-memory → fsync (if Always)
     /// - Triggers snapshot creation if `inserts_since_snapshot >= snapshot_interval`
+    #[instrument(level = "trace", skip(self, embedding), fields(doc_id, dim = embedding.len()))]
     pub fn insert(&self, doc_id: u64, embedding: Vec<f32>) -> Result<()> {
         // Log to WAL (if persistence enabled)
         if let Some(ref persistence) = self.persistence {
@@ -287,7 +289,7 @@ impl HnswBackend {
             *inserts += 1;
             
             if *inserts >= persistence.snapshot_interval {
-                println!("Snapshot interval reached ({} inserts), creating snapshot...", *inserts);
+                debug!(inserts = *inserts, interval = persistence.snapshot_interval, "snapshot interval reached; creating snapshot");
                 drop(inserts); // Release lock before snapshot
                 self.create_snapshot()?;
             }
@@ -312,6 +314,7 @@ impl HnswBackend {
     ///
     /// This is called automatically when `snapshot_interval` is reached,
     /// or can be called manually for backup purposes.
+    #[instrument(level = "debug", skip(self), ret)]
     pub fn create_snapshot(&self) -> Result<()> {
         let persistence = self.persistence.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Persistence not enabled"))?;
@@ -332,14 +335,13 @@ impl HnswBackend {
             documents[0].1.len()
         };
         
+        let doc_count = documents.len();
         let snapshot = Snapshot::new(dimension, documents);
-        
         // Save snapshot
         let snapshot_name = format!("snapshot_{}.snap", Self::timestamp());
         let snapshot_path = persistence.data_dir.join(&snapshot_name);
-        
         snapshot.save(&snapshot_path)?;
-        println!("Snapshot saved to {}", snapshot_path.display());
+        info!(path = %snapshot_path.display(), docs = doc_count, "snapshot saved");
         
         // Update manifest
         let manifest_path = persistence.data_dir.join("MANIFEST");
@@ -363,6 +365,7 @@ impl HnswBackend {
     /// - `None` if doc_id out of range
     ///
     /// **Called by**: Cache strategies on cache miss
+    #[instrument(level = "trace", skip(self), fields(doc_id))]
     pub fn fetch_document(&self, doc_id: u64) -> Option<Vec<f32>> {
         self.embeddings.read().get(doc_id as usize).cloned()
     }
@@ -377,6 +380,7 @@ impl HnswBackend {
     /// Vector of (doc_id, distance) pairs, sorted by distance (closest first)
     ///
     /// **Performance**: <1ms P99 on 10M vectors (target)
+    #[instrument(level = "trace", skip(self, query), fields(k, dim = query.len()))]
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         let index = self.index.read();
         index.knn_search(query, k)

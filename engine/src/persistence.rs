@@ -16,6 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{instrument, debug, trace};
 use serde::{Serialize, Deserialize};
 
 /// WAL magic number (identifies valid WAL files)
@@ -63,6 +64,7 @@ pub struct WalWriter {
 
 impl WalWriter {
     /// Create new WAL file
+    #[instrument(level = "debug", skip(path), fields(fsync_policy = ?fsync_policy))]
     pub fn create(path: impl AsRef<Path>, fsync_policy: FsyncPolicy) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         
@@ -89,6 +91,7 @@ impl WalWriter {
     }
     
     /// Append entry to WAL
+    #[instrument(level = "trace", skip(self, entry), fields(doc_id = entry.doc_id, op = ?entry.op, embedding_dim = entry.embedding.len()))]
     pub fn append(&mut self, entry: &WalEntry) -> Result<()> {
         // Serialize entry
         let entry_bytes = bincode::serialize(entry)
@@ -126,6 +129,7 @@ impl WalWriter {
     }
     
     /// Force fsync (for periodic policy)
+    #[instrument(level = "trace", skip(self))]
     pub fn sync(&mut self) -> Result<()> {
         self.file.flush()?;
         self.file.get_ref().sync_data()?;
@@ -155,6 +159,7 @@ pub struct WalReader {
 
 impl WalReader {
     /// Open existing WAL file
+    #[instrument(level = "debug", skip(path))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         
@@ -182,6 +187,7 @@ impl WalReader {
     }
     
     /// Read all entries (validates checksums)
+    #[instrument(level = "debug", skip(self))]
     pub fn read_all(&mut self) -> Result<Vec<WalEntry>> {
         let mut entries = Vec::new();
         
@@ -210,10 +216,7 @@ impl WalReader {
             let computed_checksum = crc32fast::hash(&entry_bytes);
             
             if stored_checksum != computed_checksum {
-                eprintln!(
-                    "WARNING: Corrupted WAL entry (checksum mismatch: stored={:#x}, computed={:#x})",
-                    stored_checksum, computed_checksum
-                );
+                debug!(stored_checksum = format!("{:#x}", stored_checksum), computed_checksum = format!("{:#x}", computed_checksum), "corrupted WAL entry; checksum mismatch");
                 self.corrupted_entries += 1;
                 continue;
             }
@@ -267,6 +270,7 @@ impl Snapshot {
     }
     
     /// Save snapshot to file (atomic: write to temp, then rename)
+    #[instrument(level = "debug", skip(self, path), fields(version = self.version, documents = self.doc_count, dimension = self.dimension))]
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         
@@ -303,6 +307,7 @@ impl Snapshot {
     }
     
     /// Load snapshot from file (validates checksum)
+    #[instrument(level = "debug", skip(path))]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         
@@ -376,6 +381,7 @@ impl Manifest {
     }
     
     /// Save manifest (atomic)
+    #[instrument(level = "debug", skip(self, path), fields(wal_segments = self.wal_segments.len(), latest_snapshot = self.latest_snapshot.as_deref().unwrap_or("none")))]
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let temp_path = path.with_extension("tmp");
@@ -393,6 +399,7 @@ impl Manifest {
     }
     
     /// Load manifest
+    #[instrument(level = "debug", skip(path))]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
             .context("Failed to read manifest file")?;
@@ -404,6 +411,7 @@ impl Manifest {
     }
     
     /// Load or create new manifest
+    #[instrument(level = "debug", skip(path))]
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         

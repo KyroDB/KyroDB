@@ -11,6 +11,7 @@ use crate::learned_cache::LearnedCachePredictor;
 use crate::semantic_adapter::SemanticAdapter;
 use crate::vector_cache::{CachedVector, VectorCache};
 use std::sync::Arc;
+use tracing::{instrument, trace, debug};
 
 /// Cache strategy trait
 ///
@@ -58,15 +59,23 @@ impl LruCacheStrategy {
 }
 
 impl CacheStrategy for LruCacheStrategy {
+    #[instrument(level = "trace", skip(self))]
     fn get_cached(&self, doc_id: u64) -> Option<CachedVector> {
-        self.cache.get(doc_id)
+        let hit = self.cache.get(doc_id);
+        if hit.is_some() {
+            trace!(doc_id, strategy = %self.name, "cache hit");
+        } else {
+            trace!(doc_id, strategy = %self.name, "cache miss");
+        }
+        hit
     }
 
+    #[instrument(level = "trace", skip(self, _embedding), fields(doc_id = _doc_id))]
     fn should_cache(&self, _doc_id: u64, _embedding: &[f32]) -> bool {
-        // LRU always caches (admission policy is permissive)
         true
     }
 
+    #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
         self.cache.insert(cached_vector);
     }
@@ -135,7 +144,7 @@ impl LearnedCacheStrategy {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
             semantic_adapter: Arc::new(parking_lot::RwLock::new(Some(semantic_adapter))),
-            name: "learned_rmi".to_string(),
+            name: "learned_semantic".to_string(),
         }
     }
 
@@ -154,13 +163,22 @@ impl LearnedCacheStrategy {
 }
 
 impl CacheStrategy for LearnedCacheStrategy {
+    #[instrument(level = "trace", skip(self), fields(doc_id))]
     fn get_cached(&self, doc_id: u64) -> Option<CachedVector> {
-        self.cache.get(doc_id)
+        let hit = self.cache.get(doc_id);
+        if hit.is_some() {
+            trace!(doc_id, strategy = %self.name, "cache hit");
+        } else {
+            trace!(doc_id, strategy = %self.name, "cache miss");
+        }
+        hit
     }
 
+    #[instrument(level = "trace", skip(self, embedding), fields(doc_id, dim = embedding.len()))]
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
         let current_len = self.cache.len();
         if current_len < self.cache.capacity() {
+            trace!(doc_id, current_len, capacity = self.cache.capacity(), "admit (cache not full)");
             return true;
         }
 
@@ -168,6 +186,7 @@ impl CacheStrategy for LearnedCacheStrategy {
 
         // Bootstrap mode until predictor is trained
         if !predictor.is_trained() {
+            trace!(doc_id, "admit (bootstrap untrained predictor)");
             return true;
         }
 
@@ -180,7 +199,9 @@ impl CacheStrategy for LearnedCacheStrategy {
             let unseen_chance =
                 predictor.unseen_admission_chance() * (1.0 - fill_ratio).clamp(0.1, 1.0);
             drop(predictor);
-            return rand::random::<f32>() < unseen_chance;
+            let admit = rand::random::<f32>() < unseen_chance;
+            trace!(doc_id, fill_ratio, unseen_chance, admit, "unseen doc admission decision");
+            return admit;
         };
 
         let threshold = predictor.cache_threshold().max(predictor.admission_floor());
@@ -190,29 +211,29 @@ impl CacheStrategy for LearnedCacheStrategy {
         let semantic_adapter_guard = self.semantic_adapter.read();
         if let Some(semantic_adapter) = semantic_adapter_guard.as_ref() {
             let should_cache = semantic_adapter.should_cache(freq_score, embedding);
-
-            // Cache embedding for future similarity checks if admitted
+            trace!(doc_id, freq_score, threshold, should_cache, "semantic adapter decision");
             if should_cache {
                 semantic_adapter.cache_embedding(doc_id, embedding.to_vec());
             }
-
             return should_cache;
         }
         drop(semantic_adapter_guard);
 
         if freq_score >= threshold {
+            trace!(doc_id, freq_score, threshold, "admit (freq >= threshold)");
             return true;
         }
 
         // Soft admission: probabilistic caching below threshold
         let soft_probability = (freq_score / threshold).clamp(0.0, 1.0) * 0.25;
         if soft_probability > 0.0 && rand::random::<f32>() < soft_probability {
+            trace!(doc_id, freq_score, threshold, soft_probability, "admit (soft probability)");
             return true;
         }
-
+        trace!(doc_id, freq_score, threshold, soft_probability, "reject (below threshold)");
         false
     }
-
+    #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
         self.cache.insert(cached_vector);
     }
@@ -458,7 +479,7 @@ mod tests {
         }
 
         // Should have 100 vectors cached
-        let stats_str = strategy.stats();
-        assert!(stats_str.contains("size"), "Stats should contain 'size': {}", stats_str);
+    let stats_str = strategy.stats();
+    assert!(stats_str.starts_with("LRU:"), "Stats format changed: {}", stats_str);
     }
 }
