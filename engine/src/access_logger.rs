@@ -131,7 +131,9 @@ impl AccessPatternLogger {
 
         // Write lock - push event (overwrites oldest if full)
         let mut events = self.events.write();
-        let _ = events.try_push(event); // If full, overwrites oldest automatically
+        // CRITICAL: Use push_overwrite to ensure FIFO behavior when buffer is full
+        // try_push returns Err when full without overwriting, which caused test_access_logger_enforces_capacity to fail
+        events.push_overwrite(event);
         drop(events);
 
         self.total_accesses.fetch_add(1, Ordering::Relaxed);
@@ -141,7 +143,7 @@ impl AccessPatternLogger {
     #[inline]
     pub fn log_event(&self, event: AccessEvent) {
         let mut events = self.events.write();
-        let _ = events.try_push(event);
+        events.push_overwrite(event);
         drop(events);
 
         self.total_accesses.fetch_add(1, Ordering::Relaxed);
@@ -233,17 +235,14 @@ impl AccessPatternLogger {
     }
 
     /// Compute doc_id diversity (for validation)
-    /// 
+    ///
     /// NOTE: Previously computed embedding hash diversity, but embeddings were removed
     /// to fix 107MB memory leak. Now computes unique doc_id count instead.
     pub fn hash_diversity(&self) -> f64 {
         use std::collections::HashSet;
 
         let events = self.events.read();
-        let unique_doc_ids: HashSet<u64> = events
-            .iter()
-            .map(|event| event.doc_id)
-            .collect();
+        let unique_doc_ids: HashSet<u64> = events.iter().map(|event| event.doc_id).collect();
 
         let total = events.occupied_len();
         if total == 0 {

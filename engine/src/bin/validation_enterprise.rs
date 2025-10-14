@@ -32,7 +32,7 @@ use kyrodb_engine::{
     cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
     hnsw_backend::HnswBackend,
     learned_cache::LearnedCachePredictor,
-    ndcg::{calculate_ndcg, calculate_mrr, calculate_recall_at_k, RankingResult},
+    ndcg::{calculate_mrr, calculate_ndcg, calculate_recall_at_k, RankingResult},
     semantic_adapter::SemanticAdapter,
     training_task::{spawn_training_task, TrainingConfig},
     vector_cache::CachedVector,
@@ -139,7 +139,6 @@ impl Default for Config {
             // Hybrid Semantic Cache predicts document-level hotness (can cache 50/200 = 25% of hot docs)
             cache_capacity: 50,
 
-        
             // Models real RAG query distribution (moderate skew)
             // Reduces artificial LRU advantage from concentrated access
             zipf_exponent: 1.4,
@@ -149,7 +148,6 @@ impl Default for Config {
             target_qps: 200,
             training_interval_secs: 60,
 
-          
             // Captures longer-term patterns for Hybrid Semantic Cache training
             logger_window_size: 100_000,
 
@@ -400,7 +398,7 @@ impl TemporalWorkloadGenerator {
             self.cold_query_count.fetch_add(1, Ordering::Relaxed);
             return doc;
         }
-        
+
         // Drop the lock on rng so other tasks can proceed
         drop(rng);
 
@@ -530,8 +528,6 @@ impl ZipfSampler {
     }
 }
 
-
-
 fn generate_mock_embeddings(corpus_size: usize, embedding_dim: usize) -> Vec<Vec<f32>> {
     let mut topics = std::cmp::max(16, corpus_size / 1000);
     topics = topics.min(256);
@@ -555,12 +551,12 @@ fn generate_mock_embeddings(corpus_size: usize, embedding_dim: usize) -> Vec<Vec
         .map(|doc_id| {
             let topic_index = doc_id % topic_bases.len();
             let mut embedding = topic_bases[topic_index].clone();
-            
+
             let mut doc_rng = ChaCha8Rng::seed_from_u64(doc_id as u64);
             for value in embedding.iter_mut() {
                 *value += noise.sample(&mut doc_rng) as f32;
             }
-            
+
             normalize_embedding(&mut embedding);
             embedding
         })
@@ -568,73 +564,73 @@ fn generate_mock_embeddings(corpus_size: usize, embedding_dim: usize) -> Vec<Vec
 }
 
 fn parse_numpy_embeddings(data: &[u8]) -> Result<Vec<Vec<f32>>> {
-        if data.len() < 128 {
-            bail!("Invalid numpy file: too small ({}  bytes)", data.len());
-        }
+    if data.len() < 128 {
+        bail!("Invalid numpy file: too small ({}  bytes)", data.len());
+    }
 
-        let header_end = data
-            .iter()
-            .position(|&b| b == b'\n')
-            .ok_or_else(|| anyhow::anyhow!("Invalid numpy header: no newline found"))?;
+    let header_end = data
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or_else(|| anyhow::anyhow!("Invalid numpy header: no newline found"))?;
 
-        if header_end > 1024 {
-            bail!("Invalid numpy header: too long ({} bytes)", header_end);
-        }
+    if header_end > 1024 {
+        bail!("Invalid numpy header: too long ({} bytes)", header_end);
+    }
 
-        let data_start = header_end + 1;
+    let data_start = header_end + 1;
 
-        if data_start >= data.len() {
-            bail!("Invalid numpy file: no data after header");
-        }
+    if data_start >= data.len() {
+        bail!("Invalid numpy file: no data after header");
+    }
 
-        let float_data = &data[data_start..];
-        let num_floats = float_data.len() / 4;
-        
-        // Try common dimensions (384 for all-MiniLM-L6-v2, 768 for others)
-        let expected_dim = if num_floats % 384 == 0 {
-            384
-        } else if num_floats % 768 == 0 {
-            768
-        } else {
-            // Fallback: try to infer from first 10K floats
-            384 // Default to 384
-        };
-        
-        let num_vectors = num_floats / expected_dim;
+    let float_data = &data[data_start..];
+    let num_floats = float_data.len() / 4;
 
-        if num_floats % expected_dim != 0 {
-            bail!(
-                "Invalid numpy file: {} floats not divisible by detected dim={}",
-                num_floats,
-                expected_dim
-            );
-        }
+    // Try common dimensions (384 for all-MiniLM-L6-v2, 768 for others)
+    let expected_dim = if num_floats % 384 == 0 {
+        384
+    } else if num_floats % 768 == 0 {
+        768
+    } else {
+        // Fallback: try to infer from first 10K floats
+        384 // Default to 384
+    };
 
-        let mut embeddings = Vec::with_capacity(num_vectors);
+    let num_vectors = num_floats / expected_dim;
 
-        for i in 0..num_vectors {
-            let mut embedding = Vec::with_capacity(expected_dim);
-            for j in 0..expected_dim {
-                let offset = (i * expected_dim + j) * 4;
-
-                if offset + 4 > float_data.len() {
-                    bail!("Invalid numpy file: unexpected EOF at vector {}", i);
-                }
-
-                let bytes = &float_data[offset..offset + 4];
-                let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                embedding.push(value);
-            }
-            embeddings.push(embedding);
-        }
-
-        println!(
-            "Parsed {} vectors of {}-dim from numpy file",
-            embeddings.len(),
+    if num_floats % expected_dim != 0 {
+        bail!(
+            "Invalid numpy file: {} floats not divisible by detected dim={}",
+            num_floats,
             expected_dim
         );
+    }
 
-        Ok(embeddings)
+    let mut embeddings = Vec::with_capacity(num_vectors);
+
+    for i in 0..num_vectors {
+        let mut embedding = Vec::with_capacity(expected_dim);
+        for j in 0..expected_dim {
+            let offset = (i * expected_dim + j) * 4;
+
+            if offset + 4 > float_data.len() {
+                bail!("Invalid numpy file: unexpected EOF at vector {}", i);
+            }
+
+            let bytes = &float_data[offset..offset + 4];
+            let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            embedding.push(value);
+        }
+        embeddings.push(embedding);
+    }
+
+    println!(
+        "Parsed {} vectors of {}-dim from numpy file",
+        embeddings.len(),
+        expected_dim
+    );
+
+    Ok(embeddings)
 }
 
 struct SemanticWorkloadGenerator {
@@ -674,11 +670,16 @@ impl SemanticWorkloadGenerator {
             &query_to_doc,
             usize::MAX, // Use all available queries
         );
-        
+
         let total_queries: usize = doc_to_queries.values().map(|v| v.len()).sum();
         let avg_queries = total_queries as f64 / doc_to_queries.len() as f64;
-        println!("  Mapped {} queries across {} documents (avg {:.1} queries/doc) in {:.2}s", 
-            total_queries, doc_to_queries.len(), avg_queries, start.elapsed().as_secs_f64());
+        println!(
+            "  Mapped {} queries across {} documents (avg {:.1} queries/doc) in {:.2}s",
+            total_queries,
+            doc_to_queries.len(),
+            avg_queries,
+            start.elapsed().as_secs_f64()
+        );
 
         let doc_sampler = ZipfSampler::new(corpus_size, zipf_exponent, 0x5EEDFACE)?;
 
@@ -699,14 +700,14 @@ impl SemanticWorkloadGenerator {
         use std::sync::atomic::{AtomicU64 as FallbackCounter, Ordering};
         static FALLBACK_COUNT: FallbackCounter = FallbackCounter::new(0);
         static TOTAL_COUNT: FallbackCounter = FallbackCounter::new(0);
-        
+
         let doc_id = {
             let mut sampler = self.doc_sampler.write().await;
             sampler.sample()
         };
 
         let total = TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
-        
+
         if let Some(paraphrases) = self.doc_to_queries.get(&doc_id) {
             if !paraphrases.is_empty() {
                 // DETERMINISTIC CYCLING: Cycle through all 30 paraphrases in order
@@ -734,10 +735,14 @@ impl SemanticWorkloadGenerator {
             eprintln!("WARNING: Using fallback embedding for doc_id {}", doc_id);
         }
         if (fallback_count + 1) % 1000 == 0 && total > 0 {
-            eprintln!("WARNING: Fallback used {} times out of {} total samples ({:.1}%)",
-                fallback_count + 1, total + 1, (fallback_count + 1) as f64 / (total + 1) as f64 * 100.0);
+            eprintln!(
+                "WARNING: Fallback used {} times out of {} total samples ({:.1}%)",
+                fallback_count + 1,
+                total + 1,
+                (fallback_count + 1) as f64 / (total + 1) as f64 * 100.0
+            );
         }
-        
+
         // Fallback: hash doc_id directly
         (doc_id, doc_id)
     }
@@ -751,20 +756,18 @@ fn build_doc_to_queries_map(
     max_queries: usize,
 ) -> HashMap<u64, Vec<usize>> {
     let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
-    
+
     for (query_idx, &doc_id) in query_to_doc.iter().enumerate() {
-        map.entry(doc_id)
-            .or_insert_with(Vec::new)
-            .push(query_idx);
+        map.entry(doc_id).or_insert_with(Vec::new).push(query_idx);
     }
-    
+
     // Limit queries per document if needed
     if max_queries < usize::MAX {
         for queries in map.values_mut() {
             queries.truncate(max_queries);
         }
     }
-    
+
     map
 }
 
@@ -773,14 +776,14 @@ fn build_doc_to_queries_map(
 fn hash_embedding(embedding: &[f32]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    
+
     let mut hasher = DefaultHasher::new();
-    
+
     // Hash first 8 floats (or all if fewer than 8)
     for &value in embedding.iter().take(8) {
         value.to_bits().hash(&mut hasher);
     }
-    
+
     hasher.finish()
 }
 
@@ -820,7 +823,7 @@ fn print_usage(program_name: &str) {
 /// Get process memory usage in MB (Linux only)
 fn get_memory_mb() -> Result<f64> {
     use kyrodb_engine::get_memory_stats;
-    
+
     match get_memory_stats() {
         Ok(stats) => Ok(stats.resident as f64 / 1_048_576.0),
         Err(e) => bail!("Memory tracking unavailable: {}", e),
@@ -985,37 +988,37 @@ async fn main() -> Result<()> {
                 && std::path::Path::new(passages_path).exists() =>
         {
             println!("Using real MS MARCO embeddings");
-            
+
             // Load embeddings
-            let embeddings_data = std::fs::read(embeddings_path)
-                .context("Failed to read embeddings file")?;
+            let embeddings_data =
+                std::fs::read(embeddings_path).context("Failed to read embeddings file")?;
             let embeddings = parse_numpy_embeddings(&embeddings_data)?;
-            
+
             // Build HNSW backend
             let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
                 .context("Failed to create HNSW backend")?;
-            
+
             Arc::new(backend)
         }
         (Some(_), Some(_)) => {
             println!("WARNING: MS MARCO paths configured but files not found");
             println!("Falling back to mock clustered embeddings");
-            
+
             let embeddings = generate_mock_embeddings(config.corpus_size, 768);
-            
+
             let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
                 .context("Failed to create HNSW backend")?;
-            
+
             Arc::new(backend)
         }
         _ => {
             println!("Using mock clustered embeddings (no MS MARCO data configured)");
-            
+
             let embeddings = generate_mock_embeddings(config.corpus_size, 768);
-            
+
             let backend = HnswBackend::new(embeddings, config.corpus_size * 2)
                 .context("Failed to create HNSW backend")?;
-            
+
             Arc::new(backend)
         }
     };
@@ -1029,12 +1032,11 @@ async fn main() -> Result<()> {
             if std::path::Path::new(query_emb_path).exists()
                 && std::path::Path::new(query_doc_path).exists() =>
         {
-            
             // Load query embeddings (numpy format)
-            let query_emb_data = std::fs::read(query_emb_path)
-                .context("Failed to read query embeddings file")?;
+            let query_emb_data =
+                std::fs::read(query_emb_path).context("Failed to read query embeddings file")?;
             let query_embeddings = parse_numpy_embeddings(&query_emb_data)?;
-            
+
             // Load query→doc mapping
             let query_doc_text = std::fs::read_to_string(query_doc_path)
                 .context("Failed to read query_to_doc file")?;
@@ -1048,7 +1050,7 @@ async fn main() -> Result<()> {
                     })
                 })
                 .collect::<Result<Vec<u64>>>()?;
-            
+
             if query_embeddings.len() != query_to_doc.len() {
                 bail!(
                     "Query embedding count ({}) != query_to_doc count ({})",
@@ -1056,14 +1058,14 @@ async fn main() -> Result<()> {
                     query_to_doc.len()
                 );
             }
-            
+
             println!(
                 "  Loaded {} query embeddings ({}×{}-dim)",
                 query_embeddings.len(),
                 query_embeddings.len(),
                 query_embeddings[0].len()
             );
-            
+
             // DEBUG: Check hash diversity
             use std::collections::HashSet;
             let mut unique_hashes = HashSet::new();
@@ -1071,27 +1073,39 @@ async fn main() -> Result<()> {
                 let hash = hash_embedding(embedding);
                 unique_hashes.insert(hash);
             }
-            println!("  Hash diversity: {} unique hashes from {} embeddings ({:.2}% unique)",
-                unique_hashes.len(), query_embeddings.len(),
-                unique_hashes.len() as f64 / query_embeddings.len() as f64 * 100.0);
-            
+            println!(
+                "  Hash diversity: {} unique hashes from {} embeddings ({:.2}% unique)",
+                unique_hashes.len(),
+                query_embeddings.len(),
+                unique_hashes.len() as f64 / query_embeddings.len() as f64 * 100.0
+            );
+
             // Check first 30 queries (should be for doc 0)
             if query_embeddings.len() >= 30 {
                 let mut doc0_hashes = HashSet::new();
                 for i in 0..30 {
                     doc0_hashes.insert(hash_embedding(&query_embeddings[i]));
                 }
-                println!("  First 30 queries (doc 0): {} unique hashes", doc0_hashes.len());
+                println!(
+                    "  First 30 queries (doc 0): {} unique hashes",
+                    doc0_hashes.len()
+                );
             }
-            
+
             (Some(Arc::new(query_embeddings)), Some(query_to_doc))
         }
         (Some(query_emb_path), Some(query_doc_path)) => {
             println!("WARNING: Query embedding paths configured but files not found");
             println!("  Expected: {}", query_emb_path);
-            println!("  Exists: {}", std::path::Path::new(query_emb_path).exists());
+            println!(
+                "  Exists: {}",
+                std::path::Path::new(query_emb_path).exists()
+            );
             println!("  Expected: {}", query_doc_path);
-            println!("  Exists: {}", std::path::Path::new(query_doc_path).exists());
+            println!(
+                "  Exists: {}",
+                std::path::Path::new(query_doc_path).exists()
+            );
             println!();
             println!("To generate query embeddings:");
             println!("  python3 scripts/generate_query_embeddings.py --size 10000 --queries-per-doc 5 --noise 0.02");
@@ -1099,9 +1113,7 @@ async fn main() -> Result<()> {
             println!("Falling back to ID-based sampling (no semantic variance)");
             (None, None)
         }
-        _ => {
-            (None, None)
-        }
+        _ => (None, None),
     };
 
     // Spawn background training task
@@ -1133,7 +1145,7 @@ async fn main() -> Result<()> {
         Temporal(TemporalWorkloadGenerator),
         Semantic(SemanticWorkloadGenerator),
     }
-    
+
     impl WorkloadGenerator {
         fn get_rotation_count(&self) -> u64 {
             match self {
@@ -1141,21 +1153,21 @@ async fn main() -> Result<()> {
                 WorkloadGenerator::Semantic(_) => 0, // Semantic gen doesn't have rotations
             }
         }
-        
+
         fn get_spike_count(&self) -> u64 {
             match self {
                 WorkloadGenerator::Temporal(gen) => gen.get_spike_count(),
                 WorkloadGenerator::Semantic(_) => 0, // Semantic gen doesn't have spikes
             }
         }
-        
+
         fn get_cold_query_count(&self) -> u64 {
             match self {
                 WorkloadGenerator::Temporal(gen) => gen.get_cold_query_count(),
                 WorkloadGenerator::Semantic(_) => 0, // Semantic gen doesn't track cold queries
             }
         }
-        
+
         fn get_working_set_draws(&self) -> u64 {
             match self {
                 WorkloadGenerator::Temporal(gen) => gen.get_working_set_draws(),
@@ -1163,35 +1175,36 @@ async fn main() -> Result<()> {
             }
         }
     }
-    
-    let workload_gen = if let (Some(query_embs), Some(query_doc_map)) = (&query_embeddings, &query_to_doc) {
-        // Get corpus embeddings from HNSW backend
-        let corpus_embs = hnsw_backend.get_all_embeddings();
-        let semantic_gen = SemanticWorkloadGenerator::new(
-            corpus_embs.clone(),
-            query_embs.clone(),
-            query_doc_map.clone(),
-            config.zipf_exponent,
-            config.top_k_queries_per_doc,
-        )?;
-        WorkloadGenerator::Semantic(semantic_gen)
-    } else {
-        println!("Using TemporalWorkloadGenerator (ID-based sampling)");
-        let temporal_gen = TemporalWorkloadGenerator::new(
-            config.corpus_size,
-            config.zipf_exponent,
-            Duration::from_secs(config.topic_rotation_interval_secs),
-            config.spike_probability,
-            Duration::from_secs(config.spike_duration_secs),
-            config.enable_temporal_patterns,
-            config.cache_capacity,
-            config.working_set_multiplier,
-            config.working_set_churn,
-            config.cold_traffic_ratio,
-            config.working_set_bias,
-        )?;
-        WorkloadGenerator::Temporal(temporal_gen)
-    };
+
+    let workload_gen =
+        if let (Some(query_embs), Some(query_doc_map)) = (&query_embeddings, &query_to_doc) {
+            // Get corpus embeddings from HNSW backend
+            let corpus_embs = hnsw_backend.get_all_embeddings();
+            let semantic_gen = SemanticWorkloadGenerator::new(
+                corpus_embs.clone(),
+                query_embs.clone(),
+                query_doc_map.clone(),
+                config.zipf_exponent,
+                config.top_k_queries_per_doc,
+            )?;
+            WorkloadGenerator::Semantic(semantic_gen)
+        } else {
+            println!("Using TemporalWorkloadGenerator (ID-based sampling)");
+            let temporal_gen = TemporalWorkloadGenerator::new(
+                config.corpus_size,
+                config.zipf_exponent,
+                Duration::from_secs(config.topic_rotation_interval_secs),
+                config.spike_probability,
+                Duration::from_secs(config.spike_duration_secs),
+                config.enable_temporal_patterns,
+                config.cache_capacity,
+                config.working_set_multiplier,
+                config.working_set_churn,
+                config.cold_traffic_ratio,
+                config.working_set_bias,
+            )?;
+            WorkloadGenerator::Temporal(temporal_gen)
+        };
 
     // Test parameters
     let test_duration = Duration::from_secs_f64(config.duration_hours * 3600.0);
@@ -1288,7 +1301,7 @@ async fn main() -> Result<()> {
             if should_cache {
                 use std::sync::atomic::{AtomicU64 as InsertCounter, Ordering};
                 static INSERT_COUNT: InsertCounter = InsertCounter::new(0);
-                
+
                 let cached = CachedVector {
                     doc_id: cache_key,
                     embedding: embedding.clone(),
@@ -1296,7 +1309,7 @@ async fn main() -> Result<()> {
                     cached_at: Instant::now(),
                 };
                 strategy.insert_cached(cached);
-                
+
                 let count = INSERT_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 10 {
                     eprintln!("DEBUG: Inserted cache_key={}, doc_id={}", cache_key, doc_id);
@@ -1311,7 +1324,7 @@ async fn main() -> Result<()> {
                 lru_queries += 1;
                 if cache_hit {
                     lru_hits += 1;
-                    
+
                     // Track: How many times was this doc accessed while in cache?
                     *lru_cache_doc_accesses.entry(cache_key).or_insert(0) += 1;
                 }
@@ -1321,7 +1334,7 @@ async fn main() -> Result<()> {
                 learned_queries += 1;
                 if cache_hit {
                     learned_hits += 1;
-                    
+
                     *learned_cache_doc_accesses.entry(cache_key).or_insert(0) += 1;
                 }
             }
@@ -1333,7 +1346,10 @@ async fn main() -> Result<()> {
         }
 
         if cache_hit {
-            stats_persister.log_hit(strategy_name, cache_key, 0).await.ok();
+            stats_persister
+                .log_hit(strategy_name, cache_key, 0)
+                .await
+                .ok();
         } else {
             stats_persister
                 .log_miss(strategy_name, cache_key, 0)
@@ -1419,20 +1435,32 @@ async fn main() -> Result<()> {
         // This fixed the 107MB memory leak!
         let bytes_per_event = 32; // doc_id + timestamp + access_type + padding
         let access_logger_mb = (access_logger_len * bytes_per_event) as f64 / 1_048_576.0;
-        
+
         let lru_cache_len = lru_strategy.cache.len();
         let lru_cache_mb = (lru_cache_len * 384 * 4) as f64 / 1_048_576.0; // 384-dim f32 vectors
-        
+
         let learned_cache_len = learned_strategy.cache.len();
         let learned_cache_mb = (learned_cache_len * 384 * 4) as f64 / 1_048_576.0;
-        
+
         println!("Memory Breakdown:");
-        println!("  Access logger:   {:.1} MB ({} events × ~32 bytes/event)", access_logger_mb, access_logger_len);
-        println!("  LRU cache:       {:.1} MB ({} vectors)", lru_cache_mb, lru_cache_len);
-        println!("  Hybrid Semantic Cache:   {:.1} MB ({} vectors)", learned_cache_mb, learned_cache_len);
+        println!(
+            "  Access logger:   {:.1} MB ({} events × ~32 bytes/event)",
+            access_logger_mb, access_logger_len
+        );
+        println!(
+            "  LRU cache:       {:.1} MB ({} vectors)",
+            lru_cache_mb, lru_cache_len
+        );
+        println!(
+            "  Hybrid Semantic Cache:   {:.1} MB ({} vectors)",
+            learned_cache_mb, learned_cache_len
+        );
         println!("  Query embeddings: ~461.0 MB (300K × 384-dim, constant)");
         println!("  Doc embeddings:  ~14.6 MB (10K × 384-dim, constant)");
-        println!("  Expected total:  ~{:.1} MB", 461.0 + 14.6 + access_logger_mb + lru_cache_mb + learned_cache_mb);
+        println!(
+            "  Expected total:  ~{:.1} MB",
+            461.0 + 14.6 + access_logger_mb + lru_cache_mb + learned_cache_mb
+        );
         println!("  NOTE: Access logger fixed - removed 107MB embedding storage leak!");
         println!();
     }
@@ -1469,11 +1497,11 @@ async fn main() -> Result<()> {
     let cache_to_ws_ratio = config.cache_capacity as f64 / expected_ws as f64;
 
     println!("\nCalculating NDCG quality metrics...");
-    
+
     // Convert HashMap to ranked RankingResults (sorted by access count DESC)
     let mut lru_ranking: Vec<(u64, usize)> = lru_cache_doc_accesses.into_iter().collect();
     lru_ranking.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by access count DESC
-    
+
     let lru_cache_ranking_results: Vec<RankingResult> = lru_ranking
         .iter()
         .enumerate()
@@ -1483,10 +1511,10 @@ async fn main() -> Result<()> {
             relevance: access_count as f64, // More accesses = more relevant
         })
         .collect();
-    
+
     let mut learned_ranking: Vec<(u64, usize)> = learned_cache_doc_accesses.into_iter().collect();
     learned_ranking.sort_by(|a, b| b.1.cmp(&a.1));
-    
+
     let learned_cache_ranking_results: Vec<RankingResult> = learned_ranking
         .iter()
         .enumerate()
@@ -1496,34 +1524,40 @@ async fn main() -> Result<()> {
             relevance: access_count as f64,
         })
         .collect();
-    
-    println!("  LRU cache: {} unique docs cached", lru_cache_ranking_results.len());
-    println!("  Hybrid Semantic Cache: {} unique docs cached", learned_cache_ranking_results.len());
-    
+
+    println!(
+        "  LRU cache: {} unique docs cached",
+        lru_cache_ranking_results.len()
+    );
+    println!(
+        "  Hybrid Semantic Cache: {} unique docs cached",
+        learned_cache_ranking_results.len()
+    );
+
     let lru_ndcg_at_10 = if !lru_cache_ranking_results.is_empty() {
         calculate_ndcg(&lru_cache_ranking_results, 10)
     } else {
         0.0
     };
-    
+
     let learned_ndcg_at_10 = if !learned_cache_ranking_results.is_empty() {
         calculate_ndcg(&learned_cache_ranking_results, 10)
     } else {
         0.0
     };
-    
+
     let lru_mrr = if !lru_cache_ranking_results.is_empty() {
         calculate_mrr(&lru_cache_ranking_results)
     } else {
         0.0
     };
-    
+
     let learned_mrr = if !learned_cache_ranking_results.is_empty() {
         calculate_mrr(&learned_cache_ranking_results)
     } else {
         0.0
     };
-    
+
     // Recall@10: Top-10 docs by access count vs all cached docs
     let lru_total_relevant = lru_cache_ranking_results.len();
     let lru_recall_at_10 = if lru_total_relevant > 0 {
@@ -1531,14 +1565,14 @@ async fn main() -> Result<()> {
     } else {
         0.0
     };
-    
+
     let learned_total_relevant = learned_cache_ranking_results.len();
     let learned_recall_at_10 = if learned_total_relevant > 0 {
         calculate_recall_at_k(&learned_cache_ranking_results, 10, learned_total_relevant)
     } else {
         0.0
     };
-    
+
     println!("  LRU NDCG@10:     {:.4}", lru_ndcg_at_10);
     println!("  Learned NDCG@10: {:.4}", learned_ndcg_at_10);
     println!("  LRU MRR:         {:.4}", lru_mrr);
@@ -1571,7 +1605,8 @@ async fn main() -> Result<()> {
         lru_recall_at_10,
         learned_recall_at_10,
 
-        expected_training_cycles: (actual_duration as f64 / config.training_interval_secs as f64).round() as u64,
+        expected_training_cycles: (actual_duration as f64 / config.training_interval_secs as f64)
+            .round() as u64,
         actual_training_cycles,
         training_task_crashed: training_crashed,
 

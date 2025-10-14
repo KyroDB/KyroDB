@@ -144,11 +144,7 @@ pub fn dump_heap_profile(_filename: &str) -> anyhow::Result<()> {
 /// Check for memory leaks by comparing stats over time
 ///
 /// Returns true if potential leak detected (allocated memory growing without bound)
-pub fn detect_memory_leak(
-    initial: &MemoryStats,
-    current: &MemoryStats,
-    threshold_mb: f64,
-) -> bool {
+pub fn detect_memory_leak(initial: &MemoryStats, current: &MemoryStats, threshold_mb: f64) -> bool {
     let delta = current.delta(initial);
     let allocated_growth_mb = delta.allocated as f64 / 1_048_576.0;
 

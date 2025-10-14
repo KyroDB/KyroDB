@@ -11,7 +11,7 @@ use crate::learned_cache::LearnedCachePredictor;
 use crate::semantic_adapter::SemanticAdapter;
 use crate::vector_cache::{CachedVector, VectorCache};
 use std::sync::Arc;
-use tracing::{instrument, trace, debug};
+use tracing::{debug, instrument, trace};
 
 /// Cache strategy trait
 ///
@@ -178,7 +178,12 @@ impl CacheStrategy for LearnedCacheStrategy {
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
         let current_len = self.cache.len();
         if current_len < self.cache.capacity() {
-            trace!(doc_id, current_len, capacity = self.cache.capacity(), "admit (cache not full)");
+            trace!(
+                doc_id,
+                current_len,
+                capacity = self.cache.capacity(),
+                "admit (cache not full)"
+            );
             return true;
         }
 
@@ -200,7 +205,13 @@ impl CacheStrategy for LearnedCacheStrategy {
                 predictor.unseen_admission_chance() * (1.0 - fill_ratio).clamp(0.1, 1.0);
             drop(predictor);
             let admit = rand::random::<f32>() < unseen_chance;
-            trace!(doc_id, fill_ratio, unseen_chance, admit, "unseen doc admission decision");
+            trace!(
+                doc_id,
+                fill_ratio,
+                unseen_chance,
+                admit,
+                "unseen doc admission decision"
+            );
             return admit;
         };
 
@@ -211,7 +222,13 @@ impl CacheStrategy for LearnedCacheStrategy {
         let semantic_adapter_guard = self.semantic_adapter.read();
         if let Some(semantic_adapter) = semantic_adapter_guard.as_ref() {
             let should_cache = semantic_adapter.should_cache(freq_score, embedding);
-            trace!(doc_id, freq_score, threshold, should_cache, "semantic adapter decision");
+            trace!(
+                doc_id,
+                freq_score,
+                threshold,
+                should_cache,
+                "semantic adapter decision"
+            );
             if should_cache {
                 semantic_adapter.cache_embedding(doc_id, embedding.to_vec());
             }
@@ -227,10 +244,22 @@ impl CacheStrategy for LearnedCacheStrategy {
         // Soft admission: probabilistic caching below threshold
         let soft_probability = (freq_score / threshold).clamp(0.0, 1.0) * 0.25;
         if soft_probability > 0.0 && rand::random::<f32>() < soft_probability {
-            trace!(doc_id, freq_score, threshold, soft_probability, "admit (soft probability)");
+            trace!(
+                doc_id,
+                freq_score,
+                threshold,
+                soft_probability,
+                "admit (soft probability)"
+            );
             return true;
         }
-        trace!(doc_id, freq_score, threshold, soft_probability, "reject (below threshold)");
+        trace!(
+            doc_id,
+            freq_score,
+            threshold,
+            soft_probability,
+            "reject (below threshold)"
+        );
         false
     }
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
@@ -408,8 +437,16 @@ mod tests {
         }
 
         // Should be roughly 50/50 (within 10% tolerance)
-        assert!((lru_count as i32 - 500).abs() < 50, "LRU count: {}", lru_count);
-        assert!((learned_count as i32 - 500).abs() < 50, "Learned count: {}", learned_count);
+        assert!(
+            (lru_count as i32 - 500).abs() < 50,
+            "LRU count: {}",
+            lru_count
+        );
+        assert!(
+            (learned_count as i32 - 500).abs() < 50,
+            "Learned count: {}",
+            learned_count
+        );
     }
 
     #[test]
@@ -479,7 +516,11 @@ mod tests {
         }
 
         // Should have 100 vectors cached
-    let stats_str = strategy.stats();
-    assert!(stats_str.starts_with("LRU:"), "Stats format changed: {}", stats_str);
+        let stats_str = strategy.stats();
+        assert!(
+            stats_str.starts_with("LRU:"),
+            "Stats format changed: {}",
+            stats_str
+        );
     }
 }

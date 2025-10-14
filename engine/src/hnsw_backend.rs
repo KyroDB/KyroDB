@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, trace, warn, instrument};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 /// HNSW-backed document store for cache integration
 ///
@@ -61,7 +61,10 @@ impl HnswBackend {
         let mut index = HnswVectorIndex::new(dimension, max_elements)?;
 
         // Build HNSW index from embeddings
-        info!(documents = embeddings.len(), dimension, "building HNSW index");
+        info!(
+            documents = embeddings.len(),
+            dimension, "building HNSW index"
+        );
         for (doc_id, embedding) in embeddings.iter().enumerate() {
             index.add_vector(doc_id as u64, embedding)?;
         }
@@ -73,7 +76,7 @@ impl HnswBackend {
             persistence: None,
         })
     }
-    
+
     /// Create new HNSW backend with persistence enabled
     ///
     /// # Parameters
@@ -95,14 +98,16 @@ impl HnswBackend {
         }
 
         let data_dir = data_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&data_dir)
-            .context("Failed to create data directory")?;
+        std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
 
         let dimension = embeddings[0].len();
         let mut index = HnswVectorIndex::new(dimension, max_elements)?;
 
         // Build HNSW index
-        info!(documents = embeddings.len(), dimension, "building HNSW index (persistence)");
+        info!(
+            documents = embeddings.len(),
+            dimension, "building HNSW index (persistence)"
+        );
         for (doc_id, embedding) in embeddings.iter().enumerate() {
             index.add_vector(doc_id as u64, embedding)?;
         }
@@ -111,10 +116,12 @@ impl HnswBackend {
         // Create initial WAL
         let wal_path = data_dir.join(format!("wal_{}.wal", Self::timestamp()));
         let wal = WalWriter::create(&wal_path, fsync_policy)?;
-        
+
         // Update manifest
         let mut manifest = Manifest::load_or_create(data_dir.join("MANIFEST"))?;
-        manifest.wal_segments.push(wal_path.file_name().unwrap().to_string_lossy().to_string());
+        manifest
+            .wal_segments
+            .push(wal_path.file_name().unwrap().to_string_lossy().to_string());
         manifest.save(data_dir.join("MANIFEST"))?;
 
         let persistence = PersistenceState {
@@ -131,7 +138,7 @@ impl HnswBackend {
             persistence: Some(persistence),
         })
     }
-    
+
     /// Recover from WAL + snapshot
     ///
     /// # Recovery Flow
@@ -149,30 +156,30 @@ impl HnswBackend {
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         info!("recovering HnswBackend");
-        
+
         // Load manifest
         let manifest_path = data_dir.join("MANIFEST");
         if !manifest_path.exists() {
             anyhow::bail!("No MANIFEST found in {}", data_dir.display());
         }
-        
+
         let manifest = Manifest::load(&manifest_path)?;
-        
+
         // Load snapshot (if exists)
         let mut embeddings: Vec<Vec<f32>> = Vec::new();
         let mut dimension = 0;
-        
+
         if let Some(snapshot_name) = &manifest.latest_snapshot {
             let snapshot_path = data_dir.join(snapshot_name);
             info!(snapshot = %snapshot_path.display(), "loading snapshot");
-            
+
             let snapshot = Snapshot::load(&snapshot_path)?;
             dimension = snapshot.dimension;
             embeddings = snapshot.documents.into_iter().map(|(_, emb)| emb).collect();
-            
+
             info!(documents = embeddings.len(), "snapshot loaded");
         }
-        
+
         // Replay WAL segments
         for wal_name in &manifest.wal_segments {
             let wal_path = data_dir.join(wal_name);
@@ -183,7 +190,7 @@ impl HnswBackend {
             info!(wal_segment = wal_name, "replaying WAL");
             let mut reader = WalReader::open(&wal_path)?;
             let entries = reader.read_all()?;
-            
+
             for entry in entries {
                 match entry.op {
                     WalOp::Insert => {
@@ -191,7 +198,7 @@ impl HnswBackend {
                         if dimension == 0 && !entry.embedding.is_empty() {
                             dimension = entry.embedding.len();
                         }
-                        
+
                         let doc_id = entry.doc_id as usize;
                         if doc_id >= embeddings.len() {
                             embeddings.resize(doc_id + 1, vec![0.0; dimension]);
@@ -207,18 +214,26 @@ impl HnswBackend {
                     }
                 }
             }
-            
-            info!(valid = reader.valid_entries(), corrupted = reader.corrupted_entries(), wal_segment = wal_name, "wal replay complete");
+
+            info!(
+                valid = reader.valid_entries(),
+                corrupted = reader.corrupted_entries(),
+                wal_segment = wal_name,
+                "wal replay complete"
+            );
         }
-        
+
         if embeddings.is_empty() {
             anyhow::bail!("Recovery failed: no data found in snapshots or WAL");
         }
-        
+
         // Rebuild HNSW index
         let mut index = HnswVectorIndex::new(dimension, max_elements)?;
-    info!(documents = embeddings.len(), dimension, "rebuilding HNSW index after recovery");
-        
+        info!(
+            documents = embeddings.len(),
+            dimension, "rebuilding HNSW index after recovery"
+        );
+
         for (doc_id, embedding) in embeddings.iter().enumerate() {
             // Skip tombstones (all zeros)
             if embedding.iter().all(|&x| x == 0.0) {
@@ -226,18 +241,20 @@ impl HnswBackend {
             }
             index.add_vector(doc_id as u64, embedding)?;
         }
-        
-    info!("HNSW index rebuilt");
-        
+
+        info!("HNSW index rebuilt");
+
         // Create new active WAL
         let wal_path = data_dir.join(format!("wal_{}.wal", Self::timestamp()));
         let wal = WalWriter::create(&wal_path, fsync_policy)?;
-        
+
         // Update manifest
         let mut manifest = manifest;
-        manifest.wal_segments.push(wal_path.file_name().unwrap().to_string_lossy().to_string());
+        manifest
+            .wal_segments
+            .push(wal_path.file_name().unwrap().to_string_lossy().to_string());
         manifest.save(&manifest_path)?;
-        
+
         let persistence = PersistenceState {
             data_dir,
             wal: Arc::new(RwLock::new(wal)),
@@ -245,16 +262,16 @@ impl HnswBackend {
             inserts_since_snapshot: Arc::new(RwLock::new(0)),
             snapshot_interval,
         };
-        
+
         info!(documents = embeddings.len(), "recovery complete");
-        
+
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
             embeddings: Arc::new(RwLock::new(embeddings)),
             persistence: Some(persistence),
         })
     }
-    
+
     fn timestamp() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -281,46 +298,52 @@ impl HnswBackend {
                 embedding: embedding.clone(),
                 timestamp: Self::timestamp(),
             };
-            
+
             persistence.wal.write().append(&entry)?;
-            
+
             // Track inserts for snapshot trigger
             let mut inserts = persistence.inserts_since_snapshot.write();
             *inserts += 1;
-            
+
             if *inserts >= persistence.snapshot_interval {
-                debug!(inserts = *inserts, interval = persistence.snapshot_interval, "snapshot interval reached; creating snapshot");
+                debug!(
+                    inserts = *inserts,
+                    interval = persistence.snapshot_interval,
+                    "snapshot interval reached; creating snapshot"
+                );
                 drop(inserts); // Release lock before snapshot
                 self.create_snapshot()?;
             }
         }
-        
+
         // Update in-memory index and embeddings
         let mut index = self.index.write();
         let mut embeddings = self.embeddings.write();
-        
+
         let doc_id_usize = doc_id as usize;
         if doc_id_usize >= embeddings.len() {
             embeddings.resize(doc_id_usize + 1, vec![0.0; embedding.len()]);
         }
-        
+
         embeddings[doc_id_usize] = embedding.clone();
         index.add_vector(doc_id, &embedding)?;
-        
+
         Ok(())
     }
-    
+
     /// Create snapshot (atomic file operation)
     ///
     /// This is called automatically when `snapshot_interval` is reached,
     /// or can be called manually for backup purposes.
     #[instrument(level = "debug", skip(self), ret)]
     pub fn create_snapshot(&self) -> Result<()> {
-        let persistence = self.persistence.as_ref()
+        let persistence = self
+            .persistence
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Persistence not enabled"))?;
-        
+
         let embeddings = self.embeddings.read();
-        
+
         // Create snapshot object
         let documents: Vec<(u64, Vec<f32>)> = embeddings
             .iter()
@@ -328,13 +351,13 @@ impl HnswBackend {
             .filter(|(_, emb)| !emb.iter().all(|&x| x == 0.0)) // Skip tombstones
             .map(|(id, emb)| (id as u64, emb.clone()))
             .collect();
-        
+
         let dimension = if documents.is_empty() {
             0
         } else {
             documents[0].1.len()
         };
-        
+
         let doc_count = documents.len();
         let snapshot = Snapshot::new(dimension, documents);
         // Save snapshot
@@ -342,19 +365,19 @@ impl HnswBackend {
         let snapshot_path = persistence.data_dir.join(&snapshot_name);
         snapshot.save(&snapshot_path)?;
         info!(path = %snapshot_path.display(), docs = doc_count, "snapshot saved");
-        
+
         // Update manifest
         let manifest_path = persistence.data_dir.join("MANIFEST");
         let mut manifest = Manifest::load_or_create(&manifest_path)?;
         manifest.latest_snapshot = Some(snapshot_name);
         manifest.save(&manifest_path)?;
-        
+
         // Reset insert counter
         *persistence.inserts_since_snapshot.write() = 0;
-        
+
         Ok(())
     }
-    
+
     /// Fetch document embedding by ID (O(1) lookup)
     ///
     /// # Parameters
@@ -411,7 +434,7 @@ impl HnswBackend {
         let embeddings = self.embeddings.read();
         Arc::new(embeddings.clone())
     }
-    
+
     /// Force fsync on WAL (for periodic fsync policy)
     pub fn sync_wal(&self) -> Result<()> {
         if let Some(ref persistence) = self.persistence {

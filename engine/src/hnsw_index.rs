@@ -168,7 +168,8 @@ impl HnswVectorIndex {
         // force linear scan. This path is only taken for tiny indexes (<= 1024) and when
         // results are incomplete, so it does not impact large-scale performance targets.
         if results.len() < k && self.current_count <= 1024 {
-            let mut present: std::collections::HashSet<u64> = results.iter().map(|r| r.doc_id).collect();
+            let mut present: std::collections::HashSet<u64> =
+                results.iter().map(|r| r.doc_id).collect();
             // Linear scan over all inserted vectors requires access to raw data; hnsw_rs does not
             // expose stored vectors, so we cannot reconstruct embeddings here. Instead, we accept
             // the smaller result set. (Future: maintain optional side array of embeddings if strict

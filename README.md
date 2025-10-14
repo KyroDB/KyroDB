@@ -247,7 +247,6 @@ Based on validation with MS MARCO dataset (71,878 queries, 10K corpus):
 
 - [`docs/THREE_TIER_IMPLEMENTATION.md`](docs/THREE_TIER_IMPLEMENTATION.md) - Architecture details
 - [`docs/NDCG_IMPLEMENTATION.md`](docs/NDCG_IMPLEMENTATION.md) - Quality metrics
-- [`docs/visiondocument.md`](docs/visiondocument.md) - Long-term vision (Phase 0-4)
 
 ## Development
 ```bash

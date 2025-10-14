@@ -31,7 +31,7 @@ anyhow = "1.0"
 # Phase 0 Week 3-8: RMI for Hybrid Semantic Cache (no external deps, pure Rust)
 
 # Phase 0 Week 9-12: A/B testing framework + minimal persistence
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "signal", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 csv = "1.3"

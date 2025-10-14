@@ -224,8 +224,14 @@ fn test_periodic_retraining() {
 
     // Verify predictions changed
     // Require doc2 becomes at least as hot as doc1 after shift and at least one score changes
-    assert!(score_2_phase2 >= score_1_phase2, "Doc 2 should become hotter after retraining");
-    assert!(score_1_phase1 != score_1_phase2 || score_2_phase1 != score_2_phase2, "At least one score should change after retraining");
+    assert!(
+        score_2_phase2 >= score_1_phase2,
+        "Doc 2 should become hotter after retraining"
+    );
+    assert!(
+        score_1_phase1 != score_1_phase2 || score_2_phase1 != score_2_phase2,
+        "At least one score should change after retraining"
+    );
 }
 
 #[test]
@@ -353,6 +359,6 @@ fn test_logger_stats_integration() {
 
     println!(
         "Logger stats: {}/{} events, {} flushes",
-    stats.current_events, stats.capacity, stats.total_flushes
+        stats.current_events, stats.capacity, stats.total_flushes
     );
 }
