@@ -1,0 +1,345 @@
+// KyroDB v1 gRPC Service Definition
+// High-performance vector database optimized for RAG workloads
+// Primary protocol: gRPC (performance-critical), REST secondary (convenience)
+
+syntax = "proto3";
+
+package kyrodb.v1;
+
+// Core KyroDB service - all operations for vector storage and retrieval
+service KyroDBService {
+  // ============================================================================
+  // WRITE OPERATIONS
+  // ============================================================================
+  
+  // Insert a single document with embedding
+  // Latency: ~100-200ns (hot tier write)
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  
+  // Insert multiple documents in a streaming fashion
+  // Use for bulk imports (millions of vectors)
+  // Throughput: 50K-100K docs/sec
+  rpc BulkInsert(stream InsertRequest) returns (InsertResponse);
+  
+  // Delete a document by ID
+  // Note: Soft delete in hot tier, physical delete on next compaction
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  
+  // ============================================================================
+  // READ OPERATIONS
+  // ============================================================================
+  
+  // Query for a specific document by ID (point lookup)
+  // Latency: <100ns cache hit, <1ms cache miss
+  // Query path: Cache → Hot Tier → HNSW
+  rpc Query(QueryRequest) returns (QueryResponse);
+  
+  // k-NN vector similarity search
+  // Latency: <1ms P99 @ 10M vectors
+  // Returns top-k most similar documents
+  rpc Search(SearchRequest) returns (SearchResponse);
+  
+  // Bulk search: multiple queries in one request (streaming)
+  // Use for batch inference workloads
+  rpc BulkSearch(stream SearchRequest) returns (stream SearchResponse);
+  
+  // ============================================================================
+  // HEALTH & OBSERVABILITY
+  // ============================================================================
+  
+  // Health check for load balancer / orchestrator
+  // Returns component-level health status
+  rpc Health(HealthRequest) returns (HealthResponse);
+  
+  // Metrics for monitoring and alerting
+  // Returns cache hit rates, latencies, throughput
+  rpc Metrics(MetricsRequest) returns (MetricsResponse);
+  
+  // ============================================================================
+  // ADMIN OPERATIONS
+  // ============================================================================
+  
+  // Force flush hot tier to cold tier (for testing/backups)
+  rpc FlushHotTier(FlushRequest) returns (FlushResponse);
+  
+  // Create snapshot for backup
+  rpc CreateSnapshot(SnapshotRequest) returns (SnapshotResponse);
+  
+  // Get engine configuration (read-only)
+  rpc GetConfig(ConfigRequest) returns (ConfigResponse);
+}
+
+// ============================================================================
+// WRITE OPERATION MESSAGES
+// ============================================================================
+
+message InsertRequest {
+  // Document ID (must be unique, non-zero)
+  // Using uint64 for 18 quintillion possible IDs
+  uint64 doc_id = 1;
+  
+  // Dense embedding vector (e.g., 384 dims for MS MARCO, 1536 for OpenAI)
+  // Packed as repeated float for efficient binary encoding
+  repeated float embedding = 2;
+  
+  // Optional metadata for future hybrid queries
+  // Phase 1: key-value pairs for filtering
+  // Phase 2: Full metadata indexing
+  map<string, string> metadata = 3;
+  
+  // Optional namespace for multi-tenancy (Phase 1)
+  string namespace = 4;
+}
+
+message InsertResponse {
+  bool success = 1;
+  string error = 2;
+  
+  // Unix timestamp (seconds since epoch)
+  uint64 inserted_at = 3;
+  
+  // Which tier the document landed in
+  enum Tier {
+    UNKNOWN = 0;
+    HOT_TIER = 1;
+    COLD_TIER = 2;
+  }
+  Tier tier = 4;
+  
+  // Stats (for bulk insert)
+  uint64 total_inserted = 5;
+  uint64 total_failed = 6;
+}
+
+message DeleteRequest {
+  uint64 doc_id = 1;
+  string namespace = 2;  // Optional namespace
+}
+
+message DeleteResponse {
+  bool success = 1;
+  string error = 2;
+  bool existed = 3;  // Was the document present before deletion?
+}
+
+// ============================================================================
+// READ OPERATION MESSAGES
+// ============================================================================
+
+message QueryRequest {
+  // Document ID to retrieve
+  uint64 doc_id = 1;
+  
+  // Whether to return the embedding vector (default: false)
+  // Set to false to save bandwidth if only checking existence
+  bool include_embedding = 2;
+  
+  // Optional namespace
+  string namespace = 3;
+}
+
+message QueryResponse {
+  bool found = 1;
+  uint64 doc_id = 2;
+  
+  // Embedding vector (only if include_embedding=true)
+  repeated float embedding = 3;
+  
+  // Optional metadata
+  map<string, string> metadata = 4;
+  
+  // Which tier served the query (for debugging)
+  enum Tier {
+    UNKNOWN = 0;
+    CACHE = 1;
+    HOT_TIER = 2;
+    COLD_TIER = 3;
+  }
+  Tier served_from = 5;
+  
+  string error = 6;
+}
+
+message SearchRequest {
+  // Query embedding vector
+  repeated float query_embedding = 1;
+  
+  // Number of nearest neighbors to return (k in k-NN)
+  // Valid range: 1-1000
+  uint32 k = 2;
+  
+  // Optional score threshold (cosine similarity)
+  // Only return results with score >= min_score
+  // Range: -1.0 to 1.0 (cosine similarity)
+  float min_score = 3;
+  
+  // Optional namespace
+  string namespace = 4;
+  
+  // Whether to include embeddings in results (default: false)
+  // Set to false to save bandwidth
+  bool include_embeddings = 5;
+  
+  // Optional metadata filters (Phase 1)
+  map<string, string> metadata_filters = 6;
+}
+
+message SearchResult {
+  uint64 doc_id = 1;
+  
+  // Cosine similarity score (-1.0 to 1.0)
+  // Higher is better (1.0 = identical vectors)
+  float score = 2;
+  
+  // Optional embedding (if include_embeddings=true)
+  repeated float embedding = 3;
+  
+  // Optional metadata
+  map<string, string> metadata = 4;
+}
+
+message SearchResponse {
+  // Top-k results, sorted by score (descending)
+  repeated SearchResult results = 1;
+  
+  // Total number of results found (before filtering)
+  uint32 total_found = 2;
+  
+  // Search latency in milliseconds
+  float search_latency_ms = 3;
+  
+  // Which tiers were accessed during search
+  enum SearchPath {
+    UNKNOWN = 0;
+    CACHE_HIT = 1;          // Found in cache
+    HOT_TIER_ONLY = 2;      // Searched hot tier only
+    COLD_TIER_ONLY = 3;     // Searched cold tier only
+    HOT_AND_COLD = 4;       // Searched both tiers
+  }
+  SearchPath search_path = 4;
+  
+  string error = 5;
+}
+
+// ============================================================================
+// HEALTH & OBSERVABILITY MESSAGES
+// ============================================================================
+
+message HealthRequest {
+  // Optional: check specific component
+  string component = 1;  // "cache", "hot_tier", "cold_tier", "wal"
+}
+
+message HealthResponse {
+  enum Status {
+    UNKNOWN = 0;
+    HEALTHY = 1;      // All systems operational
+    DEGRADED = 2;     // Some issues but functional
+    UNHEALTHY = 3;    // Critical failure
+  }
+  Status status = 1;
+  
+  // Server version (e.g., "0.1.0")
+  string version = 2;
+  
+  // Component-level health
+  // Key: component name, Value: status string
+  map<string, string> components = 3;
+  
+  // Uptime in seconds
+  uint64 uptime_seconds = 4;
+  
+  // Git commit hash (for debugging)
+  string git_commit = 5;
+}
+
+message MetricsRequest {
+  // Optional: filter metrics by category
+  // Categories: "cache", "performance", "system"
+  repeated string categories = 1;
+}
+
+message MetricsResponse {
+  // ========== CACHE METRICS (Layer 1) ==========
+  uint64 cache_hits = 1;
+  uint64 cache_misses = 2;
+  double cache_hit_rate = 3;  // Percentage: 0.0 to 100.0
+  uint64 cache_size = 4;      // Number of documents in cache
+  
+  // ========== HOT TIER METRICS (Layer 2) ==========
+  uint64 hot_tier_hits = 5;
+  uint64 hot_tier_misses = 6;
+  double hot_tier_hit_rate = 7;
+  uint64 hot_tier_size = 8;
+  uint64 hot_tier_flushes = 9;
+  
+  // ========== COLD TIER METRICS (Layer 3) ==========
+  uint64 cold_tier_searches = 10;
+  uint64 cold_tier_size = 11;  // Total documents in HNSW
+  
+  // ========== PERFORMANCE METRICS ==========
+  double p50_latency_ms = 12;
+  double p95_latency_ms = 13;
+  double p99_latency_ms = 14;
+  uint64 total_queries = 15;
+  uint64 total_inserts = 16;
+  double queries_per_second = 17;
+  double inserts_per_second = 18;
+  
+  // ========== SYSTEM METRICS ==========
+  uint64 memory_usage_bytes = 19;
+  uint64 disk_usage_bytes = 20;
+  double cpu_usage_percent = 21;
+  
+  // ========== OVERALL HEALTH ==========
+  double overall_hit_rate = 22;  // (cache_hits + hot_tier_hits) / total_queries
+  
+  // Timestamp when metrics were collected
+  uint64 collected_at = 23;
+}
+
+// ============================================================================
+// ADMIN OPERATION MESSAGES
+// ============================================================================
+
+message FlushRequest {
+  // Force immediate flush regardless of hot tier size/age
+  bool force = 1;
+}
+
+message FlushResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 documents_flushed = 3;
+  float flush_duration_ms = 4;
+}
+
+message SnapshotRequest {
+  // Optional snapshot path (default: data_dir/snapshots/)
+  string path = 1;
+}
+
+message SnapshotResponse {
+  bool success = 1;
+  string error = 2;
+  string snapshot_path = 3;
+  uint64 documents_snapshotted = 4;
+  uint64 snapshot_size_bytes = 5;
+}
+
+message ConfigRequest {}
+
+message ConfigResponse {
+  // Engine configuration (read-only)
+  uint64 hot_tier_max_size = 1;
+  uint64 hot_tier_max_age_seconds = 2;
+  uint64 hnsw_max_elements = 3;
+  string data_dir = 4;
+  string fsync_policy = 5;  // "Always", "Periodic", "Never"
+  uint64 snapshot_interval = 6;
+  uint64 flush_interval_seconds = 7;
+  
+  // Runtime info
+  uint64 embedding_dimension = 8;
+  string version = 9;
+}

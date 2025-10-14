@@ -1,6 +1,21 @@
 use std::process::Command;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ============================================================================
+    // STEP 1: Compile protobuf definitions for gRPC server
+    // ============================================================================
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(false)  // Server only (clients will use separate crate)
+        .compile(&["proto/kyrodb.proto"], &["proto"])?;
+    
+    // Rebuild when proto file changes
+    println!("cargo:rerun-if-changed=proto/kyrodb.proto");
+    
+    // ============================================================================
+    // STEP 2: Capture build metadata
+    // ============================================================================
+    
     // Best-effort Git commit (works in git checkouts; falls back to "unknown" in archives/CI)
     let commit = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -59,4 +74,6 @@ fn main() {
     // Rebuild when HEAD or refs change (best-effort; harmless if repo absent)
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
+    
+    Ok(())
 }
