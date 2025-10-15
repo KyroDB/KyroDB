@@ -51,6 +51,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
 tracing-appender = "0.2"
 
+# Observability: HTTP endpoints for metrics and health checks
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1.0"
+
 # Persistence: WAL + snapshots
 bincode = "1.3"
 crc32fast = "1.4"

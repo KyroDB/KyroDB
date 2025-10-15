@@ -21,7 +21,8 @@
 //! ```
 
 use kyrodb_engine::{
-    FsyncPolicy, LruCacheStrategy, SearchResult, TieredEngine, TieredEngineConfig,
+    ErrorCategory, FsyncPolicy, HealthStatus, LruCacheStrategy, MetricsCollector, SearchResult,
+    TieredEngine, TieredEngineConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,6 +32,16 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use tracing::{error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+// HTTP server for observability endpoints
+use axum::{
+    body::Body,
+    extract::State as AxumState,
+    http::{Response as HttpResponse, StatusCode},
+    routing::get,
+    Router,
+};
+use tower_http::trace::TraceLayer;
 
 // Generated protobuf code
 pub mod kyrodb {
@@ -68,6 +79,7 @@ struct ServerState {
     start_time: Instant,
     config: TieredEngineConfig,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    metrics: MetricsCollector,
 }
 
 /// gRPC service implementation
@@ -76,6 +88,17 @@ struct KyroDBServiceImpl {
 }
 
 // KyroDBServiceImpl is constructed directly in main() with existing engine Arc
+
+/// RAII guard for connection tracking
+struct ConnectionGuard {
+    metrics: MetricsCollector,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics.decrement_connections();
+    }
+}
 
 #[tonic::async_trait]
 impl KyroDbService for KyroDBServiceImpl {
@@ -92,17 +115,26 @@ impl KyroDbService for KyroDBServiceImpl {
         let start = Instant::now();
         let req = request.into_inner();
 
+        // Track connection
+        self.state.metrics.increment_connections();
+        let _conn_guard = ConnectionGuard {
+            metrics: self.state.metrics.clone(),
+        };
+
         // Validate input
         if req.doc_id < MIN_DOC_ID {
+            self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument(format!(
                 "doc_id must be >= {}",
                 MIN_DOC_ID
             )));
         }
         if req.embedding.is_empty() {
+            self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument("embedding cannot be empty"));
         }
         if req.embedding.len() > MAX_EMBEDDING_DIM {
+            self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument(format!(
                 "embedding dimension {} exceeds maximum {}",
                 req.embedding.len(),
@@ -116,10 +148,12 @@ impl KyroDbService for KyroDBServiceImpl {
 
         match engine.insert(req.doc_id, req.embedding) {
             Ok(_) => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let latency_ns = start.elapsed().as_nanos() as u64;
+                self.state.metrics.record_insert(true);
+                
                 info!(
                     doc_id = req.doc_id,
-                    latency_ms = latency_ms,
+                    latency_ns = latency_ns,
                     "Document inserted successfully"
                 );
 
@@ -139,6 +173,8 @@ impl KyroDbService for KyroDBServiceImpl {
                 }))
             }
             Err(e) => {
+                self.state.metrics.record_insert(false);
+                self.state.metrics.record_error(ErrorCategory::Internal);
                 error!(
                     doc_id = req.doc_id,
                     error = %e,
@@ -319,11 +355,19 @@ impl KyroDbService for KyroDBServiceImpl {
         let start = Instant::now();
         let req = request.into_inner();
 
+        // Track connection
+        self.state.metrics.increment_connections();
+        let _conn_guard = ConnectionGuard {
+            metrics: self.state.metrics.clone(),
+        };
+
         // Validate input
         if req.query_embedding.is_empty() {
+            self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument("query_embedding cannot be empty"));
         }
         if req.query_embedding.len() > MAX_EMBEDDING_DIM {
+            self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument(format!(
                 "query_embedding dimension {} exceeds maximum {}",
                 req.query_embedding.len(),
@@ -331,9 +375,11 @@ impl KyroDbService for KyroDBServiceImpl {
             )));
         }
         if req.k == 0 {
+            self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument("k must be greater than 0"));
         }
         if req.k > MAX_KNN_K {
+            self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument(format!(
                 "k must be <= {}",
                 MAX_KNN_K
@@ -347,7 +393,11 @@ impl KyroDbService for KyroDBServiceImpl {
 
         match engine.knn_search(&req.query_embedding, req.k as usize) {
             Ok(results) => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let latency_ns = start.elapsed().as_nanos() as u64;
+                
+                // Record metrics
+                self.state.metrics.record_query_latency(latency_ns);
+                self.state.metrics.record_hnsw_search(latency_ns);
 
                 // Convert distance to similarity score
                 // CRITICAL: Assumes cosine distance metric from HNSW
@@ -397,10 +447,12 @@ impl KyroDbService for KyroDBServiceImpl {
                         .collect()
                 };
 
+                let latency_ms = latency_ns as f64 / 1_000_000.0;
+
                 info!(
                     k = req.k,
                     results_found = search_results.len(),
-                    latency_ms = latency_ms,
+                    latency_ns = latency_ns,
                     min_score = req.min_score,
                     "Search completed successfully"
                 );
@@ -414,6 +466,8 @@ impl KyroDbService for KyroDBServiceImpl {
                 }))
             }
             Err(e) => {
+                self.state.metrics.record_query_failure();
+                self.state.metrics.record_error(ErrorCategory::Internal);
                 error!(
                     error = %e,
                     k = req.k,
@@ -623,6 +677,144 @@ impl KyroDbService for KyroDBServiceImpl {
 }
 
 // ============================================================================
+// HTTP OBSERVABILITY ENDPOINTS
+// ============================================================================
+
+/// Prometheus /metrics endpoint handler
+async fn metrics_handler(
+    AxumState(state): AxumState<Arc<ServerState>>,
+) -> HttpResponse<Body> {
+    let prometheus_text = state.metrics.export_prometheus();
+    
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/plain; version=0.0.4")
+        .body(Body::from(prometheus_text))
+        .unwrap()
+}
+
+/// Health check /health endpoint (liveness probe)
+async fn health_handler(
+    AxumState(state): AxumState<Arc<ServerState>>,
+) -> HttpResponse<Body> {
+    let health = state.metrics.health_status();
+    
+    let (status_code, body) = match health {
+        HealthStatus::Healthy => (
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "healthy",
+                "uptime_seconds": state.metrics.uptime().as_secs(),
+            }),
+        ),
+        HealthStatus::Starting => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "status": "starting",
+                "uptime_seconds": state.metrics.uptime().as_secs(),
+            }),
+        ),
+        HealthStatus::Degraded { reason } => (
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "degraded",
+                "reason": reason,
+                "uptime_seconds": state.metrics.uptime().as_secs(),
+            }),
+        ),
+        HealthStatus::Unhealthy { reason } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "status": "unhealthy",
+                "reason": reason,
+                "uptime_seconds": state.metrics.uptime().as_secs(),
+            }),
+        ),
+    };
+    
+    HttpResponse::builder()
+        .status(status_code)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Readiness check /ready endpoint (readiness probe)
+async fn ready_handler(
+    AxumState(state): AxumState<Arc<ServerState>>,
+) -> HttpResponse<Body> {
+    let health = state.metrics.health_status();
+    
+    let (status_code, body) = match health {
+        HealthStatus::Healthy | HealthStatus::Degraded { .. } => (
+            StatusCode::OK,
+            serde_json::json!({
+                "ready": true,
+                "status": "ready",
+            }),
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "ready": false,
+                "status": "not_ready",
+            }),
+        ),
+    };
+    
+    HttpResponse::builder()
+        .status(status_code)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// SLO status endpoint for alerting systems
+async fn slo_handler(
+    AxumState(state): AxumState<Arc<ServerState>>,
+) -> HttpResponse<Body> {
+    let slo = state.metrics.slo_status();
+    
+    let any_breach = slo.p99_latency_breached
+        || slo.cache_hit_rate_breached
+        || slo.error_rate_breached
+        || slo.availability_breached;
+    
+    let status_code = if any_breach {
+        StatusCode::OK // Still return 200, but include breach details
+    } else {
+        StatusCode::OK
+    };
+    
+    let body = serde_json::json!({
+        "slo_breaches": {
+            "p99_latency": slo.p99_latency_breached,
+            "cache_hit_rate": slo.cache_hit_rate_breached,
+            "error_rate": slo.error_rate_breached,
+            "availability": slo.availability_breached,
+        },
+        "current_metrics": {
+            "p99_latency_ns": slo.current_p99_ns,
+            "cache_hit_rate": slo.current_cache_hit_rate,
+            "error_rate": slo.current_error_rate,
+            "availability": slo.current_availability,
+        },
+        "slo_thresholds": {
+            "p99_latency_ns": 1_000_000, // 1ms
+            "min_cache_hit_rate": 0.70,
+            "max_error_rate": 0.001,
+            "min_availability": 0.999,
+        },
+    });
+    
+    HttpResponse::builder()
+        .status(status_code)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+// ============================================================================
 // SERVER INITIALIZATION
 // ============================================================================
 
@@ -713,11 +905,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wrap engine in Arc<RwLock> for concurrent access
     let engine_arc = Arc::new(RwLock::new(engine));
 
+    // Create metrics collector
+    let metrics = MetricsCollector::new();
+
     // Create shutdown channel for graceful shutdown
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // Spawn background flush task with graceful shutdown
     let flush_engine = engine_arc.clone();
+    let flush_metrics = metrics.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         info!("Background flush task started (60s interval)");
@@ -730,6 +926,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match engine.flush_hot_tier() {
                         Ok(count) if count > 0 => {
                             info!(docs_flushed = count, "Background flush completed");
+                            flush_metrics.record_flush();
                         }
                         Ok(_) => {}  // No docs to flush
                         Err(e) => {
@@ -745,6 +942,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(count) = engine.flush_hot_tier() {
                         if count > 0 {
                             info!(docs_flushed = count, "Final flush completed on shutdown");
+                            flush_metrics.record_flush();
                         }
                     }
                     break;
@@ -753,25 +951,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Create shared server state
+    let state = Arc::new(ServerState {
+        engine: engine_arc,
+        start_time: Instant::now(),
+        config: config.clone(),
+        shutdown_tx,
+        metrics: metrics.clone(),
+    });
+
     // Create gRPC service with engine Arc reference
-    let service = KyroDBServiceImpl {
-        state: Arc::new(ServerState {
-            engine: engine_arc,
-            start_time: Instant::now(),
-            config: config.clone(),
-            shutdown_tx,
-        }),
+    let grpc_service = KyroDBServiceImpl {
+        state: state.clone(),
     };
 
-    let addr = format!("0.0.0.0:{}", port).parse()?;
+    // Build HTTP router for observability endpoints
+    let http_app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/health", get(health_handler))
+        .route("/ready", get(ready_handler))
+        .route("/slo", get(slo_handler))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state.clone());
 
-    info!("gRPC server listening on {}", addr);
+    // HTTP port for observability (gRPC port + 1000)
+    let http_port = port + 1000;
+    let http_addr = format!("0.0.0.0:{}", http_port)
+        .parse::<std::net::SocketAddr>()?;
+
+    info!("HTTP observability server listening on http://{}", http_addr);
+    info!("  GET /metrics  - Prometheus metrics");
+    info!("  GET /health   - Liveness probe");
+    info!("  GET /ready    - Readiness probe");
+    info!("  GET /slo      - SLO breach status");
+
+    // Spawn HTTP server with proper error handling
+    let http_addr_clone = http_addr;
+    let _http_handle = tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(http_addr_clone).await {
+            Ok(listener) => {
+                info!("HTTP listener bound successfully on {}", http_addr_clone);
+                if let Err(e) = axum::serve(listener, http_app).await {
+                    error!(error = %e, "HTTP observability server failed");
+                    return Err(anyhow::anyhow!("HTTP server error: {}", e));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    addr = %http_addr_clone,
+                    "Failed to bind HTTP observability listener - port may be in use"
+                );
+                Err(anyhow::anyhow!("Failed to bind HTTP listener: {}", e))
+            }
+        }
+    });
+
+    // Give HTTP server a moment to bind before marking ready
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Mark server as ready after initialization
+    metrics.mark_ready();
+
+    let grpc_addr = format!("0.0.0.0:{}", port).parse()?;
+
+    info!("gRPC server listening on {}", grpc_addr);
     info!("Server ready to accept connections");
 
-    // Start gRPC server
+    // Start gRPC server (blocking)
     Server::builder()
-        .add_service(KyroDbServiceServer::new(service))
-        .serve(addr)
+        .add_service(KyroDbServiceServer::new(grpc_service))
+        .serve(grpc_addr)
         .await?;
 
     Ok(())

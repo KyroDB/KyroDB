@@ -46,6 +46,9 @@ pub mod hot_tier;
 // Tiered engine: Three-layer architecture orchestrator
 pub mod tiered_engine;
 
+// Metrics and observability: Prometheus metrics, health checks, SLO monitoring
+pub mod metrics;
+
 // ===== Global Allocator (jemalloc-profiling feature) =====
 
 #[cfg(feature = "jemalloc-profiling")]
@@ -98,3 +101,6 @@ pub use hot_tier::{HotTier, HotTierStats};
 
 // Tiered engine components (three-layer architecture)
 pub use tiered_engine::{TieredEngine, TieredEngineConfig, TieredEngineStats};
+
+// Metrics and observability components
+pub use metrics::{ErrorCategory, HealthStatus, MetricsCollector, SloStatus};
