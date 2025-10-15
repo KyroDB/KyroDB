@@ -20,6 +20,7 @@
 //! RUST_LOG=kyrodb_engine=debug kyrodb_server
 //! ```
 
+use clap::Parser;
 use kyrodb_engine::{
     ErrorCategory, FsyncPolicy, HealthStatus, LruCacheStrategy, MetricsCollector, SearchResult,
     TieredEngine, TieredEngineConfig,
@@ -77,7 +78,8 @@ const MAX_KNN_K: u32 = 1000;
 struct ServerState {
     engine: Arc<RwLock<TieredEngine>>,
     start_time: Instant,
-    config: TieredEngineConfig,
+    app_config: kyrodb_engine::config::KyroDbConfig,
+    engine_config: TieredEngineConfig,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     metrics: MetricsCollector,
 }
@@ -660,17 +662,18 @@ impl KyroDbService for KyroDBServiceImpl {
         &self,
         _request: Request<ConfigRequest>,
     ) -> Result<Response<ConfigResponse>, Status> {
-        let config = &self.state.config;
+        let engine_config = &self.state.engine_config;
+        let app_config = &self.state.app_config;
 
         Ok(Response::new(ConfigResponse {
-            hot_tier_max_size: config.hot_tier_max_size as u64,
-            hot_tier_max_age_seconds: config.hot_tier_max_age.as_secs(),
-            hnsw_max_elements: config.hnsw_max_elements as u64,
-            data_dir: config.data_dir.clone().unwrap_or_default(),
-            fsync_policy: format!("{:?}", config.fsync_policy),
-            snapshot_interval: config.snapshot_interval as u64,
-            flush_interval_seconds: config.flush_interval.as_secs(),
-            embedding_dimension: 384, // TODO: Track dynamically
+            hot_tier_max_size: engine_config.hot_tier_max_size as u64,
+            hot_tier_max_age_seconds: engine_config.hot_tier_max_age.as_secs(),
+            hnsw_max_elements: engine_config.hnsw_max_elements as u64,
+            data_dir: engine_config.data_dir.clone().unwrap_or_default(),
+            fsync_policy: format!("{:?}", engine_config.fsync_policy),
+            snapshot_interval: engine_config.snapshot_interval as u64,
+            flush_interval_seconds: engine_config.flush_interval.as_secs(),
+            embedding_dimension: app_config.hnsw.dimension as u64,
             version: env!("CARGO_PKG_VERSION").to_string(),
         }))
     }
@@ -817,87 +820,183 @@ async fn slo_handler(
 // ============================================================================
 // SERVER INITIALIZATION
 // ============================================================================
+// CLI ARGUMENTS
+// ============================================================================
+
+/// KyroDB - High-performance vector database for RAG workloads
+#[derive(Parser, Debug)]
+#[command(name = "kyrodb_server")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(about = "Production gRPC server for KyroDB vector database", long_about = None)]
+struct CliArgs {
+    /// Path to configuration file (YAML or TOML)
+    #[arg(short, long, env = "KYRODB_CONFIG")]
+    config: Option<String>,
+    
+    /// Override gRPC server port
+    #[arg(short, long, env = "KYRODB_PORT")]
+    port: Option<u16>,
+    
+    /// Override data directory
+    #[arg(short, long, env = "KYRODB_DATA_DIR")]
+    data_dir: Option<String>,
+    
+    /// Generate example config file (yaml or toml) and exit
+    #[arg(long, value_name = "FORMAT")]
+    generate_config: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize structured logging
-    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
+    // Parse command-line arguments
+    let cli_args = CliArgs::parse();
+    
+    // Handle --generate-config early exit
+    if let Some(format) = cli_args.generate_config {
+        match format.to_lowercase().as_str() {
+            "yaml" | "yml" => {
+                println!("{}", kyrodb_engine::config::generate_example_yaml());
+                return Ok(());
+            }
+            "toml" => {
+                println!("{}", kyrodb_engine::config::generate_example_toml());
+                return Ok(());
+            }
+            _ => {
+                eprintln!("Error: Invalid format '{}'. Use 'yaml' or 'toml'.", format);
+                std::process::exit(1);
+            }
+        }
+    }
+    
+    // Load configuration with priority: CLI args > env vars > config file > defaults
+    let mut config = kyrodb_engine::config::KyroDbConfig::load(cli_args.config.as_deref())?;
+    
+    // Apply CLI overrides (highest priority)
+    if let Some(port) = cli_args.port {
+        config.server.port = port;
+    }
+    if let Some(data_dir) = cli_args.data_dir {
+        config.persistence.data_dir = data_dir.into();
+    }
+    
+    // Validate final configuration
+    config.validate()?;
+    
+    // Initialize structured logging based on config
+    let (non_blocking, _guard) = if let Some(log_file) = &config.logging.file {
+        match std::fs::File::create(log_file) {
+            Ok(file) => tracing_appender::non_blocking(file),
+            Err(e) => {
+                eprintln!("Warning: Failed to create log file {:?}: {}. Falling back to stdout.", log_file, e);
+                tracing_appender::non_blocking(std::io::stdout())
+            }
+        }
+    } else {
+        tracing_appender::non_blocking(std::io::stdout())
+    };
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "kyrodb_engine=info,kyrodb_server=info".into()),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(non_blocking)
-                .json()
-                .with_target(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true),
-        )
-        .init();
+    let log_level = config.logging.level.as_str();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| format!("kyrodb_engine={},kyrodb_server={}", log_level, log_level).into());
+
+    match config.logging.format {
+        kyrodb_engine::config::LogFormat::Json => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .json()
+                        .with_target(true)
+                        .with_thread_ids(true)
+                        .with_file(true)
+                        .with_line_number(true),
+                )
+                .init();
+        }
+        kyrodb_engine::config::LogFormat::Text => {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .with_target(true)
+                        .with_thread_ids(true)
+                        .with_file(true)
+                        .with_line_number(true),
+                )
+                .init();
+        }
+    }
 
     info!("Starting KyroDB gRPC server v{}", env!("CARGO_PKG_VERSION"));
     info!("Git commit: {}", env!("GIT_COMMIT_HASH"));
     info!("Build target: {}", env!("TARGET_TRIPLE"));
-
-    // Parse configuration from environment
-    let data_dir = std::env::var("KYRODB_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-    let port = std::env::var("KYRODB_PORT")
-        .unwrap_or_else(|_| "50051".to_string())
-        .parse::<u16>()?;
-    let hot_tier_max_size = std::env::var("KYRODB_HOT_TIER_SIZE")
-        .unwrap_or_else(|_| "10000".to_string())
-        .parse::<usize>()?;
-
     info!(
-        data_dir = %data_dir,
-        port = port,
-        hot_tier_max_size = hot_tier_max_size,
+        grpc_port = config.server.port,
+        http_port = config.http_port(),
+        data_dir = %config.persistence.data_dir.display(),
+        cache_capacity = config.cache.capacity,
+        cache_strategy = ?config.cache.strategy,
+        hnsw_max_elements = config.hnsw.max_elements,
+        hnsw_m = config.hnsw.m,
+        hnsw_ef_construction = config.hnsw.ef_construction,
+        hnsw_ef_search = config.hnsw.ef_search,
+        log_level = log_level,
         "Configuration loaded"
     );
 
-    // Create engine configuration
-    let config = TieredEngineConfig {
-        hot_tier_max_size,
-        hot_tier_max_age: Duration::from_secs(300), // 5 minutes
-        hnsw_max_elements: 10_000_000,              // 10M vectors
-        data_dir: Some(data_dir.clone()),
-        fsync_policy: FsyncPolicy::Periodic(5000), // Fsync every 5 seconds
-        snapshot_interval: 10_000,
-        flush_interval: Duration::from_secs(60),
+    // Create engine configuration from loaded config
+    let fsync_policy = match config.persistence.fsync_policy {
+        kyrodb_engine::config::FsyncPolicy::None => FsyncPolicy::Never,
+        kyrodb_engine::config::FsyncPolicy::DataOnly => {
+            FsyncPolicy::Periodic(config.persistence.wal_flush_interval_ms)
+        }
+        kyrodb_engine::config::FsyncPolicy::Full => {
+            FsyncPolicy::Always  // Most conservative for "full"
+        }
+    };
+    
+    let engine_config = TieredEngineConfig {
+        hot_tier_max_size: config.cache.capacity,
+        hot_tier_max_age: Duration::from_secs(config.cache.training_interval_secs),
+        hnsw_max_elements: config.hnsw.max_elements,
+        data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
+        fsync_policy,
+        snapshot_interval: config.persistence.snapshot_interval_secs as usize,
+        flush_interval: config.wal_flush_interval(),
     };
 
     // Initialize or recover engine
     info!("Initializing TieredEngine...");
 
     // Create cache strategy (LRU for now, Learned in Phase 1)
-    let cache_strategy = Box::new(LruCacheStrategy::new(5000));
+    let cache_strategy = Box::new(LruCacheStrategy::new(config.cache.capacity));
 
-    let engine = if std::path::Path::new(&data_dir).exists() {
+    let data_dir_path = config.persistence.data_dir.clone();
+    let engine = if data_dir_path.exists() {
         info!("Data directory exists, attempting recovery...");
-        match TieredEngine::recover(cache_strategy, &data_dir, config.clone()) {
+        match TieredEngine::recover(cache_strategy, data_dir_path.to_str().unwrap(), engine_config.clone()) {
             Ok(engine) => {
                 info!("Recovery successful");
                 engine
             }
             Err(e) => {
                 warn!(error = %e, "Recovery failed, creating new engine");
-                let cache_strategy = Box::new(LruCacheStrategy::new(5000));
+                let cache_strategy = Box::new(LruCacheStrategy::new(config.cache.capacity));
                 // WORKAROUND Phase 0: HnswBackend requires at least 1 embedding
                 // Phase 1 TODO: Support true empty database initialization
-                let dummy_embedding = vec![vec![0.0; 384]]; // 384-dim zero vector
-                TieredEngine::new(cache_strategy, dummy_embedding, config.clone())?
+                let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]]; // Zero vector with configured dimension
+                TieredEngine::new(cache_strategy, dummy_embedding, engine_config.clone())?
             }
         }
     } else {
         info!("Creating new TieredEngine...");
         // WORKAROUND Phase 0: HnswBackend requires at least 1 embedding
         // Phase 1 TODO: Support true empty database initialization
-        let dummy_embedding = vec![vec![0.0; 384]]; // 384-dim zero vector
-        TieredEngine::new(cache_strategy, dummy_embedding, config.clone())?
+        let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]]; // Zero vector with configured dimension
+        TieredEngine::new(cache_strategy, dummy_embedding, engine_config.clone())?
     };
 
     info!("TieredEngine initialized successfully");
@@ -955,7 +1054,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(ServerState {
         engine: engine_arc,
         start_time: Instant::now(),
-        config: config.clone(),
+        app_config: config.clone(),
+        engine_config: engine_config.clone(),
         shutdown_tx,
         metrics: metrics.clone(),
     });
@@ -974,9 +1074,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    // HTTP port for observability (gRPC port + 1000)
-    let http_port = port + 1000;
-    let http_addr = format!("0.0.0.0:{}", http_port)
+    // HTTP port for observability (from config)
+    let http_port = config.http_port();
+    let http_addr = format!("{}:{}", config.server.host, http_port)
         .parse::<std::net::SocketAddr>()?;
 
     info!("HTTP observability server listening on http://{}", http_addr);
@@ -1014,7 +1114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Mark server as ready after initialization
     metrics.mark_ready();
 
-    let grpc_addr = format!("0.0.0.0:{}", port).parse()?;
+    let grpc_addr = format!("{}:{}", config.server.host, config.server.port).parse()?;
 
     info!("gRPC server listening on {}", grpc_addr);
     info!("Server ready to accept connections");

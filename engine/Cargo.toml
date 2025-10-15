@@ -57,6 +57,12 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 hyper = "1.0"
 
+# Configuration management: YAML/TOML parsing + env var support
+config = "0.14"
+clap = { version = "4.5", features = ["derive", "env"] }
+serde_yaml = "0.9"
+toml = "0.8"
+
 # Persistence: WAL + snapshots
 bincode = "1.3"
 crc32fast = "1.4"

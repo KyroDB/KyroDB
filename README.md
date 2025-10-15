@@ -80,6 +80,42 @@ Complete implementation of layered query routing:
 - Performance optimization: hot path profiling, SIMD vectorization
 - Integration testing under concurrent load
 
+## Configuration
+
+KyroDB supports **flexible configuration** through multiple sources (priority: CLI args > env vars > config file > defaults):
+
+```bash
+# 1. Generate example config
+./kyrodb_server --generate-config yaml > config.yaml
+
+# 2. Edit config.yaml to customize:
+#    - Cache capacity (1K-100K+ documents)
+#    - HNSW parameters (M, ef_construction, ef_search)
+#    - SLO thresholds (P99 latency, cache hit rate)
+#    - Persistence settings (fsync policy, WAL flush interval)
+
+# 3. Start server with config
+./kyrodb_server --config config.yaml
+
+# 4. Override specific settings via environment variables
+KYRODB__CACHE__CAPACITY=50000 \
+KYRODB__SERVER__PORT=50052 \
+./kyrodb_server --config config.yaml
+
+# 5. CLI overrides (highest priority)
+./kyrodb_server --config config.yaml --port 50052 --data-dir /mnt/ssd/data
+```
+
+**Key Configuration Sections**:
+- **Server**: Host, port, connections, timeouts
+- **Cache**: Capacity, strategy (LRU/Learned/A-B test), training interval
+- **HNSW**: Vector dimensions, M parameter, ef_construction, distance metric
+- **Persistence**: Data directory, WAL settings, fsync policy, snapshots
+- **SLO**: P99 latency, cache hit rate, error rate, availability thresholds
+- **Rate Limiting**: QPS limits per connection and globally
+- **Logging**: Level, format (text/JSON), file rotation
+
+See [Configuration Management Guide](docs/CONFIGURATION_MANAGEMENT.md) for complete documentation.
 
 ## Quick Start
 

@@ -49,6 +49,9 @@ pub mod tiered_engine;
 // Metrics and observability: Prometheus metrics, health checks, SLO monitoring
 pub mod metrics;
 
+// Configuration management: YAML/TOML parsing, env vars, validation
+pub mod config;
+
 // ===== Global Allocator (jemalloc-profiling feature) =====
 
 #[cfg(feature = "jemalloc-profiling")]
@@ -104,3 +107,10 @@ pub use tiered_engine::{TieredEngine, TieredEngineConfig, TieredEngineStats};
 
 // Metrics and observability components
 pub use metrics::{ErrorCategory, HealthStatus, MetricsCollector, SloStatus};
+
+// Configuration components
+pub use config::{
+    CacheConfig, CacheStrategy as ConfigCacheStrategy, DistanceMetric,
+    FsyncPolicy as ConfigFsyncPolicy, HnswConfig, KyroDbConfig, LogFormat, LogLevel,
+    LoggingConfig, PersistenceConfig, RateLimitConfig, ServerConfig, SloConfig,
+};
