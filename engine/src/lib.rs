@@ -52,6 +52,12 @@ pub mod metrics;
 // Configuration management: YAML/TOML parsing, env vars, validation
 pub mod config;
 
+// Authentication and authorization: API keys, multi-tenancy, rate limiting
+pub mod auth;
+pub mod rate_limiter;
+pub mod tenant;
+pub mod usage_tracker;
+
 // ===== Global Allocator (jemalloc-profiling feature) =====
 
 #[cfg(feature = "jemalloc-profiling")]
@@ -110,7 +116,13 @@ pub use metrics::{ErrorCategory, HealthStatus, MetricsCollector, SloStatus};
 
 // Configuration components
 pub use config::{
-    CacheConfig, CacheStrategy as ConfigCacheStrategy, DistanceMetric,
+    AuthConfig, CacheConfig, CacheStrategy as ConfigCacheStrategy, DistanceMetric,
     FsyncPolicy as ConfigFsyncPolicy, HnswConfig, KyroDbConfig, LogFormat, LogLevel,
     LoggingConfig, PersistenceConfig, RateLimitConfig, ServerConfig, SloConfig,
 };
+
+// Authentication and authorization components
+pub use auth::{ApiKey, AuthManager, TenantInfo};
+pub use rate_limiter::{RateLimiter, TokenBucket};
+pub use tenant::{filter_tenant_results, SearchResult as TenantSearchResult, TenantManager};
+pub use usage_tracker::{TenantUsage, UsageSnapshot, UsageTracker};

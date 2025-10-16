@@ -48,6 +48,9 @@ pub struct KyroDbConfig {
     
     /// Logging configuration
     pub logging: LoggingConfig,
+    
+    /// Authentication and authorization configuration
+    pub auth: AuthConfig,
 }
 
 // ============================================================================
@@ -380,6 +383,37 @@ pub enum LogFormat {
 }
 
 // ============================================================================
+// Authentication Configuration
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Enable authentication (default: false for backward compatibility)
+    pub enabled: bool,
+    
+    /// Path to API keys file (YAML format)
+    pub api_keys_file: Option<PathBuf>,
+    
+    /// Path to usage stats export (CSV)
+    pub usage_stats_file: PathBuf,
+    
+    /// How often to export usage stats (seconds)
+    pub usage_export_interval_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Disabled by default (backward compatibility)
+            api_keys_file: None,
+            usage_stats_file: PathBuf::from("data/usage_stats.csv"),
+            usage_export_interval_secs: 300, // Every 5 minutes
+        }
+    }
+}
+
+// ============================================================================
 // Default Implementation
 // ============================================================================
 
@@ -393,6 +427,7 @@ impl Default for KyroDbConfig {
             slo: SloConfig::default(),
             rate_limit: RateLimitConfig::default(),
             logging: LoggingConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -606,6 +641,19 @@ impl KyroDbConfig {
             );
         }
         
+        // Authentication validation
+        if self.auth.enabled {
+            anyhow::ensure!(
+                self.auth.api_keys_file.is_some(),
+                "api_keys_file must be provided when authentication is enabled"
+            );
+        }
+        anyhow::ensure!(
+            self.auth.usage_export_interval_secs > 0,
+            "usage_export_interval_secs must be > 0, got {}",
+            self.auth.usage_export_interval_secs
+        );
+        
         Ok(())
     }
     
@@ -642,6 +690,11 @@ impl KyroDbConfig {
     /// Get cache training interval as Duration
     pub fn cache_training_interval(&self) -> Duration {
         Duration::from_secs(self.cache.training_interval_secs)
+    }
+    
+    /// Get usage export interval as Duration
+    pub fn usage_export_interval(&self) -> Duration {
+        Duration::from_secs(self.auth.usage_export_interval_secs)
     }
 }
 

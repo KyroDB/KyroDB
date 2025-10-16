@@ -91,11 +91,13 @@ async fn end_to_end_insert_query_search() -> Result<()> {
     let temp_dir = tempfile::tempdir().context("failed to create temp directory")?;
     let data_dir = create_data_dir(&temp_dir)?;
     let port = reserve_port()?;
+    let http_port = reserve_port()?;
     let endpoint = format!("http://127.0.0.1:{port}");
 
     let mut child = Command::new(binary)
         .env("KYRODB_DATA_DIR", &data_dir)
         .env("KYRODB_PORT", port.to_string())
+        .env("KYRODB_HTTP_PORT", http_port.to_string())
         .kill_on_drop(true)
         .spawn()
         .context("failed to spawn kyrodb_server")?;
@@ -103,7 +105,8 @@ async fn end_to_end_insert_query_search() -> Result<()> {
     let mut client = wait_for_server(&endpoint, Duration::from_secs(10)).await?;
 
     let doc_id = 42u64;
-    let embedding: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
+    // Use 768 dimensions to match server default config
+    let embedding: Vec<f32> = (0..768).map(|i| i as f32 * 0.001).collect();
 
     let insert_request = InsertRequest {
         doc_id,
