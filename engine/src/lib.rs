@@ -40,6 +40,9 @@ pub mod memory_profiler;
 // Persistence: WAL + snapshots for durability
 pub mod persistence;
 
+// Backup and restore: Full/incremental backups, PITR, retention policies
+pub mod backup;
+
 // Hot tier: Recent writes buffer (Layer 2)
 pub mod hot_tier;
 
@@ -52,7 +55,10 @@ pub mod metrics;
 // Configuration management: YAML/TOML parsing, env vars, validation
 pub mod config;
 
-// Authentication and authorization: API keys, multi-tenancy, rate limiting
+// Error recovery: Circuit breaker pattern for fault tolerance
+pub mod circuit_breaker;
+
+// Authentication & multi-tenancy: API key auth, tenant isolation, rate limiting
 pub mod auth;
 pub mod rate_limiter;
 pub mod tenant;
@@ -105,11 +111,17 @@ pub use semantic_adapter::{SemanticAdapter, SemanticConfig, SemanticStats};
 // Persistence components (WAL + snapshots)
 pub use persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
 
+// Backup and restore components
+pub use backup::{BackupManager, BackupMetadata, BackupType, ClearDirectoryOptions, RestoreManager, RetentionPolicy, compute_backup_checksum};
+
 // Hot tier components (Layer 2)
 pub use hot_tier::{HotTier, HotTierStats};
 
 // Tiered engine components (three-layer architecture)
 pub use tiered_engine::{TieredEngine, TieredEngineConfig, TieredEngineStats};
+
+// Circuit breaker components (error recovery)
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats};
 
 // Metrics and observability components
 pub use metrics::{ErrorCategory, HealthStatus, MetricsCollector, SloStatus};

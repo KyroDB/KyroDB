@@ -6,6 +6,7 @@
 //! **Persistence**: WAL + snapshots for durability and fast recovery.
 
 use crate::hnsw_index::{HnswVectorIndex, SearchResult};
+use crate::metrics::MetricsCollector;
 use crate::persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -143,16 +144,17 @@ impl HnswBackend {
     ///
     /// # Recovery Flow
     /// 1. Load manifest
-    /// 2. Load latest snapshot (if exists)
+    /// 2. Load latest snapshot with fallback recovery (if corrupted)
     /// 3. Replay WAL entries since snapshot
     /// 4. Rebuild HNSW index
     /// 5. Create new active WAL
-    #[instrument(level = "info", skip(data_dir), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval))]
+    #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval))]
     pub fn recover(
         data_dir: impl AsRef<Path>,
         max_elements: usize,
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
+        metrics: MetricsCollector,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         info!("recovering HnswBackend");
@@ -165,22 +167,43 @@ impl HnswBackend {
 
         let manifest = Manifest::load(&manifest_path)?;
 
-        // Load snapshot (if exists)
+        // Load snapshot with fallback recovery (if exists)
         let mut embeddings: Vec<Vec<f32>> = Vec::new();
         let mut dimension = 0;
+        let mut snapshot_timestamp = 0u64;
 
         if let Some(snapshot_name) = &manifest.latest_snapshot {
             let snapshot_path = data_dir.join(snapshot_name);
-            info!(snapshot = %snapshot_path.display(), "loading snapshot");
+            info!(snapshot = %snapshot_path.display(), "loading snapshot with validation");
 
-            let snapshot = Snapshot::load(&snapshot_path)?;
-            dimension = snapshot.dimension;
-            embeddings = snapshot.documents.into_iter().map(|(_, emb)| emb).collect();
+            // Use load_with_validation for automatic fallback recovery
+            match Snapshot::load_with_validation(&snapshot_path, &metrics) {
+                Ok((snapshot, recovered_from_fallback)) => {
+                    dimension = snapshot.dimension;
+                    snapshot_timestamp = snapshot.timestamp;
+                    embeddings = snapshot.documents.into_iter().map(|(_, emb)| emb).collect();
 
-            info!(documents = embeddings.len(), "snapshot loaded");
+                    if recovered_from_fallback {
+                        warn!(
+                            documents = embeddings.len(),
+                            "snapshot loaded from fallback (primary corrupted)"
+                        );
+                    } else {
+                        info!(documents = embeddings.len(), "snapshot loaded successfully");
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        "failed to load snapshot (primary and all fallbacks corrupted)"
+                    );
+                    // Continue with empty state - will replay all WAL entries
+                    warn!("continuing recovery with empty state from WAL only");
+                }
+            }
         }
 
-        // Replay WAL segments
+        // Replay WAL segments (skip entries already captured in snapshot)
         for wal_name in &manifest.wal_segments {
             let wal_path = data_dir.join(wal_name);
             if !wal_path.exists() {
@@ -192,6 +215,17 @@ impl HnswBackend {
             let entries = reader.read_all()?;
 
             for entry in entries {
+                // Skip entries older than snapshot timestamp (already included in snapshot)
+                if snapshot_timestamp > 0 && entry.timestamp <= snapshot_timestamp {
+                    trace!(
+                        doc_id = entry.doc_id,
+                        entry_ts = entry.timestamp,
+                        snapshot_ts = snapshot_timestamp,
+                        "skipping entry older than snapshot"
+                    );
+                    continue;
+                }
+                
                 match entry.op {
                     WalOp::Insert => {
                         // Infer dimension from first entry if no snapshot

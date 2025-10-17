@@ -51,6 +51,9 @@ pub struct KyroDbConfig {
     
     /// Authentication and authorization configuration
     pub auth: AuthConfig,
+    
+    /// Timeout configuration for tiered engine operations
+    pub timeouts: TimeoutConfig,
 }
 
 // ============================================================================
@@ -414,6 +417,33 @@ impl Default for AuthConfig {
 }
 
 // ============================================================================
+// Timeout Configuration
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TimeoutConfig {
+    /// Cache tier timeout in milliseconds (default: 10ms)
+    pub cache_ms: u64,
+    
+    /// Hot tier timeout in milliseconds (default: 50ms)
+    pub hot_tier_ms: u64,
+    
+    /// Cold tier timeout in milliseconds (default: 1000ms)
+    pub cold_tier_ms: u64,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            cache_ms: 10,
+            hot_tier_ms: 50,
+            cold_tier_ms: 1000,
+        }
+    }
+}
+
+// ============================================================================
 // Default Implementation
 // ============================================================================
 
@@ -428,6 +458,7 @@ impl Default for KyroDbConfig {
             rate_limit: RateLimitConfig::default(),
             logging: LoggingConfig::default(),
             auth: AuthConfig::default(),
+            timeouts: TimeoutConfig::default(),
         }
     }
 }

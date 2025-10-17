@@ -55,6 +55,11 @@ const SLO_MIN_AVAILABILITY: f64 = 0.999;
 /// Number of latency buckets for histogram (P50, P95, P99)
 const LATENCY_BUCKETS: usize = 1000;
 
+/// WAL Circuit Breaker States
+pub const WAL_CIRCUIT_BREAKER_CLOSED: u64 = 0;
+pub const WAL_CIRCUIT_BREAKER_OPEN: u64 = 1;
+pub const WAL_CIRCUIT_BREAKER_HALF_OPEN: u64 = 2;
+
 // ============================================================================
 // CORE METRICS STRUCTURE
 // ============================================================================
@@ -98,6 +103,23 @@ struct MetricsInner {
     inserts_total: AtomicU64,
     inserts_failed: AtomicU64,
     hot_tier_flushes: AtomicU64,
+    
+    // WAL Metrics
+    wal_writes_total: AtomicU64,
+    wal_writes_failed: AtomicU64,
+    wal_retries_total: AtomicU64,
+    wal_circuit_breaker_state: AtomicU64, // 0=closed, 1=open, 2=half-open
+    wal_disk_full_errors: AtomicU64,
+    
+    // HNSW Corruption Metrics
+    hnsw_corruption_detected_total: AtomicU64,
+    hnsw_fallback_recovery_success: AtomicU64,
+    hnsw_fallback_recovery_failed: AtomicU64,
+    
+    // Training Task Metrics
+    training_crashes_total: AtomicU64,
+    training_restarts_total: AtomicU64,
+    training_cycles_completed: AtomicU64,
 
     // Error Tracking
     error_counts: RwLock<ErrorCounters>,
@@ -192,6 +214,20 @@ impl MetricsCollector {
                 inserts_total: AtomicU64::new(0),
                 inserts_failed: AtomicU64::new(0),
                 hot_tier_flushes: AtomicU64::new(0),
+                
+                wal_writes_total: AtomicU64::new(0),
+                wal_writes_failed: AtomicU64::new(0),
+                wal_retries_total: AtomicU64::new(0),
+                wal_circuit_breaker_state: AtomicU64::new(0), // 0=closed
+                wal_disk_full_errors: AtomicU64::new(0),
+                
+                hnsw_corruption_detected_total: AtomicU64::new(0),
+                hnsw_fallback_recovery_success: AtomicU64::new(0),
+                hnsw_fallback_recovery_failed: AtomicU64::new(0),
+                
+                training_crashes_total: AtomicU64::new(0),
+                training_restarts_total: AtomicU64::new(0),
+                training_cycles_completed: AtomicU64::new(0),
 
                 error_counts: RwLock::new(ErrorCounters::default()),
 
@@ -342,6 +378,82 @@ impl MetricsCollector {
     }
 
     // ========================================================================
+    // WAL METRICS
+    // ========================================================================
+
+    /// Record WAL write operation
+    #[inline]
+    pub fn record_wal_write(&self, success: bool) {
+        self.inner.wal_writes_total.fetch_add(1, Ordering::Relaxed);
+        if !success {
+            self.inner.wal_writes_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record WAL retry
+    #[inline]
+    pub fn record_wal_retry(&self) {
+        self.inner.wal_retries_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record disk full error
+    #[inline]
+    pub fn record_wal_disk_full(&self) {
+        self.inner.wal_disk_full_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Update WAL circuit breaker state (0=closed, 1=open, 2=half-open)
+    #[inline]
+    pub fn update_wal_circuit_breaker_state(&self, state: u64) {
+        debug_assert!(state <= 2, "Invalid circuit breaker state: {}", state);
+        self.inner.wal_circuit_breaker_state.store(state, Ordering::Relaxed);
+    }
+
+    // ========================================================================
+    // HNSW CORRUPTION METRICS
+    // ========================================================================
+
+    /// Record HNSW corruption detection
+    #[inline]
+    pub fn record_hnsw_corruption(&self) {
+        self.inner.hnsw_corruption_detected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record successful fallback recovery
+    #[inline]
+    pub fn record_hnsw_fallback_success(&self) {
+        self.inner.hnsw_fallback_recovery_success.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record failed fallback recovery
+    #[inline]
+    pub fn record_hnsw_fallback_failed(&self) {
+        self.inner.hnsw_fallback_recovery_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ========================================================================
+    // TRAINING TASK METRICS
+    // ========================================================================
+
+    /// Record training task crash
+    #[inline]
+    pub fn record_training_crash(&self) {
+        self.inner.training_crashes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record training task restart
+    #[inline]
+    pub fn record_training_restart(&self) {
+        self.inner.training_restarts_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record completed training cycle
+    #[inline]
+    pub fn record_training_cycle(&self) {
+        self.inner.training_cycles_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ========================================================================
     // ERROR TRACKING
     // ========================================================================
 
@@ -485,6 +597,65 @@ impl MetricsCollector {
             current_availability: availability,
             insufficient_data,
         }
+    }
+
+    // ========================================================================
+    // METRIC GETTERS (for testing)
+    // ========================================================================
+
+    /// Get HNSW corruption detection count
+    pub fn get_hnsw_corruption_count(&self) -> u64 {
+        self.inner.hnsw_corruption_detected_total.load(Ordering::Relaxed)
+    }
+
+    /// Get successful fallback recovery count
+    pub fn get_hnsw_fallback_success_count(&self) -> u64 {
+        self.inner.hnsw_fallback_recovery_success.load(Ordering::Relaxed)
+    }
+
+    /// Get failed fallback recovery count
+    pub fn get_hnsw_fallback_failed_count(&self) -> u64 {
+        self.inner.hnsw_fallback_recovery_failed.load(Ordering::Relaxed)
+    }
+
+    /// Get training crashes count
+    pub fn get_training_crashes_count(&self) -> u64 {
+        self.inner.training_crashes_total.load(Ordering::Relaxed)
+    }
+
+    /// Get training restarts count
+    pub fn get_training_restarts_count(&self) -> u64 {
+        self.inner.training_restarts_total.load(Ordering::Relaxed)
+    }
+
+    /// Get training cycles completed count
+    pub fn get_training_cycles_completed(&self) -> u64 {
+        self.inner.training_cycles_completed.load(Ordering::Relaxed)
+    }
+
+    /// Get WAL writes total count
+    pub fn get_wal_writes_total(&self) -> u64 {
+        self.inner.wal_writes_total.load(Ordering::Relaxed)
+    }
+
+    /// Get WAL writes failed count
+    pub fn get_wal_writes_failed(&self) -> u64 {
+        self.inner.wal_writes_failed.load(Ordering::Relaxed)
+    }
+
+    /// Get WAL retries total count
+    pub fn get_wal_retries_total(&self) -> u64 {
+        self.inner.wal_retries_total.load(Ordering::Relaxed)
+    }
+
+    /// Get WAL circuit breaker state (0=closed, 1=open, 2=half-open)
+    pub fn get_wal_circuit_breaker_state(&self) -> u64 {
+        self.inner.wal_circuit_breaker_state.load(Ordering::Relaxed)
+    }
+
+    /// Get WAL disk full errors count
+    pub fn get_wal_disk_full_errors(&self) -> u64 {
+        self.inner.wal_disk_full_errors.load(Ordering::Relaxed)
     }
 
     // ========================================================================
@@ -650,6 +821,67 @@ impl MetricsCollector {
         output.push_str("# HELP kyrodb_hot_tier_flushes_total Total hot tier flushes\n");
         output.push_str("# TYPE kyrodb_hot_tier_flushes_total counter\n");
         output.push_str(&format!("kyrodb_hot_tier_flushes_total {}\n", flushes));
+
+        // WAL Metrics
+        let wal_writes = self.inner.wal_writes_total.load(Ordering::Relaxed);
+        let wal_failed = self.inner.wal_writes_failed.load(Ordering::Relaxed);
+        let wal_retries = self.inner.wal_retries_total.load(Ordering::Relaxed);
+        let wal_circuit_state = self.inner.wal_circuit_breaker_state.load(Ordering::Relaxed);
+        let wal_disk_full = self.inner.wal_disk_full_errors.load(Ordering::Relaxed);
+
+        output.push_str("# HELP kyrodb_wal_writes_total Total WAL write operations\n");
+        output.push_str("# TYPE kyrodb_wal_writes_total counter\n");
+        output.push_str(&format!("kyrodb_wal_writes_total {}\n", wal_writes));
+
+        output.push_str("# HELP kyrodb_wal_writes_failed WAL write failures\n");
+        output.push_str("# TYPE kyrodb_wal_writes_failed counter\n");
+        output.push_str(&format!("kyrodb_wal_writes_failed {}\n", wal_failed));
+
+        output.push_str("# HELP kyrodb_wal_retries_total WAL write retries\n");
+        output.push_str("# TYPE kyrodb_wal_retries_total counter\n");
+        output.push_str(&format!("kyrodb_wal_retries_total {}\n", wal_retries));
+
+        output.push_str("# HELP kyrodb_wal_circuit_breaker_state WAL circuit breaker state (0=closed, 1=open, 2=half-open)\n");
+        output.push_str("# TYPE kyrodb_wal_circuit_breaker_state gauge\n");
+        output.push_str(&format!("kyrodb_wal_circuit_breaker_state {}\n", wal_circuit_state));
+
+        output.push_str("# HELP kyrodb_wal_disk_full_errors Disk full errors during WAL writes\n");
+        output.push_str("# TYPE kyrodb_wal_disk_full_errors counter\n");
+        output.push_str(&format!("kyrodb_wal_disk_full_errors {}\n", wal_disk_full));
+
+        // HNSW Corruption Metrics
+        let corruption_detected = self.inner.hnsw_corruption_detected_total.load(Ordering::Relaxed);
+        let fallback_success = self.inner.hnsw_fallback_recovery_success.load(Ordering::Relaxed);
+        let fallback_failed = self.inner.hnsw_fallback_recovery_failed.load(Ordering::Relaxed);
+
+        output.push_str("# HELP kyrodb_hnsw_corruption_detected_total HNSW snapshot corruption detections\n");
+        output.push_str("# TYPE kyrodb_hnsw_corruption_detected_total counter\n");
+        output.push_str(&format!("kyrodb_hnsw_corruption_detected_total {}\n", corruption_detected));
+
+        output.push_str("# HELP kyrodb_hnsw_fallback_recovery_success Successful fallback recoveries\n");
+        output.push_str("# TYPE kyrodb_hnsw_fallback_recovery_success counter\n");
+        output.push_str(&format!("kyrodb_hnsw_fallback_recovery_success {}\n", fallback_success));
+
+        output.push_str("# HELP kyrodb_hnsw_fallback_recovery_failed Failed fallback recoveries\n");
+        output.push_str("# TYPE kyrodb_hnsw_fallback_recovery_failed counter\n");
+        output.push_str(&format!("kyrodb_hnsw_fallback_recovery_failed {}\n", fallback_failed));
+
+        // Training Task Metrics
+        let training_crashes = self.inner.training_crashes_total.load(Ordering::Relaxed);
+        let training_restarts = self.inner.training_restarts_total.load(Ordering::Relaxed);
+        let training_cycles = self.inner.training_cycles_completed.load(Ordering::Relaxed);
+
+        output.push_str("# HELP kyrodb_training_crashes_total Training task crashes\n");
+        output.push_str("# TYPE kyrodb_training_crashes_total counter\n");
+        output.push_str(&format!("kyrodb_training_crashes_total {}\n", training_crashes));
+
+        output.push_str("# HELP kyrodb_training_restarts_total Training task restarts\n");
+        output.push_str("# TYPE kyrodb_training_restarts_total counter\n");
+        output.push_str(&format!("kyrodb_training_restarts_total {}\n", training_restarts));
+
+        output.push_str("# HELP kyrodb_training_cycles_completed_total Completed training cycles\n");
+        output.push_str("# TYPE kyrodb_training_cycles_completed_total counter\n");
+        output.push_str(&format!("kyrodb_training_cycles_completed_total {}\n", training_cycles));
 
         // Error Metrics
         let errors = self.inner.error_counts.read();

@@ -966,6 +966,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fsync_policy,
         snapshot_interval: config.persistence.snapshot_interval_secs as usize,
         flush_interval: config.wal_flush_interval(),
+        cache_timeout_ms: config.timeouts.cache_ms,
+        hot_tier_timeout_ms: config.timeouts.hot_tier_ms,
+        cold_tier_timeout_ms: config.timeouts.cold_tier_ms,
     };
 
     // Initialize or recover engine

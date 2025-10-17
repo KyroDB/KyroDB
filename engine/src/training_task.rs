@@ -4,6 +4,7 @@
 use crate::access_logger::AccessPatternLogger;
 use crate::cache_strategy::LearnedCacheStrategy;
 use crate::learned_cache::LearnedCachePredictor;
+use crate::metrics::MetricsCollector;
 use anyhow::Result;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -12,6 +13,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 /// Configuration for background training task
 #[derive(Debug, Clone)]
@@ -126,6 +128,154 @@ fn train_predictor(
     let mut predictor = LearnedCachePredictor::new(capacity)?;
     predictor.train_from_accesses(events)?;
     Ok(predictor)
+}
+
+/// Training task supervisor - monitors training task and auto-restarts on crash
+///
+/// Handles both panic and normal error scenarios with exponential backoff.
+/// Automatically restarts the training task up to max_restarts times.
+pub struct TrainingTaskSupervisor {
+    access_logger: Arc<RwLock<AccessPatternLogger>>,
+    learned_strategy: Arc<LearnedCacheStrategy>,
+    config: TrainingConfig,
+    metrics: MetricsCollector,
+    max_restarts: usize,
+    base_delay_secs: u64,
+}
+
+impl TrainingTaskSupervisor {
+    /// Create new training task supervisor
+    ///
+    /// # Parameters
+    /// - `access_logger`: Access pattern logger
+    /// - `learned_strategy`: Learned cache strategy to update
+    /// - `config`: Training configuration
+    /// - `metrics`: Metrics collector
+    ///
+    /// # Default Restart Policy
+    /// - Max restarts: 10
+    /// - Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped at 16s)
+    pub fn new(
+        access_logger: Arc<RwLock<AccessPatternLogger>>,
+        learned_strategy: Arc<LearnedCacheStrategy>,
+        config: TrainingConfig,
+        metrics: MetricsCollector,
+    ) -> Self {
+        Self {
+            access_logger,
+            learned_strategy,
+            config,
+            metrics,
+            max_restarts: 10,
+            base_delay_secs: 1,
+        }
+    }
+
+    /// Create supervisor with custom restart policy
+    pub fn with_restart_policy(
+        access_logger: Arc<RwLock<AccessPatternLogger>>,
+        learned_strategy: Arc<LearnedCacheStrategy>,
+        config: TrainingConfig,
+        metrics: MetricsCollector,
+        max_restarts: usize,
+        base_delay_secs: u64,
+    ) -> Self {
+        Self {
+            access_logger,
+            learned_strategy,
+            config,
+            metrics,
+            max_restarts,
+            base_delay_secs,
+        }
+    }
+
+    /// Start supervised training task
+    ///
+    /// Spawns the training task and monitors it for crashes. On crash, automatically
+    /// restarts with exponential backoff (1s, 2s, 4s, 8s, 16s max).
+    ///
+    /// Returns a JoinHandle for the supervisor task (not the training task itself).
+    pub async fn supervise(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut restart_count = 0;
+
+            loop {
+                info!(
+                    restart_count,
+                    max_restarts = self.max_restarts,
+                    "starting training task"
+                );
+
+                // Spawn training task
+                let handle = spawn_training_task(
+                    self.access_logger.clone(),
+                    self.learned_strategy.clone(),
+                    self.config.clone(),
+                    None,
+                )
+                .await;
+
+                // Wait for task to complete (should never return unless crash/abort)
+                match handle.await {
+                    Ok(()) => {
+                        // Normal completion (should not happen - training runs forever)
+                        warn!("training task completed normally (unexpected)");
+                        break;
+                    }
+                    Err(e) => {
+                        // Task panicked or was aborted
+                        if e.is_panic() {
+                            error!(
+                                error = %e,
+                                restart_count,
+                                "training task panicked"
+                            );
+                            self.metrics.record_training_crash();
+                        } else if e.is_cancelled() {
+                            info!("training task cancelled - stopping supervisor");
+                            break;
+                        } else {
+                            error!(
+                                error = %e,
+                                restart_count,
+                                "training task failed"
+                            );
+                            self.metrics.record_training_crash();
+                        }
+
+                        // Check restart limit
+                        if restart_count >= self.max_restarts {
+                            error!(
+                                restart_count,
+                                max_restarts = self.max_restarts,
+                                "training task restart limit reached - stopping supervisor"
+                            );
+                            break;
+                        }
+
+                        // Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped)
+                        let delay_secs = 2u64
+                            .checked_pow(restart_count as u32)
+                            .and_then(|exp| self.base_delay_secs.checked_mul(exp))
+                            .map(|delay| std::cmp::min(delay, 16))
+                            .unwrap_or(16); // Fallback to cap on overflow
+                        warn!(
+                            delay_secs,
+                            restart_count,
+                            "restarting training task after delay"
+                        );
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+                        restart_count += 1;
+                        self.metrics.record_training_restart();
+                    }
+                }
+            }
+
+            info!("training task supervisor stopped");
+        })
+    }
 }
 
 #[cfg(test)]
@@ -298,5 +448,88 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_training_supervisor_clean_abort() {
+        use std::sync::atomic::AtomicBool;
+
+        // Create logger with sufficient data
+        let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
+        {
+            let mut log = logger.write().await;
+            for i in 0..200 {
+                let embedding = vec![i as f32; 128];
+                log.log_access(i % 10, &embedding);
+            }
+        }
+
+        // Create learned strategy
+        let predictor = LearnedCachePredictor::new(100).unwrap();
+        let strategy = Arc::new(LearnedCacheStrategy::new(100, predictor));
+
+        let config = TrainingConfig {
+            interval: Duration::from_millis(100),
+            window_duration: Duration::from_secs(3600),
+            min_events_for_training: 100,
+            rmi_capacity: 100,
+        };
+
+        let metrics = MetricsCollector::new();
+
+        // Create supervisor with fast restart policy for testing
+        let supervisor = TrainingTaskSupervisor::with_restart_policy(
+            logger.clone(),
+            strategy.clone(),
+            config,
+            metrics.clone(),
+            3, // max 3 restarts
+            0, // 0s base delay for fast testing
+        );
+
+        let handle = supervisor.supervise().await;
+
+        // Give time for training task to start
+        sleep(Duration::from_millis(200)).await;
+
+        // Abort supervisor
+        handle.abort();
+
+        // Verify metrics show no crashes yet (task didn't panic, just cancelled)
+        let crashes = metrics.get_training_crashes_count();
+        assert_eq!(crashes, 0, "No crashes should be recorded for clean abort");
+    }
+
+    #[tokio::test]
+    async fn test_training_supervisor_restart_limit() {
+        // This test verifies correct initialization of restart policy fields.
+        // Full restart behavior testing requires integration test infrastructure
+        // to reliably trigger task panics (e.g., via fault injection or chaos tests).
+        
+        let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
+        let predictor = LearnedCachePredictor::new(100).unwrap();
+        let strategy = Arc::new(LearnedCacheStrategy::new(100, predictor));
+
+        let config = TrainingConfig {
+            interval: Duration::from_secs(600),
+            window_duration: Duration::from_secs(3600),
+            min_events_for_training: 100,
+            rmi_capacity: 100,
+        };
+
+        let metrics = MetricsCollector::new();
+
+        let supervisor = TrainingTaskSupervisor::with_restart_policy(
+            logger,
+            strategy,
+            config,
+            metrics,
+            5, // max 5 restarts
+            1, // 1s base delay
+        );
+
+        // Verify supervisor was created with correct config
+        assert_eq!(supervisor.max_restarts, 5);
+        assert_eq!(supervisor.base_delay_secs, 1);
     }
 }

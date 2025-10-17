@@ -22,6 +22,10 @@ hybrid-cache = []
 bench-no-metrics = []
 # Memory profiling: jemalloc allocator with profiling support
 jemalloc-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
+# CLI tools: Optional progress bars and table formatting
+cli-tools = ["indicatif", "tabled", "env_logger"]
+# S3 backup: Optional AWS S3 integration for remote backups
+s3-backup = ["aws-config", "aws-sdk-s3"]
 
 [dependencies]
 # Phase 0 Week 1-2: HNSW vector search
@@ -64,10 +68,24 @@ serde_yaml = "0.9"
 toml = "0.8"
 chrono = "0.4"  # ISO 8601 timestamp validation for API keys
 
+# CLI tools: Progress bars and table formatting (optional)
+indicatif = { version = "0.17", optional = true }
+tabled = { version = "0.15", optional = true }
+env_logger = { version = "0.11", optional = true }
+
 # Persistence: WAL + snapshots
 bincode = "1.3"
 crc32fast = "1.4"
 memmap2 = "0.9"
+
+# Backup and restore: UUID for backup identifiers
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+
+# S3 integration: AWS SDK for remote backup storage (optional, latest versions)
+# Security note: aws-sigv4 (used by AWS SDK) had CVE-2023-30610 credential-exposure
+# issue when TRACE logging is enabled. Use patched versions and avoid TRACE logging.
+aws-config = { version = "1.8.8", optional = true }
+aws-sdk-s3 = { version = "1.108.0", optional = true }
 
 # Memory profiling: jemalloc allocator with profiling support (optional)
 tikv-jemallocator = { version = "0.6", optional = true, features = ["profiling", "stats"] }
@@ -80,6 +98,9 @@ ringbuf = "0.4"
 # Phase 0 Week 1-2: Testing HNSW recall guarantees
 proptest = "1.0"
 tempfile = "3.8"  # For testing file persistence
+
+# Chaos testing: Fault injection for error recovery validation
+fail = "0.5"
 
 [[bench]]
 name = "hnsw_knn"
