@@ -350,6 +350,12 @@ impl HnswBackend {
             }
         }
 
+        // Validate embedding dimension against backend dimension
+        let current_dim = self.dimension();
+        if current_dim != 0 && embedding.len() != current_dim {
+            anyhow::bail!("embedding dimension mismatch: expected {} found {}", current_dim, embedding.len());
+        }
+
         // Update in-memory index and embeddings
         let mut index = self.index.write();
         let mut embeddings = self.embeddings.write();
@@ -379,12 +385,19 @@ impl HnswBackend {
         let embeddings = self.embeddings.read();
 
         // Create snapshot object
+        // Collect a consistent view of documents. This clones embeddings while holding
+        // the read lock to ensure snapshot consistency. We drop the read lock before
+        // performing the potentially slow file I/O below to avoid blocking writers
+        // for the duration of the save.
         let documents: Vec<(u64, Vec<f32>)> = embeddings
             .iter()
             .enumerate()
             .filter(|(_, emb)| !emb.iter().all(|&x| x == 0.0)) // Skip tombstones
             .map(|(id, emb)| (id as u64, emb.clone()))
             .collect();
+
+        // Release embeddings read lock before heavy I/O (snapshot.save)
+        drop(embeddings);
 
         let dimension = if documents.is_empty() {
             0
