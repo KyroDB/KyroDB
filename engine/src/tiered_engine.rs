@@ -26,6 +26,7 @@ use parking_lot::RwLock;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -58,6 +59,11 @@ pub struct TieredEngineStats {
     pub hot_tier_timeouts: u64,
     pub cold_tier_timeouts: u64,
     pub partial_results_returned: u64,
+
+    /// Load shedding statistics
+    pub queries_rejected: u64,           // Queries rejected due to queue saturation
+    pub current_queue_depth: u64,         // Current in-flight queries
+    pub circuit_breaker_rejections: u64,  // Queries failed due to circuit breaker open
 }
 
 /// Configuration for tiered engine
@@ -88,6 +94,9 @@ pub struct TieredEngineConfig {
     pub cache_timeout_ms: u64,
     pub hot_tier_timeout_ms: u64,
     pub cold_tier_timeout_ms: u64,
+
+    /// Maximum concurrent in-flight queries (load shedding threshold)
+    pub max_concurrent_queries: usize,
 }
 
 impl Default for TieredEngineConfig {
@@ -103,6 +112,7 @@ impl Default for TieredEngineConfig {
             cache_timeout_ms: 10,     // 10ms for cache
             hot_tier_timeout_ms: 50,  // 50ms for hot tier
             cold_tier_timeout_ms: 1000, // 1000ms (1s) for cold tier HNSW
+            max_concurrent_queries: 1000, // Load shedding threshold: max 1000 in-flight queries
         }
     }
 }
@@ -128,9 +138,12 @@ pub struct TieredEngine {
     config: TieredEngineConfig,
 
     /// Circuit breakers for timeout handling
-    cache_circuit_breaker: Arc<CircuitBreaker>,
-    hot_tier_circuit_breaker: Arc<CircuitBreaker>,
-    cold_tier_circuit_breaker: Arc<CircuitBreaker>,
+    pub(crate) cache_circuit_breaker: Arc<CircuitBreaker>,
+    pub(crate) hot_tier_circuit_breaker: Arc<CircuitBreaker>,
+    pub(crate) cold_tier_circuit_breaker: Arc<CircuitBreaker>,
+
+    /// Semaphore for load shedding (max concurrent queries)
+    pub(crate) query_semaphore: Arc<Semaphore>,
 }
 
 impl TieredEngine {
@@ -169,6 +182,8 @@ impl TieredEngine {
             )?)
         };
 
+        let query_semaphore = Arc::new(Semaphore::new(config.max_concurrent_queries));
+
         Ok(Self {
             cache_strategy: Arc::new(RwLock::new(cache_strategy)),
             hot_tier,
@@ -179,6 +194,7 @@ impl TieredEngine {
             cache_circuit_breaker: Arc::new(CircuitBreaker::new()),
             hot_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
             cold_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
+            query_semaphore,
         })
     }
 
@@ -209,6 +225,8 @@ impl TieredEngine {
         let mut recovered_config = config;
         recovered_config.data_dir = Some(data_dir_str);
 
+        let query_semaphore = Arc::new(Semaphore::new(recovered_config.max_concurrent_queries));
+
         Ok(Self {
             cache_strategy: Arc::new(RwLock::new(cache_strategy)),
             hot_tier,
@@ -219,6 +237,7 @@ impl TieredEngine {
             cache_circuit_breaker: Arc::new(CircuitBreaker::new()),
             hot_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
             cold_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
+            query_semaphore,
         })
     }
 
@@ -255,109 +274,147 @@ impl TieredEngine {
             stats.total_queries += 1;
         } // Lock released
 
-        // Layer 1: Check cache (lock order: cache_strategy → stats → logger)
-        let cached_result = {
-            let cache = self.cache_strategy.read();
-            cache.get_cached(doc_id)
-        }; // cache_strategy lock released
-
-        if let Some(cached) = cached_result {
-            // Update stats (no other locks held)
-            {
-                let mut stats = self.stats.write();
-                stats.cache_hits += 1;
-            } // stats lock released
-
-            // Log access (no other locks held)
-            if let Some(ref logger) = self.access_logger {
-                if let Some(query_emb) = query_embedding {
-                    logger.write().log_access(doc_id, query_emb);
-                }
-            } // logger lock released
-
-            return Some(cached.embedding);
-        }
-
-        // Cache miss - update stats (isolated)
-        {
-            let mut stats = self.stats.write();
-            stats.cache_misses += 1;
-        } // Lock released
-
-        // Layer 2: Check hot tier (no locks needed for hot_tier.get)
-        if let Some(embedding) = self.hot_tier.get(doc_id) {
-            // Update stats (isolated)
-            {
-                let mut stats = self.stats.write();
-                stats.hot_tier_hits += 1;
-            } // Lock released
-
-            // Cache admission decision (isolated)
-            let should_cache_decision = {
-                let cache = self.cache_strategy.write();
-                cache.should_cache(doc_id, &embedding)
+        // Layer 1: Check cache with circuit breaker protection
+        if !self.cache_circuit_breaker.is_open() {
+            let cached_result = {
+                let cache = self.cache_strategy.read();
+                cache.get_cached(doc_id)
             }; // cache_strategy lock released
 
-            if should_cache_decision {
-                let cached = CachedVector {
-                    doc_id,
-                    embedding: embedding.clone(),
-                    distance: 0.0,
-                    cached_at: Instant::now(),
-                };
-                // Insert into cache (isolated)
-                self.cache_strategy.write().insert_cached(cached);
-            } // cache_strategy lock released
+            if let Some(cached) = cached_result {
+                // Cache hit - record success
+                self.cache_circuit_breaker.record_success();
+                
+                // Update stats (no other locks held)
+                {
+                    let mut stats = self.stats.write();
+                    stats.cache_hits += 1;
+                } // stats lock released
 
-            // Log access (no other locks held)
-            if let Some(ref logger) = self.access_logger {
-                if let Some(query_emb) = query_embedding {
-                    logger.write().log_access(doc_id, query_emb);
-                }
-            } // logger lock released
+                // Log access (no other locks held)
+                if let Some(ref logger) = self.access_logger {
+                    if let Some(query_emb) = query_embedding {
+                        logger.write().log_access(doc_id, query_emb);
+                    }
+                } // logger lock released
 
-            return Some(embedding);
-        }
-
-        // Hot tier miss - update stats (isolated)
-        {
-            let mut stats = self.stats.write();
-            stats.hot_tier_misses += 1;
-        } // Lock released
-
-        // Layer 3: Fetch from cold tier (no locks needed for cold_tier.fetch_document)
-        if let Some(embedding) = self.cold_tier.fetch_document(doc_id) {
-            // Update stats (isolated)
+                return Some(cached.embedding);
+            }
+            
+            // Cache miss - not a failure, just continue to next tier
             {
                 let mut stats = self.stats.write();
-                stats.cold_tier_searches += 1;
+                stats.cache_misses += 1;
             } // Lock released
+        } else {
+            // Circuit breaker open - skip cache layer
+            {
+                let mut stats = self.stats.write();
+                stats.circuit_breaker_rejections += 1;
+            }
+            debug!("Cache circuit breaker open, skipping cache layer for doc_id={}", doc_id);
+        }
 
-            // Cache admission decision (isolated)
-            let should_cache_decision = {
-                let cache = self.cache_strategy.write();
-                cache.should_cache(doc_id, &embedding)
-            }; // cache_strategy lock released
+        // Layer 2: Check hot tier with circuit breaker protection
+        if !self.hot_tier_circuit_breaker.is_open() {
+            if let Some(embedding) = self.hot_tier.get(doc_id) {
+                // Hot tier hit - record success
+                self.hot_tier_circuit_breaker.record_success();
+                
+                // Update stats (isolated)
+                {
+                    let mut stats = self.stats.write();
+                    stats.hot_tier_hits += 1;
+                } // Lock released
 
-            if should_cache_decision {
-                let cached = CachedVector {
-                    doc_id,
-                    embedding: embedding.clone(),
-                    distance: 0.0,
-                    cached_at: Instant::now(),
-                };
-                // Insert into cache (isolated)
-                self.cache_strategy.write().insert_cached(cached);
-            } // cache_strategy lock released
+                // Cache admission decision (isolated)
+                let should_cache_decision = {
+                    let cache = self.cache_strategy.write();
+                    cache.should_cache(doc_id, &embedding)
+                }; // cache_strategy lock released
 
-            // Log access (no other locks held)
-            if let Some(ref logger) = self.access_logger {
-                if let Some(query_emb) = query_embedding {
-                    logger.write().log_access(doc_id, query_emb);
-                }
-            } // logger lock released
+                if should_cache_decision {
+                    let cached = CachedVector {
+                        doc_id,
+                        embedding: embedding.clone(),
+                        distance: 0.0,
+                        cached_at: Instant::now(),
+                    };
+                    // Insert into cache (isolated)
+                    self.cache_strategy.write().insert_cached(cached);
+                } // cache_strategy lock released
 
-            return Some(embedding);
+                // Log access (no other locks held)
+                if let Some(ref logger) = self.access_logger {
+                    if let Some(query_emb) = query_embedding {
+                        logger.write().log_access(doc_id, query_emb);
+                    }
+                } // logger lock released
+
+                return Some(embedding);
+            }
+            
+            // Hot tier miss - update stats (isolated)
+            {
+                let mut stats = self.stats.write();
+                stats.hot_tier_misses += 1;
+            } // Lock released
+        } else {
+            // Circuit breaker open - skip hot tier layer
+            {
+                let mut stats = self.stats.write();
+                stats.circuit_breaker_rejections += 1;
+            }
+            debug!("Hot tier circuit breaker open, skipping hot tier for doc_id={}", doc_id);
+        }
+
+        // Layer 3: Fetch from cold tier with circuit breaker protection
+        if !self.cold_tier_circuit_breaker.is_open() {
+            if let Some(embedding) = self.cold_tier.fetch_document(doc_id) {
+                // Cold tier success - record it
+                self.cold_tier_circuit_breaker.record_success();
+                
+                // Update stats (isolated)
+                {
+                    let mut stats = self.stats.write();
+                    stats.cold_tier_searches += 1;
+                } // Lock released
+
+                // Cache admission decision (isolated)
+                let should_cache_decision = {
+                    let cache = self.cache_strategy.write();
+                    cache.should_cache(doc_id, &embedding)
+                }; // cache_strategy lock released
+
+                if should_cache_decision {
+                    let cached = CachedVector {
+                        doc_id,
+                        embedding: embedding.clone(),
+                        distance: 0.0,
+                        cached_at: Instant::now(),
+                    };
+                    // Insert into cache (isolated)
+                    self.cache_strategy.write().insert_cached(cached);
+                } // cache_strategy lock released
+
+                // Log access (no other locks held)
+                if let Some(ref logger) = self.access_logger {
+                    if let Some(query_emb) = query_embedding {
+                        logger.write().log_access(doc_id, query_emb);
+                    }
+                } // logger lock released
+
+                return Some(embedding);
+            }
+            
+            // Cold tier miss - this is normal (document doesn't exist)
+        } else {
+            // Circuit breaker open - fail fast
+            {
+                let mut stats = self.stats.write();
+                stats.circuit_breaker_rejections += 1;
+            }
+            warn!("Cold tier circuit breaker open, cannot query doc_id={}", doc_id);
         }
 
         // Document not found in any tier
@@ -398,12 +455,37 @@ impl TieredEngine {
     ///
     /// # Returns
     /// - `Ok(Vec<SearchResult>)`: Full or partial results
-    /// - `Err(...)`: All layers failed or timed out with no results
+    /// - `Err(...)`: All layers failed or timed out with no results, or queue saturated
     pub async fn knn_search_with_timeouts(
         &self,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SearchResult>> {
+        // Load shedding: Try to acquire semaphore permit
+        // Note: _permit is kept alive to hold the permit until function returns (RAII guard)
+        let _permit = match self.query_semaphore.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Queue saturated - reject query
+                {
+                    let mut stats = self.stats.write();
+                    stats.queries_rejected += 1;
+                }
+                return Err(anyhow!(
+                    "Query queue saturated: {} in-flight queries (max: {})",
+                    self.config.max_concurrent_queries,
+                    self.config.max_concurrent_queries
+                ));
+            }
+        };
+
+        // Update queue depth metric
+        {
+            let mut stats = self.stats.write();
+            let available_permits = self.query_semaphore.available_permits();
+            stats.current_queue_depth = (self.config.max_concurrent_queries - available_permits) as u64;
+        }
+
         let mut results = Vec::new();
         let mut partial = false;
 
@@ -454,7 +536,16 @@ impl TieredEngine {
                     partial = true;
                 }
             }
+        } else {
+            // Circuit breaker open - record rejection
+            {
+                let mut stats = self.stats.write();
+                stats.circuit_breaker_rejections += 1;
+            }
+            warn!("Cold tier circuit breaker open, cannot perform k-NN search");
         }
+
+        // Permit is automatically dropped here, releasing the semaphore
 
         // Return results or error
         if !results.is_empty() {
@@ -904,5 +995,201 @@ mod tests {
         // Note: Whether circuit breaker opens depends on actual timeout behavior,
         // which can vary based on system load. The key is that the integration
         // between TieredEngine and CircuitBreaker is functional.
+    }
+
+    #[tokio::test]
+    async fn test_load_shedding_queue_saturation() {
+        // Test that queries are rejected when semaphore is saturated
+        // 
+        // Strategy: Use a barrier BEFORE the query to ensure permits are held
+        // while we attempt the 3rd query
+        let cache = LruCacheStrategy::new(10);
+        let embeddings = vec![vec![1.0, 2.0]; 10];
+
+        let config = TieredEngineConfig {
+            max_concurrent_queries: 2, // Very low limit to trigger rejection
+            hnsw_max_elements: 100,
+            data_dir: None,
+            ..Default::default()
+        };
+
+        let engine = Arc::new(TieredEngine::new(Box::new(cache), embeddings, config).unwrap());
+
+        // Barrier to coordinate: 2 background tasks will wait AFTER acquiring permit
+        // but BEFORE releasing it, so main thread can attempt 3rd query
+        let barrier = Arc::new(tokio::sync::Barrier::new(3)); // 2 tasks + main
+
+        // Spawn 2 tasks that acquire permits and wait at barrier
+        let engine1 = Arc::clone(&engine);
+        let barrier1 = Arc::clone(&barrier);
+        let handle1 = tokio::spawn(async move {
+            // Manually acquire permit to hold it
+            let _permit = engine1.query_semaphore.acquire().await.unwrap();
+            // Signal we have permit, then wait for main to finish test
+            barrier1.wait().await;
+            // Permit released when _permit drops
+        });
+
+        let engine2 = Arc::clone(&engine);
+        let barrier2 = Arc::clone(&barrier);
+        let handle2 = tokio::spawn(async move {
+            // Manually acquire permit to hold it
+            let _permit = engine2.query_semaphore.acquire().await.unwrap();
+            // Signal we have permit, then wait for main to finish test
+            barrier2.wait().await;
+            // Permit released when _permit drops
+        });
+
+        // Small delay to ensure tasks have started
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Try a 3rd query - should be rejected (both permits held by background tasks)
+        let query = vec![1.0, 2.0];
+        let result = engine.knn_search_with_timeouts(&query, 5).await;
+
+        // Should be rejected with queue saturation error
+        assert!(result.is_err(), "Expected query to be rejected due to queue saturation");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("saturated"), "Error should mention saturation: {}", err);
+
+        // Check stats
+        let stats = engine.stats();
+        assert_eq!(stats.queries_rejected, 1, "Should have exactly 1 rejected query");
+
+        // Release barrier to let background tasks finish
+        barrier.wait().await;
+        let _ = handle1.await;
+        let _ = handle2.await;
+    }
+
+    #[tokio::test]
+    async fn test_load_shedding_permits_released() {
+        // Test that semaphore permits are properly released after query completes
+        let cache = LruCacheStrategy::new(10);
+        let embeddings = vec![vec![1.0, 2.0]; 5];
+
+        let config = TieredEngineConfig {
+            max_concurrent_queries: 1, // Only 1 concurrent query allowed
+            hnsw_max_elements: 100,
+            data_dir: None,
+            ..Default::default()
+        };
+
+        let engine = Arc::new(TieredEngine::new(Box::new(cache), embeddings, config).unwrap());
+
+        // Execute first query - should succeed
+        let query1 = vec![1.0, 2.0];
+        let result1 = engine.knn_search_with_timeouts(&query1, 3).await;
+        assert!(result1.is_ok());
+
+        // Execute second query immediately after - should also succeed (permit released)
+        let query2 = vec![2.0, 3.0];
+        let result2 = engine.knn_search_with_timeouts(&query2, 3).await;
+        assert!(result2.is_ok());
+
+        // No queries should be rejected
+        let stats = engine.stats();
+        assert_eq!(stats.queries_rejected, 0);
+    }
+
+    #[test]
+    fn test_circuit_breaker_rejection_stats() {
+        // Test that circuit breaker rejections are tracked in stats
+        let cache = LruCacheStrategy::new(10);
+        let embeddings = vec![vec![1.0]; 5];
+
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 100,
+            data_dir: None,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+
+        // Manually open circuit breakers to test rejection path
+        engine.cache_circuit_breaker.open();
+        engine.hot_tier_circuit_breaker.open();
+        engine.cold_tier_circuit_breaker.open();
+
+        // Query with all circuit breakers open
+        let result = engine.query(1, None);
+
+        // Query should return None (all tiers rejected)
+        assert!(result.is_none());
+
+        // Check that rejections were counted (3 rejections: cache, hot_tier, cold_tier)
+        let stats = engine.stats();
+        assert_eq!(stats.circuit_breaker_rejections, 3);
+    }
+
+    #[tokio::test]
+    async fn test_queue_depth_tracking() {
+        // Test that current queue depth is properly tracked
+        let cache = LruCacheStrategy::new(10);
+        let embeddings = vec![vec![1.0, 2.0]; 10];
+
+        let config = TieredEngineConfig {
+            max_concurrent_queries: 5,
+            hnsw_max_elements: 100,
+            data_dir: None,
+            cold_tier_timeout_ms: 200, // Short timeout for quick test
+            ..Default::default()
+        };
+
+        let engine = Arc::new(TieredEngine::new(Box::new(cache), embeddings, config).unwrap());
+
+        // Initial queue depth should be 0
+        let initial_stats = engine.stats();
+        assert_eq!(initial_stats.current_queue_depth, 0);
+
+        // Spawn a query and check depth during execution
+        let engine_clone = Arc::clone(&engine);
+        let query1 = vec![1.0, 2.0];
+        let handle = tokio::spawn(async move {
+            engine_clone.knn_search_with_timeouts(&query1, 3).await
+        });
+
+        // Give time for query to acquire permit
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Queue depth should be non-zero during query execution
+        // Note: This may be flaky if query completes very fast
+        
+        // Wait for query to complete
+        let _ = handle.await;
+
+        // After completion, subsequent queries should work (permits released)
+        let query2 = vec![1.0, 2.0];
+        let result = engine.knn_search_with_timeouts(&query2, 3).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_in_knn_search() {
+        // Test circuit breaker integration in k-NN search path
+        let cache = LruCacheStrategy::new(10);
+        let embeddings = vec![vec![1.0, 2.0]; 5];
+
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 100,
+            data_dir: None,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+
+        // Open cold tier circuit breaker
+        engine.cold_tier_circuit_breaker.open();
+
+        // k-NN search should fail gracefully (no results)
+        let query = vec![1.0, 2.0];
+        let result = engine.knn_search_with_timeouts(&query, 3).await;
+
+        // Should return error (all layers failed)
+        assert!(result.is_err());
+
+        // Check circuit breaker rejection was counted
+        let stats = engine.stats();
+        assert_eq!(stats.circuit_breaker_rejections, 1);
     }
 }

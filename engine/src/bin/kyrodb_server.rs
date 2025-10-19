@@ -972,6 +972,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache_timeout_ms: config.timeouts.cache_ms,
         hot_tier_timeout_ms: config.timeouts.hot_tier_ms,
         cold_tier_timeout_ms: config.timeouts.cold_tier_ms,
+        max_concurrent_queries: 1000, // Load shedding: max 1000 in-flight queries
     };
 
     // Initialize or recover engine
