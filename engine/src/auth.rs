@@ -294,7 +294,7 @@ impl Default for AuthManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Seek, Write};
     use tempfile::NamedTempFile;
     
     fn create_test_tenant_info(tenant_id: &str) -> TenantInfo {

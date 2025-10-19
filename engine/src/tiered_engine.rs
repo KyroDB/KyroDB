@@ -516,16 +516,12 @@ impl TieredEngine {
             return Ok(0);
         }
 
-        println!("Flushing {} documents from hot tier to cold tier...", count);
-
         // Insert into cold tier (HNSW + WAL)
         for (doc_id, embedding) in documents {
             self.cold_tier
                 .insert(doc_id, embedding)
                 .context("Failed to insert into cold tier during flush")?;
         }
-
-        println!("Flush complete: {} documents moved to cold tier", count);
 
         Ok(count)
     }
@@ -703,11 +699,8 @@ mod tests {
             let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
 
             // Insert and flush (should trigger because hot_tier_max_size=1)
-            println!("Inserting doc_id 10...");
             engine.insert(10, vec![0.5, 0.5]).unwrap();
-            println!("Flushing hot tier...");
             let flushed = engine.flush_hot_tier().unwrap();
-            println!("Flushed {} documents", flushed);
             assert_eq!(flushed, 1, "Expected 1 document to be flushed");
 
             // Verify doc 10 is in cold tier before snapshot
@@ -717,16 +710,13 @@ mod tests {
             );
 
             // Create snapshot
-            println!("Creating snapshot...");
             engine.cold_tier().create_snapshot().unwrap();
-            println!("Snapshot created");
 
             // Explicit drop to ensure WAL fsynced
             drop(engine);
         }
 
         // Recover
-        println!("Recovering...");
         let cache = LruCacheStrategy::new(100);
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
@@ -737,7 +727,6 @@ mod tests {
         let recovered = TieredEngine::recover(Box::new(cache), dir.path(), config).unwrap();
 
         // Verify data recovered
-        println!("Verifying recovery...");
         assert!(
             recovered.cold_tier().fetch_document(0).is_some(),
             "Doc 0 not recovered"
@@ -746,7 +735,6 @@ mod tests {
             recovered.cold_tier().fetch_document(10).is_some(),
             "Doc 10 not recovered"
         );
-        println!("Persistence test passed!");
     }
 
     #[tokio::test]

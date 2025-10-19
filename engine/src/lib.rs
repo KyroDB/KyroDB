@@ -131,7 +131,7 @@ pub use access_logger::{hash_embedding, AccessLoggerStats, AccessPatternLogger};
 pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
 pub use cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy};
 pub use training_task::{spawn_training_task, TrainingConfig};
-pub use vector_cache::{CacheStats, CachedVector, VectorCache};
+pub use vector_cache::{CachedVector, CacheStatsSnapshot, VectorCache};
 
 // Quality metrics components
 pub use ndcg::{

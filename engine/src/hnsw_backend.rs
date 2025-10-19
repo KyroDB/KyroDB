@@ -181,7 +181,15 @@ impl HnswBackend {
                 Ok((snapshot, recovered_from_fallback)) => {
                     dimension = snapshot.dimension;
                     snapshot_timestamp = snapshot.timestamp;
-                    embeddings = snapshot.documents.into_iter().map(|(_, emb)| emb).collect();
+                    
+                    // Restore embeddings preserving doc_id → index mapping
+                    // Find max doc_id to size the vector correctly
+                    let max_doc_id = snapshot.documents.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
+                    embeddings = vec![vec![0.0; dimension]; max_doc_id + 1];
+                    
+                    for (doc_id, embedding) in snapshot.documents {
+                        embeddings[doc_id as usize] = embedding;
+                    }
 
                     if recovered_from_fallback {
                         warn!(

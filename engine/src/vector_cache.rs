@@ -22,27 +22,50 @@ pub struct CachedVector {
 /// Vector cache with LRU eviction
 ///
 /// # Thread Safety
-/// Uses RwLock for concurrent access. Multiple readers can access simultaneously,
-/// writes are exclusive.
+/// Uses single RwLock protecting both HashMap and VecDeque to prevent TOCTOU races.
+/// Multiple readers can access simultaneously, writes are exclusive.
+///
+/// # Concurrency Design
+/// Previous design used separate locks for cache and LRU queue, which caused race:
+/// - Thread A: reads cache (finds doc_id) → releases lock
+/// - Thread B: evicts doc_id from both cache and queue
+/// - Thread A: acquires LRU lock → tries to update queue for evicted doc_id → queue drift
+///
+/// Current design: Single lock protects both structures atomically.
 ///
 /// # Performance
-/// - Get: O(1) hashmap lookup
-/// - Insert: O(1) hashmap insert + O(1) LRU update
+/// - Get: O(1) hashmap lookup + O(n) LRU queue update (where n = capacity)
+/// - Insert: O(1) hashmap insert + O(1) LRU queue push
 /// - Eviction: O(1) (evicts oldest when full)
+///
+/// Lock contention: Acceptable for cache sizes <100k entries. For larger caches,
+/// consider sharded locks or lock-free skip list.
 pub struct VectorCache {
-    /// Main cache storage (doc_id → cached vector)
-    cache: Arc<RwLock<HashMap<u64, CachedVector>>>,
-
-    /// LRU queue (front = oldest, back = newest)
-    lru_queue: Arc<RwLock<VecDeque<u64>>>,
+    /// Combined cache state: (HashMap, LRU queue)
+    /// Single lock prevents TOCTOU races between cache lookup and LRU update
+    state: Arc<RwLock<CacheState>>,
 
     /// Maximum capacity
     capacity: usize,
 
-    /// Cache statistics
-    hits: Arc<RwLock<u64>>,
-    misses: Arc<RwLock<u64>>,
-    evictions: Arc<RwLock<u64>>,
+    /// Cache statistics (separate lock to avoid contention on hot path)
+    stats: Arc<RwLock<CacheStats>>,
+}
+
+/// Internal cache state protected by single RwLock
+struct CacheState {
+    /// Main cache storage (doc_id → cached vector)
+    cache: HashMap<u64, CachedVector>,
+    
+    /// LRU queue (front = oldest, back = newest)
+    lru_queue: VecDeque<u64>,
+}
+
+/// Cache statistics
+struct CacheStats {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
 }
 
 impl VectorCache {
@@ -56,12 +79,16 @@ impl VectorCache {
     /// For 10k vectors with 128-dim embeddings: ~5MB
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
-            lru_queue: Arc::new(RwLock::new(VecDeque::with_capacity(capacity))),
+            state: Arc::new(RwLock::new(CacheState {
+                cache: HashMap::with_capacity(capacity),
+                lru_queue: VecDeque::with_capacity(capacity),
+            })),
             capacity,
-            hits: Arc::new(RwLock::new(0)),
-            misses: Arc::new(RwLock::new(0)),
-            evictions: Arc::new(RwLock::new(0)),
+            stats: Arc::new(RwLock::new(CacheStats {
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+            })),
         }
     }
 
@@ -73,24 +100,26 @@ impl VectorCache {
     /// # Performance
     /// O(1) hashmap lookup + O(n) LRU queue update (where n = capacity)
     /// Typically <100ns for small caches (<10k entries)
+    ///
+    /// # Atomicity
+    /// Single lock acquisition ensures no TOCTOU race between cache lookup and LRU update.
     pub fn get(&self, doc_id: u64) -> Option<CachedVector> {
-        let cache = self.cache.read();
+        let mut state = self.state.write();
 
-        if let Some(cached) = cache.get(&doc_id) {
-            // Cache hit
-            *self.hits.write() += 1;
-
-            // Update LRU queue (move to back)
-            let mut lru = self.lru_queue.write();
-            if let Some(pos) = lru.iter().position(|&id| id == doc_id) {
-                lru.remove(pos);
-                lru.push_back(doc_id);
+        if let Some(cached) = state.cache.get(&doc_id).cloned() {
+            // Cache hit - update LRU queue atomically
+            if let Some(pos) = state.lru_queue.iter().position(|&id| id == doc_id) {
+                state.lru_queue.remove(pos);
+                state.lru_queue.push_back(doc_id);
             }
 
-            Some(cached.clone())
+            // Update stats (separate lock to reduce contention)
+            self.stats.write().hits += 1;
+
+            Some(cached)
         } else {
             // Cache miss
-            *self.misses.write() += 1;
+            self.stats.write().misses += 1;
             None
         }
     }
@@ -101,81 +130,59 @@ impl VectorCache {
     ///
     /// # Performance
     /// O(1) hashmap insert + O(1) LRU queue push
+    ///
+    /// # Atomicity
+    /// Single lock ensures cache and LRU queue remain synchronized.
     pub fn insert(&self, cached_vector: CachedVector) {
         let doc_id = cached_vector.doc_id;
-        let mut cache = self.cache.write();
-        let mut lru = self.lru_queue.write();
+        let mut state = self.state.write();
 
-        // Check if already in cache
-        if cache.contains_key(&doc_id) {
-            // Update existing entry
-            cache.insert(doc_id, cached_vector);
+        // Check if already in cache (update case)
+        if state.cache.contains_key(&doc_id) {
+            state.cache.insert(doc_id, cached_vector);
 
             // Update LRU position
-            if let Some(pos) = lru.iter().position(|&id| id == doc_id) {
-                lru.remove(pos);
-                lru.push_back(doc_id);
+            if let Some(pos) = state.lru_queue.iter().position(|&id| id == doc_id) {
+                state.lru_queue.remove(pos);
+                state.lru_queue.push_back(doc_id);
             } else {
-                // CRITICAL FIX: doc_id in cache but not in LRU queue
-                // This can happen if state is corrupted - add it now
-                lru.push_back(doc_id);
-            }
-
-            // CRITICAL FIX: Check capacity even on update
-            // Handles case where lru_queue grew unbounded
-            while lru.len() > self.capacity {
-                if let Some(evict_id) = lru.pop_front() {
-                    cache.remove(&evict_id);
-                    *self.evictions.write() += 1;
-                }
+                // Defensive: doc_id in cache but not in queue (should never happen with single lock)
+                state.lru_queue.push_back(doc_id);
             }
 
             return;
         }
 
-        // Evict if at capacity BEFORE inserting
-        while cache.len() >= self.capacity {
-            if let Some(evict_id) = lru.pop_front() {
-                cache.remove(&evict_id);
-                *self.evictions.write() += 1;
-            } else {
-                break; // Queue empty but cache full (should not happen)
+        // Evict if at capacity
+        if state.cache.len() >= self.capacity {
+            if let Some(evict_id) = state.lru_queue.pop_front() {
+                state.cache.remove(&evict_id);
+                self.stats.write().evictions += 1;
             }
         }
 
         // Insert new entry
-        cache.insert(doc_id, cached_vector);
-        lru.push_back(doc_id);
-
-        // DEFENSIVE: Final capacity check
-        debug_assert_eq!(
-            cache.len(),
-            lru.len(),
-            "Cache/LRU size mismatch: cache={}, lru={}",
-            cache.len(),
-            lru.len()
-        );
+        state.cache.insert(doc_id, cached_vector);
+        state.lru_queue.push_back(doc_id);
     }
 
     /// Get cache statistics
-    pub fn stats(&self) -> CacheStats {
-        let hits = *self.hits.read();
-        let misses = *self.misses.read();
-        let evictions = *self.evictions.read();
-        let size = self.cache.read().len();
+    pub fn stats(&self) -> CacheStatsSnapshot {
+        let stats = self.stats.read();
+        let state = self.state.read();
 
-        let total_requests = hits + misses;
+        let total_requests = stats.hits + stats.misses;
         let hit_rate = if total_requests > 0 {
-            hits as f64 / total_requests as f64
+            stats.hits as f64 / total_requests as f64
         } else {
             0.0
         };
 
-        CacheStats {
-            hits,
-            misses,
-            evictions,
-            size,
+        CacheStatsSnapshot {
+            hits: stats.hits,
+            misses: stats.misses,
+            evictions: stats.evictions,
+            size: state.cache.len(),
             capacity: self.capacity,
             hit_rate,
         }
@@ -183,21 +190,24 @@ impl VectorCache {
 
     /// Clear cache (useful for testing)
     pub fn clear(&self) {
-        self.cache.write().clear();
-        self.lru_queue.write().clear();
-        *self.hits.write() = 0;
-        *self.misses.write() = 0;
-        *self.evictions.write() = 0;
+        let mut state = self.state.write();
+        state.cache.clear();
+        state.lru_queue.clear();
+
+        let mut stats = self.stats.write();
+        stats.hits = 0;
+        stats.misses = 0;
+        stats.evictions = 0;
     }
 
     /// Get current size
     pub fn len(&self) -> usize {
-        self.cache.read().len()
+        self.state.read().cache.len()
     }
 
     /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
-        self.cache.read().is_empty()
+        self.state.read().cache.is_empty()
     }
 
     /// Get maximum capacity
@@ -206,9 +216,9 @@ impl VectorCache {
     }
 }
 
-/// Cache statistics
+/// Cache statistics snapshot
 #[derive(Debug, Clone, Copy)]
-pub struct CacheStats {
+pub struct CacheStatsSnapshot {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
