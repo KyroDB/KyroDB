@@ -2232,6 +2232,7 @@ dependencies = [
  "hnsw_rs",
  "hyper 1.7.0",
  "indicatif",
+ "libc",
  "memmap2",
  "parking_lot",
  "proptest",
@@ -2259,6 +2260,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.52.0",
  "zipf",
 ]
 

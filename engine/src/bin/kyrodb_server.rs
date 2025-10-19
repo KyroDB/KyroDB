@@ -963,6 +963,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let engine_config = TieredEngineConfig {
         hot_tier_max_size: config.cache.capacity,
+        hot_tier_hard_limit: config.cache.capacity * 2, // 2x soft limit for emergency eviction
         hot_tier_max_age: Duration::from_secs(config.cache.training_interval_secs),
         hnsw_max_elements: config.hnsw.max_elements,
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),

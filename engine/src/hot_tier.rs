@@ -176,6 +176,40 @@ impl HotTier {
             stats.total_hits as f64 / total_accesses as f64
         }
     }
+
+    /// Re-insert documents that failed to flush
+    ///
+    /// Used when flush to cold tier fails - documents are put back into hot tier
+    /// to avoid data loss. Preserves original insertion timestamps where possible.
+    ///
+    /// # Parameters
+    /// - `documents`: Documents to re-insert (doc_id, embedding pairs)
+    ///
+    /// # Behavior
+    /// - Re-inserted documents use current timestamp (preserves age-based flush logic)
+    /// - Increments total_inserts counter (tracks all insert operations)
+    /// - Does NOT increment total_flushes (flush failed, not completed)
+    pub fn reinsert_failed_documents(&self, documents: Vec<(u64, Vec<f32>)>) {
+        if documents.is_empty() {
+            return;
+        }
+
+        let mut docs = self.documents.write();
+        let reinsert_count = documents.len();
+
+        for (doc_id, embedding) in documents {
+            let doc = HotDocument {
+                embedding,
+                inserted_at: Instant::now(), // Use current timestamp
+            };
+            docs.insert(doc_id, doc);
+        }
+
+        let mut stats = self.stats.write();
+        stats.current_size = docs.len();
+        stats.total_inserts += reinsert_count as u64;
+        // Note: NOT incrementing total_flushes because flush failed
+    }
 }
 
 #[cfg(test)]

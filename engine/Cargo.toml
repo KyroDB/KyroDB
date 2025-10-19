@@ -94,6 +94,12 @@ tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["use_std", "
 # Lock-free ring buffer: ringbuf crate (replaces custom RingBuffer)
 ringbuf = "0.4"
 
+# Disk space monitoring: platform-specific APIs
+libc = "0.2"  # Unix: statvfs for disk space
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 # Phase 0 Week 1-2: Testing HNSW recall guarantees
 proptest = "1.0"

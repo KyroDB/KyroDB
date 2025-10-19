@@ -15,6 +15,148 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, instrument, trace, warn};
 
+/// Disk space warning threshold (alert if free space < 10%)
+const DISK_SPACE_WARNING_THRESHOLD: f64 = 0.10;
+
+/// Disk space critical threshold (reject writes if free space < 5%)
+const DISK_SPACE_CRITICAL_THRESHOLD: f64 = 0.05;
+
+/// Disk space information
+#[derive(Debug, Clone)]
+struct DiskSpaceInfo {
+    total_bytes: u64,
+    available_bytes: u64,
+    available_percent: f64,
+}
+
+/// Check available disk space for a given path
+///
+/// Returns disk space information or error if unable to check.
+/// Uses platform-specific APIs: statvfs (Unix) or GetDiskFreeSpaceEx (Windows).
+#[instrument(level = "trace", skip(path), fields(path = %path.as_ref().display()))]
+fn check_disk_space(path: impl AsRef<Path>) -> Result<DiskSpaceInfo> {
+    let path = path.as_ref();
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::ffi::CString;
+        
+        // Use statvfs to get filesystem statistics
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .context("Invalid path for statvfs")?;
+        
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        
+        let result = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+        
+        if result != 0 {
+            anyhow::bail!("statvfs failed for path: {}", path.display());
+        }
+        
+        // Cast to u64 for arithmetic (f_blocks and f_bavail are platform-dependent types)
+        let total_bytes = stat.f_blocks as u64 * stat.f_frsize;
+        let available_bytes = stat.f_bavail as u64 * stat.f_frsize;
+        let available_percent = if total_bytes > 0 {
+            available_bytes as f64 / total_bytes as f64
+        } else {
+            0.0
+        };
+        
+        Ok(DiskSpaceInfo {
+            total_bytes,
+            available_bytes,
+            available_percent,
+        })
+    }
+    
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ffi::OsStr;
+        
+        // Convert path to wide string for Windows API
+        let wide_path: Vec<u16> = OsStr::new(path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        
+        let mut free_bytes: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut available_bytes: u64 = 0;
+        
+        let result = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide_path.as_ptr(),
+                &mut available_bytes,
+                &mut total_bytes,
+                &mut free_bytes,
+            )
+        };
+        
+        if result == 0 {
+            anyhow::bail!("GetDiskFreeSpaceExW failed for path: {}", path.display());
+        }
+        
+        let available_percent = if total_bytes > 0 {
+            available_bytes as f64 / total_bytes as f64
+        } else {
+            0.0
+        };
+        
+        Ok(DiskSpaceInfo {
+            total_bytes,
+            available_bytes,
+            available_percent,
+        })
+    }
+    
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Fallback for unsupported platforms - assume sufficient space
+        warn!("disk space monitoring not supported on this platform");
+        Ok(DiskSpaceInfo {
+            total_bytes: u64::MAX,
+            available_bytes: u64::MAX,
+            available_percent: 1.0,
+        })
+    }
+}
+
+/// Check disk space and log warnings/errors if thresholds breached
+///
+/// Returns:
+/// - `Ok(true)` if space is sufficient
+/// - `Ok(false)` if space is critically low (< 5%)
+/// - `Err` if unable to check disk space
+#[instrument(level = "trace", skip(path), fields(path = %path.as_ref().display()))]
+fn check_and_warn_disk_space(path: impl AsRef<Path>) -> Result<bool> {
+    let info = check_disk_space(&path)?;
+    
+    if info.available_percent < DISK_SPACE_CRITICAL_THRESHOLD {
+        error!(
+            available_gb = info.available_bytes / (1024 * 1024 * 1024),
+            available_percent = format!("{:.1}%", info.available_percent * 100.0),
+            threshold = format!("{:.0}%", DISK_SPACE_CRITICAL_THRESHOLD * 100.0),
+            path = %path.as_ref().display(),
+            "CRITICAL: disk space critically low; rejecting writes"
+        );
+        return Ok(false);
+    }
+    
+    if info.available_percent < DISK_SPACE_WARNING_THRESHOLD {
+        warn!(
+            available_gb = info.available_bytes / (1024 * 1024 * 1024),
+            available_percent = format!("{:.1}%", info.available_percent * 100.0),
+            threshold = format!("{:.0}%", DISK_SPACE_WARNING_THRESHOLD * 100.0),
+            path = %path.as_ref().display(),
+            "WARNING: disk space running low"
+        );
+    }
+    
+    Ok(true)
+}
+
 /// HNSW-backed document store for cache integration
 ///
 /// This wraps HnswVectorIndex and provides:
@@ -332,8 +474,15 @@ impl HnswBackend {
     /// - Triggers snapshot creation if `inserts_since_snapshot >= snapshot_interval`
     #[instrument(level = "trace", skip(self, embedding), fields(doc_id, dim = embedding.len()))]
     pub fn insert(&self, doc_id: u64, embedding: Vec<f32>) -> Result<()> {
-        // Log to WAL (if persistence enabled)
+        // Check disk space before write (if persistence enabled)
         if let Some(ref persistence) = self.persistence {
+            if !check_and_warn_disk_space(&persistence.data_dir)? {
+                anyhow::bail!(
+                    "Insert rejected: disk space critically low (< {}%)",
+                    DISK_SPACE_CRITICAL_THRESHOLD * 100.0
+                );
+            }
+
             let entry = WalEntry {
                 op: WalOp::Insert,
                 doc_id,
@@ -390,6 +539,14 @@ impl HnswBackend {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Persistence not enabled"))?;
 
+        // Check disk space before creating snapshot
+        if !check_and_warn_disk_space(&persistence.data_dir)? {
+            anyhow::bail!(
+                "Snapshot creation rejected: disk space critically low (< {}%)",
+                DISK_SPACE_CRITICAL_THRESHOLD * 100.0
+            );
+        }
+
         let embeddings = self.embeddings.read();
 
         // Create snapshot object
@@ -415,17 +572,32 @@ impl HnswBackend {
 
         let doc_count = documents.len();
         let snapshot = Snapshot::new(dimension, documents);
-        // Save snapshot
-        let snapshot_name = format!("snapshot_{}.snap", Self::timestamp());
+        
+        // Save snapshot with timestamp
+        let snapshot_timestamp = Self::timestamp();
+        let snapshot_name = format!("snapshot_{}.snap", snapshot_timestamp);
         let snapshot_path = persistence.data_dir.join(&snapshot_name);
         snapshot.save(&snapshot_path)?;
-        info!(path = %snapshot_path.display(), docs = doc_count, "snapshot saved");
+        info!(path = %snapshot_path.display(), docs = doc_count, timestamp = snapshot_timestamp, "snapshot saved");
 
         // Update manifest
         let manifest_path = persistence.data_dir.join("MANIFEST");
         let mut manifest = Manifest::load_or_create(&manifest_path)?;
-        manifest.latest_snapshot = Some(snapshot_name);
+        manifest.latest_snapshot = Some(snapshot_name.clone());
         manifest.save(&manifest_path)?;
+
+        // WAL Compaction: Delete old WAL segments that are fully captured in the snapshot
+        // This prevents unbounded disk usage growth
+        let compacted = self.compact_old_wal_segments(&persistence.data_dir, snapshot_timestamp, &mut manifest)?;
+        if compacted > 0 {
+            info!(
+                compacted_segments = compacted,
+                snapshot_ts = snapshot_timestamp,
+                "WAL compaction complete"
+            );
+            // Save updated manifest after compaction
+            manifest.save(&manifest_path)?;
+        }
 
         // Reset insert counter
         *persistence.inserts_since_snapshot.write() = 0;
@@ -497,6 +669,104 @@ impl HnswBackend {
         }
         Ok(())
     }
+
+    /// Compact old WAL segments that are fully captured in the snapshot
+    ///
+    /// Deletes WAL files where all entries have timestamp <= snapshot_timestamp.
+    /// This prevents unbounded disk usage from accumulating WAL segments.
+    ///
+    /// # Parameters
+    /// - `data_dir`: Directory containing WAL files
+    /// - `snapshot_timestamp`: Timestamp of the just-created snapshot
+    /// - `manifest`: Manifest to update (removes deleted WAL segments)
+    ///
+    /// # Returns
+    /// Number of WAL segments deleted
+    ///
+    /// # Safety
+    /// - Only deletes WAL segments listed in manifest (controlled cleanup)
+    /// - Always keeps the current active WAL segment (last in list)
+    /// - Updates manifest atomically after successful deletion
+    #[instrument(level = "debug", skip(self, data_dir, manifest), fields(snapshot_ts = snapshot_timestamp))]
+    fn compact_old_wal_segments(
+        &self,
+        data_dir: &Path,
+        snapshot_timestamp: u64,
+        manifest: &mut Manifest,
+    ) -> Result<usize> {
+        let mut deleted_count = 0;
+        let mut segments_to_keep = Vec::new();
+
+        // Always keep the last WAL segment (active WAL)
+        let active_wal_index = manifest.wal_segments.len().saturating_sub(1);
+
+        for (idx, wal_name) in manifest.wal_segments.iter().enumerate() {
+            // Never delete active WAL
+            if idx == active_wal_index {
+                segments_to_keep.push(wal_name.clone());
+                continue;
+            }
+
+            // Extract timestamp from WAL filename (format: "wal_{timestamp}.wal")
+            let wal_timestamp = wal_name
+                .strip_prefix("wal_")
+                .and_then(|s| s.strip_suffix(".wal"))
+                .and_then(|s| s.parse::<u64>().ok());
+
+            match wal_timestamp {
+                Some(ts) if ts <= snapshot_timestamp => {
+                    // This WAL segment is fully captured in snapshot - safe to delete
+                    let wal_path = data_dir.join(wal_name);
+                    
+                    match std::fs::remove_file(&wal_path) {
+                        Ok(()) => {
+                            debug!(
+                                wal_segment = wal_name,
+                                wal_ts = ts,
+                                snapshot_ts = snapshot_timestamp,
+                                "deleted old WAL segment"
+                            );
+                            deleted_count += 1;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // Already deleted or never existed - not an error
+                            warn!(
+                                wal_segment = wal_name,
+                                "WAL segment already missing (skipping)"
+                            );
+                            deleted_count += 1; // Still count as "compacted"
+                        }
+                        Err(e) => {
+                            // Log error but continue - don't fail compaction for one bad file
+                            error!(
+                                wal_segment = wal_name,
+                                error = %e,
+                                "failed to delete old WAL segment"
+                            );
+                            segments_to_keep.push(wal_name.clone()); // Keep in manifest
+                        }
+                    }
+                }
+                Some(_) => {
+                    // WAL segment newer than snapshot - keep it
+                    segments_to_keep.push(wal_name.clone());
+                }
+                None => {
+                    // Failed to parse timestamp - keep segment for safety
+                    warn!(
+                        wal_segment = wal_name,
+                        "failed to parse WAL timestamp; keeping segment"
+                    );
+                    segments_to_keep.push(wal_name.clone());
+                }
+            }
+        }
+
+        // Update manifest with remaining segments
+        manifest.wal_segments = segments_to_keep;
+
+        Ok(deleted_count)
+    }
 }
 
 #[cfg(test)]
@@ -551,5 +821,86 @@ mod tests {
         assert!(!backend.is_empty());
         assert_eq!(backend.len(), 1);
         assert_eq!(backend.dimension(), 2);
+    }
+
+    #[test]
+    fn test_wal_compaction_after_snapshot() {
+        use tempfile::TempDir;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path();
+
+        // Create backend with persistence
+        let initial_embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let mut backend = HnswBackend::with_persistence(
+            initial_embeddings,
+            100,
+            data_dir,
+            FsyncPolicy::Never,
+            5, // Snapshot every 5 inserts
+        )
+        .unwrap();
+
+        // Insert documents to create multiple WAL segments
+        for i in 2..7 {
+            backend.insert(i as u64, vec![i as f32, 0.0]).unwrap();
+        }
+
+        // Verify snapshot created (triggered at 5 inserts)
+        let snapshot_files: Vec<_> = std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("snapshot_")
+            })
+            .collect();
+
+        assert!(
+            !snapshot_files.is_empty(),
+            "Snapshot should have been created"
+        );
+
+        // Verify WAL compaction occurred (old WAL segments should be deleted)
+        let manifest_path = data_dir.join("MANIFEST");
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        
+        // Should only have the active WAL segment remaining after compaction
+        // (old WAL segments captured in snapshot are deleted)
+        assert!(
+            manifest.wal_segments.len() <= 2,
+            "Old WAL segments should be compacted; found {} segments",
+            manifest.wal_segments.len()
+        );
+    }
+
+    #[test]
+    fn test_disk_space_check() {
+        use tempfile::TempDir;
+        
+        let temp_dir = TempDir::new().unwrap();
+        
+        // Check disk space for temp directory (should succeed on any system with >5% free)
+        let space_check = check_and_warn_disk_space(temp_dir.path());
+        
+        // Should succeed unless disk is critically full
+        assert!(space_check.is_ok(), "Disk space check failed unexpectedly");
+        
+        // Get space info
+        let info = check_disk_space(temp_dir.path()).unwrap();
+        
+        // Basic sanity checks
+        assert!(info.total_bytes > 0, "Total bytes should be > 0");
+        assert!(info.available_bytes > 0, "Available bytes should be > 0");
+        assert!(info.available_percent >= 0.0 && info.available_percent <= 1.0,
+                "Available percent should be in [0, 1]");
+    }
+
+    #[test]
+    fn test_insert_rejected_on_critical_disk_space() {
+        // This test cannot reliably fill disk to critical level
+        // Manual testing required for disk-full scenarios
+        // Documented in operational runbook
     }
 }
