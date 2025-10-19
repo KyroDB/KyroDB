@@ -848,6 +848,9 @@ struct CliArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize deadlock detection in debug builds
+    kyrodb_engine::init_deadlock_detection();
+    
     // Parse command-line arguments
     let cli_args = CliArgs::parse();
     

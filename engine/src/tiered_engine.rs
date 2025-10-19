@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// Tiered engine statistics
 #[derive(Debug, Clone, Default)]
@@ -236,50 +236,67 @@ impl TieredEngine {
     /// 4. Cache admission decision (should we cache this result?)
     /// 5. Log access for training
     ///
+    /// # Lock Ordering Discipline
+    /// **CRITICAL**: To prevent deadlocks, locks MUST be acquired in this order:
+    /// 1. cache_strategy (read/write)
+    /// 2. stats (write)
+    /// 3. access_logger (write)
+    ///
+    /// Never hold multiple locks simultaneously. Always drop locks before
+    /// calling methods that may acquire other locks.
+    ///
     /// # Returns
     /// - `Some(embedding)` if document found in any tier
     /// - `None` if document doesn't exist
     pub fn query(&self, doc_id: u64, query_embedding: Option<&[f32]>) -> Option<Vec<f32>> {
-        let mut stats = self.stats.write();
-        stats.total_queries += 1;
-        drop(stats);
-
-        // Layer 1: Check cache
+        // Increment total queries (isolated lock)
         {
+            let mut stats = self.stats.write();
+            stats.total_queries += 1;
+        } // Lock released
+
+        // Layer 1: Check cache (lock order: cache_strategy → stats → logger)
+        let cached_result = {
             let cache = self.cache_strategy.read();
-            if let Some(cached) = cache.get_cached(doc_id) {
+            cache.get_cached(doc_id)
+        }; // cache_strategy lock released
+
+        if let Some(cached) = cached_result {
+            // Update stats (no other locks held)
+            {
                 let mut stats = self.stats.write();
                 stats.cache_hits += 1;
-                drop(stats);
+            } // stats lock released
 
-                // Log access (cache hit)
-                if let Some(ref logger) = self.access_logger {
-                    if let Some(query_emb) = query_embedding {
-                        logger.write().log_access(doc_id, query_emb);
-                    }
+            // Log access (no other locks held)
+            if let Some(ref logger) = self.access_logger {
+                if let Some(query_emb) = query_embedding {
+                    logger.write().log_access(doc_id, query_emb);
                 }
+            } // logger lock released
 
-                return Some(cached.embedding);
-            }
+            return Some(cached.embedding);
         }
 
-        // Cache miss
+        // Cache miss - update stats (isolated)
         {
             let mut stats = self.stats.write();
             stats.cache_misses += 1;
-        }
+        } // Lock released
 
-        // Layer 2: Check hot tier
+        // Layer 2: Check hot tier (no locks needed for hot_tier.get)
         if let Some(embedding) = self.hot_tier.get(doc_id) {
-            let mut stats = self.stats.write();
-            stats.hot_tier_hits += 1;
-            drop(stats);
+            // Update stats (isolated)
+            {
+                let mut stats = self.stats.write();
+                stats.hot_tier_hits += 1;
+            } // Lock released
 
-            // Cache admission decision: should_cache takes (doc_id, embedding)
+            // Cache admission decision (isolated)
             let should_cache_decision = {
-                let mut cache = self.cache_strategy.write();
+                let cache = self.cache_strategy.write();
                 cache.should_cache(doc_id, &embedding)
-            };
+            }; // cache_strategy lock released
 
             if should_cache_decision {
                 let cached = CachedVector {
@@ -288,36 +305,39 @@ impl TieredEngine {
                     distance: 0.0,
                     cached_at: Instant::now(),
                 };
+                // Insert into cache (isolated)
                 self.cache_strategy.write().insert_cached(cached);
-            }
+            } // cache_strategy lock released
 
-            // Log access (hot tier hit) - use query embedding if available
+            // Log access (no other locks held)
             if let Some(ref logger) = self.access_logger {
                 if let Some(query_emb) = query_embedding {
                     logger.write().log_access(doc_id, query_emb);
                 }
-            }
+            } // logger lock released
 
             return Some(embedding);
         }
 
-        // Hot tier miss
+        // Hot tier miss - update stats (isolated)
         {
             let mut stats = self.stats.write();
             stats.hot_tier_misses += 1;
-        }
+        } // Lock released
 
-        // Layer 3: Fetch from cold tier (HNSW)
+        // Layer 3: Fetch from cold tier (no locks needed for cold_tier.fetch_document)
         if let Some(embedding) = self.cold_tier.fetch_document(doc_id) {
-            let mut stats = self.stats.write();
-            stats.cold_tier_searches += 1;
-            drop(stats);
+            // Update stats (isolated)
+            {
+                let mut stats = self.stats.write();
+                stats.cold_tier_searches += 1;
+            } // Lock released
 
-            // Cache admission decision: should_cache takes (doc_id, embedding)
+            // Cache admission decision (isolated)
             let should_cache_decision = {
-                let mut cache = self.cache_strategy.write();
+                let cache = self.cache_strategy.write();
                 cache.should_cache(doc_id, &embedding)
-            };
+            }; // cache_strategy lock released
 
             if should_cache_decision {
                 let cached = CachedVector {
@@ -326,15 +346,16 @@ impl TieredEngine {
                     distance: 0.0,
                     cached_at: Instant::now(),
                 };
+                // Insert into cache (isolated)
                 self.cache_strategy.write().insert_cached(cached);
-            }
+            } // cache_strategy lock released
 
-            // Log access (cold tier hit) - use query embedding if available
+            // Log access (no other locks held)
             if let Some(ref logger) = self.access_logger {
                 if let Some(query_emb) = query_embedding {
                     logger.write().log_access(doc_id, query_emb);
                 }
-            }
+            } // logger lock released
 
             return Some(embedding);
         }

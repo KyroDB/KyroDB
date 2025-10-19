@@ -5,6 +5,46 @@
 //!
 //! See Implementation.md for roadmap and IMPLEMENTATION_UPDATE_ANALYSIS.md for current status.
 
+// Deadlock detection in debug builds (parking_lot feature)
+#[cfg(debug_assertions)]
+use parking_lot::deadlock;
+#[cfg(debug_assertions)]
+use std::thread;
+#[cfg(debug_assertions)]
+use std::time::Duration;
+
+/// Initialize deadlock detection in debug builds
+///
+/// This spawns a background thread that checks for deadlocks every 10 seconds.
+/// If a deadlock is detected, it prints diagnostic information and panics.
+///
+/// **ONLY active in debug builds** - zero overhead in release builds.
+#[cfg(debug_assertions)]
+pub fn init_deadlock_detection() {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(10));
+        let deadlocks = deadlock::check_deadlock();
+        if !deadlocks.is_empty() {
+            eprintln!("🚨 DEADLOCK DETECTED 🚨");
+            eprintln!("{} deadlock(s) found:", deadlocks.len());
+            for (i, threads) in deadlocks.iter().enumerate() {
+                eprintln!("Deadlock #{}", i);
+                for t in threads {
+                    eprintln!("Thread ID: {:?}", t.thread_id());
+                    eprintln!("Backtrace:\n{:#?}", t.backtrace());
+                }
+            }
+            panic!("Deadlock detected - see stderr for details");
+        }
+    });
+}
+
+/// No-op in release builds
+#[cfg(not(debug_assertions))]
+pub fn init_deadlock_detection() {
+    // No-op in release builds
+}
+
 // ===== Core modules =====
 
 // Vector search: HNSW k-NN index

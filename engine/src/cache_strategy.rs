@@ -11,7 +11,7 @@ use crate::learned_cache::LearnedCachePredictor;
 use crate::semantic_adapter::SemanticAdapter;
 use crate::vector_cache::{CachedVector, VectorCache};
 use std::sync::Arc;
-use tracing::{debug, instrument, trace};
+use tracing::{instrument, trace};
 
 /// Cache strategy trait
 ///
