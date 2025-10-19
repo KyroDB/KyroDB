@@ -26,6 +26,8 @@ jemalloc-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 cli-tools = ["indicatif", "tabled", "env_logger"]
 # S3 backup: Optional AWS S3 integration for remote backups
 s3-backup = ["aws-config", "aws-sdk-s3"]
+# Loom testing: Enable loom model checker for concurrency correctness
+loom = ["dep:loom"]
 
 [dependencies]
 # Phase 0 Week 1-2: HNSW vector search
@@ -96,6 +98,9 @@ ringbuf = "0.4"
 
 # Disk space monitoring: platform-specific APIs
 libc = "0.2"  # Unix: statvfs for disk space
+
+# Loom: Concurrency correctness testing (detects deadlocks and race conditions)
+loom = { version = "0.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }

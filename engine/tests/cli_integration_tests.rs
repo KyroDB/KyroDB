@@ -235,8 +235,32 @@ fn test_cli_prune_backups() -> Result<()> {
 
     let backup_manager = BackupManager::new(backup_dir.path(), data_dir.path())?;
 
+    // Create backups with timestamps spanning multiple days to test retention policy
+    // This ensures backups fall into different daily/weekly/monthly buckets
     for i in 0..10 {
-        backup_manager.create_full_backup(format!("Backup {}", i))?;
+        let metadata = backup_manager.create_full_backup(format!("Backup {}", i))?;
+        
+        // Adjust timestamps to simulate backups from different days
+        // i=0: today, i=1-2: yesterday, i=3-4: last week, i=5+: last month
+        let days_ago = match i {
+            0 => 0,      // today
+            1..=2 => 1,  // yesterday  
+            3..=4 => 7,  // last week
+            _ => 30,     // last month
+        };
+        let adjusted_timestamp = metadata.timestamp - (days_ago * 86400); // Subtract days
+        
+        // Update the metadata file with adjusted timestamp
+        let metadata_path = backup_dir.path().join(format!("backup_{}.json", metadata.id));
+        let mut metadata_content: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&metadata_path)?
+        )?;
+        metadata_content["timestamp"] = adjusted_timestamp.into();
+        
+        std::fs::write(metadata_path, serde_json::to_string_pretty(&metadata_content)?)?;
+        
+        // Small delay to ensure different IDs
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
     let output = Command::new(env!("CARGO_BIN_EXE_kyrodb_backup"))

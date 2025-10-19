@@ -80,7 +80,8 @@ struct ServerState {
     start_time: Instant,
     app_config: kyrodb_engine::config::KyroDbConfig,
     engine_config: TieredEngineConfig,
-    shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    #[allow(dead_code)] // Used in shutdown sequence, not via field access
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
     metrics: MetricsCollector,
 }
 
@@ -1015,12 +1016,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create metrics collector
     let metrics = MetricsCollector::new();
 
-    // Create shutdown channel for graceful shutdown
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Create shutdown broadcast channel for graceful shutdown
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(16);
 
     // Spawn background flush task with graceful shutdown
-    let flush_engine = engine_arc.clone();
-    let flush_metrics = metrics.clone();
+    let mut flush_shutdown_rx = shutdown_tx.subscribe();
+    let engine_for_flush = engine_arc.clone();
+    
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         info!("Background flush task started (60s interval)");
@@ -1028,28 +1030,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Acquire write lock only for flush operation
-                    let engine = flush_engine.write().await;
+                    let engine = engine_for_flush.write().await;
                     match engine.flush_hot_tier() {
                         Ok(count) if count > 0 => {
                             info!(docs_flushed = count, "Background flush completed");
-                            flush_metrics.record_flush();
                         }
-                        Ok(_) => {}  // No docs to flush
+                        Ok(_) => {}
                         Err(e) => {
                             error!(error = %e, "Background flush failed");
                         }
                     }
-                    // Lock released here
                 }
-                _ = shutdown_rx.recv() => {
+                _ = flush_shutdown_rx.recv() => {
                     info!("Background flush task shutting down gracefully");
-                    // Perform final flush before shutdown
-                    let engine = flush_engine.write().await;
+                    let engine = engine_for_flush.write().await;
                     if let Ok(count) = engine.flush_hot_tier() {
                         if count > 0 {
                             info!(docs_flushed = count, "Final flush completed on shutdown");
-                            flush_metrics.record_flush();
                         }
                     }
                     break;
@@ -1064,7 +1061,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         start_time: Instant::now(),
         app_config: config.clone(),
         engine_config: engine_config.clone(),
-        shutdown_tx,
+        shutdown_tx: shutdown_tx.clone(),
         metrics: metrics.clone(),
     });
 
@@ -1127,11 +1124,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("gRPC server listening on {}", grpc_addr);
     info!("Server ready to accept connections");
 
-    // Start gRPC server (blocking)
-    Server::builder()
-        .add_service(KyroDbServiceServer::new(grpc_service))
-        .serve(grpc_addr)
-        .await?;
+    // Setup signal handling for graceful shutdown
+    let shutdown_signal = async {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
 
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
+            },
+            _ = terminate => {
+                info!("Received SIGTERM, initiating graceful shutdown");
+            },
+        }
+    };
+
+    // Start gRPC server with graceful shutdown
+    let grpc_server = Server::builder()
+        .add_service(KyroDbServiceServer::new(grpc_service))
+        .serve_with_shutdown(grpc_addr, shutdown_signal);
+
+    // Wait for shutdown
+    let result = grpc_server.await;
+
+    // Broadcast shutdown to all background tasks
+    info!("Shutting down background tasks...");
+    let _ = shutdown_tx.send(());
+
+    // Give tasks time to stop gracefully
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    info!("KyroDB server stopped");
+
+    result?;
     Ok(())
 }

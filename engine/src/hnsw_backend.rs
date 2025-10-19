@@ -24,7 +24,6 @@ const DISK_SPACE_CRITICAL_THRESHOLD: f64 = 0.05;
 /// Disk space information
 #[derive(Debug, Clone)]
 struct DiskSpaceInfo {
-    total_bytes: u64,
     available_bytes: u64,
     available_percent: f64,
 }
@@ -64,7 +63,6 @@ fn check_disk_space(path: impl AsRef<Path>) -> Result<DiskSpaceInfo> {
         };
         
         Ok(DiskSpaceInfo {
-            total_bytes,
             available_bytes,
             available_percent,
         })
@@ -105,7 +103,6 @@ fn check_disk_space(path: impl AsRef<Path>) -> Result<DiskSpaceInfo> {
         };
         
         Ok(DiskSpaceInfo {
-            total_bytes,
             available_bytes,
             available_percent,
         })
@@ -179,12 +176,9 @@ pub struct HnswBackend {
 struct PersistenceState {
     data_dir: PathBuf,
     wal: Arc<RwLock<WalWriter>>,
-    fsync_policy: FsyncPolicy,
     inserts_since_snapshot: Arc<RwLock<usize>>,
-    snapshot_interval: usize, // Create snapshot every N inserts
-}
-
-impl HnswBackend {
+    snapshot_interval: usize,
+}impl HnswBackend {
     /// Create new HNSW backend from pre-loaded embeddings (no persistence)
     ///
     /// # Parameters
@@ -270,7 +264,6 @@ impl HnswBackend {
         let persistence = PersistenceState {
             data_dir,
             wal: Arc::new(RwLock::new(wal)),
-            fsync_policy,
             inserts_since_snapshot: Arc::new(RwLock::new(0)),
             snapshot_interval,
         };
@@ -442,7 +435,6 @@ impl HnswBackend {
         let persistence = PersistenceState {
             data_dir,
             wal: Arc::new(RwLock::new(wal)),
-            fsync_policy,
             inserts_since_snapshot: Arc::new(RwLock::new(0)),
             snapshot_interval,
         };
@@ -632,6 +624,27 @@ impl HnswBackend {
     /// **Performance**: <1ms P99 on 10M vectors (target)
     #[instrument(level = "trace", skip(self, query), fields(k, dim = query.len()))]
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        if query.is_empty() {
+            anyhow::bail!("query embedding cannot be empty");
+        }
+        
+        if k == 0 {
+            anyhow::bail!("k must be greater than 0");
+        }
+        
+        if k > 10_000 {
+            anyhow::bail!("k must be <= 10,000 (requested: {})", k);
+        }
+        
+        let backend_dim = self.dimension();
+        if backend_dim != 0 && query.len() != backend_dim {
+            anyhow::bail!(
+                "query dimension mismatch: expected {} found {}",
+                backend_dim,
+                query.len()
+            );
+        }
+
         let index = self.index.read();
         index.knn_search(query, k)
     }
@@ -832,7 +845,7 @@ mod tests {
 
         // Create backend with persistence
         let initial_embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        let mut backend = HnswBackend::with_persistence(
+        let backend = HnswBackend::with_persistence(
             initial_embeddings,
             100,
             data_dir,
@@ -891,7 +904,6 @@ mod tests {
         let info = check_disk_space(temp_dir.path()).unwrap();
         
         // Basic sanity checks
-        assert!(info.total_bytes > 0, "Total bytes should be > 0");
         assert!(info.available_bytes > 0, "Available bytes should be > 0");
         assert!(info.available_percent >= 0.0 && info.available_percent <= 1.0,
                 "Available percent should be in [0, 1]");

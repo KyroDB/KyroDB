@@ -412,7 +412,6 @@ enum WalErrorKind {
 /// WAL reader: iterate over entries with checksum validation
 pub struct WalReader {
     file: BufReader<File>,
-    path: PathBuf,
     valid_entries: usize,
     corrupted_entries: usize,
 }
@@ -421,9 +420,9 @@ impl WalReader {
     /// Open existing WAL file
     #[instrument(level = "debug", skip(path))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let path = path.as_ref();
 
-        let file = File::open(&path).context("Failed to open WAL file")?;
+        let file = File::open(path).context("Failed to open WAL file")?;
 
         let mut reader = BufReader::new(file);
 
@@ -444,7 +443,6 @@ impl WalReader {
 
         Ok(Self {
             file: reader,
-            path,
             valid_entries: 0,
             corrupted_entries: 0,
         })

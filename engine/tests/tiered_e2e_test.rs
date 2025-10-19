@@ -7,7 +7,6 @@
 
 use kyrodb_engine::*;
 use std::sync::Arc;
-use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]

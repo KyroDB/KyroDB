@@ -9,6 +9,8 @@ use kyrodb_engine::{
     AbTestSplitter, AccessEvent, AccessPatternLogger, AccessType, CacheStrategy, CachedVector,
     LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy,
 };
+use rand::distributions::Distribution;
+use rand_distr::Zipf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -179,15 +181,14 @@ fn test_lru_hit_rate_realistic_on_zipf() {
     // We have cache for 1000 docs, so we can't cache all hot docs
 
     let mut rng = rand::thread_rng();
-    use rand::distributions::Distribution;
-    let zipf = zipf::ZipfDistribution::new(corpus_size, 1.5).unwrap();
+    let zipf = Zipf::new(corpus_size as u64, 1.5).unwrap();
 
     // Run 10K queries
     let mut hits = 0;
     let mut misses = 0;
 
     for _ in 0..10_000 {
-        let doc_id = (zipf.sample(&mut rng) - 1) as u64; // Convert to 0-indexed
+        let doc_id = (zipf.sample(&mut rng) as u64).saturating_sub(1); // Convert to 0-indexed
 
         if let Some(_cached) = strategy.get_cached(doc_id) {
             hits += 1;
@@ -240,7 +241,7 @@ fn test_lru_hit_rate_realistic_on_zipf() {
 #[test]
 fn test_access_logger_enforces_capacity() {
     let capacity = 1000;
-    let mut logger = AccessPatternLogger::new(capacity);
+    let logger = AccessPatternLogger::new(capacity);
 
     // Log 2× capacity events
     for i in 0..2000 {
@@ -320,11 +321,10 @@ fn test_cache_memory_bounded() {
 
     // Simulate 100K queries with Zipf distribution
     let mut rng = rand::thread_rng();
-    use rand::distributions::Distribution;
-    let zipf = zipf::ZipfDistribution::new(10_000, 1.5).unwrap();
+    let zipf = Zipf::new(10_000, 1.5).unwrap();
 
     for _ in 0..100_000 {
-        let doc_id = (zipf.sample(&mut rng) - 1) as u64;
+        let doc_id = (zipf.sample(&mut rng) as u64).saturating_sub(1);
 
         if strategy.get_cached(doc_id).is_none() {
             strategy.insert_cached(create_test_vector(doc_id));
@@ -360,12 +360,11 @@ fn test_full_ab_validation_simulation() {
     let splitter = AbTestSplitter::new(lru.clone(), learned.clone());
 
     // Access logger for training
-    let mut logger = AccessPatternLogger::new(100_000);
+    let logger = AccessPatternLogger::new(100_000);
 
     // Simulate Zipf workload
     let mut rng = rand::thread_rng();
-    use rand::distributions::Distribution;
-    let zipf = zipf::ZipfDistribution::new(corpus_size, 1.5).unwrap();
+    let zipf = Zipf::new(corpus_size as u64, 1.5).unwrap();
 
     let mut lru_hits = 0u64;
     let mut lru_misses = 0u64;
@@ -374,7 +373,7 @@ fn test_full_ab_validation_simulation() {
 
     // Run 50K queries (with training every 10K)
     for i in 0..50_000 {
-        let doc_id = (zipf.sample(&mut rng) - 1) as u64;
+        let doc_id = (zipf.sample(&mut rng) as u64).saturating_sub(1);
 
         // Route to strategy
         let strategy = splitter.get_strategy(doc_id);

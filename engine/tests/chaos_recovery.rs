@@ -13,7 +13,6 @@ use kyrodb_engine::{
 };
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 

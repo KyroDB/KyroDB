@@ -244,7 +244,8 @@ async fn test_background_training_updates_predictor() {
         rmi_capacity: 100,
     };
 
-    let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None).await;
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+    let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
 
     // Wait for training cycle
     tokio::time::sleep(Duration::from_secs(2)).await;

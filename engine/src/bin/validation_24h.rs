@@ -26,15 +26,14 @@ use kyrodb_engine::{
     spawn_training_task, AbStatsPersister, AbTestSplitter, AccessPatternLogger, CacheStrategy,
     CachedVector, LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, TrainingConfig,
 };
-use rand::{distributions::Distribution, Rng, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rand_distr::Normal;
+use rand_distr::{Distribution, Normal, Zipf};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
-use zipf::ZipfDistribution;
 
 /// Validation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,16 +162,17 @@ struct ValidationResults {
 
 /// Zipf distribution sampler for hot/cold access patterns
 struct ZipfSampler {
-    dist: ZipfDistribution,
+    dist: Zipf<f64>,
 }
 
 impl ZipfSampler {
     fn new(corpus_size: usize, exponent: f64) -> Result<Self> {
-        let dist = ZipfDistribution::new(corpus_size, exponent).map_err(|_| {
+        let dist = Zipf::new(corpus_size as u64, exponent).map_err(|e| {
             anyhow::anyhow!(
-                "Failed to create Zipf distribution with corpus_size={}, exponent={}",
+                "Failed to create Zipf distribution with corpus_size={}, exponent={}: {}",
                 corpus_size,
-                exponent
+                exponent,
+                e
             )
         })?;
         Ok(Self { dist })
@@ -182,8 +182,7 @@ impl ZipfSampler {
     /// Lower IDs are more frequent (hot documents)
     fn sample(&self) -> u64 {
         let mut rng = rand::thread_rng();
-        // ZipfDistribution returns 1-indexed, convert to 0-indexed
-        (self.dist.sample(&mut rng) - 1) as u64
+        self.dist.sample(&mut rng) as u64
     }
 }
 
@@ -357,11 +356,15 @@ async fn main() -> Result<()> {
         rmi_capacity: config.cache_capacity,
     };
 
+    // Create shutdown channel (unused in validation, but required for API)
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
     let training_handle = spawn_training_task(
         access_logger.clone(),
         learned_strategy.clone(),
         training_config,
         None,
+        shutdown_rx,
     )
     .await;
 
@@ -524,7 +527,7 @@ async fn main() -> Result<()> {
 
         // Log access for training
         {
-            let mut logger = access_logger.write().await;
+            let logger = access_logger.write().await;
             logger.log_access(doc_id, &embedding);
         }
 

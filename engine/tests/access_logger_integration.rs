@@ -144,7 +144,7 @@ fn test_zipf_distribution_detection() {
 #[test]
 fn test_time_windowed_training() {
     // Verify that only recent events are used for training
-    let mut logger = AccessPatternLogger::with_flush_interval(100_000, Duration::from_secs(0));
+    let logger = AccessPatternLogger::with_flush_interval(100_000, Duration::from_secs(0));
     let _predictor = LearnedCachePredictor::new(1000).expect("Failed to create predictor");
 
     let embedding = vec![0.5; 128];
@@ -342,7 +342,7 @@ fn test_high_volume_integration() {
 #[test]
 fn test_logger_stats_integration() {
     // Verify stats tracking through integration
-    let mut logger = AccessPatternLogger::new(100_000);
+    let logger = AccessPatternLogger::new(100_000);
     let embedding = vec![0.5; 128];
 
     // Log some accesses

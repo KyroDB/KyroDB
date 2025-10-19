@@ -37,16 +37,15 @@ use kyrodb_engine::{
     training_task::{spawn_training_task, TrainingConfig},
     vector_cache::CachedVector,
 };
-use rand::{distributions::Distribution, Rng, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rand_distr::Normal;
+use rand_distr::{Distribution, Normal, Zipf};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::{fs, sync::RwLock};
-use zipf::ZipfDistribution;
 
 /// Enterprise validation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,17 +503,18 @@ impl TemporalWorkloadGenerator {
 
 /// Basic Zipf sampler (for baseline)
 struct ZipfSampler {
-    dist: ZipfDistribution,
+    dist: Zipf<f64>,
     rng: ChaCha8Rng,
 }
 
 impl ZipfSampler {
     fn new(corpus_size: usize, exponent: f64, seed: u64) -> Result<Self> {
-        let dist = ZipfDistribution::new(corpus_size, exponent).map_err(|_| {
+        let dist = Zipf::new(corpus_size as u64, exponent).map_err(|e| {
             anyhow::anyhow!(
-                "Failed to create Zipf distribution with corpus_size={}, exponent={}",
+                "Failed to create Zipf distribution with corpus_size={}, exponent={}: {}",
                 corpus_size,
-                exponent
+                exponent,
+                e
             )
         })?;
         Ok(Self {
@@ -524,7 +524,7 @@ impl ZipfSampler {
     }
 
     fn sample(&mut self) -> u64 {
-        (self.dist.sample(&mut self.rng) - 1) as u64
+        self.dist.sample(&mut self.rng) as u64
     }
 }
 
@@ -1127,11 +1127,15 @@ async fn main() -> Result<()> {
 
     let training_cycles = Arc::new(AtomicU64::new(0));
 
+    // Create shutdown channel (unused in validation, but required for API)
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+
     let training_handle = spawn_training_task(
         access_logger.clone(),
         learned_strategy.clone(),
         training_config,
         Some(training_cycles.clone()),
+        shutdown_rx,
     )
     .await;
 

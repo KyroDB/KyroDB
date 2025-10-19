@@ -432,7 +432,32 @@ impl TieredEngine {
     ///
     /// This searches the cold tier (HNSW) for approximate k-NN,
     /// then augments with hot tier results if needed.
+    ///
+    /// # Validation
+    /// - `query` dimension must match backend dimension
+    /// - `k` must be > 0 and <= 10,000 (reasonable upper bound)
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        if query.is_empty() {
+            anyhow::bail!("query embedding cannot be empty");
+        }
+        
+        if k == 0 {
+            anyhow::bail!("k must be greater than 0");
+        }
+        
+        if k > 10_000 {
+            anyhow::bail!("k must be <= 10,000 (requested: {})", k);
+        }
+        
+        let backend_dim = self.cold_tier.dimension();
+        if backend_dim != 0 && query.len() != backend_dim {
+            anyhow::bail!(
+                "query dimension mismatch: expected {} found {}",
+                backend_dim,
+                query.len()
+            );
+        }
+
         // Search cold tier (HNSW)
         let results = self.cold_tier.knn_search(query, k)?;
 
@@ -778,28 +803,58 @@ impl TieredEngine {
     /// Spawn background flush task
     ///
     /// Periodically checks if hot tier needs flushing and flushes to cold tier.
-    pub fn spawn_flush_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    ///
+    /// # Graceful Shutdown
+    /// Accepts a broadcast receiver for shutdown signal. When shutdown is signaled,
+    /// performs a final flush (if needed) and stops gracefully.
+    pub fn spawn_flush_task(
+        self: Arc<Self>,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
         let flush_interval = self.config.flush_interval;
 
         tokio::spawn(async move {
             let mut ticker = interval(flush_interval);
 
             loop {
-                ticker.tick().await;
-
-                if self.hot_tier.needs_flush() {
-                    match self.flush_hot_tier() {
-                        Ok(count) => {
-                            if count > 0 {
-                                println!(
-                                    "Background flush: {} documents moved to cold tier",
-                                    count
-                                );
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if self.hot_tier.needs_flush() {
+                            match self.flush_hot_tier() {
+                                Ok(count) => {
+                                    if count > 0 {
+                                        info!(
+                                            count,
+                                            "Background flush: documents moved to cold tier"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Background flush failed");
+                                }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("Background flush failed: {}", e);
+                    }
+                    _ = shutdown_rx.recv() => {
+                        info!("Flush task received shutdown signal, performing final flush");
+                        
+                        // Final flush before shutdown
+                        if self.hot_tier.needs_flush() {
+                            match self.flush_hot_tier() {
+                                Ok(count) => {
+                                    info!(
+                                        count,
+                                        "Final flush: documents moved to cold tier before shutdown"
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Final flush failed during shutdown");
+                                }
+                            }
                         }
+                        
+                        info!("Flush task stopped gracefully");
+                        break;
                     }
                 }
             }

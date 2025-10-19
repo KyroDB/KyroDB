@@ -158,7 +158,7 @@ fn test_frequency_only_strategy_without_semantic() {
 
 #[test]
 fn test_semantic_cache_admission_flow() {
-    let mut logger = AccessPatternLogger::new(10000);
+    let logger = AccessPatternLogger::new(10000);
     let mut predictor = LearnedCachePredictor::new(100).unwrap();
 
     // Simulate access pattern

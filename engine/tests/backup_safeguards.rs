@@ -4,8 +4,9 @@ use tempfile::TempDir;
 
 #[test]
 fn test_clear_directory_requires_confirmation() {
-    // Make sure BACKUP_ALLOW_CLEAR is not set
-    std::env::remove_var("BACKUP_ALLOW_CLEAR");
+    // Ensure BACKUP_ALLOW_CLEAR is not set to "true" - override it if necessary
+    // This handles the case where parallel tests might have set it
+    std::env::set_var("BACKUP_ALLOW_CLEAR", "false");
 
     let data_dir = TempDir::new().unwrap();
     let backup_dir = TempDir::new().unwrap();
@@ -38,6 +39,9 @@ fn test_clear_directory_requires_confirmation() {
         data_dir.path().join("test2.bin").exists(),
         "Files should not be deleted without confirmation"
     );
+
+    // Clean up
+    std::env::remove_var("BACKUP_ALLOW_CLEAR");
 }
 
 #[test]
@@ -69,7 +73,15 @@ fn test_clear_directory_with_explicit_allow() {
 
 #[test]
 fn test_clear_directory_environment_variable() {
-    // Clean up any previous state
+    // Clean up any previous state and use a guard to ensure cleanup even on panic
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("BACKUP_ALLOW_CLEAR");
+        }
+    }
+    let _guard = EnvGuard;
+    
     std::env::remove_var("BACKUP_ALLOW_CLEAR");
 
     let data_dir = TempDir::new().unwrap();
@@ -96,8 +108,7 @@ fn test_clear_directory_environment_variable() {
         "File should be deleted with env var"
     );
 
-    // Clean up
-    std::env::remove_var("BACKUP_ALLOW_CLEAR");
+    // Clean up happens automatically via Drop
 }
 
 #[test]

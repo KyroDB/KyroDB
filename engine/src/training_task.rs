@@ -53,6 +53,8 @@ impl Default for TrainingConfig {
 /// * `access_logger` - Shared access pattern logger (tracks query accesses)
 /// * `learned_strategy` - Shared Hybrid Semantic Cache strategy (will be updated with new predictor)
 /// * `config` - Training configuration (interval, window, capacity)
+/// * `cycle_counter` - Optional counter to track training cycles
+/// * `mut shutdown_rx` - Broadcast receiver for graceful shutdown signal
 ///
 /// # Returns
 /// JoinHandle for the background task (can be used to cancel or await completion)
@@ -62,19 +64,21 @@ impl Default for TrainingConfig {
 /// use kyrodb_engine::{AccessPatternLogger, LearnedCacheStrategy, LearnedCachePredictor, VectorCache};
 /// use kyrodb_engine::training_task::{spawn_training_task, TrainingConfig};
 /// use std::sync::Arc;
-/// use tokio::sync::RwLock;
+/// use tokio::sync::{RwLock, broadcast};
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     let logger = Arc::new(RwLock::new(AccessPatternLogger::new(100_000)));
 ///     let predictor = LearnedCachePredictor::new(10_000).unwrap();
 ///     let strategy = Arc::new(LearnedCacheStrategy::new(10_000, predictor));
+///     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 ///     
 ///     let config = TrainingConfig::default();
-///     let handle = spawn_training_task(logger, strategy, config, None).await;
+///     let handle = spawn_training_task(logger, strategy, config, None, shutdown_rx).await;
 ///     
 ///     // Task runs in background...
-///     handle.abort(); // Cancel when done
+///     shutdown_tx.send(()).unwrap(); // Signal shutdown
+///     handle.await.unwrap(); // Wait for graceful termination
 /// }
 /// ```
 pub async fn spawn_training_task(
@@ -82,39 +86,48 @@ pub async fn spawn_training_task(
     learned_strategy: Arc<LearnedCacheStrategy>,
     config: TrainingConfig,
     cycle_counter: Option<Arc<AtomicU64>>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.interval);
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Fetch recent access events
+                    let events = {
+                        let logger = access_logger.read().await;
+                        logger.get_recent_window(config.window_duration)
+                    };
 
-            // Fetch recent access events
-            let events = {
-                let logger = access_logger.read().await;
-                logger.get_recent_window(config.window_duration)
-            };
+                    // Skip training if insufficient data
+                    if events.len() < config.min_events_for_training {
+                        continue;
+                    }
 
-            // Skip training if insufficient data
-            if events.len() < config.min_events_for_training {
-                continue;
-            }
+                    // Train new predictor
+                    match train_predictor(&events, config.rmi_capacity) {
+                        Ok(new_predictor) => {
+                            // Update learned strategy atomically
+                            learned_strategy.update_predictor(new_predictor);
 
-            // Train new predictor
-            match train_predictor(&events, config.rmi_capacity) {
-                Ok(new_predictor) => {
-                    // Update learned strategy atomically
-                    learned_strategy.update_predictor(new_predictor);
-
-                    if let Some(counter) = &cycle_counter {
-                        counter.fetch_add(1, Ordering::Relaxed);
+                            if let Some(counter) = &cycle_counter {
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Training task error: {}", e);
+                        }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Training task error: {}", e);
+                _ = shutdown_rx.recv() => {
+                    info!("Training task received shutdown signal, stopping gracefully");
+                    break;
                 }
             }
         }
+
+        info!("Training task stopped");
     })
 }
 
@@ -196,7 +209,10 @@ impl TrainingTaskSupervisor {
     /// restarts with exponential backoff (1s, 2s, 4s, 8s, 16s max).
     ///
     /// Returns a JoinHandle for the supervisor task (not the training task itself).
-    pub async fn supervise(self) -> JoinHandle<()> {
+    pub async fn supervise(
+        self,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut restart_count = 0;
 
@@ -207,68 +223,79 @@ impl TrainingTaskSupervisor {
                     "starting training task"
                 );
 
+                // Create a new shutdown receiver for this training task instance
+                let task_shutdown_rx = shutdown_rx.resubscribe();
+
                 // Spawn training task
                 let handle = spawn_training_task(
                     self.access_logger.clone(),
                     self.learned_strategy.clone(),
                     self.config.clone(),
                     None,
+                    task_shutdown_rx,
                 )
                 .await;
 
-                // Wait for task to complete (should never return unless crash/abort)
-                match handle.await {
-                    Ok(()) => {
-                        // Normal completion (should not happen - training runs forever)
-                        warn!("training task completed normally (unexpected)");
-                        break;
+                tokio::select! {
+                    result = handle => {
+                        match result {
+                            Ok(()) => {
+                                // Normal completion (shutdown signal received)
+                                info!("training task completed normally (shutdown)");
+                                break;
+                            }
+                            Err(e) => {
+                                // Task panicked or was aborted
+                                if e.is_panic() {
+                                    error!(
+                                        error = %e,
+                                        restart_count,
+                                        "training task panicked"
+                                    );
+                                    self.metrics.record_training_crash();
+                                } else if e.is_cancelled() {
+                                    info!("training task cancelled - stopping supervisor");
+                                    break;
+                                } else {
+                                    error!(
+                                        error = %e,
+                                        restart_count,
+                                        "training task failed"
+                                    );
+                                    self.metrics.record_training_crash();
+                                }
+
+                                // Check restart limit
+                                if restart_count >= self.max_restarts {
+                                    error!(
+                                        restart_count,
+                                        max_restarts = self.max_restarts,
+                                        "training task restart limit reached - stopping supervisor"
+                                    );
+                                    break;
+                                }
+
+                                // Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped)
+                                let delay_secs = 2u64
+                                    .checked_pow(restart_count as u32)
+                                    .and_then(|exp| self.base_delay_secs.checked_mul(exp))
+                                    .map(|delay| std::cmp::min(delay, 16))
+                                    .unwrap_or(16); // Fallback to cap on overflow
+                                warn!(
+                                    delay_secs,
+                                    restart_count,
+                                    "restarting training task after delay"
+                                );
+                                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+                                restart_count += 1;
+                                self.metrics.record_training_restart();
+                            }
+                        }
                     }
-                    Err(e) => {
-                        // Task panicked or was aborted
-                        if e.is_panic() {
-                            error!(
-                                error = %e,
-                                restart_count,
-                                "training task panicked"
-                            );
-                            self.metrics.record_training_crash();
-                        } else if e.is_cancelled() {
-                            info!("training task cancelled - stopping supervisor");
-                            break;
-                        } else {
-                            error!(
-                                error = %e,
-                                restart_count,
-                                "training task failed"
-                            );
-                            self.metrics.record_training_crash();
-                        }
-
-                        // Check restart limit
-                        if restart_count >= self.max_restarts {
-                            error!(
-                                restart_count,
-                                max_restarts = self.max_restarts,
-                                "training task restart limit reached - stopping supervisor"
-                            );
-                            break;
-                        }
-
-                        // Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped)
-                        let delay_secs = 2u64
-                            .checked_pow(restart_count as u32)
-                            .and_then(|exp| self.base_delay_secs.checked_mul(exp))
-                            .map(|delay| std::cmp::min(delay, 16))
-                            .unwrap_or(16); // Fallback to cap on overflow
-                        warn!(
-                            delay_secs,
-                            restart_count,
-                            "restarting training task after delay"
-                        );
-                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-
-                        restart_count += 1;
-                        self.metrics.record_training_restart();
+                    _ = shutdown_rx.recv() => {
+                        info!("training supervisor received shutdown signal");
+                        break;
                     }
                 }
             }
@@ -289,7 +316,7 @@ mod tests {
         // Create logger with some access events
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {
-            let mut log = logger.write().await;
+            let log = logger.write().await;
             for i in 0..200 {
                 let embedding = vec![i as f32; 128];
                 log.log_access(i % 10, &embedding); // 10 documents, 20 accesses each
@@ -308,7 +335,8 @@ mod tests {
             rmi_capacity: 100,
         };
 
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None).await;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
 
         // Wait for multiple training cycles
         sleep(Duration::from_secs(3)).await;
@@ -324,7 +352,7 @@ mod tests {
         // Create logger with too few events
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {
-            let mut log = logger.write().await;
+            let log = logger.write().await;
             for i in 0..50 {
                 let embedding = vec![i as f32; 128];
                 log.log_access(i, &embedding);
@@ -343,7 +371,8 @@ mod tests {
             rmi_capacity: 100,
         };
 
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None).await;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -358,7 +387,7 @@ mod tests {
         // Create logger with valid events
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {
-            let mut log = logger.write().await;
+            let log = logger.write().await;
             for i in 0..200 {
                 let embedding = vec![i as f32; 128];
                 log.log_access(i % 10, &embedding);
@@ -377,7 +406,8 @@ mod tests {
             rmi_capacity: 100,
         };
 
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None).await;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -436,7 +466,8 @@ mod tests {
         let strategy = Arc::new(LearnedCacheStrategy::new(100, predictor));
 
         let config = TrainingConfig::default();
-        let handle = spawn_training_task(logger, strategy, config, None).await;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = spawn_training_task(logger, strategy, config, None, shutdown_rx).await;
 
         // Task should be cancellable
         handle.abort();
@@ -457,7 +488,7 @@ mod tests {
         // Create logger with sufficient data
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {
-            let mut log = logger.write().await;
+            let log = logger.write().await;
             for i in 0..200 {
                 let embedding = vec![i as f32; 128];
                 log.log_access(i % 10, &embedding);
@@ -487,7 +518,8 @@ mod tests {
             0, // 0s base delay for fast testing
         );
 
-        let handle = supervisor.supervise().await;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = supervisor.supervise(shutdown_rx).await;
 
         // Give time for training task to start
         sleep(Duration::from_millis(200)).await;

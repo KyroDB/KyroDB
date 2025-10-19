@@ -139,6 +139,8 @@ fn test_hnsw_results_ordered() {
         vec![1.0, 0.0, 0.0, 0.0],
         vec![0.5, 0.5, 0.0, 0.0],
         vec![0.0, 1.0, 0.0, 0.0],
+        vec![0.0, 0.0, 1.0, 0.0], // Add a 4th vector to ensure we get multiple results
+        vec![0.0, 0.0, 0.0, 1.0], // Add a 5th vector
     ];
 
     for (id, vec) in vectors.iter().enumerate() {
@@ -148,8 +150,9 @@ fn test_hnsw_results_ordered() {
     let query = vec![0.9, 0.1, 0.0, 0.0];
     let results = index.knn_search(&query, 3).unwrap();
 
-    // Should be ordered: [1.0, 0, 0, 0], [0.5, 0.5, 0, 0], [0, 1.0, 0, 0]
-    assert_eq!(results[0].doc_id, 0); // Closest
+    // Should return at least 3 results, ordered by distance
+    assert!(results.len() >= 3, "Expected at least 3 results, got {}", results.len());
+    assert_eq!(results[0].doc_id, 0); // Closest should be vector 0
     assert!(results[0].distance < results[1].distance);
     assert!(results[1].distance < results[2].distance);
 }
