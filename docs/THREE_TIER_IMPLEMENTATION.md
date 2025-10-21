@@ -1,10 +1,6 @@
-# Three-Tier Architecture Implementation - Complete
+# Three-Tier Architecture
 
-## Executive Summary
-
-The complete three-tier vector database architecture has been implemented and validated end-to-end. All three layers (Cache → Hot Tier → HNSW) are working together with persistence, A/B testing, and comprehensive test coverage.
-
-## Architecture Overview
+## Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -158,19 +154,7 @@ pub struct TieredEngineConfig {
 }
 ```
 
-## Testing Coverage
-
-### Unit Tests (4 tests, all passing)
-- ✅ `test_tiered_engine_query_path`: L1→L2→L3 fallback logic
-- ✅ `test_tiered_engine_insert_and_query`: Insert to hot tier, query path
-- ✅ `test_tiered_engine_flush`: Hot tier flush to cold tier
-- ✅ `test_tiered_engine_with_persistence`: WAL + snapshot recovery
-
-### End-to-End Integration Tests (4 tests, all passing)
-- ✅ `test_three_tier_query_journey`: Complete query flow through all layers
-- ✅ `test_persistence_across_all_tiers`: Write → recover → verify
-- ✅ `test_concurrent_tier_access`: Concurrent queries + inserts + k-NN
-- ✅ `test_query_path_layering`: Validate cache/hot/cold tier hit metrics
+---
 
 ## Performance Characteristics
 
@@ -193,7 +177,9 @@ pub struct TieredEngineConfig {
 - **Hot Tier**: 1000 docs × 384 dims × 4 bytes = ~1.5MB
 - **Cold Tier**: 10M docs × 384 dims × 4 bytes = ~15GB
 
-## Statistics & Monitoring
+---
+
+## Monitoring
 
 ### TieredEngineStats
 ```rust
@@ -215,6 +201,9 @@ pub struct TieredEngineStats {
     pub total_inserts: u64,
     pub overall_hit_rate: f64,
 }
+```
+
+Access via `/stats` endpoint or `TieredEngine::stats()` method.
 ```
 
 ## Files Modified/Created

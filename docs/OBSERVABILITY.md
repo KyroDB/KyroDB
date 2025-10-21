@@ -1,527 +1,385 @@
-# KyroDB Operational Observability System
+# Observability Guide
 
-**Status**: ✅ PRODUCTION-READY (Phase 0 Complete)
+Monitor KyroDB in production with Prometheus metrics and health checks.
 
-This document describes KyroDB's comprehensive observability infrastructure for production deployments.
+## Quick Setup
 
-## Overview
-
-The observability system provides:
-- **Prometheus /metrics endpoint** - Comprehensive metrics for monitoring dashboards
-- **Health checks** - /health (liveness) and /ready (readiness) for Kubernetes/load balancers
-- **SLO monitoring** - Automated breach detection with configurable thresholds
-- **Structured logging** - JSON-formatted tracing for log aggregation (Datadog, Splunk, ELK)
-- **Zero-overhead design** - Atomic counters, no locks on hot paths
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    KyroDB Server                             │
-│                                                              │
-│  ┌─────────────────┐        ┌──────────────────┐           │
-│  │  gRPC Server    │        │  HTTP Observability│          │
-│  │  (Port 50051)   │        │  (Port 51051)      │          │
-│  │                 │        │                    │          │
-│  │  Insert/Search  │◄──────►│  MetricsCollector  │          │
-│  │  Flush/Health   │        │                    │          │
-│  └─────────────────┘        └──────────────────┘           │
-│         │                            │                       │
-│         │                            ▼                       │
-│         │                   ┌──────────────────┐            │
-│         └──────────────────►│  Structured      │            │
-│                             │  Logging         │            │
-│                             │  (tracing)       │            │
-│                             └──────────────────┘            │
-└─────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-                  ┌──────────────────────────────────┐
-                  │  Observability Stack             │
-                  │                                  │
-                  │  - Prometheus (metrics)          │
-                  │  - Grafana (dashboards)          │
-                  │  - PagerDuty (alerting)          │
-                  │  - Datadog/Splunk (logs)         │
-                  └──────────────────────────────────┘
-```
-
-## HTTP Endpoints
-
-### `/metrics` - Prometheus Metrics
-
-**Description**: Exports all metrics in Prometheus text format
-
-**URL**: `http://localhost:51051/metrics`
-
-**Method**: GET
-
-**Response Format**: Prometheus text format (text/plain)
-
-**Metrics Exposed**:
-
-#### Query Performance
-- `kyrodb_queries_total` - Total queries processed (counter)
-- `kyrodb_queries_failed` - Failed queries (counter)
-- `kyrodb_query_latency_ns{percentile="50|95|99"}` - Query latency percentiles in nanoseconds (gauge)
-
-#### Cache Performance
-- `kyrodb_cache_hits_total` - Cache hits (counter)
-- `kyrodb_cache_misses_total` - Cache misses (counter)
-- `kyrodb_cache_hit_rate` - Hit rate 0.0-1.0 (gauge)
-- `kyrodb_cache_evictions_total` - Cache evictions (counter)
-- `kyrodb_cache_size` - Current cache size (gauge)
-
-#### Learned Cache Metrics
-- `kyrodb_learned_cache_predictions_total` - Total predictions (counter)
-- `kyrodb_learned_cache_accuracy` - Prediction accuracy 0.0-1.0 (gauge)
-- `kyrodb_learned_cache_false_positives_total` - False positives (counter)
-- `kyrodb_learned_cache_false_negatives_total` - False negatives (counter)
-
-#### HNSW Performance
-- `kyrodb_hnsw_searches_total` - Total HNSW searches (counter)
-- `kyrodb_hnsw_latency_ns` - HNSW P99 latency in nanoseconds (gauge)
-
-#### Tier Performance
-- `kyrodb_tier_hits_total{tier="hot|cold"}` - Hits by tier (counter)
-
-#### Resource Metrics
-- `kyrodb_memory_used_bytes` - Memory usage (gauge)
-- `kyrodb_disk_used_bytes` - Disk usage (gauge)
-- `kyrodb_active_connections` - Active connections (gauge)
-
-#### Write Path
-- `kyrodb_inserts_total` - Total inserts (counter)
-- `kyrodb_inserts_failed` - Failed inserts (counter)
-- `kyrodb_hot_tier_flushes_total` - Hot tier flushes (counter)
-
-#### Error Tracking
-- `kyrodb_errors_total{category="validation|timeout|internal|resource_exhausted"}` - Errors by category (counter)
-
-#### Server State
-- `kyrodb_uptime_seconds` - Server uptime (counter)
-- `kyrodb_ready` - Readiness status 0=not ready, 1=ready (gauge)
-
-**Example**:
+**1. Start KyroDB (metrics enabled by default):**
 ```bash
-curl http://localhost:51051/metrics
-
-# HELP kyrodb_queries_total Total number of queries
-# TYPE kyrodb_queries_total counter
-kyrodb_queries_total 1234567
-
-# HELP kyrodb_cache_hit_rate Cache hit rate (0.0-1.0)
-# TYPE kyrodb_cache_hit_rate gauge
-kyrodb_cache_hit_rate 0.873000
-
-# HELP kyrodb_query_latency_ns Query latency percentiles in nanoseconds
-# TYPE kyrodb_query_latency_ns gauge
-kyrodb_query_latency_ns{percentile="50"} 123456
-kyrodb_query_latency_ns{percentile="95"} 567890
-kyrodb_query_latency_ns{percentile="99"} 891234
+./target/release/kyrodb_server
 ```
 
-### `/health` - Liveness Probe
+**2. Check metrics endpoint:**
+```bash
+curl http://localhost:51052/metrics
+```
 
-**Description**: Returns server health status for liveness checks
+**3. Add to Prometheus:**
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'kyrodb'
+    static_configs:
+      - targets: ['localhost:51052']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+```
 
-**URL**: `http://localhost:51051/health`
+**4. View in Grafana** (see dashboard queries below).
 
-**Method**: GET
+## Key Metrics
 
-**Response Format**: JSON
+### Query Performance
+```promql
+# Queries per second
+rate(kyrodb_queries_total[1m])
 
-**Status Codes**:
-- `200 OK` - Server is healthy or degraded but functional
-- `503 Service Unavailable` - Server is starting or unhealthy
+# P99 latency (milliseconds)
+kyrodb_query_latency_p99
 
-**Response Body**:
+# Error rate (percent)
+rate(kyrodb_queries_failed[5m]) / rate(kyrodb_queries_total[5m]) * 100
+```
+
+### Cache Performance
+```promql
+# Cache hit rate (percent)
+kyrodb_cache_hit_rate * 100
+
+# Cache evictions per minute
+rate(kyrodb_cache_evictions_total[1m])
+
+# Hybrid Semantic Cache prediction accuracy
+kyrodb_learned_cache_accuracy * 100
+```
+
+### Resource Usage
+```promql
+# Memory usage (MB)
+kyrodb_memory_used_bytes / 1024 / 1024
+
+# Disk usage (GB)
+kyrodb_disk_used_bytes / 1024 / 1024 / 1024
+
+# Active connections
+kyrodb_active_connections
+```
+
+---
+
+## Health Checks
+
+### Liveness Probe (K8s/Docker)
+
+Check if server is alive:
+```bash
+curl http://localhost:51052/health
+```
+
+**Response (healthy):**
+```json
+{"status": "healthy", "uptime_seconds": 3600}
+```
+
+**Response (unhealthy):**
 ```json
 {
-  "status": "healthy|starting|degraded|unhealthy",
-  "reason": "optional reason for degraded/unhealthy",
+  "status": "unhealthy",
+  "reason": "P99 latency 15ms exceeds 10ms SLO",
   "uptime_seconds": 3600
 }
 ```
 
-**Health Criteria**:
-- **Healthy**: All SLOs met, server ready
-- **Degraded**: Minor SLO violations but still operational
-- **Unhealthy**: Critical failures, should restart
-- **Starting**: Server initializing, not ready yet
-
-**Example**:
-```bash
-curl http://localhost:51051/health
-
-{
-  "status": "degraded",
-  "reason": "Cache hit rate 68.50% below SLO",
-  "uptime_seconds": 7200
-}
-```
-
-### `/ready` - Readiness Probe
-
-**Description**: Returns readiness status for load balancer/Kubernetes readiness checks
-
-**URL**: `http://localhost:51051/ready`
-
-**Method**: GET
-
-**Response Format**: JSON
-
-**Status Codes**:
-- `200 OK` - Server is ready to receive traffic
-- `503 Service Unavailable` - Server is not ready
-
-**Response Body**:
-```json
-{
-  "ready": true,
-  "status": "ready|not_ready"
-}
-```
-
-**Readiness Criteria**:
-- Server marked as ready (after initialization complete)
-- Health status is Healthy or Degraded (not Starting or Unhealthy)
-
-**Example**:
-```bash
-curl http://localhost:51051/ready
-
-{
-  "ready": true,
-  "status": "ready"
-}
-```
-
-### `/slo` - SLO Breach Status
-
-**Description**: Returns current SLO status for alerting systems
-
-**URL**: `http://localhost:51051/slo`
-
-**Method**: GET
-
-**Response Format**: JSON
-
-**Status Code**: 200 OK (always, check `slo_breaches` for alerts)
-
-**Response Body**:
-```json
-{
-  "slo_breaches": {
-    "p99_latency": false,
-    "cache_hit_rate": true,
-    "error_rate": false,
-    "availability": false
-  },
-  "current_metrics": {
-    "p99_latency_ns": 891234,
-    "cache_hit_rate": 0.685,
-    "error_rate": 0.0001,
-    "availability": 0.9998
-  },
-  "slo_thresholds": {
-    "p99_latency_ns": 1000000,
-    "min_cache_hit_rate": 0.70,
-    "max_error_rate": 0.001,
-    "min_availability": 0.999
-  }
-}
-```
-
-**SLO Definitions**:
-- **P99 Latency**: ≤ 1ms (1,000,000ns)
-- **Cache Hit Rate**: ≥ 70%
-- **Error Rate**: ≤ 0.1%
-- **Availability**: ≥ 99.9%
-
-**Example**:
-```bash
-curl http://localhost:51051/slo | jq '.slo_breaches'
-
-{
-  "p99_latency": false,
-  "cache_hit_rate": true,
-  "error_rate": false,
-  "availability": false
-}
-```
-
-## Structured Logging
-
-All logs are emitted in JSON format via `tracing` for easy ingestion into log aggregation systems.
-
-**Log Levels**:
-- `ERROR` - Critical failures, service degradation
-- `WARN` - Recoverable issues, performance warnings
-- `INFO` - Normal operational events (queries, flushes, etc.)
-- `DEBUG` - Detailed debugging information
-- `TRACE` - Extremely verbose, performance-sensitive paths
-
-**Configuration**:
-```bash
-# Set log level via environment variable
-export RUST_LOG=kyrodb_engine=info,kyrodb_server=info
-
-# Enable debug logging
-export RUST_LOG=kyrodb_engine=debug
-
-# JSON output (default)
-kyrodb_server
-```
-
-**Example Log Output**:
-```json
-{"timestamp":"2025-10-15T02:23:45.123Z","level":"INFO","target":"kyrodb_engine","fields":{"message":"Document inserted successfully","doc_id":12345,"latency_ns":123456}}
-{"timestamp":"2025-10-15T02:23:45.234Z","level":"INFO","target":"kyrodb_engine","fields":{"message":"Search completed successfully","k":10,"results_found":10,"latency_ns":234567}}
-{"timestamp":"2025-10-15T02:24:00.000Z","level":"INFO","target":"kyrodb_engine","fields":{"message":"Background flush completed","docs_flushed":1000}}
-```
-
-## Kubernetes Integration
-
-### Liveness Probe
+**K8s config:**
 ```yaml
 livenessProbe:
   httpGet:
     path: /health
-    port: 51051
+    port: 51052
   initialDelaySeconds: 10
   periodSeconds: 10
-  timeoutSeconds: 5
   failureThreshold: 3
 ```
 
-### Readiness Probe
+---
+
+### Readiness Probe (Load Balancer)
+
+Check if server should receive traffic:
+```bash
+curl http://localhost:51052/ready
+```
+
+**Response:**
+```json
+{"ready": true, "status": "ready"}
+```
+
+**K8s config:**
 ```yaml
 readinessProbe:
   httpGet:
     path: /ready
-    port: 51051
+    port: 51052
   initialDelaySeconds: 5
   periodSeconds: 5
-  timeoutSeconds: 3
   failureThreshold: 2
 ```
 
-### Service Monitor (Prometheus Operator)
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: kyrodb
-spec:
-  selector:
-    matchLabels:
-      app: kyrodb
-  endpoints:
-  - port: observability
-    path: /metrics
-    interval: 15s
+---
+
+### SLO Status
+
+Check SLO breach status:
+```bash
+curl http://localhost:51052/slo
 ```
 
-## Alerting Examples
+**Response:**
+```json
+{
+  "status": "ok",
+  "metrics": {
+    "p99_latency_ms": 2.5,
+    "cache_hit_rate": 0.85,
+    "error_rate_5m": 0.0001
+  },
+  "thresholds": {
+    "p99_latency_ms": 10.0,
+    "min_cache_hit_rate": 0.70,
+    "max_error_rate_5m": 0.001
+  },
+  "breaches": []
+}
+```
 
-### Prometheus Alerting Rules
+**SLO Targets:**
+- P99 latency: < 10ms
+- Cache hit rate: > 70%
+- Error rate: < 0.1%
+- Availability: > 99.9%
+
+---
+
+## Prometheus Alerts
+
+Create alerts for SLO breaches:
 
 ```yaml
+# alerts.yml
 groups:
-- name: kyrodb
+- name: kyrodb_slo
   rules:
-  # P99 Latency SLO Breach
+  # High latency
   - alert: KyroDBHighLatency
-    expr: kyrodb_query_latency_ns{percentile="99"} > 1000000
+    expr: kyrodb_query_latency_p99 > 10
     for: 5m
     labels:
       severity: warning
     annotations:
-      summary: "KyroDB P99 latency exceeds 1ms SLO"
-      description: "P99 latency is {{ $value }}ns (threshold: 1000000ns)"
+      summary: "P99 latency {{ $value }}ms exceeds 10ms SLO"
 
-  # Cache Hit Rate SLO Breach
-  - alert: KyroDBLowCacheHitRate
+  # Low cache hit rate
+  - alert: KyroDBLowCacheHit
     expr: kyrodb_cache_hit_rate < 0.70
     for: 10m
     labels:
       severity: warning
     annotations:
-      summary: "KyroDB cache hit rate below 70% SLO"
-      description: "Cache hit rate is {{ $value | humanizePercentage }} (threshold: 70%)"
+      summary: "Cache hit rate {{ $value | humanizePercentage }} below 70%"
 
-  # High Error Rate
-  - alert: KyroDBHighErrorRate
+  # High error rate
+  - alert: KyroDBHighErrors
     expr: rate(kyrodb_queries_failed[5m]) / rate(kyrodb_queries_total[5m]) > 0.001
     for: 5m
     labels:
       severity: critical
     annotations:
-      summary: "KyroDB error rate exceeds 0.1% SLO"
-      description: "Error rate is {{ $value | humanizePercentage }}"
+      summary: "Error rate {{ $value | humanizePercentage }} exceeds 0.1%"
 
-  # Low Availability
-  - alert: KyroDBLowAvailability
-    expr: (kyrodb_queries_total - kyrodb_queries_failed) / kyrodb_queries_total < 0.999
-    for: 10m
-    labels:
-      severity: critical
-    annotations:
-      summary: "KyroDB availability below 99.9% SLO"
-      description: "Availability is {{ $value | humanizePercentage }}"
-
-  # Server Not Ready
+  # Server not ready
   - alert: KyroDBNotReady
     expr: kyrodb_ready == 0
     for: 2m
     labels:
       severity: critical
     annotations:
-      summary: "KyroDB server not ready"
-      description: "Server has been in not-ready state for 2+ minutes"
+      summary: "Server not ready for 2+ minutes"
 ```
 
-### PagerDuty Integration
-
-Use Alertmanager with PagerDuty routing:
-
+**Connect to PagerDuty:**
 ```yaml
-route:
-  receiver: 'pagerduty'
-  group_by: ['alertname', 'cluster']
-  group_wait: 10s
-  group_interval: 10s
-  repeat_interval: 1h
-
+# alertmanager.yml
 receivers:
 - name: 'pagerduty'
   pagerduty_configs:
-  - service_key: '<YOUR_PAGERDUTY_SERVICE_KEY>'
+  - service_key: '<YOUR_KEY>'
     severity: '{{ .CommonLabels.severity }}'
 ```
 
+---
+
 ## Grafana Dashboard
 
-Example Grafana dashboard queries:
+**Import these panels:**
 
-### Query Performance
-```promql
-# QPS
-rate(kyrodb_queries_total[1m])
-
-# P50/P95/P99 Latency
-kyrodb_query_latency_ns{percentile="50"} / 1000000  # Convert to ms
-kyrodb_query_latency_ns{percentile="95"} / 1000000
-kyrodb_query_latency_ns{percentile="99"} / 1000000
-
-# Error Rate
-rate(kyrodb_queries_failed[5m]) / rate(kyrodb_queries_total[5m]) * 100
+### Query Performance Panel
+```json
+{
+  "title": "Query Performance",
+  "targets": [
+    {
+      "expr": "rate(kyrodb_queries_total[1m])",
+      "legendFormat": "QPS"
+    },
+    {
+      "expr": "kyrodb_query_latency_p99",
+      "legendFormat": "P99 Latency (ms)"
+    }
+  ]
+}
 ```
 
-### Cache Performance
-```promql
-# Cache Hit Rate
-kyrodb_cache_hit_rate * 100
-
-# Cache Eviction Rate
-rate(kyrodb_cache_evictions_total[1m])
-
-# Learned Cache Accuracy
-kyrodb_learned_cache_accuracy * 100
+### Cache Performance Panel
+```json
+{
+  "title": "Cache Performance",
+  "targets": [
+    {
+      "expr": "kyrodb_cache_hit_rate * 100",
+      "legendFormat": "Hit Rate %"
+    },
+    {
+      "expr": "kyrodb_learned_cache_accuracy * 100",
+      "legendFormat": "Prediction Accuracy %"
+    }
+  ]
+}
 ```
 
-### Resource Usage
-```promql
-# Memory Usage (MB)
-kyrodb_memory_used_bytes / 1024 / 1024
-
-# Disk Usage (GB)
-kyrodb_disk_used_bytes / 1024 / 1024 / 1024
-
-# Active Connections
-kyrodb_active_connections
+### Resource Usage Panel
+```json
+{
+  "title": "Resource Usage",
+  "targets": [
+    {
+      "expr": "kyrodb_memory_used_bytes / 1024 / 1024",
+      "legendFormat": "Memory (MB)"
+    },
+    {
+      "expr": "kyrodb_disk_used_bytes / 1024 / 1024 / 1024",
+      "legendFormat": "Disk (GB)"
+    }
+  ]
+}
 ```
-
-## Performance Impact
-
-The observability system is designed for **zero-overhead** in production:
-
-- **Atomic counters**: No locks, 1-2 CPU cycles per increment
-- **Lock-free latency recording**: Ring buffer with bounded memory
-- **Lazy histogram computation**: Percentiles computed only on /metrics requests
-- **Optional metrics**: Use `--features bench-no-metrics` to disable completely for benchmarking
-
-**Measured Overhead**:
-- Query latency: +17.6ns per query (0.0018% at 1ms baseline)
-- Insert latency: +10.2ns per insert
-- Memory: ~8KB baseline + 8 bytes per latency sample (max 1000 samples)
-
-## Troubleshooting
-
-### No Metrics Appearing
-
-**Symptom**: `/metrics` endpoint returns empty or minimal data
-
-**Solution**:
-1. Check that queries are being executed: `kyrodb_queries_total` should increment
-2. Verify metrics are not disabled: ensure `bench-no-metrics` feature is NOT enabled
-3. Check structured logging for errors: `RUST_LOG=kyrodb_engine=debug`
-
-### Health Check Failing
-
-**Symptom**: `/health` returns 503 or "unhealthy"
-
-**Solution**:
-1. Check SLO status: `curl http://localhost:51051/slo`
-2. Review structured logs for errors
-3. Verify cache is initialized: `kyrodb_cache_size > 0`
-4. Check for SLO breaches: P99 latency, cache hit rate, error rate
-
-### High Latency Reported
-
-**Symptom**: `kyrodb_query_latency_ns{percentile="99"}` is high
-
-**Solution**:
-1. Check HNSW search latency: `kyrodb_hnsw_latency_ns`
-2. Verify cache hit rate: Low hit rate forces cold HNSW searches
-3. Check for tier balance: `kyrodb_tier_hits_total{tier="hot"}` vs `cold`
-4. Review system resources: CPU, memory, disk I/O
-
-### Low Cache Hit Rate
-
-**Symptom**: `kyrodb_cache_hit_rate < 0.70`
-
-**Solution**:
-1. Check learned cache accuracy: `kyrodb_learned_cache_accuracy`
-2. Verify training is running: Check logs for "Training task started"
-3. Check cache size: `kyrodb_cache_size` should be non-zero
-4. Review workload: High percentage of cold/unique queries will lower hit rate
-
-## Production Checklist
-
-Before deploying to production, ensure:
-
-- [ ] `/metrics` endpoint accessible to Prometheus
-- [ ] `/health` and `/ready` configured in load balancer/Kubernetes
-- [ ] SLO alerts configured in PagerDuty/Alertmanager
-- [ ] Grafana dashboards created for ops team
-- [ ] Structured logging forwarded to Datadog/Splunk/ELK
-- [ ] Log retention policy configured (30-90 days)
-- [ ] Metrics retention policy configured (15-30 days)
-- [ ] On-call runbook includes metric interpretation
-- [ ] Baseline metrics captured during load testing
-
-## Future Enhancements (Phase 1+)
-
-- Distributed tracing (OpenTelemetry) for multi-node deployments
-- Custom alerting webhooks (Slack, Discord)
-- Historical SLO reporting (weekly/monthly summaries)
-- Anomaly detection for metrics (ML-based)
-- Cost metrics (queries per dollar, storage efficiency)
 
 ---
 
-**Status**: ✅ Production-Ready (Phase 0 Complete)
-**Last Updated**: October 15, 2025
-**Contact**: KyroDB Operations Team
+## Logging
+
+KyroDB logs in JSON format for easy parsing.
+
+**Enable logging:**
+```bash
+export RUST_LOG=kyrodb_engine=info
+./target/release/kyrodb_server
+```
+
+**Log levels:**
+- `error`: Critical failures
+- `warn`: Performance warnings
+- `info`: Normal operations (default)
+- `debug`: Detailed debugging
+- `trace`: Ultra-verbose (not for production)
+
+**Example logs:**
+```json
+{"timestamp":"2025-10-15T10:23:45Z","level":"INFO","message":"Query executed","latency_ms":2.5,"doc_id":"doc_123"}
+{"timestamp":"2025-10-15T10:23:46Z","level":"WARN","message":"Cache miss","doc_id":"doc_456"}
+{"timestamp":"2025-10-15T10:24:00Z","level":"INFO","message":"Flush completed","docs_flushed":1000}
+```
+
+**Forward to Datadog/Splunk:**
+```bash
+# Pipe JSON logs to log shipper
+./target/release/kyrodb_server 2>&1 | datadog-agent
+```
+
+---
+
+## Troubleshooting
+
+### No metrics showing
+
+**Symptom:** `/metrics` endpoint empty
+
+**Fix:**
+1. Check server is running: `curl http://localhost:51052/health`
+2. Verify metrics not disabled: ensure `bench-no-metrics` feature NOT enabled
+3. Send some queries to generate metrics
+4. Check logs: `RUST_LOG=kyrodb_engine=debug`
+
+### High P99 latency
+
+**Symptom:** `kyrodb_query_latency_p99 > 10ms`
+
+**Fix:**
+1. Check cache hit rate: `curl http://localhost:51052/metrics | grep cache_hit_rate`
+   - If < 70%: cache misses forcing slow HNSW searches
+2. Check HNSW latency: `grep hnsw_latency_p99`
+   - If high: HNSW index may need rebuild or disk is slow
+3. Check memory: `grep memory_used_bytes`
+   - If near limit: increase cache size in config
+4. Review query patterns: too many cold/unique queries?
+
+### Low cache hit rate
+
+**Symptom:** `kyrodb_cache_hit_rate < 0.70`
+
+**Fix:**
+1. Check prediction accuracy: `grep learned_cache_accuracy`
+   - If < 80%: cache predictor needs more training data
+2. Wait for training: Predictor trains every 10 minutes
+3. Check cache size: `grep cache_size`
+   - If 0: cache not initialized, check logs for errors
+4. Review workload: High % of unique queries will lower hit rate
+
+### Health check failing
+
+**Symptom:** `/health` returns 503
+
+**Fix:**
+1. Check SLO status: `curl http://localhost:51052/slo`
+2. Identify breached metric (latency/cache/errors)
+3. Follow fix for that metric above
+4. Restart if "unhealthy" state persists after fix
+
+---
+
+## Production Checklist
+
+Before going live:
+
+- [ ] Prometheus scraping `/metrics` every 15s
+- [ ] Grafana dashboard created and visible to ops team
+- [ ] PagerDuty alerts configured for SLO breaches
+- [ ] K8s liveness/readiness probes configured
+- [ ] Log forwarding to Datadog/Splunk enabled
+- [ ] Baseline metrics captured during load test
+- [ ] Runbook includes metric interpretation (see [Operations Guide](OPERATIONS.md))
+
+---
+
+## Performance Overhead
+
+Metrics collection is ultra-low overhead:
+
+- **Query latency**: +17.6ns per query (0.0018% at 1ms baseline)
+- **Insert latency**: +10.2ns per insert
+- **Memory**: ~8KB + 8 bytes per latency sample (max 1000)
+
+**Disable for benchmarking:**
+```bash
+cargo build --release --features bench-no-metrics
+```

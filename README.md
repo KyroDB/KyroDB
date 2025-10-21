@@ -36,14 +36,6 @@ Complete implementation of layered query routing:
 - **Layer 2 (Hot Tier)**: Recent writes buffer (HashMap), handles 1000-doc working set
 - **Layer 3 (Cold Tier)**: HNSW vector index with WAL and snapshot persistence, <1ms P99 search
 
-### Design Philosophy
-
-- **Performance-first**: Every line of code on the query path is optimized
-- **Zero allocations**: Arena allocators, pre-allocated buffers, SIMD everywhere
-- **Lock-free reads**: Atomic index swaps, zero contention
-- **Bounded operations**: No O(n) scans, no unpredictable latency
-- **Deep implementation**: Production-grade from day one, not MVP quality
-
 ## Current Performance
 
 | Component | Status | Result |
@@ -281,8 +273,33 @@ Based on validation with MS MARCO dataset (71,878 queries, 10K corpus):
 
 ## Documentation
 
-- [`docs/THREE_TIER_IMPLEMENTATION.md`](docs/THREE_TIER_IMPLEMENTATION.md) - Architecture details
-- [`docs/NDCG_IMPLEMENTATION.md`](docs/NDCG_IMPLEMENTATION.md) - Quality metrics
+### Getting Started
+- [`docs/QUICKSTART.md`](docs/QUICKSTART.md) - Quick start guide for running KyroDB
+- [`docs/README.md`](docs/README.md) - Documentation overview and navigation
+
+### Architecture & Design
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - System architecture and data flow
+- [`docs/THREE_TIER_IMPLEMENTATION.md`](docs/THREE_TIER_IMPLEMENTATION.md) - Three-tier architecture details (Cache → Hot Tier → HNSW)
+
+### Operations & Management
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) - Operational procedures and troubleshooting
+- [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) - Monitoring, metrics, and alerting
+- [`docs/CONFIGURATION_MANAGEMENT.md`](docs/CONFIGURATION_MANAGEMENT.md) - Configuration options and deployment settings
+- [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md) - API key authentication and multi-tenancy
+
+### API & Development
+- [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) - Complete API documentation and examples
+
+### Backup & Recovery
+- [`docs/BACKUP_AND_RECOVERY.md`](docs/BACKUP_AND_RECOVERY.md) - Backup and restore procedures
+- [`docs/CLI_BACKUP_REFERENCE.md`](docs/CLI_BACKUP_REFERENCE.md) - Command-line backup tool reference
+
+### Quality & Metrics
+- [`docs/NDCG_IMPLEMENTATION.md`](docs/NDCG_IMPLEMENTATION.md) - Cache quality metrics and NDCG@10 guide
+
+### Advanced Topics
+- [`docs/CONCURRENCY.md`](docs/CONCURRENCY.md) - Lock ordering, atomicity guarantees, and thread safety
+
 
 ## Development
 ```bash

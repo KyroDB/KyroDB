@@ -51,8 +51,8 @@ kyrodb_backup --data-dir /var/lib/kyrodb \
 
 **Output:**
 ```
-⠁ Creating full backup...
-✓ Full backup created successfully
+Creating full backup...
+Full backup created successfully
 
 Backup ID: 550e8400-e29b-41d4-a716-446655440000
 Type: Full
@@ -128,13 +128,13 @@ kyrodb_backup --data-dir /var/lib/kyrodb \
 
 **Output:**
 ```
-⠁ Restoring from backup 550e8400...
-✓ Restore completed successfully
+Restoring from backup 550e8400...
+Restore completed successfully
 
 Database restored from backup 550e8400-e29b-41d4-a716-446655440000
 ```
 
-**⚠️  Warning:** Restore operation will overwrite existing data directory.
+**Warning:** Restore operation will overwrite existing data directory.
 
 ---
 
@@ -161,8 +161,8 @@ kyrodb_backup prune \
 
 **Output:**
 ```
-⠁ Evaluating backups for pruning...
-✓ Done
+Evaluating backups for pruning...
+Done
 
 Pruned 3 backup(s):
   - 6ba7b810-9dad-11d1-80b4-00c04fd430c8
@@ -186,8 +186,8 @@ kyrodb_backup verify 550e8400-e29b-41d4-a716-446655440000
 
 **Output:**
 ```
-⠁ Verifying backup integrity...
-✓ Backup verification successful
+Verifying backup integrity...
+Backup verification successful
 
 Backup 550e8400-e29b-41d4-a716-446655440000 is valid
 Size: 1048576 bytes
