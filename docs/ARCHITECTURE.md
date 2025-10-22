@@ -267,7 +267,7 @@ Expected accuracy: 80-95%
 │                                                               │
 │  ┌────────────────┐        ┌────────────────┐               │
 │  │  HTTP Server   │        │  gRPC Server   │               │
-│  │  (port 51052)  │        │  (port 50052)  │               │
+│  │  (port 51051)  │        │  (port 50051)  │               │
 │  └───────┬────────┘        └───────┬────────┘               │
 │          │                         │                          │
 │          └──────────┬──────────────┘                         │
@@ -384,10 +384,12 @@ Lookup: < 100ns (O(log n))
 **Key config parameters:**
 
 ```yaml
+```yaml
 # config.yaml
 server:
-  grpc_port: 50052
-  http_port: 51052
+  grpc_port: 50051
+  http_port: 51051
+```
   
 cache:
   strategy: "learned"  # or "lru"

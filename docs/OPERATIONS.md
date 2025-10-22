@@ -6,7 +6,7 @@ Common failure scenarios and how to fix them.
 
 ### Symptom
 ```bash
-curl http://localhost:51052/health
+curl http://localhost:51051/health
 # Returns: 503 Service Unavailable
 ```
 
@@ -30,7 +30,7 @@ tail -f /var/log/kyrodb/server.log
 
 **Step 3**: Check metrics
 ```bash
-curl -s http://localhost:51052/metrics | grep -E "error|breach|circuit"
+curl -s http://localhost:51051/metrics | grep -E "error|breach|circuit"
 
 # Key indicators:
 # - kyrodb_wal_circuit_breaker_state = 1 (open) → Disk I/O issue
@@ -63,7 +63,7 @@ dmesg | grep -i "i/o error" | tail -20
 
 # Circuit breaker auto-resets after 60 seconds
 # Wait and monitor:
-watch -n 5 'curl -s http://localhost:51052/metrics | grep circuit_breaker'
+watch -n 5 'curl -s http://localhost:51051/metrics | grep circuit_breaker'
 
 # If doesn't reset: restart server
 systemctl restart kyrodb
@@ -73,7 +73,7 @@ systemctl restart kyrodb
 
 ```bash
 # Check crash count
-curl -s http://localhost:51052/metrics | grep training_crashes
+curl -s http://localhost:51051/metrics | grep training_crashes
 
 # Restart training task (not whole server)
 kill -HUP $(pgrep kyrodb_server)
@@ -86,7 +86,7 @@ journalctl -f -u kyrodb | grep training
 
 ### Symptom
 ```bash
-curl -s http://localhost:51052/metrics | grep p99
+curl -s http://localhost:51051/metrics | grep p99
 # kyrodb_query_latency_p99 = 15.2  (>10ms threshold)
 ```
 
@@ -94,7 +94,7 @@ curl -s http://localhost:51052/metrics | grep p99
 
 **Which layer is slow?**
 ```bash
-curl -s http://localhost:51052/metrics | grep latency
+curl -s http://localhost:51051/metrics | grep latency
 
 # Compare:
 # - kyrodb_cache_latency_p99 (Layer 1)
@@ -108,7 +108,7 @@ curl -s http://localhost:51052/metrics | grep latency
 
 ```bash
 # Check cache hit rate
-curl -s http://localhost:51052/metrics | grep cache_hit_rate
+curl -s http://localhost:51051/metrics | grep cache_hit_rate
 
 # If <40%: Cache not trained yet or too small
 # Solution: Increase cache capacity
@@ -127,7 +127,7 @@ systemctl restart kyrodb
 
 ```bash
 # Check vector count
-curl -s http://localhost:51052/metrics | grep hnsw_vector_count
+curl -s http://localhost:51051/metrics | grep hnsw_vector_count
 
 # If >10M vectors: Index too large for RAM
 # Solution: Horizontal scaling (Phase 1 feature)
@@ -303,7 +303,7 @@ rm -rf /backups/*
 ### Symptom
 ```bash
 # Inserts taking >100ms
-curl -s http://localhost:51052/metrics | grep insert_latency
+curl -s http://localhost:51051/metrics | grep insert_latency
 # kyrodb_insert_latency_p99 = 150.5
 ```
 
@@ -311,7 +311,7 @@ curl -s http://localhost:51052/metrics | grep insert_latency
 
 ```bash
 # Check WAL fsync policy
-curl -s http://localhost:51052/metrics | grep fsync
+curl -s http://localhost:51051/metrics | grep fsync
 
 # If fsync policy = "DataOnly" or "DataAndManifest":
 # Every write waits for disk sync (slow but safe)
@@ -345,7 +345,7 @@ systemctl start kyrodb
 
 ### Symptom
 ```bash
-curl -s http://localhost:51052/metrics | grep circuit_breaker
+curl -s http://localhost:51051/metrics | grep circuit_breaker
 # kyrodb_wal_circuit_breaker_state = 1 (open)
 # Stays open >5 minutes
 ```
@@ -368,7 +368,7 @@ chown -R kyrodb:kyrodb /var/lib/kyrodb/data
 smartctl -H /dev/sdX
 
 # Manual circuit breaker reset (force close)
-curl -X POST http://localhost:51052/admin/circuit-breaker/reset
+curl -X POST http://localhost:51051/admin/circuit-breaker/reset
 ```
 
 ## Training Task Crash Loop
@@ -385,7 +385,7 @@ curl -X POST http://localhost:51052/admin/circuit-breaker/reset
 
 ```bash
 # Check training metrics
-curl -s http://localhost:51052/metrics | grep training
+curl -s http://localhost:51051/metrics | grep training
 
 # kyrodb_training_crashes_total increasing
 # kyrodb_training_restarts_total >5 in 5 minutes
@@ -456,7 +456,7 @@ Server Unhealthy?
 Daily checks:
 ```bash
 # 1. Health status
-curl http://localhost:51052/health
+curl http://localhost:51051/health
 
 # 2. Recent errors
 journalctl -u kyrodb --since "1 hour ago" | grep -i error
@@ -468,7 +468,7 @@ kyrodb_backup list --backup-dir /backups | head -1
 df -h /var/lib/kyrodb
 
 # 5. Performance metrics
-curl -s http://localhost:51052/metrics | grep -E "p99|hit_rate|error"
+curl -s http://localhost:51051/metrics | grep -E "p99|hit_rate|error"
 ```
 
 Weekly checks:
@@ -498,7 +498,7 @@ ps aux | grep kyrodb_server | awk '{print $6}'  # RSS memory
 ## Getting Help
 
 1. **Check logs**: `/var/log/kyrodb/server.log`
-2. **Check metrics**: `curl http://localhost:51052/metrics`
+2. **Check metrics**: `curl http://localhost:51051/metrics`
 3. **Review this guide**: Common issues covered above
 4. **GitHub Issues**: Report bugs with full logs
 5. **Emergency**: Restore from last known good backup

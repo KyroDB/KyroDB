@@ -25,64 +25,59 @@ ls target/release/kyrodb_*
 ## 2. Start the Server
 
 ```bash
-# Start with default settings (port 50052)
+# Start with default settings (port 50051)
 ./target/release/kyrodb_server
 
 # Or specify custom port and data directory
 ./target/release/kyrodb_server \
-  --port 50052 \
+  --port 50051 \
   --data-dir ./data
 ```
 
 **Server starts in seconds**. You should see:
 ```
-KyroDB server listening on 127.0.0.1:50052
-HTTP observability on http://127.0.0.1:51052
+KyroDB server listening on 127.0.0.1:50051
+HTTP observability on http://127.0.0.1:51051
 ```
 
 ## 3. Insert Your First Vector
 
+KyroDB uses **gRPC** for vector operations. Use the load tester tool to interact with the server:
+
 ```bash
-# Using curl (HTTP API)
-curl -X POST http://127.0.0.1:51052/v1/insert \
-  -H "Content-Type: application/json" \
-  -d '{
-    "doc_id": "doc_1",
-    "embedding": [0.1, 0.2, 0.3, 0.4]
-  }'
+# The load_tester tool includes commands for vector operations
+./target/release/kyrodb_load_tester --help
 ```
 
-**Response**: `{"status": "ok"}`
+Or use a gRPC client library (Python, Go, Node.js, etc.) to call the gRPC service.
+
+**Example**: Insert a vector using the HTTP observability endpoints (read-only):
+
+```bash
+# Note: HTTP endpoints are for observability only, not vector operations
+# Vector operations must use gRPC
+
+# Check server health
+curl http://127.0.0.1:51051/health
+```
 
 ## 4. Search for Similar Vectors
 
-```bash
-# Find 5 nearest neighbors
-curl -X POST http://127.0.0.1:51052/v1/search \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query_embedding": [0.1, 0.2, 0.3, 0.4],
-    "k": 5
-  }'
-```
+Vector search operations use gRPC. Refer to the gRPC service definition for API details.
 
-**Response**:
-```json
-{
-  "results": [
-    {"doc_id": "doc_1", "score": 1.0}
-  ]
-}
+```bash
+# See gRPC proto definition for search API
+cat engine/proto/kyrodb.proto | grep -A 20 "rpc Search"
 ```
 
 ## 5. Check System Health
 
 ```bash
 # Health check
-curl http://127.0.0.1:51052/health
+curl http://127.0.0.1:51051/health
 
 # Metrics (Prometheus format)
-curl http://127.0.0.1:51052/metrics
+curl http://127.0.0.1:51051/metrics
 ```
 
 ## What's Next?
@@ -107,15 +102,25 @@ See [Configuration Guide](CONFIGURATION_MANAGEMENT.md) for all options.
 ### Set Up Backups
 
 ```bash
-# Create full backup
-./target/release/kyrodb_backup create-full \
+# Create full backup (default behavior without --incremental flag)
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  create \
   --description "My first backup"
 
-# List backups
-./target/release/kyrodb_backup list \
-  --backup-dir ./backups
+# List all backups
+./target/release/kyrodb_backup \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  list
+
+# Restore from a backup (requires backup ID from list command)
+./target/release/kyrodb_backup \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  restore \
+  --backup-id <BACKUP_ID>
 ```
 
 See [Backup Guide](BACKUP_AND_RECOVERY.md) for backup strategies.
@@ -124,7 +129,7 @@ See [Backup Guide](BACKUP_AND_RECOVERY.md) for backup strategies.
 
 ```bash
 # View real-time metrics
-watch -n 2 'curl -s http://127.0.0.1:51052/metrics | grep kyrodb_'
+watch -n 2 'curl -s http://127.0.0.1:51051/metrics | grep kyrodb_'
 
 # Key metrics to watch:
 # - kyrodb_cache_hit_rate: Should be >40%

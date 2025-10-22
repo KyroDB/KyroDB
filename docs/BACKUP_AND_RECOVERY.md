@@ -13,21 +13,38 @@ KyroDB provides:
 ## Quick Reference
 
 ```bash
-# Create full backup
-kyrodb_backup create-full --data-dir ./data --backup-dir ./backups
+# Create full backup (default)
+kyrodb_backup create \
+  --description "Daily backup"
 
 # Create incremental backup
-kyrodb_backup create-incremental --parent-id <backup_id> --data-dir ./data
+kyrodb_backup create \
+  --incremental \
+  --reference <PARENT_BACKUP_ID> \
+  --description "Hourly incremental"
 
 # List all backups
-kyrodb_backup list --backup-dir ./backups
+kyrodb_backup list
+
+# List backups in JSON format
+kyrodb_backup list --format json
 
 # Restore from backup
-kyrodb_backup restore --backup-id <id> --data-dir ./data --allow-clear
+kyrodb_backup restore --backup-id <BACKUP_ID>
+
+# Restore to specific point in time
+kyrodb_backup restore --point-in-time <UNIX_TIMESTAMP>
 
 # Verify backup integrity
-kyrodb_backup verify --backup-id <id> --backup-dir ./backups
+kyrodb_backup verify <BACKUP_ID>
+
+# Prune old backups (keep 7 daily, 4 weekly, 6 monthly)
+kyrodb_backup prune
 ```
+
+**Note**: All backup commands use default directories:
+- Data: `./data` (override with `--data-dir`)
+- Backups: `./backups` (override with `--backup-dir`)
 
 ## Backup Types
 
@@ -36,15 +53,13 @@ kyrodb_backup verify --backup-id <id> --backup-dir ./backups
 Captures complete database state at a point in time.
 
 ```bash
-./target/release/kyrodb_backup create-full \
-  --data-dir /var/lib/kyrodb/data \
-  --backup-dir /backups \
+./target/release/kyrodb_backup create \
   --description "Daily backup $(date +%Y-%m-%d)"
 ```
 
 **Creates**:
-- `backup_<uuid>.tar` - All data files (vectors, snapshots, WAL)
-- `backup_<uuid>.json` - Metadata (timestamp, size, checksum)
+- Snapshot of all vectors
+- Backup metadata and checksum
 
 **When to use**: Daily, before major upgrades, before risky operations.
 
@@ -54,19 +69,14 @@ Captures only changes since parent backup.
 
 ```bash
 # Get ID of last full backup
-PARENT_ID=$(kyrodb_backup list --backup-dir /backups --json | jq -r '.[0].id')
+PARENT_ID=$(./target/release/kyrodb_backup list --format json | jq -r '.[0].id')
 
 # Create incremental
-./target/release/kyrodb_backup create-incremental \
-  --parent-id $PARENT_ID \
-  --data-dir /var/lib/kyrodb/data \
-  --backup-dir /backups \
+./target/release/kyrodb_backup create \
+  --incremental \
+  --reference $PARENT_ID \
   --description "Hourly incremental"
 ```
-
-**Creates**:
-- Only new WAL files since parent backup
-- Much faster and smaller than full backup
 
 **When to use**: Hourly, between full backups, for continuous protection.
 
@@ -74,45 +84,35 @@ PARENT_ID=$(kyrodb_backup list --backup-dir /backups --json | jq -r '.[0].id')
 
 ```bash
 # Daily full backup at 2 AM
-0 2 * * * /usr/local/bin/kyrodb_backup create-full \
-  --data-dir /var/lib/kyrodb/data \
-  --backup-dir /backups/daily \
+0 2 * * * /usr/local/bin/kyrodb_backup create \
   --description "Daily-$(date +\%Y-\%m-\%d)"
 
 # Hourly incremental (during business hours)
-0 9-17 * * 1-5 /usr/local/bin/kyrodb_backup create-incremental \
-  --parent-id $(kyrodb_backup list --backup-dir /backups/daily --json | jq -r '.[0].id') \
-  --data-dir /var/lib/kyrodb/data \
-  --backup-dir /backups/hourly
+0 9-17 * * 1-5 /usr/local/bin/kyrodb_backup create \
+  --incremental \
+  --reference $(kyrodb_backup list --format json | jq -r '.[0].id') \
+  --description "Hourly-$(date +\%Y-\%m-\%d-\%H)"
 ```
 
 ## Recovery Scenarios
 
-### Scenario 1: Restore Latest Backup
+### Scenario 1: Restore from Specific Backup
 
 ```bash
 # 1. Stop server
 systemctl stop kyrodb
 
-# 2. Find latest backup
-kyrodb_backup list --backup-dir /backups | head -n 5
+# 2. List available backups
+./target/release/kyrodb_backup list
 
-# 3. Restore (with confirmation)
-kyrodb_backup restore \
-  --backup-id <latest_backup_id> \
-  --data-dir /var/lib/kyrodb/data \
-  --allow-clear
+# 3. Restore from backup ID
+./target/release/kyrodb_backup restore --backup-id <BACKUP_ID>
 
 # 4. Start server
 systemctl start kyrodb
-```
 
-**Dry run first** (recommended):
-```bash
-kyrodb_backup restore \
-  --backup-id <id> \
-  --data-dir /var/lib/kyrodb/data \
-  --dry-run
+# 5. Verify data restored
+curl http://localhost:51051/metrics | grep kyrodb_hnsw_vector_count
 ```
 
 ### Scenario 2: Point-in-Time Recovery
@@ -124,21 +124,20 @@ Restore database to exact moment (e.g., before bad data was written).
 # Example: October 20, 2025 14:30 UTC
 TARGET_TIME=$(date -d "2025-10-20 14:30:00 UTC" +%s)
 
-# 2. Restore to that time
-kyrodb_backup restore-pitr \
-  --timestamp $TARGET_TIME \
-  --data-dir /var/lib/kyrodb/data \
-  --backup-dir /backups \
-  --allow-clear
+# 2. Stop server
+systemctl stop kyrodb
 
-# 3. Verify data
-kyrodb_backup list --backup-dir /backups | grep $TARGET_TIME
+# 3. Restore to that time
+./target/release/kyrodb_backup restore --point-in-time $TARGET_TIME
+
+# 4. Start server
+systemctl start kyrodb
 ```
 
 **How it works**:
-1. Finds most recent full backup before target time
-2. Applies incremental backups up to target time
-3. Stops at exact timestamp (precision: 1 second)
+- Finds most recent backup before target time
+- Applies incremental changes up to timestamp
+- Precision: 1 second
 
 ### Scenario 3: Disaster Recovery
 
@@ -146,67 +145,76 @@ Complete data center failure. Restore from offsite backup.
 
 ```bash
 # 1. Download backups from S3/cloud storage
-aws s3 sync s3://kyrodb-backups /tmp/backups
+aws s3 sync s3://kyrodb-backups ./backups
 
 # 2. Restore on new server
-kyrodb_backup restore \
-  --backup-id <id> \
-  --data-dir /var/lib/kyrodb/data \
-  --allow-clear
+./target/release/kyrodb_backup \
+  --backup-dir ./backups \
+  restore --backup-id <ID>
 
 # 3. Verify restoration
-curl http://localhost:51052/health
-curl http://localhost:51052/metrics | grep kyrodb_hnsw_vector_count
+curl http://localhost:51051/health
 ```
 
 ## Backup Retention
 
 Keep backups organized and storage costs low.
 
-### Manual Pruning
+### Automatic Pruning
 
 ```bash
-# Delete backups older than 30 days
-kyrodb_backup prune \
-  --backup-dir /backups \
-  --older-than-days 30
+# Default policy (7 daily, 4 weekly, 6 monthly backups)
+./target/release/kyrodb_backup prune
+
+# Custom policy
+./target/release/kyrodb_backup prune \
+  --keep-daily 30 \
+  --keep-weekly 12 \
+  --keep-monthly 12 \
+  --min-age-days 7
 ```
 
 ### Automated Retention Policy
 
 ```bash
 # Keep:
-# - All hourly backups for 24 hours
-# - Daily backups for 7 days
-# - Weekly backups for 4 weeks
-# - Monthly backups for 12 months
+# - Hourly backups for 24 hours (keep_hourly)
+# - Daily backups for 7 days (keep_daily)
+# - Weekly backups for 4 weeks (keep_weekly)
+# - Monthly backups for 12 months (keep_monthly)
+# - Don't delete backups < 7 days old (min_age_days)
 
-kyrodb_backup prune \
-  --backup-dir /backups \
-  --hourly-hours 24 \
-  --daily-days 7 \
-  --weekly-weeks 4 \
-  --monthly-months 12
+./target/release/kyrodb_backup prune \
+  --keep-hourly 24 \
+  --keep-daily 7 \
+  --keep-weekly 4 \
+  --keep-monthly 12 \
+  --min-age-days 7
 ```
 
-**Retention script** (cron daily):
+**Automated retention script** (run daily via cron):
+
 ```bash
 #!/bin/bash
 # /usr/local/bin/kyrodb_backup_retention.sh
 
-BACKUP_DIR=/backups
+set -e
 
 # Apply retention policy
 /usr/local/bin/kyrodb_backup prune \
-  --backup-dir $BACKUP_DIR \
-  --hourly-hours 24 \
-  --daily-days 7 \
-  --weekly-weeks 4 \
-  --monthly-months 12 \
-  --min-age-days 1  # Never delete backups < 1 day old
+  --keep-daily 30 \
+  --keep-weekly 12 \
+  --keep-monthly 12 \
+  --min-age-days 1
 
 # Log result
-echo "$(date): Backup retention applied" >> /var/log/kyrodb/retention.log
+echo "$(date): Backup retention applied successfully" >> /var/log/kyrodb/retention.log
+```
+
+Add to crontab:
+```bash
+# Daily backup retention at 3 AM
+0 3 * * * /usr/local/bin/kyrodb_backup_retention.sh
 ```
 
 ## Backup Verification
@@ -216,33 +224,34 @@ echo "$(date): Backup retention applied" >> /var/log/kyrodb/retention.log
 ### Quick Verification
 
 ```bash
-# Verify metadata and checksum
-kyrodb_backup verify \
-  --backup-id <id> \
-  --backup-dir /backups
+# Verify backup integrity and checksum
+./target/release/kyrodb_backup verify <BACKUP_ID>
 ```
 
 ### Full Verification (Test Restore)
 
 ```bash
-# 1. Restore to temporary directory
+# 1. Create temporary directory
 TMP_DIR=$(mktemp -d)
 
-kyrodb_backup restore \
-  --backup-id <id> \
+# 2. Restore to temporary location
+./target/release/kyrodb_backup \
+  --backup-dir ./backups \
   --data-dir $TMP_DIR \
-  --allow-clear
+  restore --backup-id <BACKUP_ID>
 
-# 2. Start server on temporary data
-kyrodb_server --data-dir $TMP_DIR --port 50099 &
+# 3. Start server on temporary data (different port)
+./target/release/kyrodb_server \
+  --data-dir $TMP_DIR \
+  --port 50099 &
 SERVER_PID=$!
 
-# 3. Run smoke tests
-sleep 5
+# 4. Run smoke tests
+sleep 2
 curl http://localhost:51099/health
 curl http://localhost:51099/metrics | grep kyrodb_hnsw_vector_count
 
-# 4. Clean up
+# 5. Clean up
 kill $SERVER_PID
 rm -rf $TMP_DIR
 ```
@@ -338,7 +347,7 @@ kyrodb_backup sync-s3 \
 
 ```bash
 # View backup statistics
-curl http://localhost:51052/metrics | grep backup
+curl http://localhost:51051/metrics | grep backup
 
 # Key metrics:
 # - kyrodb_backup_total: Total backups created

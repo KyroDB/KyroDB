@@ -34,7 +34,7 @@ api_keys:
 **3. Use API key in requests:**
 ```bash
 curl -H "Authorization: Bearer kyro_acme_corp_..." \
-  http://localhost:51052/v1/insert
+  http://localhost:51051/v1/insert
 ```
 
 ---

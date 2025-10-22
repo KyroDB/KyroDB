@@ -1,33 +1,134 @@
 # API Reference
 
-Complete HTTP API documentation.
+KyroDB provides two interfaces:
 
-## Base URL
+1. **gRPC API** (primary) - Vector operations, high performance
+2. **HTTP API** (observability only) - Monitoring and health checks
+
+## gRPC API (Vector Operations)
+
+All vector operations use gRPC for performance and efficiency. 
+
+### Protocol Details
+
+- **Server**: `127.0.0.1:50051` (default, configurable via `--port`)
+- **Credentials**: TLS optional (disable in dev with environment: `KYRODB_GRPC_TLS=false`)
+- **Timeout**: 30 seconds (configurable per request)
+
+### Service Definition
+
+Complete service definitions are in `engine/proto/kyrodb.proto`.
+
+**KyroDBService** includes:
+
+**Write Operations**:
+- `Insert(InsertRequest) → InsertResponse` - Insert single vector
+- `BulkInsert(stream InsertRequest) → InsertResponse` - Bulk insert (streaming)
+- `Delete(DeleteRequest) → DeleteResponse` - Delete by ID
+
+**Read Operations**:
+- `Query(QueryRequest) → QueryResponse` - Point lookup by ID
+- `Search(SearchRequest) → SearchResponse` - k-NN search
+- `BulkSearch(stream SearchRequest) → stream SearchResponse` - Batch search
+
+**Admin**:
+- `Health(HealthRequest) → HealthResponse` - Health check
+- `Metrics(MetricsRequest) → MetricsResponse` - Metrics
+- `FlushHotTier(FlushRequest) → FlushResponse` - Force flush hot tier
+- `CreateSnapshot(SnapshotRequest) → SnapshotResponse` - Create backup snapshot
+- `GetConfig(ConfigRequest) → ConfigResponse` - Get server config
+
+### Message Types
+
+**InsertRequest**:
+```protobuf
+message InsertRequest {
+  uint64 doc_id = 1;                    // Document ID (non-zero)
+  repeated float embedding = 2;         // Vector (dimension from config)
+  map<string, string> metadata = 3;     // Optional metadata
+  string namespace = 4;                 // Optional namespace (multi-tenancy)
+}
+```
+
+**SearchRequest**:
+```protobuf
+message SearchRequest {
+  repeated float query_embedding = 1;   // Query vector
+  uint32 k = 2;                         // Top-k results (1-1000)
+  string namespace = 3;                 // Optional namespace filter
+}
+```
+
+### Example: Python Client
+
+```python
+import grpc
+from kyrodb_pb2 import InsertRequest, SearchRequest
+from kyrodb_pb2_grpc import KyroDBServiceStub
+
+# Connect to server
+channel = grpc.aio.secure_channel(
+    '127.0.0.1:50051',
+    grpc.aio.ssl_channel_credentials()
+)
+stub = KyroDBServiceStub(channel)
+
+# Insert a vector
+response = await stub.Insert(InsertRequest(
+    doc_id=1,
+    embedding=[0.1, 0.2, 0.3, 0.4]
+))
+print(f"Inserted: {response.doc_id}")
+
+# Search for similar vectors
+results = await stub.Search(SearchRequest(
+    query_embedding=[0.1, 0.2, 0.3, 0.4],
+    k=10
+))
+
+for result in results.results:
+    print(f"doc_id: {result.doc_id}, score: {result.score}")
+
+await channel.close()
+```
+
+### Example: Go Client
+
+```go
+package main
+
+import (
+    pb "github.com/kyrodb/kyrodb/engine/proto"
+    "google.golang.org/grpc"
+)
+
+func main() {
+    conn, _ := grpc.Dial("127.0.0.1:50051", grpc.WithInsecure())
+    defer conn.Close()
+    client := pb.NewKyroDBServiceClient(conn)
+
+    // Insert
+    resp, _ := client.Insert(context.Background(), &pb.InsertRequest{
+        DocId:     1,
+        Embedding: []float32{0.1, 0.2, 0.3, 0.4},
+    })
+    println("Inserted:", resp.DocId)
+}
+```
+
+## HTTP API (Observability Only)
+
+### Base URL
 
 ```
-http://localhost:51052
+http://localhost:51051
 ```
 
-Default HTTP port is `gRPC port + 1000` (e.g., gRPC on 50052 → HTTP on 51052).
+HTTP port is `gRPC port + 1000` (e.g., if gRPC is 50051, HTTP is 51051).
 
-## Authentication
+**Important**: HTTP API is for observability/monitoring only. **All vector operations must use gRPC**.
 
-Currently disabled by default. Enable in `config.yaml`:
-
-```yaml
-auth:
-  enabled: true
-  api_keys_file: /etc/kyrodb/api_keys.yaml
-```
-
-When enabled, include API key in requests:
-```bash
-curl -H "X-API-Key: kyrodb_your_api_key_here" http://localhost:51052/v1/insert
-```
-
-## Endpoints
-
-### Health & Monitoring
+### Endpoints
 
 #### GET /health
 
@@ -35,20 +136,12 @@ Check if server is healthy.
 
 **Request:**
 ```bash
-curl http://localhost:51052/health
+curl http://localhost:51051/health
 ```
 
 **Response (healthy):**
 ```json
 {"status": "healthy"}
-```
-
-**Response (unhealthy):**
-```json
-{
-  "status": "unhealthy",
-  "reason": "SLO breach: P99 latency 15.2ms > 10ms threshold"
-}
 ```
 
 **Status Codes:**
@@ -63,7 +156,7 @@ Check if server is ready to accept traffic (used by load balancers).
 
 **Request:**
 ```bash
-curl http://localhost:51052/ready
+curl http://localhost:51051/ready
 ```
 
 **Response:**
@@ -83,14 +176,14 @@ Prometheus-compatible metrics.
 
 **Request:**
 ```bash
-curl http://localhost:51052/metrics
+curl http://localhost:51051/metrics
 ```
 
 **Response (text/plain):**
 ```
-# HELP kyrodb_query_latency_p99 Query latency P99 in milliseconds
-# TYPE kyrodb_query_latency_p99 gauge
-kyrodb_query_latency_p99 2.5
+# HELP kyrodb_query_latency_p99_ms Query latency P99 in milliseconds
+# TYPE kyrodb_query_latency_p99_ms gauge
+kyrodb_query_latency_p99_ms 2.5
 
 # HELP kyrodb_cache_hit_rate Cache hit rate (0-1)
 # TYPE kyrodb_cache_hit_rate gauge
@@ -99,11 +192,9 @@ kyrodb_cache_hit_rate 0.451
 # HELP kyrodb_hnsw_vector_count Total vectors in HNSW index
 # TYPE kyrodb_hnsw_vector_count gauge
 kyrodb_hnsw_vector_count 10000
-
-...
 ```
 
-See [Observability Guide](OBSERVABILITY.md) for all metrics.
+See [Observability Guide](OBSERVABILITY.md) for complete metric reference.
 
 ---
 
@@ -113,7 +204,7 @@ Current SLO status and breach information.
 
 **Request:**
 ```bash
-curl http://localhost:51052/slo
+curl http://localhost:51051/slo
 ```
 
 **Response:**
@@ -122,245 +213,56 @@ curl http://localhost:51052/slo
   "status": "ok",
   "metrics": {
     "p99_latency_ms": 2.5,
-    "error_rate_5m": 0.001,
-    "cache_hit_rate": 0.451,
-    "availability_5m": 0.9998
+    "cache_hit_rate": 0.451
   },
   "thresholds": {
     "p99_latency_ms": 10.0,
-    "error_rate_5m": 0.01,
-    "cache_hit_rate": 0.40,
-    "availability_5m": 0.995
+    "cache_hit_rate": 0.40
   },
   "breaches": []
 }
 ```
 
-**Response (with breaches):**
-```json
-{
-  "status": "breach",
-  "breaches": [
-    {
-      "metric": "p99_latency_ms",
-      "current": 15.2,
-      "threshold": 10.0,
-      "since": "2025-10-20T14:30:00Z"
-    }
-  ]
-}
-```
-
 ---
 
-### Vector Operations
+## Authentication
 
-#### POST /v1/insert
+API key authentication is available (disabled by default).
 
-Insert a vector.
+### Enable in config.yaml
 
-**Request:**
-```bash
-curl -X POST http://localhost:51052/v1/insert \
-  -H "Content-Type: application/json" \
-  -d '{
-    "doc_id": "doc_123",
-    "embedding": [0.1, 0.2, 0.3, ...]
-  }'
+```yaml
+auth:
+  enabled: true
+  api_keys_file: /etc/kyrodb/api_keys.yaml
 ```
 
-**Request Body:**
-```json
-{
-  "doc_id": "string (required)",
-  "embedding": "array of f32 (required, must match configured dimension)"
-}
+### API Key Format
+
+File: `/etc/kyrodb/api_keys.yaml`
+
+```yaml
+api_keys:
+  - key: "kyrodb_prod_xyz123"
+    namespace: "production"
+    permissions: ["read", "write", "admin"]
+  - key: "kyrodb_read_only_abc456"
+    namespace: "staging"
+    permissions: ["read"]
 ```
 
-**Response (success):**
-```json
-{
-  "status": "ok",
-  "doc_id": "doc_123"
-}
+### Using with gRPC
+
+Include API key in metadata:
+
+```python
+metadata = [('authorization', f'Bearer kyrodb_prod_xyz123')]
+channel = grpc.aio.secure_channel('127.0.0.1:50051', credentials=...)
+stub = KyroDBServiceStub(channel)
+
+# Calls automatically include metadata
+response = await stub.Insert(request, metadata=metadata)
 ```
-
-**Response (error):**
-```json
-{
-  "error": "Embedding dimension mismatch: expected 768, got 384"
-}
-```
-
-**Status Codes:**
-- `200 OK`: Inserted successfully
-- `400 Bad Request`: Invalid input (wrong dimension, malformed JSON)
-- `500 Internal Server Error`: Server error (disk full, WAL failure)
-
----
-
-#### POST /v1/query
-
-Query a vector by ID.
-
-**Request:**
-```bash
-curl -X POST http://localhost:51052/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "doc_id": "doc_123"
-  }'
-```
-
-**Response (found):**
-```json
-{
-  "doc_id": "doc_123",
-  "embedding": [0.1, 0.2, 0.3, ...],
-  "found": true
-}
-```
-
-**Response (not found):**
-```json
-{
-  "doc_id": "doc_123",
-  "found": false
-}
-```
-
----
-
-#### POST /v1/search
-
-k-NN vector search.
-
-**Request:**
-```bash
-curl -X POST http://localhost:51052/v1/search \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query_embedding": [0.1, 0.2, 0.3, ...],
-    "k": 10
-  }'
-```
-
-**Request Body:**
-```json
-{
-  "query_embedding": "array of f32 (required)",
-  "k": "int (required, 1-1000)"
-}
-```
-
-**Response:**
-```json
-{
-  "results": [
-    {
-      "doc_id": "doc_123",
-      "score": 0.95,
-      "distance": 0.05
-    },
-    {
-      "doc_id": "doc_456",
-      "score": 0.87,
-      "distance": 0.13
-    }
-  ],
-  "query_time_ms": 2.5
-}
-```
-
-**Notes:**
-- Results ordered by similarity (highest score first)
-- `score`: Cosine similarity (1.0 = identical, 0 = orthogonal)
-- `distance`: Cosine distance (0 = identical, 2 = opposite)
-
----
-
-### Administrative
-
-#### POST /v1/flush
-
-Flush hot tier to cold tier (HNSW).
-
-**Request:**
-```bash
-curl -X POST http://localhost:51052/v1/flush \
-  -H "Content-Type: application/json" \
-  -d '{"force": true}'
-```
-
-**Request Body:**
-```json
-{
-  "force": "bool (optional, default: false)"
-}
-```
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "docs_flushed": 1523,
-  "duration_ms": 150.5
-}
-```
-
-**When to use:**
-- Before backup (ensures all data persisted)
-- Before shutdown (prevents data loss)
-- When hot tier size exceeds threshold
-
----
-
-#### POST /admin/circuit-breaker/reset
-
-Manually reset circuit breaker (dangerous).
-
-**Request:**
-```bash
-curl -X POST http://localhost:51052/admin/circuit-breaker/reset
-```
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "message": "Circuit breaker reset to CLOSED state"
-}
-```
-
-**WARNING**: Only use if you've fixed the root cause. Resetting without fixing will trigger immediate re-open.
-
----
-
-## Error Responses
-
-All errors follow this format:
-
-```json
-{
-  "error": "Human-readable error message",
-  "error_code": "DIMENSION_MISMATCH",
-  "details": {
-    "expected": 768,
-    "actual": 384
-  }
-}
-```
-
-**Common Error Codes:**
-
-| Code | Meaning | Fix |
-|------|---------|-----|
-| `DIMENSION_MISMATCH` | Embedding dimension wrong | Use correct dimension (check config) |
-| `INVALID_JSON` | Malformed JSON | Fix JSON syntax |
-| `DOC_NOT_FOUND` | Document doesn't exist | Check doc_id spelling |
-| `INTERNAL_ERROR` | Server error | Check logs, may need restart |
-| `CIRCUIT_BREAKER_OPEN` | WAL writes disabled | Wait 60s for auto-reset or fix disk issue |
-| `RATE_LIMIT_EXCEEDED` | Too many requests | Slow down request rate |
 
 ---
 
@@ -369,155 +271,48 @@ All errors follow this format:
 Configured in `config.yaml`:
 
 ```yaml
-rate_limiting:
+rate_limit:
   enabled: true
-  global_qps: 10000  # Max queries per second globally
-  per_connection_qps: 1000  # Max per client
+  max_qps_global: 10000
+  max_qps_per_client: 1000
 ```
 
-**When rate limited:**
-```json
-{
-  "error": "Rate limit exceeded",
-  "error_code": "RATE_LIMIT_EXCEEDED",
-  "retry_after_ms": 1000
-}
-```
-
-**Status Code:** `429 Too Many Requests`
+Rate limit errors return gRPC status code `RESOURCE_EXHAUSTED`.
 
 ---
 
-## Pagination
+## Configuration
 
-Search results are not paginated. Specify desired `k` value:
-
-```bash
-# Get top 100 results
-curl -X POST http://localhost:51052/v1/search \
-  -d '{"query_embedding": [...], "k": 100}'
-```
-
-**Maximum k**: 1000 (configurable in `config.yaml`)
+See [Configuration Management Guide](CONFIGURATION_MANAGEMENT.md) for:
+- Server port configuration
+- TLS certificate setup
+- Performance tuning parameters
+- Timeout configuration
 
 ---
 
-## Batch Operations
+## Troubleshooting
 
-Currently not supported. Insert vectors one at a time:
+### Connection refused
+- Check server is running: `./target/release/kyrodb_server`
+- Verify port (default 50051): `netstat -an | grep 50051`
+- Check firewall rules
 
-```bash
-for id in {1..1000}; do
-  curl -X POST http://localhost:51052/v1/insert \
-    -d "{\"doc_id\": \"doc_$id\", \"embedding\": [...]}"
-done
-```
+### Dimension mismatch error
+- Vector embedding dimension must match server config
+- Check config: `curl http://localhost:51051/slo`
+- Look for `embedding_dimension` in response
 
-**Future**: Batch insert API planned for Phase 1.
-
----
-
-## Client Examples
-
-### Python
-
-```python
-import requests
-import json
-
-# Insert vector
-response = requests.post(
-    "http://localhost:51052/v1/insert",
-    json={
-        "doc_id": "doc_1",
-        "embedding": [0.1] * 768
-    }
-)
-print(response.json())
-
-# Search
-response = requests.post(
-    "http://localhost:51052/v1/search",
-    json={
-        "query_embedding": [0.1] * 768,
-        "k": 10
-    }
-)
-results = response.json()["results"]
-for result in results:
-    print(f"{result['doc_id']}: {result['score']}")
-```
-
-### JavaScript
-
-```javascript
-// Insert vector
-const insert = await fetch("http://localhost:51052/v1/insert", {
-  method: "POST",
-  headers: {"Content-Type": "application/json"},
-  body: JSON.stringify({
-    doc_id: "doc_1",
-    embedding: Array(768).fill(0.1)
-  })
-});
-
-// Search
-const search = await fetch("http://localhost:51052/v1/search", {
-  method: "POST",
-  headers: {"Content-Type": "application/json"},
-  body: JSON.stringify({
-    query_embedding: Array(768).fill(0.1),
-    k: 10
-  })
-});
-
-const results = await search.json();
-console.log(results.results);
-```
-
-### cURL
-
-```bash
-# Health check
-curl http://localhost:51052/health
-
-# Insert
-curl -X POST http://localhost:51052/v1/insert \
-  -H "Content-Type: application/json" \
-  -d '{"doc_id": "doc_1", "embedding": [0.1, 0.2, 0.3]}'
-
-# Search
-curl -X POST http://localhost:51052/v1/search \
-  -H "Content-Type: application/json" \
-  -d '{"query_embedding": [0.1, 0.2, 0.3], "k": 5}'
-```
+### Timeout errors
+- Increase timeout in gRPC client
+- Check server logs for performance issues
+- Verify network latency to server
 
 ---
 
-## Timeouts
+## See Also
 
-Default timeouts (configurable):
-
-| Operation | Timeout |
-|-----------|---------|
-| Insert | 10 seconds |
-| Query | 5 seconds |
-| Search | 10 seconds |
-| Flush | 60 seconds |
-
-Configure in `config.yaml`:
-```yaml
-server:
-  read_timeout_secs: 30
-  write_timeout_secs: 30
-```
-
----
-
-## Versioning
-
-Current API version: **v1**
-
-Future versions will be prefixed: `/v2/insert`, `/v2/search`, etc.
-
-All v1 endpoints remain backwards-compatible.
+- [gRPC Proto Definition](../engine/proto/kyrodb.proto)
+- [Configuration Guide](CONFIGURATION_MANAGEMENT.md)
+- [Observability Guide](OBSERVABILITY.md)
+- [Operations Guide](OPERATIONS.md)

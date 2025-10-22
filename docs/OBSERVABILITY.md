@@ -11,7 +11,7 @@ Monitor KyroDB in production with Prometheus metrics and health checks.
 
 **2. Check metrics endpoint:**
 ```bash
-curl http://localhost:51052/metrics
+curl http://localhost:51051/metrics
 ```
 
 **3. Add to Prometheus:**
@@ -20,7 +20,7 @@ curl http://localhost:51052/metrics
 scrape_configs:
   - job_name: 'kyrodb'
     static_configs:
-      - targets: ['localhost:51052']
+      - targets: ['localhost:51051']
     metrics_path: '/metrics'
     scrape_interval: 15s
 ```
@@ -73,7 +73,7 @@ kyrodb_active_connections
 
 Check if server is alive:
 ```bash
-curl http://localhost:51052/health
+curl http://localhost:51051/health
 ```
 
 **Response (healthy):**
@@ -95,7 +95,7 @@ curl http://localhost:51052/health
 livenessProbe:
   httpGet:
     path: /health
-    port: 51052
+    port: 51051
   initialDelaySeconds: 10
   periodSeconds: 10
   failureThreshold: 3
@@ -107,7 +107,7 @@ livenessProbe:
 
 Check if server should receive traffic:
 ```bash
-curl http://localhost:51052/ready
+curl http://localhost:51051/ready
 ```
 
 **Response:**
@@ -120,7 +120,7 @@ curl http://localhost:51052/ready
 readinessProbe:
   httpGet:
     path: /ready
-    port: 51052
+    port: 51051
   initialDelaySeconds: 5
   periodSeconds: 5
   failureThreshold: 2
@@ -132,7 +132,7 @@ readinessProbe:
 
 Check SLO breach status:
 ```bash
-curl http://localhost:51052/slo
+curl http://localhost:51051/slo
 ```
 
 **Response:**
@@ -315,7 +315,7 @@ export RUST_LOG=kyrodb_engine=info
 **Symptom:** `/metrics` endpoint empty
 
 **Fix:**
-1. Check server is running: `curl http://localhost:51052/health`
+1. Check server is running: `curl http://localhost:51051/health`
 2. Verify metrics not disabled: ensure `bench-no-metrics` feature NOT enabled
 3. Send some queries to generate metrics
 4. Check logs: `RUST_LOG=kyrodb_engine=debug`
@@ -325,7 +325,7 @@ export RUST_LOG=kyrodb_engine=info
 **Symptom:** `kyrodb_query_latency_p99 > 10ms`
 
 **Fix:**
-1. Check cache hit rate: `curl http://localhost:51052/metrics | grep cache_hit_rate`
+1. Check cache hit rate: `curl http://localhost:51051/metrics | grep cache_hit_rate`
    - If < 70%: cache misses forcing slow HNSW searches
 2. Check HNSW latency: `grep hnsw_latency_p99`
    - If high: HNSW index may need rebuild or disk is slow
@@ -350,7 +350,7 @@ export RUST_LOG=kyrodb_engine=info
 **Symptom:** `/health` returns 503
 
 **Fix:**
-1. Check SLO status: `curl http://localhost:51052/slo`
+1. Check SLO status: `curl http://localhost:51051/slo`
 2. Identify breached metric (latency/cache/errors)
 3. Follow fix for that metric above
 4. Restart if "unhealthy" state persists after fix

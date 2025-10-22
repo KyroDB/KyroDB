@@ -91,11 +91,11 @@ KyroDB supports **flexible configuration** through multiple sources (priority: C
 
 # 4. Override specific settings via environment variables
 KYRODB__CACHE__CAPACITY=50000 \
-KYRODB__SERVER__PORT=50052 \
+KYRODB__SERVER__PORT=50051 \
 ./kyrodb_server --config config.yaml
 
 # 5. CLI overrides (highest priority)
-./kyrodb_server --config config.yaml --port 50052 --data-dir /mnt/ssd/data
+./kyrodb_server --config config.yaml --port 50051 --data-dir /mnt/ssd/data
 ```
 
 **Key Configuration Sections**:

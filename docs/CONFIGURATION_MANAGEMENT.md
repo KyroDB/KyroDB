@@ -36,8 +36,8 @@ Configure KyroDB via YAML/TOML files, environment variables, or command-line arg
 ```yaml
 server:
   host: "127.0.0.1"
-  port: 50052                    # gRPC port
-  http_port: 51052               # HTTP port (gRPC + 1000)
+  port: 50051                    # gRPC port
+  http_port: 51051               # HTTP port (gRPC + 1000)
   max_connections: 10000
   connection_timeout_secs: 300
   shutdown_timeout_secs: 30
@@ -142,7 +142,7 @@ Override any config value using `KYRODB__` prefix with double underscores:
 
 ```bash
 # Server port
-export KYRODB__SERVER__PORT=50052
+export KYRODB__SERVER__PORT=50051
 
 # Cache capacity
 export KYRODB__CACHE__CAPACITY=50000
@@ -169,15 +169,17 @@ KYRODB__<section>__<key>=<value>
 Override specific settings (highest priority):
 
 ```bash
+```bash
 # Override port and data directory
 ./kyrodb_server --config config.yaml \
-  --port 50052 \
+  --port 50051 \
   --data-dir /var/lib/kyrodb
 
 # Available arguments:
 #   --config <FILE>       Config file path
 #   --port <PORT>         gRPC port
 #   --data-dir <PATH>     Data directory
+```
 #   --generate-config     Generate example config (yaml|toml)
 ```
 
@@ -208,7 +210,7 @@ Override specific settings (highest priority):
 
 ### 4. Environment Variables
 ```bash
-KYRODB__SERVER__PORT=50052 \
+KYRODB__SERVER__PORT=50051 \
 KYRODB__CACHE__CAPACITY=50000 \
 ./kyrodb_server
 ```
@@ -217,7 +219,7 @@ KYRODB__CACHE__CAPACITY=50000 \
 ```bash
 # Priority: CLI > Env > File > Defaults
 KYRODB__CACHE__CAPACITY=25000 \
-./kyrodb_server --config config.yaml --port 50052
+./kyrodb_server --config config.yaml --port 50051
 ```
 
 ---

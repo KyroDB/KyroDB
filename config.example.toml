@@ -4,7 +4,7 @@
 # All settings are optional - defaults are production-ready.
 #
 # Environment variables override config file values:
-#   KYRODB__SERVER__PORT=50052 ./kyrodb_server
+#   KYRODB__SERVER__PORT=50051 ./kyrodb_server
 #   KYRODB__CACHE__CAPACITY=50000 ./kyrodb_server --config config.toml
 
 # ============================================================================
