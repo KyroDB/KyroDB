@@ -15,12 +15,14 @@ Get KyroDB running in 5 minutes.
 git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
-# Build release binaries
-cargo build --release
+# Build release binaries with all CLI tools enabled
+cargo build --release --features cli-tools
 
 # Binaries created in ./target/release/
 ls target/release/kyrodb_*
 ```
+
+**Note**: The `--features cli-tools` flag is required to build all binaries (server, load tester, backup tool). Without it, you'll get a compile error on the backup binary.
 
 ## 2. Start the Server
 
