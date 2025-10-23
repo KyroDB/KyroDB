@@ -37,7 +37,12 @@ pub struct BackupMetadata {
 }
 
 impl BackupMetadata {
-    pub fn new_full(size_bytes: u64, vector_count: u64, checksum: u32, description: String) -> Self {
+    pub fn new_full(
+        size_bytes: u64,
+        vector_count: u64,
+        checksum: u32,
+        description: String,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
             timestamp: SystemTime::now()
@@ -134,46 +139,51 @@ fn list_backups_from_dir(backup_dir: &Path) -> Result<Vec<BackupMetadata>> {
 /// Backup format: [file_count][name_len][name][data_len][data]...
 /// Checksum is computed only from file data, not metadata
 pub fn compute_backup_checksum(backup_path: &Path) -> Result<u32> {
-    let file = File::open(backup_path)
-        .context("Failed to open backup file for checksum computation")?;
+    let file =
+        File::open(backup_path).context("Failed to open backup file for checksum computation")?;
     let mut reader = BufReader::new(file);
-    
+
     // Read file count
     let mut file_count_bytes = [0u8; 4];
-    reader.read_exact(&mut file_count_bytes)
+    reader
+        .read_exact(&mut file_count_bytes)
         .context("Failed to read file count")?;
     let file_count = u32::from_le_bytes(file_count_bytes);
-    
+
     let mut checksum = 0u32;
-    
+
     // Process each file in the backup
     for _ in 0..file_count {
         // Read filename length
         let mut name_len_bytes = [0u8; 4];
-        reader.read_exact(&mut name_len_bytes)
+        reader
+            .read_exact(&mut name_len_bytes)
             .context("Failed to read filename length")?;
         let name_len = u32::from_le_bytes(name_len_bytes);
-        
+
         // Skip filename
         let mut name_bytes = vec![0u8; name_len as usize];
-        reader.read_exact(&mut name_bytes)
+        reader
+            .read_exact(&mut name_bytes)
             .context("Failed to read filename")?;
-        
+
         // Read data length
         let mut data_len_bytes = [0u8; 8];
-        reader.read_exact(&mut data_len_bytes)
+        reader
+            .read_exact(&mut data_len_bytes)
             .context("Failed to read data length")?;
         let data_len = u64::from_le_bytes(data_len_bytes);
-        
+
         // Read and checksum file data
         let mut file_data = vec![0u8; data_len as usize];
-        reader.read_exact(&mut file_data)
+        reader
+            .read_exact(&mut file_data)
             .context("Failed to read file data")?;
-        
+
         // Update checksum (only from file content, matching backup creation)
         checksum = checksum.wrapping_add(crc32fast::hash(&file_data));
     }
-    
+
     Ok(checksum)
 }
 
@@ -189,8 +199,7 @@ impl BackupManager {
         let data_dir = data_dir.as_ref().to_path_buf();
 
         // Create backup directory if it doesn't exist
-        fs::create_dir_all(&backup_dir)
-            .context("Failed to create backup directory")?;
+        fs::create_dir_all(&backup_dir).context("Failed to create backup directory")?;
 
         Ok(Self {
             backup_dir,
@@ -214,8 +223,7 @@ impl BackupManager {
         // Read MANIFEST to get snapshot number
         let manifest_path = self.data_dir.join("MANIFEST");
         let snapshot_number = if manifest_path.exists() {
-            let manifest = fs::read_to_string(&manifest_path)
-                .context("Failed to read MANIFEST")?;
+            let manifest = fs::read_to_string(&manifest_path).context("Failed to read MANIFEST")?;
             manifest
                 .lines()
                 .find(|line| line.starts_with("snapshot_number:"))
@@ -293,8 +301,7 @@ impl BackupManager {
         }
 
         // Create tar archive
-        let backup_file = File::create(&backup_path)
-            .context("Failed to create backup file")?;
+        let backup_file = File::create(&backup_path).context("Failed to create backup file")?;
         let mut writer = BufWriter::new(backup_file);
 
         // Simple tar-like format: [file_count][name_len][name][data_len][data]...
@@ -554,7 +561,7 @@ impl BackupManager {
         for backup in &backups {
             if !to_keep.contains(&backup.id) {
                 let age = now.saturating_sub(backup.timestamp);
-                
+
                 // Skip if backup is younger than minimum age threshold
                 if age < min_age_seconds {
                     debug!(
@@ -565,7 +572,7 @@ impl BackupManager {
                     );
                     continue;
                 }
-                
+
                 debug!("Deleting backup: {} (age={} days)", backup.id, age / day);
 
                 let backup_path = self.backup_dir.join(format!("backup_{}.tar", backup.id));
@@ -643,10 +650,7 @@ impl RestoreManager {
     pub fn clear_data_directory(&self, options: &ClearDirectoryOptions) -> Result<()> {
         // Check if data directory exists and get its contents
         if !self.data_dir.exists() {
-            warn!(
-                "Data directory does not exist: {}",
-                self.data_dir.display()
-            );
+            warn!("Data directory does not exist: {}", self.data_dir.display());
             return Ok(());
         }
 
@@ -665,7 +669,9 @@ impl RestoreManager {
         }
 
         // Get absolute path for warning message
-        let abs_path = self.data_dir.canonicalize()
+        let abs_path = self
+            .data_dir
+            .canonicalize()
             .unwrap_or_else(|_| self.data_dir.clone());
 
         if file_count == 0 {
@@ -724,11 +730,7 @@ impl RestoreManager {
                     debug!("Deleted file: {}", file_path.display());
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to delete file {}: {}",
-                        file_path.display(),
-                        e
-                    );
+                    warn!("Failed to delete file {}: {}", file_path.display(), e);
                 }
             }
         }
@@ -751,7 +753,6 @@ impl RestoreManager {
         Ok(())
     }
 
-
     /// Restore from a full backup
     pub fn restore_from_backup(&self, backup_id: Uuid) -> Result<()> {
         self.restore_from_backup_with_options(backup_id, &ClearDirectoryOptions::default())
@@ -763,8 +764,10 @@ impl RestoreManager {
         backup_id: Uuid,
         clear_options: &ClearDirectoryOptions,
     ) -> Result<()> {
-        info!("Restoring from backup: {} (allow_clear={}, dry_run={})", 
-              backup_id, clear_options.allow_clear, clear_options.dry_run);
+        info!(
+            "Restoring from backup: {} (allow_clear={}, dry_run={})",
+            backup_id, clear_options.allow_clear, clear_options.dry_run
+        );
 
         // Load metadata
         let metadata_path = self.backup_dir.join(format!("backup_{}.json", backup_id));
@@ -772,8 +775,7 @@ impl RestoreManager {
             return Err(anyhow!("Backup {} not found", backup_id));
         }
 
-        let metadata: BackupMetadata =
-            serde_json::from_str(&fs::read_to_string(metadata_path)?)?;
+        let metadata: BackupMetadata = serde_json::from_str(&fs::read_to_string(metadata_path)?)?;
 
         // Verify this is a full backup or build chain
         let restore_chain = if metadata.backup_type == BackupType::Full {
@@ -813,7 +815,10 @@ impl RestoreManager {
 
         // Return early if dry-run was enabled
         if clear_options.dry_run {
-            info!("DRY-RUN: Skipping actual restore (would restore {} backups)", restore_chain.len());
+            info!(
+                "DRY-RUN: Skipping actual restore (would restore {} backups)",
+                restore_chain.len()
+            );
             return Ok(());
         }
 
@@ -910,11 +915,11 @@ impl RestoreManager {
 
         loop {
             let next = backups.iter().find(|b| {
-                b.parent_id == Some(current_id) 
-                && b.timestamp <= timestamp
-                && b.backup_type == BackupType::Incremental
+                b.parent_id == Some(current_id)
+                    && b.timestamp <= timestamp
+                    && b.backup_type == BackupType::Incremental
             });
-            
+
             match next {
                 Some(backup) => {
                     incrementals.push(backup);
@@ -935,7 +940,10 @@ impl RestoreManager {
 
         // Return early if dry-run was enabled
         if clear_options.dry_run {
-            info!("DRY-RUN: Skipping actual restore (would restore 1 full backup + {} incrementals)", incrementals.len());
+            info!(
+                "DRY-RUN: Skipping actual restore (would restore 1 full backup + {} incrementals)",
+                incrementals.len()
+            );
             return Ok(());
         }
 
@@ -973,7 +981,10 @@ impl S3Client {
         let config = aws_config::load_from_env().await;
         let client = aws_sdk_s3::Client::new(&config);
 
-        info!("S3 client initialized: bucket={}, prefix={}", bucket, prefix);
+        info!(
+            "S3 client initialized: bucket={}, prefix={}",
+            bucket, prefix
+        );
 
         Ok(Self {
             client,
@@ -1007,7 +1018,7 @@ impl S3Client {
 
         // Get file size to determine upload strategy
         let file_size = fs::metadata(&backup_path)?.len();
-        
+
         // S3 multipart upload is required for files >5GB and improves reliability
         // with resumable uploads for large files. Using threshold well below the
         // 5GB S3 object size limit to ensure reliable single-part uploads.
@@ -1035,8 +1046,12 @@ impl S3Client {
 
     /// Simple upload for files <5GB
     async fn upload_simple(&self, file_path: &Path, key: &str) -> Result<()> {
-        debug!("Uploading {} to s3://{}/{}", 
-            file_path.display(), self.bucket, key);
+        debug!(
+            "Uploading {} to s3://{}/{}",
+            file_path.display(),
+            self.bucket,
+            key
+        );
 
         let mut retries = 0;
         let max_retries = 3;
@@ -1046,7 +1061,7 @@ impl S3Client {
             // This is more memory-efficient for retries of large files
             let body = tokio::fs::read(file_path).await?;
             let body_len = body.len();
-            
+
             match self
                 .client
                 .put_object()
@@ -1063,7 +1078,11 @@ impl S3Client {
                 Err(e) => {
                     retries += 1;
                     if retries >= max_retries {
-                        return Err(anyhow!("Upload failed after {} retries: {}", max_retries, e));
+                        return Err(anyhow!(
+                            "Upload failed after {} retries: {}",
+                            max_retries,
+                            e
+                        ));
                     }
 
                     let backoff_ms = 1000 * (1 << (retries - 1)); // 1s, 2s, 4s
@@ -1121,11 +1140,7 @@ impl S3Client {
 
             buffer.truncate(bytes_read);
 
-            debug!(
-                "Uploading part {} ({} bytes)",
-                part_number,
-                bytes_read
-            );
+            debug!("Uploading part {} ({} bytes)", part_number, bytes_read);
 
             // Upload part with retry
             let mut retries = 0;
@@ -1280,11 +1295,7 @@ impl S3Client {
     }
 
     /// Generate a presigned URL for temporary access to a backup
-    pub async fn presigned_url(
-        &self,
-        backup_id: Uuid,
-        expiration_secs: u64,
-    ) -> Result<String> {
+    pub async fn presigned_url(&self, backup_id: Uuid, expiration_secs: u64) -> Result<String> {
         let key = format!("{}/backup_{}.tar", self.prefix, backup_id);
 
         let presigned = self
@@ -1503,9 +1514,7 @@ mod tests {
 
         // Create multiple backups
         for i in 0..5 {
-            manager
-                .create_full_backup(format!("Backup {}", i))
-                .unwrap();
+            manager.create_full_backup(format!("Backup {}", i)).unwrap();
             thread::sleep(Duration::from_millis(10));
         }
 
@@ -1534,17 +1543,14 @@ mod tests {
     async fn test_s3_client_creation() {
         // Test S3Client creation (requires AWS credentials in env)
         // This test will be skipped if AWS credentials are not available
-        
+
         if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
             eprintln!("Skipping S3 test: AWS credentials not configured");
             return;
         }
 
-        let client = S3Client::new(
-            "test-kyrodb-backups".to_string(),
-            "test-prefix".to_string(),
-        )
-        .await;
+        let client =
+            S3Client::new("test-kyrodb-backups".to_string(), "test-prefix".to_string()).await;
 
         // Just verify we can create the client
         assert!(client.is_ok() || client.is_err()); // Either works (depends on env)
@@ -1555,7 +1561,7 @@ mod tests {
     async fn test_s3_backup_upload_download() {
         // Integration test for S3 upload/download
         // Requires localstack or real S3 credentials
-        
+
         if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
             eprintln!("Skipping S3 upload/download test: AWS credentials not configured");
             return;
@@ -1569,18 +1575,17 @@ mod tests {
         fs::write(temp_data.path().join("snapshot_1"), b"test data").unwrap();
 
         let backup_mgr = BackupManager::new(temp_backup.path(), temp_data.path()).unwrap();
-        let metadata = backup_mgr.create_full_backup("S3 test".to_string()).unwrap();
+        let metadata = backup_mgr
+            .create_full_backup("S3 test".to_string())
+            .unwrap();
 
         // Try to create S3 client
-        if let Ok(s3_client) = S3Client::new(
-            "test-kyrodb-backups".to_string(),
-            "test".to_string(),
-        )
-        .await
+        if let Ok(s3_client) =
+            S3Client::new("test-kyrodb-backups".to_string(), "test".to_string()).await
         {
             // Try upload (may fail if S3 not available, that's okay for local dev)
             let upload_result = s3_client.upload_backup(&backup_mgr, metadata.id).await;
-            
+
             if upload_result.is_ok() {
                 eprintln!("S3 upload succeeded");
 
@@ -1588,7 +1593,10 @@ mod tests {
                 let download_result = s3_client.download_backup(&backup_mgr, metadata.id).await;
                 assert!(download_result.is_ok());
             } else {
-                eprintln!("S3 upload failed (expected in local dev): {:?}", upload_result.err());
+                eprintln!(
+                    "S3 upload failed (expected in local dev): {:?}",
+                    upload_result.err()
+                );
             }
         }
     }

@@ -79,7 +79,7 @@ impl WalWriter {
     pub fn create(path: impl AsRef<Path>, fsync_policy: FsyncPolicy) -> Result<Self> {
         Self::create_with_error_handler(path, fsync_policy, None)
     }
-    
+
     /// Create new WAL file with error handler
     #[instrument(level = "debug", skip(path, error_handler), fields(fsync_policy = ?fsync_policy))]
     pub fn create_with_error_handler(
@@ -129,7 +129,7 @@ impl WalWriter {
             }
         }
     }
-    
+
     /// Internal append logic (called by append or via error handler)
     fn append_internal(&mut self, entry: &WalEntry) -> Result<()> {
         // Serialize entry
@@ -192,17 +192,18 @@ impl WalWriter {
     /// ```
     pub fn sync_async(&mut self) -> Result<tokio::task::JoinHandle<Result<()>>> {
         self.file.flush()?;
-        
+
         // Clone file descriptor for background sync
-        let file = self.file.get_ref().try_clone()
+        let file = self
+            .file
+            .get_ref()
+            .try_clone()
             .context("Failed to clone file descriptor for async sync")?;
-        
+
         // Spawn blocking fsync on separate thread pool
-        let handle = tokio::task::spawn_blocking(move || {
-            file.sync_data()
-                .context("Async fsync failed")
-        });
-        
+        let handle =
+            tokio::task::spawn_blocking(move || file.sync_data().context("Async fsync failed"));
+
         Ok(handle)
     }
 
@@ -235,7 +236,7 @@ impl WalErrorHandler {
     pub fn new() -> Self {
         Self::with_metrics(MetricsCollector::new())
     }
-    
+
     /// Create error handler with custom metrics collector
     pub fn with_metrics(metrics: MetricsCollector) -> Self {
         let config = CircuitBreakerConfig {
@@ -244,7 +245,7 @@ impl WalErrorHandler {
             timeout: Duration::from_secs(60),
             window_size: Duration::from_secs(60),
         };
-        
+
         Self {
             circuit_breaker: Arc::new(CircuitBreaker::with_config(config)),
             max_retries: 5,
@@ -252,7 +253,7 @@ impl WalErrorHandler {
             metrics,
         }
     }
-    
+
     /// Create error handler with custom config
     pub fn with_config(
         circuit_breaker_config: CircuitBreakerConfig,
@@ -267,7 +268,7 @@ impl WalErrorHandler {
             metrics,
         }
     }
-    
+
     /// Write entry with retry logic
     ///
     /// Retries transient errors with exponential backoff.
@@ -281,7 +282,7 @@ impl WalErrorHandler {
             self.update_circuit_state();
             bail!("WAL circuit breaker is open - writes disabled");
         }
-        
+
         let mut attempt = 0;
         loop {
             match write_fn() {
@@ -293,7 +294,7 @@ impl WalErrorHandler {
                 }
                 Err(e) => {
                     let error_kind = Self::classify_error(&e);
-                    
+
                     match error_kind {
                         WalErrorKind::DiskFull => {
                             error!("Disk full detected: {}", e);
@@ -334,7 +335,7 @@ impl WalErrorHandler {
             }
         }
     }
-    
+
     /// Update circuit breaker state in metrics
     fn update_circuit_state(&self) {
         let state = if self.circuit_breaker.is_closed() {
@@ -346,12 +347,12 @@ impl WalErrorHandler {
         };
         self.metrics.update_wal_circuit_breaker_state(state);
     }
-    
+
     /// Get circuit breaker for monitoring
     pub fn circuit_breaker(&self) -> &Arc<CircuitBreaker> {
         &self.circuit_breaker
     }
-    
+
     /// Classify error for retry decision
     fn classify_error(error: &anyhow::Error) -> WalErrorKind {
         // Check if it's an I/O error
@@ -622,7 +623,7 @@ impl Snapshot {
 
         Ok(snapshot)
     }
-    
+
     /// Load snapshot with validation and fallback recovery
     ///
     /// Attempts to load the primary snapshot. On corruption, tries fallback
@@ -641,7 +642,7 @@ impl Snapshot {
         metrics: &MetricsCollector,
     ) -> Result<(Self, bool)> {
         let path = path.as_ref();
-        
+
         // Try loading primary snapshot
         match Self::load(path) {
             Ok(snapshot) => {
@@ -657,7 +658,7 @@ impl Snapshot {
                 metrics.record_hnsw_corruption();
             }
         }
-        
+
         // Extract snapshot number from filename (e.g., "snapshot_123.snap" -> 123)
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let snapshot_number = filename
@@ -665,26 +666,26 @@ impl Snapshot {
             .trim_end_matches(".snap")
             .parse::<u64>()
             .ok();
-        
+
         if let Some(num) = snapshot_number {
             // Try up to 5 previous snapshots
             for fallback_idx in 1..=5 {
                 if num < fallback_idx {
                     break;
                 }
-                
+
                 let fallback_num = num - fallback_idx;
                 let fallback_path = path.with_file_name(format!("snapshot_{}.snap", fallback_num));
-                
+
                 if !fallback_path.exists() {
                     continue;
                 }
-                
+
                 warn!(
                     fallback = %fallback_path.display(),
                     "attempting fallback recovery"
                 );
-                
+
                 match Self::load(&fallback_path) {
                     Ok(snapshot) => {
                         info!(
@@ -704,7 +705,7 @@ impl Snapshot {
                 }
             }
         }
-        
+
         // All fallback attempts failed
         error!("all snapshot recovery attempts failed");
         metrics.record_hnsw_fallback_failed();
@@ -920,7 +921,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(call_count, 1); // No retry on disk full
-        
+
         let err_msg = result.unwrap_err().to_string();
         println!("Error message: {}", err_msg);
         assert!(err_msg.contains("Disk full") || err_msg.contains("ENOSPC"));
@@ -1037,7 +1038,7 @@ mod tests {
     #[test]
     fn test_snapshot_corruption_detection() {
         use std::io::Write;
-        
+
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("corrupted.snapshot");
 
@@ -1048,10 +1049,7 @@ mod tests {
 
         // Corrupt the snapshot by modifying bytes in the data section
         // Magic (4) + Size (8) + data... = start corrupting at byte 20
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&snapshot_path)
-            .unwrap();
+        let mut file = OpenOptions::new().write(true).open(&snapshot_path).unwrap();
         file.seek(std::io::SeekFrom::Start(20)).unwrap();
         file.write_all(b"CORRUPTED_DATA").unwrap();
         drop(file);

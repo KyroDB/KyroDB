@@ -8,8 +8,7 @@
 //! - Retry exhaustion handling
 
 use kyrodb_engine::{
-    CircuitBreaker, CircuitBreakerConfig, FsyncPolicy, HnswBackend, MetricsCollector,
-    Snapshot,
+    CircuitBreaker, CircuitBreakerConfig, FsyncPolicy, HnswBackend, MetricsCollector, Snapshot,
 };
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -57,9 +56,12 @@ fn test_retry_exhaustion_handling() {
 
     let stats = breaker.stats();
     assert_eq!(stats.total_failures, 10);
-    
+
     // Verify that further operations would fail-fast
-    assert!(breaker.is_open(), "Circuit should remain open after retry exhaustion");
+    assert!(
+        breaker.is_open(),
+        "Circuit should remain open after retry exhaustion"
+    );
 
     println!("Retry exhaustion: circuit breaker stops further attempts");
 }
@@ -111,20 +113,17 @@ fn test_hnsw_corruption_recovery() {
         .collect();
 
     snapshot_files.sort_by_key(|e| e.file_name());
-    
+
     if let Some(latest_snapshot) = snapshot_files.last() {
         let snapshot_path = latest_snapshot.path();
         println!("Corrupting latest snapshot: {}", snapshot_path.display());
-        
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&snapshot_path)
-            .unwrap();
-        
+
+        let mut file = OpenOptions::new().write(true).open(&snapshot_path).unwrap();
+
         // Corrupt data at offset 20 (inside data section)
         file.write_all_at(&[0xFF, 0xFF, 0xFF, 0xFF], 20).unwrap();
         file.sync_all().unwrap();
-        
+
         println!("Corrupted snapshot at offset 20");
     }
 
@@ -152,14 +151,22 @@ fn test_hnsw_corruption_recovery() {
     // The important thing is recovery succeeded
     let corruption_count = metrics.get_hnsw_corruption_count();
     let fallback_count = metrics.get_hnsw_fallback_success_count();
-    
-    println!("Corruption detections: {}, Fallback successes: {}", corruption_count, fallback_count);
-    
-    // At minimum, recovery should have succeeded
-    assert!(backend.fetch_document(0).is_some(), "Document 0 should be recoverable");
 
-    println!("HNSW corruption recovery: recovery successful (corruption_count={}, fallback_count={})", 
-             corruption_count, fallback_count);
+    println!(
+        "Corruption detections: {}, Fallback successes: {}",
+        corruption_count, fallback_count
+    );
+
+    // At minimum, recovery should have succeeded
+    assert!(
+        backend.fetch_document(0).is_some(),
+        "Document 0 should be recoverable"
+    );
+
+    println!(
+        "HNSW corruption recovery: recovery successful (corruption_count={}, fallback_count={})",
+        corruption_count, fallback_count
+    );
 }
 
 /// Test training task metrics tracking
@@ -222,7 +229,7 @@ fn test_circuit_breaker_with_backend_operations() {
                 FsyncPolicy::Always,
                 10,
             );
-            
+
             if backend.is_ok() {
                 breaker.record_success();
             } else {
@@ -233,7 +240,7 @@ fn test_circuit_breaker_with_backend_operations() {
 
     // All operations should succeed, circuit should be closed
     assert!(breaker.is_closed());
-    
+
     let stats = breaker.stats();
     assert_eq!(stats.total_successes, 5);
     assert_eq!(stats.total_failures, 0);
@@ -248,11 +255,8 @@ fn test_snapshot_corruption_metrics() {
     let snapshot_path = temp_dir.path().join("snapshot_100");
 
     // Create a valid snapshot
-    let documents = vec![
-        (0, vec![1.0, 0.0, 0.0, 0.0]),
-        (1, vec![0.0, 1.0, 0.0, 0.0]),
-    ];
-    
+    let documents = vec![(0, vec![1.0, 0.0, 0.0, 0.0]), (1, vec![0.0, 1.0, 0.0, 0.0])];
+
     let snapshot = Snapshot::new(4, documents.clone());
 
     snapshot.save(&snapshot_path).unwrap();
@@ -263,11 +267,8 @@ fn test_snapshot_corruption_metrics() {
 
     // Now corrupt it
     {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&snapshot_path)
-            .unwrap();
-        
+        let mut file = OpenOptions::new().write(true).open(&snapshot_path).unwrap();
+
         // Corrupt the data section
         file.write_all_at(&[0xDE, 0xAD, 0xBE, 0xEF], 20).unwrap();
         file.sync_all().unwrap();
@@ -343,10 +344,13 @@ fn test_circuit_breaker_reset_after_timeout() {
     // Circuit should transition to half-open (ready to test)
     // Record success to help circuit recover
     breaker.record_success();
-    
+
     // Verify circuit is no longer fully open (either half-open or closed)
     // After timeout and one success, should be recovering
-    assert!(!breaker.is_open(), "Circuit should not be open after timeout and successful probe");
+    assert!(
+        !breaker.is_open(),
+        "Circuit should not be open after timeout and successful probe"
+    );
 
     println!("Circuit breaker reset: auto-recovery after timeout works");
 }
@@ -359,7 +363,7 @@ fn test_recovery_metrics_tracking() {
     // Simulate various recovery events
     metrics.record_hnsw_corruption();
     metrics.record_hnsw_fallback_success();
-    
+
     metrics.record_training_crash();
     metrics.record_training_restart();
     metrics.record_training_cycle();

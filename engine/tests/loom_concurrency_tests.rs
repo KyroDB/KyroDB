@@ -148,9 +148,7 @@ fn hot_tier_concurrent_insert_flush() {
             hot1.insert(2, vec![2.0]);
         });
 
-        let t2 = thread::spawn(move || {
-            hot2.flush()
-        });
+        let t2 = thread::spawn(move || hot2.flush());
 
         t1.join().unwrap();
         let flushed = t2.join().unwrap();
@@ -173,9 +171,7 @@ fn hot_tier_concurrent_insert_get() {
             hot1.insert(1, vec![1.0, 2.0]);
         });
 
-        let t2 = thread::spawn(move || {
-            hot2.get(1)
-        });
+        let t2 = thread::spawn(move || hot2.get(1));
 
         t1.join().unwrap();
         let result = t2.join().unwrap();

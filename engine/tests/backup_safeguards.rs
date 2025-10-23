@@ -19,10 +19,7 @@ fn test_clear_directory_requires_confirmation() {
 
     // Test 1: Default options should deny clearing without confirmation
     let result = restore_manager.clear_data_directory(&ClearDirectoryOptions::default());
-    assert!(
-        result.is_err(),
-        "Should require confirmation by default"
-    );
+    assert!(result.is_err(), "Should require confirmation by default");
 
     let err = result.unwrap_err();
     assert!(
@@ -81,7 +78,7 @@ fn test_clear_directory_environment_variable() {
         }
     }
     let _guard = EnvGuard;
-    
+
     std::env::remove_var("BACKUP_ALLOW_CLEAR");
 
     let data_dir = TempDir::new().unwrap();
@@ -237,5 +234,8 @@ fn test_point_in_time_restore_requires_confirmation() {
 
     // PITR should also respect safeguards
     let result = restore_manager.restore_point_in_time(0);
-    assert!(result.is_err(), "PITR should fail when clearing requires confirmation");
+    assert!(
+        result.is_err(),
+        "PITR should fail when clearing requires confirmation"
+    );
 }

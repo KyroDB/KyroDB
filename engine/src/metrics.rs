@@ -103,19 +103,19 @@ struct MetricsInner {
     inserts_total: AtomicU64,
     inserts_failed: AtomicU64,
     hot_tier_flushes: AtomicU64,
-    
+
     // WAL Metrics
     wal_writes_total: AtomicU64,
     wal_writes_failed: AtomicU64,
     wal_retries_total: AtomicU64,
     wal_circuit_breaker_state: AtomicU64, // 0=closed, 1=open, 2=half-open
     wal_disk_full_errors: AtomicU64,
-    
+
     // HNSW Corruption Metrics
     hnsw_corruption_detected_total: AtomicU64,
     hnsw_fallback_recovery_success: AtomicU64,
     hnsw_fallback_recovery_failed: AtomicU64,
-    
+
     // Training Task Metrics
     training_crashes_total: AtomicU64,
     training_restarts_total: AtomicU64,
@@ -214,17 +214,17 @@ impl MetricsCollector {
                 inserts_total: AtomicU64::new(0),
                 inserts_failed: AtomicU64::new(0),
                 hot_tier_flushes: AtomicU64::new(0),
-                
+
                 wal_writes_total: AtomicU64::new(0),
                 wal_writes_failed: AtomicU64::new(0),
                 wal_retries_total: AtomicU64::new(0),
                 wal_circuit_breaker_state: AtomicU64::new(0), // 0=closed
                 wal_disk_full_errors: AtomicU64::new(0),
-                
+
                 hnsw_corruption_detected_total: AtomicU64::new(0),
                 hnsw_fallback_recovery_success: AtomicU64::new(0),
                 hnsw_fallback_recovery_failed: AtomicU64::new(0),
-                
+
                 training_crashes_total: AtomicU64::new(0),
                 training_restarts_total: AtomicU64::new(0),
                 training_cycles_completed: AtomicU64::new(0),
@@ -372,9 +372,7 @@ impl MetricsCollector {
     /// Record hot tier flush
     #[inline]
     pub fn record_flush(&self) {
-        self.inner
-            .hot_tier_flushes
-            .fetch_add(1, Ordering::Relaxed);
+        self.inner.hot_tier_flushes.fetch_add(1, Ordering::Relaxed);
     }
 
     // ========================================================================
@@ -399,14 +397,18 @@ impl MetricsCollector {
     /// Record disk full error
     #[inline]
     pub fn record_wal_disk_full(&self) {
-        self.inner.wal_disk_full_errors.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .wal_disk_full_errors
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Update WAL circuit breaker state (0=closed, 1=open, 2=half-open)
     #[inline]
     pub fn update_wal_circuit_breaker_state(&self, state: u64) {
         debug_assert!(state <= 2, "Invalid circuit breaker state: {}", state);
-        self.inner.wal_circuit_breaker_state.store(state, Ordering::Relaxed);
+        self.inner
+            .wal_circuit_breaker_state
+            .store(state, Ordering::Relaxed);
     }
 
     // ========================================================================
@@ -416,19 +418,25 @@ impl MetricsCollector {
     /// Record HNSW corruption detection
     #[inline]
     pub fn record_hnsw_corruption(&self) {
-        self.inner.hnsw_corruption_detected_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .hnsw_corruption_detected_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record successful fallback recovery
     #[inline]
     pub fn record_hnsw_fallback_success(&self) {
-        self.inner.hnsw_fallback_recovery_success.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .hnsw_fallback_recovery_success
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record failed fallback recovery
     #[inline]
     pub fn record_hnsw_fallback_failed(&self) {
-        self.inner.hnsw_fallback_recovery_failed.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .hnsw_fallback_recovery_failed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // ========================================================================
@@ -438,19 +446,25 @@ impl MetricsCollector {
     /// Record training task crash
     #[inline]
     pub fn record_training_crash(&self) {
-        self.inner.training_crashes_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .training_crashes_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record training task restart
     #[inline]
     pub fn record_training_restart(&self) {
-        self.inner.training_restarts_total.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .training_restarts_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record completed training cycle
     #[inline]
     pub fn record_training_cycle(&self) {
-        self.inner.training_cycles_completed.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .training_cycles_completed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // ========================================================================
@@ -564,7 +578,7 @@ impl MetricsCollector {
         let cache_hits = self.inner.cache_hits.load(Ordering::Relaxed);
         let cache_misses = self.inner.cache_misses.load(Ordering::Relaxed);
         let cache_total = cache_hits + cache_misses;
-        
+
         // No data = 0% hit rate (will trigger breach alerting, which is correct)
         let cache_hit_rate = if cache_total > 0 {
             cache_hits as f64 / cache_total as f64
@@ -605,17 +619,23 @@ impl MetricsCollector {
 
     /// Get HNSW corruption detection count
     pub fn get_hnsw_corruption_count(&self) -> u64 {
-        self.inner.hnsw_corruption_detected_total.load(Ordering::Relaxed)
+        self.inner
+            .hnsw_corruption_detected_total
+            .load(Ordering::Relaxed)
     }
 
     /// Get successful fallback recovery count
     pub fn get_hnsw_fallback_success_count(&self) -> u64 {
-        self.inner.hnsw_fallback_recovery_success.load(Ordering::Relaxed)
+        self.inner
+            .hnsw_fallback_recovery_success
+            .load(Ordering::Relaxed)
     }
 
     /// Get failed fallback recovery count
     pub fn get_hnsw_fallback_failed_count(&self) -> u64 {
-        self.inner.hnsw_fallback_recovery_failed.load(Ordering::Relaxed)
+        self.inner
+            .hnsw_fallback_recovery_failed
+            .load(Ordering::Relaxed)
     }
 
     /// Get training crashes count
@@ -685,11 +705,21 @@ impl MetricsCollector {
         let p99 = latencies.percentile(99.0);
         drop(latencies); // Release lock early
 
-        output.push_str("# HELP kyrodb_query_latency_ns Query latency percentiles in nanoseconds\n");
+        output
+            .push_str("# HELP kyrodb_query_latency_ns Query latency percentiles in nanoseconds\n");
         output.push_str("# TYPE kyrodb_query_latency_ns gauge\n");
-        output.push_str(&format!("kyrodb_query_latency_ns{{percentile=\"50\"}} {}\n", p50));
-        output.push_str(&format!("kyrodb_query_latency_ns{{percentile=\"95\"}} {}\n", p95));
-        output.push_str(&format!("kyrodb_query_latency_ns{{percentile=\"99\"}} {}\n", p99));
+        output.push_str(&format!(
+            "kyrodb_query_latency_ns{{percentile=\"50\"}} {}\n",
+            p50
+        ));
+        output.push_str(&format!(
+            "kyrodb_query_latency_ns{{percentile=\"95\"}} {}\n",
+            p95
+        ));
+        output.push_str(&format!(
+            "kyrodb_query_latency_ns{{percentile=\"99\"}} {}\n",
+            p99
+        ));
 
         // Cache Metrics
         let cache_hits = self.inner.cache_hits.load(Ordering::Relaxed);
@@ -717,7 +747,10 @@ impl MetricsCollector {
 
         output.push_str("# HELP kyrodb_cache_evictions_total Total cache evictions\n");
         output.push_str("# TYPE kyrodb_cache_evictions_total counter\n");
-        output.push_str(&format!("kyrodb_cache_evictions_total {}\n", cache_evictions));
+        output.push_str(&format!(
+            "kyrodb_cache_evictions_total {}\n",
+            cache_evictions
+        ));
 
         output.push_str("# HELP kyrodb_cache_size Current cache size (entries)\n");
         output.push_str("# TYPE kyrodb_cache_size gauge\n");
@@ -729,14 +762,18 @@ impl MetricsCollector {
         let learned_fp = self.inner.learned_false_positives.load(Ordering::Relaxed);
         let learned_fn = self.inner.learned_false_negatives.load(Ordering::Relaxed);
 
-        output.push_str("# HELP kyrodb_learned_cache_predictions_total Total learned cache predictions\n");
+        output.push_str(
+            "# HELP kyrodb_learned_cache_predictions_total Total learned cache predictions\n",
+        );
         output.push_str("# TYPE kyrodb_learned_cache_predictions_total counter\n");
         output.push_str(&format!(
             "kyrodb_learned_cache_predictions_total {}\n",
             learned_predictions
         ));
 
-        output.push_str("# HELP kyrodb_learned_cache_accuracy Learned cache prediction accuracy (0.0-1.0)\n");
+        output.push_str(
+            "# HELP kyrodb_learned_cache_accuracy Learned cache prediction accuracy (0.0-1.0)\n",
+        );
         output.push_str("# TYPE kyrodb_learned_cache_accuracy gauge\n");
         let accuracy = if learned_predictions > 0 {
             learned_correct as f64 / learned_predictions as f64
@@ -745,14 +782,18 @@ impl MetricsCollector {
         };
         output.push_str(&format!("kyrodb_learned_cache_accuracy {:.6}\n", accuracy));
 
-        output.push_str("# HELP kyrodb_learned_cache_false_positives_total False positive predictions\n");
+        output.push_str(
+            "# HELP kyrodb_learned_cache_false_positives_total False positive predictions\n",
+        );
         output.push_str("# TYPE kyrodb_learned_cache_false_positives_total counter\n");
         output.push_str(&format!(
             "kyrodb_learned_cache_false_positives_total {}\n",
             learned_fp
         ));
 
-        output.push_str("# HELP kyrodb_learned_cache_false_negatives_total False negative predictions\n");
+        output.push_str(
+            "# HELP kyrodb_learned_cache_false_negatives_total False negative predictions\n",
+        );
         output.push_str("# TYPE kyrodb_learned_cache_false_negatives_total counter\n");
         output.push_str(&format!(
             "kyrodb_learned_cache_false_negatives_total {}\n",
@@ -843,28 +884,53 @@ impl MetricsCollector {
 
         output.push_str("# HELP kyrodb_wal_circuit_breaker_state WAL circuit breaker state (0=closed, 1=open, 2=half-open)\n");
         output.push_str("# TYPE kyrodb_wal_circuit_breaker_state gauge\n");
-        output.push_str(&format!("kyrodb_wal_circuit_breaker_state {}\n", wal_circuit_state));
+        output.push_str(&format!(
+            "kyrodb_wal_circuit_breaker_state {}\n",
+            wal_circuit_state
+        ));
 
         output.push_str("# HELP kyrodb_wal_disk_full_errors Disk full errors during WAL writes\n");
         output.push_str("# TYPE kyrodb_wal_disk_full_errors counter\n");
         output.push_str(&format!("kyrodb_wal_disk_full_errors {}\n", wal_disk_full));
 
         // HNSW Corruption Metrics
-        let corruption_detected = self.inner.hnsw_corruption_detected_total.load(Ordering::Relaxed);
-        let fallback_success = self.inner.hnsw_fallback_recovery_success.load(Ordering::Relaxed);
-        let fallback_failed = self.inner.hnsw_fallback_recovery_failed.load(Ordering::Relaxed);
+        let corruption_detected = self
+            .inner
+            .hnsw_corruption_detected_total
+            .load(Ordering::Relaxed);
+        let fallback_success = self
+            .inner
+            .hnsw_fallback_recovery_success
+            .load(Ordering::Relaxed);
+        let fallback_failed = self
+            .inner
+            .hnsw_fallback_recovery_failed
+            .load(Ordering::Relaxed);
 
-        output.push_str("# HELP kyrodb_hnsw_corruption_detected_total HNSW snapshot corruption detections\n");
+        output.push_str(
+            "# HELP kyrodb_hnsw_corruption_detected_total HNSW snapshot corruption detections\n",
+        );
         output.push_str("# TYPE kyrodb_hnsw_corruption_detected_total counter\n");
-        output.push_str(&format!("kyrodb_hnsw_corruption_detected_total {}\n", corruption_detected));
+        output.push_str(&format!(
+            "kyrodb_hnsw_corruption_detected_total {}\n",
+            corruption_detected
+        ));
 
-        output.push_str("# HELP kyrodb_hnsw_fallback_recovery_success Successful fallback recoveries\n");
+        output.push_str(
+            "# HELP kyrodb_hnsw_fallback_recovery_success Successful fallback recoveries\n",
+        );
         output.push_str("# TYPE kyrodb_hnsw_fallback_recovery_success counter\n");
-        output.push_str(&format!("kyrodb_hnsw_fallback_recovery_success {}\n", fallback_success));
+        output.push_str(&format!(
+            "kyrodb_hnsw_fallback_recovery_success {}\n",
+            fallback_success
+        ));
 
         output.push_str("# HELP kyrodb_hnsw_fallback_recovery_failed Failed fallback recoveries\n");
         output.push_str("# TYPE kyrodb_hnsw_fallback_recovery_failed counter\n");
-        output.push_str(&format!("kyrodb_hnsw_fallback_recovery_failed {}\n", fallback_failed));
+        output.push_str(&format!(
+            "kyrodb_hnsw_fallback_recovery_failed {}\n",
+            fallback_failed
+        ));
 
         // Training Task Metrics
         let training_crashes = self.inner.training_crashes_total.load(Ordering::Relaxed);
@@ -873,15 +939,25 @@ impl MetricsCollector {
 
         output.push_str("# HELP kyrodb_training_crashes_total Training task crashes\n");
         output.push_str("# TYPE kyrodb_training_crashes_total counter\n");
-        output.push_str(&format!("kyrodb_training_crashes_total {}\n", training_crashes));
+        output.push_str(&format!(
+            "kyrodb_training_crashes_total {}\n",
+            training_crashes
+        ));
 
         output.push_str("# HELP kyrodb_training_restarts_total Training task restarts\n");
         output.push_str("# TYPE kyrodb_training_restarts_total counter\n");
-        output.push_str(&format!("kyrodb_training_restarts_total {}\n", training_restarts));
+        output.push_str(&format!(
+            "kyrodb_training_restarts_total {}\n",
+            training_restarts
+        ));
 
-        output.push_str("# HELP kyrodb_training_cycles_completed_total Completed training cycles\n");
+        output
+            .push_str("# HELP kyrodb_training_cycles_completed_total Completed training cycles\n");
         output.push_str("# TYPE kyrodb_training_cycles_completed_total counter\n");
-        output.push_str(&format!("kyrodb_training_cycles_completed_total {}\n", training_cycles));
+        output.push_str(&format!(
+            "kyrodb_training_cycles_completed_total {}\n",
+            training_cycles
+        ));
 
         // Error Metrics
         let errors = self.inner.error_counts.read();
@@ -1031,7 +1107,10 @@ mod tests {
 
         // Check computed metrics
         let slo = metrics.slo_status();
-        assert!(!slo.insufficient_data, "Should have sufficient data with 11 queries"); 
+        assert!(
+            !slo.insufficient_data,
+            "Should have sufficient data with 11 queries"
+        );
         assert!(slo.p99_latency_breached); // P99 = 1.5ms > 1ms SLO
         assert!(!slo.cache_hit_rate_breached); // 70% = 70% SLO (not breached)
     }
@@ -1045,12 +1124,12 @@ mod tests {
 
         // Mark ready
         metrics.mark_ready();
-        
+
         // Record enough successful queries to be healthy
         for _ in 0..100 {
             metrics.record_query_latency(100_000);
         }
-        
+
         // Record enough cache hits to meet SLO
         for _ in 0..75 {
             metrics.record_cache_hit(true);
@@ -1058,9 +1137,12 @@ mod tests {
         for _ in 0..25 {
             metrics.record_cache_hit(false);
         }
-        
+
         let health = metrics.health_status();
-        assert!(matches!(health, HealthStatus::Healthy | HealthStatus::Degraded { .. }));
+        assert!(matches!(
+            health,
+            HealthStatus::Healthy | HealthStatus::Degraded { .. }
+        ));
     }
 
     #[test]
@@ -1087,7 +1169,7 @@ mod tests {
         // With 100 samples, P50 is at index (0.5 * 100) = 50, which contains value 51_000
         let p50 = hist.percentile(50.0);
         assert!(p50 >= 50_000 && p50 <= 51_000, "P50 was {}", p50);
-        
+
         let p99 = hist.percentile(99.0);
         assert!(p99 >= 99_000 && p99 <= 100_000, "P99 was {}", p99);
     }
@@ -1103,16 +1185,23 @@ mod tests {
         }
 
         let slo = metrics.slo_status();
-        
+
         // Should flag insufficient data
         assert!(slo.insufficient_data);
-        
+
         // Should NOT flag breaches when insufficient data
-        assert!(!slo.p99_latency_breached, "Should not breach with insufficient data");
-        
+        assert!(
+            !slo.p99_latency_breached,
+            "Should not breach with insufficient data"
+        );
+
         // Health should be healthy during warmup
         let health = metrics.health_status();
-        assert_eq!(health, HealthStatus::Healthy, "Should be healthy during warmup");
+        assert_eq!(
+            health,
+            HealthStatus::Healthy,
+            "Should be healthy during warmup"
+        );
     }
 
     #[test]
@@ -1126,10 +1215,13 @@ mod tests {
 
         // Should only contain last 10 samples (6-15)
         assert!(hist.filled, "Buffer should be marked as filled");
-        
+
         // Median should be around 10-11 (samples 6-15)
         let p50 = hist.percentile(50.0);
-        assert!(p50 >= 10_000 && p50 <= 12_000, "P50 was {}, expected ~10500", p50);
+        assert!(
+            p50 >= 10_000 && p50 <= 12_000,
+            "P50 was {}, expected ~10500",
+            p50
+        );
     }
 }
-

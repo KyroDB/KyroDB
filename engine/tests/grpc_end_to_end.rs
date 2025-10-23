@@ -51,19 +51,22 @@ fn server_binary() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
 
-    let current = std::env::current_exe().context("failed to detect current test executable path")?;
+    let current =
+        std::env::current_exe().context("failed to detect current test executable path")?;
     let candidate = current
         .parent()
         .and_then(|p| p.parent())
         .map(|dir| dir.join(binary_name()));
 
-    let path = candidate
-        .context("failed to derive kyrodb_server path from current executable")?;
+    let path = candidate.context("failed to derive kyrodb_server path from current executable")?;
 
     if path.exists() {
         Ok(path)
     } else {
-        Err(anyhow!("kyrodb_server binary not found at {}", path.display()))
+        Err(anyhow!(
+            "kyrodb_server binary not found at {}",
+            path.display()
+        ))
     }
 }
 
@@ -125,7 +128,10 @@ async fn end_to_end_insert_query_search() -> Result<()> {
         .flush_hot_tier(Request::new(FlushRequest { force: true }))
         .await
         .context("flush_hot_tier RPC failed")?;
-    assert!(flush_response.get_ref().success, "forced flush should succeed");
+    assert!(
+        flush_response.get_ref().success,
+        "forced flush should succeed"
+    );
 
     let query_request = QueryRequest {
         doc_id,

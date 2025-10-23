@@ -56,7 +56,7 @@ pub struct VectorCache {
 struct CacheState {
     /// Main cache storage (doc_id → cached vector)
     cache: HashMap<u64, CachedVector>,
-    
+
     /// LRU queue (front = oldest, back = newest)
     lru_queue: VecDeque<u64>,
 }

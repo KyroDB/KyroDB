@@ -311,7 +311,7 @@ git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
 # Build release binary
-cargo build --release
+cargo build --release --features cli-tools
 
 # Run tests
 cargo test

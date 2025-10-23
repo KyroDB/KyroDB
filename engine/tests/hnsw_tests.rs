@@ -151,7 +151,11 @@ fn test_hnsw_results_ordered() {
     let results = index.knn_search(&query, 3).unwrap();
 
     // Should return at least 3 results, ordered by distance
-    assert!(results.len() >= 3, "Expected at least 3 results, got {}", results.len());
+    assert!(
+        results.len() >= 3,
+        "Expected at least 3 results, got {}",
+        results.len()
+    );
     assert_eq!(results[0].doc_id, 0); // Closest should be vector 0
     assert!(results[0].distance < results[1].distance);
     assert!(results[1].distance < results[2].distance);

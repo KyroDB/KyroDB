@@ -52,7 +52,12 @@ enum Commands {
 
     #[command(about = "Restore database from a backup")]
     Restore {
-        #[arg(long, help = "Backup ID to restore from", conflicts_with = "point_in_time", required_unless_present = "point_in_time")]
+        #[arg(
+            long,
+            help = "Backup ID to restore from",
+            conflicts_with = "point_in_time",
+            required_unless_present = "point_in_time"
+        )]
         backup_id: Option<String>,
 
         #[arg(
@@ -137,17 +142,17 @@ fn main() -> Result<()> {
             if incremental {
                 #[cfg(feature = "cli-tools")]
                 progress.set_message("Creating incremental backup...");
-                
+
                 let reference_id = reference
                     .ok_or_else(|| anyhow::anyhow!("Reference backup ID required"))?
                     .parse::<Uuid>()?;
 
-                let metadata =
-                    backup_manager.create_incremental_backup(reference_id, description.unwrap_or_default())?;
-                
+                let metadata = backup_manager
+                    .create_incremental_backup(reference_id, description.unwrap_or_default())?;
+
                 #[cfg(feature = "cli-tools")]
                 progress.finish_with_message("Incremental backup created successfully");
-                
+
                 println!("\nBackup ID: {}", metadata.id);
                 println!("Type: Incremental");
                 println!("Size: {} bytes", metadata.size_bytes);
@@ -155,12 +160,13 @@ fn main() -> Result<()> {
             } else {
                 #[cfg(feature = "cli-tools")]
                 progress.set_message("Creating full backup...");
-                
-                let metadata = backup_manager.create_full_backup(description.unwrap_or_default())?;
-                
+
+                let metadata =
+                    backup_manager.create_full_backup(description.unwrap_or_default())?;
+
                 #[cfg(feature = "cli-tools")]
                 progress.finish_with_message("Full backup created successfully");
-                
+
                 println!("\nBackup ID: {}", metadata.id);
                 println!("Type: Full");
                 println!("Size: {} bytes", metadata.size_bytes);
@@ -188,13 +194,16 @@ fn main() -> Result<()> {
                             id: b.id.to_string(),
                             backup_type: match b.backup_type {
                                 kyrodb_engine::backup::BackupType::Full => "Full".to_string(),
-                                kyrodb_engine::backup::BackupType::Incremental => "Incremental".to_string(),
+                                kyrodb_engine::backup::BackupType::Incremental => {
+                                    "Incremental".to_string()
+                                }
                             },
                             created_at: chrono::DateTime::from_timestamp(
-                                b.timestamp.try_into().unwrap_or(i64::MAX), 0
+                                b.timestamp.try_into().unwrap_or(i64::MAX),
+                                0,
                             )
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                                .unwrap_or_else(|| "Unknown".to_string()),
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                            .unwrap_or_else(|| "Unknown".to_string()),
                             size: format_bytes(b.size_bytes),
                             vectors: b.vector_count,
                             description: b.description,
@@ -232,28 +241,27 @@ fn main() -> Result<()> {
             if let Some(backup_id_str) = backup_id {
                 #[cfg(feature = "cli-tools")]
                 progress.set_message(format!("Restoring from backup {}...", backup_id_str));
-                
+
                 let backup_id = backup_id_str.parse::<Uuid>()?;
                 restore_manager.restore_from_backup(backup_id)?;
-                
+
                 #[cfg(feature = "cli-tools")]
                 progress.finish_with_message("Restore completed successfully");
-                
+
                 println!("\nDatabase restored from backup {}", backup_id_str);
             } else if let Some(timestamp) = point_in_time {
                 #[cfg(feature = "cli-tools")]
                 progress.set_message(format!("Restoring to point-in-time {}...", timestamp));
-                
+
                 restore_manager.restore_point_in_time(timestamp)?;
-                
+
                 #[cfg(feature = "cli-tools")]
                 progress.finish_with_message("Point-in-time restore completed successfully");
-                
-                let dt = chrono::DateTime::from_timestamp(
-                    timestamp.try_into().unwrap_or(i64::MAX), 0
-                )
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "Unknown".to_string());
+
+                let dt =
+                    chrono::DateTime::from_timestamp(timestamp.try_into().unwrap_or(i64::MAX), 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "Unknown".to_string());
                 println!("\nDatabase restored to point-in-time: {}", dt);
             }
         }
@@ -288,7 +296,7 @@ fn main() -> Result<()> {
             };
 
             let pruned = backup_manager.prune_backups(&policy)?;
-            
+
             #[cfg(feature = "cli-tools")]
             progress.finish();
 
@@ -330,9 +338,13 @@ fn main() -> Result<()> {
                 backup_path = cli.backup_dir.join(format!("backup_{}.tar", backup_id));
             }
             if !backup_path.exists() {
-                anyhow::bail!("Backup file not found at {} or backup_{}.tar", 
-                    cli.backup_dir.join(format!("{}.backup", backup_id)).display(),
-                    backup_id);
+                anyhow::bail!(
+                    "Backup file not found at {} or backup_{}.tar",
+                    cli.backup_dir
+                        .join(format!("{}.backup", backup_id))
+                        .display(),
+                    backup_id
+                );
             }
 
             // Verify file size
@@ -348,9 +360,9 @@ fn main() -> Result<()> {
             // Compute and verify checksum
             #[cfg(feature = "cli-tools")]
             progress.set_message("Computing checksum...");
-            
+
             let computed_checksum = kyrodb_engine::backup::compute_backup_checksum(&backup_path)?;
-            
+
             if computed_checksum != backup.checksum {
                 anyhow::bail!(
                     "Checksum mismatch: expected 0x{:08X}, computed 0x{:08X}",
@@ -361,7 +373,7 @@ fn main() -> Result<()> {
 
             #[cfg(feature = "cli-tools")]
             progress.finish_with_message("Backup verification successful");
-            
+
             println!("\nBackup {} is valid", backup_id);
             println!("Size: {} bytes", file_size);
             println!("Checksum: 0x{:08X} (verified)", backup.checksum);

@@ -336,7 +336,8 @@ mod tests {
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
+        let handle =
+            spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
 
         // Wait for multiple training cycles
         sleep(Duration::from_secs(3)).await;
@@ -372,7 +373,8 @@ mod tests {
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
+        let handle =
+            spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -407,7 +409,8 @@ mod tests {
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let handle = spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
+        let handle =
+            spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -537,7 +540,7 @@ mod tests {
         // This test verifies correct initialization of restart policy fields.
         // Full restart behavior testing requires integration test infrastructure
         // to reliably trigger task panics (e.g., via fault injection or chaos tests).
-        
+
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         let predictor = LearnedCachePredictor::new(100).unwrap();
         let strategy = Arc::new(LearnedCacheStrategy::new(100, predictor));
@@ -552,11 +555,7 @@ mod tests {
         let metrics = MetricsCollector::new();
 
         let supervisor = TrainingTaskSupervisor::with_restart_policy(
-            logger,
-            strategy,
-            config,
-            metrics,
-            5, // max 5 restarts
+            logger, strategy, config, metrics, 5, // max 5 restarts
             1, // 1s base delay
         );
 

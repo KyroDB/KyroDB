@@ -108,7 +108,8 @@ fn test_hnsw_backend_persistence() {
 
     // Recover from persistence with metrics
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
-    let recovered = HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 10, metrics.clone()).unwrap();
+    let recovered =
+        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 10, metrics.clone()).unwrap();
 
     // Verify all documents recovered
     assert_eq!(recovered.len(), 4);
@@ -125,8 +126,8 @@ fn test_hnsw_backend_persistence() {
     // Verify metrics were collected during recovery
     // Recovery should not record errors if successful
     assert_eq!(
-        metrics.get_hnsw_corruption_count(), 
-        0, 
+        metrics.get_hnsw_corruption_count(),
+        0,
         "No corruption should be detected during clean recovery"
     );
 }
@@ -156,7 +157,8 @@ fn test_crash_recovery_wal_only() {
 
     // Recover from WAL
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
-    let recovered = HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 1000, metrics).unwrap();
+    let recovered =
+        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 1000, metrics).unwrap();
 
     // Verify data recovered from WAL
     assert_eq!(recovered.len(), 3);
@@ -220,7 +222,8 @@ fn test_knn_search_after_recovery() {
 
     // Recover and test k-NN search
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
-    let recovered = HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 10, metrics).unwrap();
+    let recovered =
+        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 10, metrics).unwrap();
 
     // Query closest to doc 0
     let query = vec![1.0, 0.0, 0.0, 0.0];

@@ -153,7 +153,7 @@ impl KyroDbService for KyroDBServiceImpl {
             Ok(_) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 self.state.metrics.record_insert(true);
-                
+
                 info!(
                     doc_id = req.doc_id,
                     latency_ns = latency_ns,
@@ -397,7 +397,7 @@ impl KyroDbService for KyroDBServiceImpl {
         match engine.knn_search(&req.query_embedding, req.k as usize) {
             Ok(results) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
-                
+
                 // Record metrics
                 self.state.metrics.record_query_latency(latency_ns);
                 self.state.metrics.record_hnsw_search(latency_ns);
@@ -685,11 +685,9 @@ impl KyroDbService for KyroDBServiceImpl {
 // ============================================================================
 
 /// Prometheus /metrics endpoint handler
-async fn metrics_handler(
-    AxumState(state): AxumState<Arc<ServerState>>,
-) -> HttpResponse<Body> {
+async fn metrics_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let prometheus_text = state.metrics.export_prometheus();
-    
+
     HttpResponse::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/plain; version=0.0.4")
@@ -698,11 +696,9 @@ async fn metrics_handler(
 }
 
 /// Health check /health endpoint (liveness probe)
-async fn health_handler(
-    AxumState(state): AxumState<Arc<ServerState>>,
-) -> HttpResponse<Body> {
+async fn health_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let health = state.metrics.health_status();
-    
+
     let (status_code, body) = match health {
         HealthStatus::Healthy => (
             StatusCode::OK,
@@ -735,7 +731,7 @@ async fn health_handler(
             }),
         ),
     };
-    
+
     HttpResponse::builder()
         .status(status_code)
         .header("Content-Type", "application/json")
@@ -744,11 +740,9 @@ async fn health_handler(
 }
 
 /// Readiness check /ready endpoint (readiness probe)
-async fn ready_handler(
-    AxumState(state): AxumState<Arc<ServerState>>,
-) -> HttpResponse<Body> {
+async fn ready_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let health = state.metrics.health_status();
-    
+
     let (status_code, body) = match health {
         HealthStatus::Healthy | HealthStatus::Degraded { .. } => (
             StatusCode::OK,
@@ -765,7 +759,7 @@ async fn ready_handler(
             }),
         ),
     };
-    
+
     HttpResponse::builder()
         .status(status_code)
         .header("Content-Type", "application/json")
@@ -774,22 +768,20 @@ async fn ready_handler(
 }
 
 /// SLO status endpoint for alerting systems
-async fn slo_handler(
-    AxumState(state): AxumState<Arc<ServerState>>,
-) -> HttpResponse<Body> {
+async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let slo = state.metrics.slo_status();
-    
+
     let any_breach = slo.p99_latency_breached
         || slo.cache_hit_rate_breached
         || slo.error_rate_breached
         || slo.availability_breached;
-    
+
     let status_code = if any_breach {
         StatusCode::OK // Still return 200, but include breach details
     } else {
         StatusCode::OK
     };
-    
+
     let body = serde_json::json!({
         "slo_breaches": {
             "p99_latency": slo.p99_latency_breached,
@@ -810,7 +802,7 @@ async fn slo_handler(
             "min_availability": 0.999,
         },
     });
-    
+
     HttpResponse::builder()
         .status(status_code)
         .header("Content-Type", "application/json")
@@ -833,15 +825,15 @@ struct CliArgs {
     /// Path to configuration file (YAML or TOML)
     #[arg(short, long, env = "KYRODB_CONFIG")]
     config: Option<String>,
-    
+
     /// Override gRPC server port
     #[arg(short, long, env = "KYRODB_PORT")]
     port: Option<u16>,
-    
+
     /// Override data directory
     #[arg(short, long, env = "KYRODB_DATA_DIR")]
     data_dir: Option<String>,
-    
+
     /// Generate example config file (yaml or toml) and exit
     #[arg(long, value_name = "FORMAT")]
     generate_config: Option<String>,
@@ -851,10 +843,10 @@ struct CliArgs {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize deadlock detection in debug builds
     kyrodb_engine::init_deadlock_detection();
-    
+
     // Parse command-line arguments
     let cli_args = CliArgs::parse();
-    
+
     // Handle --generate-config early exit
     if let Some(format) = cli_args.generate_config {
         match format.to_lowercase().as_str() {
@@ -872,10 +864,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     // Load configuration with priority: CLI args > env vars > config file > defaults
     let mut config = kyrodb_engine::config::KyroDbConfig::load(cli_args.config.as_deref())?;
-    
+
     // Apply CLI overrides (highest priority)
     if let Some(port) = cli_args.port {
         config.server.port = port;
@@ -883,16 +875,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(data_dir) = cli_args.data_dir {
         config.persistence.data_dir = data_dir.into();
     }
-    
+
     // Validate final configuration
     config.validate()?;
-    
+
     // Initialize structured logging based on config
     let (non_blocking, _guard) = if let Some(log_file) = &config.logging.file {
         match std::fs::File::create(log_file) {
             Ok(file) => tracing_appender::non_blocking(file),
             Err(e) => {
-                eprintln!("Warning: Failed to create log file {:?}: {}. Falling back to stdout.", log_file, e);
+                eprintln!(
+                    "Warning: Failed to create log file {:?}: {}. Falling back to stdout.",
+                    log_file, e
+                );
                 tracing_appender::non_blocking(std::io::stdout())
             }
         }
@@ -901,8 +896,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let log_level = config.logging.level.as_str();
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| format!("kyrodb_engine={},kyrodb_server={}", log_level, log_level).into());
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        format!("kyrodb_engine={},kyrodb_server={}", log_level, log_level).into()
+    });
 
     match config.logging.format {
         kyrodb_engine::config::LogFormat::Json => {
@@ -958,10 +954,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             FsyncPolicy::Periodic(config.persistence.wal_flush_interval_ms)
         }
         kyrodb_engine::config::FsyncPolicy::Full => {
-            FsyncPolicy::Always  // Most conservative for "full"
+            FsyncPolicy::Always // Most conservative for "full"
         }
     };
-    
+
     let engine_config = TieredEngineConfig {
         hot_tier_max_size: config.cache.capacity,
         hot_tier_hard_limit: config.cache.capacity * 2, // 2x soft limit for emergency eviction
@@ -986,7 +982,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir_path = config.persistence.data_dir.clone();
     let engine = if data_dir_path.exists() {
         info!("Data directory exists, attempting recovery...");
-        match TieredEngine::recover(cache_strategy, data_dir_path.to_str().unwrap(), engine_config.clone()) {
+        match TieredEngine::recover(
+            cache_strategy,
+            data_dir_path.to_str().unwrap(),
+            engine_config.clone(),
+        ) {
             Ok(engine) => {
                 info!("Recovery successful");
                 engine
@@ -1022,7 +1022,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn background flush task with graceful shutdown
     let mut flush_shutdown_rx = shutdown_tx.subscribe();
     let engine_for_flush = engine_arc.clone();
-    
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         info!("Background flush task started (60s interval)");
@@ -1081,10 +1081,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // HTTP port for observability (from config)
     let http_port = config.http_port();
-    let http_addr = format!("{}:{}", config.server.host, http_port)
-        .parse::<std::net::SocketAddr>()?;
+    let http_addr =
+        format!("{}:{}", config.server.host, http_port).parse::<std::net::SocketAddr>()?;
 
-    info!("HTTP observability server listening on http://{}", http_addr);
+    info!(
+        "HTTP observability server listening on http://{}",
+        http_addr
+    );
     info!("  GET /metrics  - Prometheus metrics");
     info!("  GET /health   - Liveness probe");
     info!("  GET /ready    - Readiness probe");

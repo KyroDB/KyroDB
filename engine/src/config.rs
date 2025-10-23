@@ -30,28 +30,28 @@ use std::time::Duration;
 pub struct KyroDbConfig {
     /// Server configuration (gRPC and HTTP endpoints)
     pub server: ServerConfig,
-    
+
     /// Vector cache configuration (Hybrid Semantic Cache layer)
     pub cache: CacheConfig,
-    
+
     /// HNSW index configuration (vector search backend)
     pub hnsw: HnswConfig,
-    
+
     /// Persistence configuration (WAL and snapshots)
     pub persistence: PersistenceConfig,
-    
+
     /// SLO thresholds for alerting
     pub slo: SloConfig,
-    
+
     /// Rate limiting configuration
     pub rate_limit: RateLimitConfig,
-    
+
     /// Logging configuration
     pub logging: LoggingConfig,
-    
+
     /// Authentication and authorization configuration
     pub auth: AuthConfig,
-    
+
     /// Timeout configuration for tiered engine operations
     pub timeouts: TimeoutConfig,
 }
@@ -65,19 +65,19 @@ pub struct KyroDbConfig {
 pub struct ServerConfig {
     /// gRPC server host (IPv4 or IPv6)
     pub host: String,
-    
+
     /// gRPC server port
     pub port: u16,
-    
+
     /// HTTP observability server port (defaults to gRPC port + 1000)
     pub http_port: Option<u16>,
-    
+
     /// Maximum number of concurrent connections
     pub max_connections: usize,
-    
+
     /// Connection idle timeout (seconds)
     pub connection_timeout_secs: u64,
-    
+
     /// Graceful shutdown timeout (seconds)
     pub shutdown_timeout_secs: u64,
 }
@@ -104,19 +104,19 @@ impl Default for ServerConfig {
 pub struct CacheConfig {
     /// Maximum number of vectors to cache
     pub capacity: usize,
-    
+
     /// Cache eviction strategy
     pub strategy: CacheStrategy,
-    
+
     /// Training interval for Hybrid Semantic Cache (seconds)
     pub training_interval_secs: u64,
-    
+
     /// Minimum access count before training
     pub min_training_samples: usize,
-    
+
     /// Enable A/B testing between strategies
     pub enable_ab_testing: bool,
-    
+
     /// A/B test traffic split (0.0-1.0, fraction for treatment group)
     pub ab_test_split: f64,
 }
@@ -154,19 +154,19 @@ pub enum CacheStrategy {
 pub struct HnswConfig {
     /// Maximum number of vectors in index
     pub max_elements: usize,
-    
+
     /// Number of bidirectional links per node (M parameter)
     pub m: usize,
-    
+
     /// Size of dynamic candidate list during construction (ef_construction)
     pub ef_construction: usize,
-    
+
     /// Size of dynamic candidate list during search (ef_search)
     pub ef_search: usize,
-    
+
     /// Vector dimension (must match your embeddings)
     pub dimension: usize,
-    
+
     /// Distance metric
     pub distance: DistanceMetric,
 }
@@ -204,22 +204,22 @@ pub enum DistanceMetric {
 pub struct PersistenceConfig {
     /// Data directory for WAL and snapshots
     pub data_dir: PathBuf,
-    
+
     /// Enable write-ahead log
     pub enable_wal: bool,
-    
+
     /// WAL flush interval (milliseconds, 0 = immediate)
     pub wal_flush_interval_ms: u64,
-    
+
     /// fsync policy
     pub fsync_policy: FsyncPolicy,
-    
+
     /// Snapshot interval (seconds, 0 = disabled)
     pub snapshot_interval_secs: u64,
-    
+
     /// Maximum WAL size before rotation (bytes)
     pub max_wal_size_bytes: u64,
-    
+
     /// Enable automatic crash recovery on startup
     pub enable_recovery: bool,
 }
@@ -231,7 +231,7 @@ impl Default for PersistenceConfig {
             enable_wal: true,
             wal_flush_interval_ms: 100,
             fsync_policy: FsyncPolicy::DataOnly,
-            snapshot_interval_secs: 3600, // 1 hour
+            snapshot_interval_secs: 3600,          // 1 hour
             max_wal_size_bytes: 100 * 1024 * 1024, // 100 MB
             enable_recovery: true,
         }
@@ -258,16 +258,16 @@ pub enum FsyncPolicy {
 pub struct SloConfig {
     /// P99 latency threshold (milliseconds)
     pub p99_latency_ms: f64,
-    
+
     /// Cache hit rate threshold (0.0-1.0)
     pub cache_hit_rate: f64,
-    
+
     /// Error rate threshold (0.0-1.0)
     pub error_rate: f64,
-    
+
     /// Availability threshold (0.0-1.0)
     pub availability: f64,
-    
+
     /// Minimum sample size before alerting
     pub min_samples: usize,
 }
@@ -293,13 +293,13 @@ impl Default for SloConfig {
 pub struct RateLimitConfig {
     /// Enable rate limiting
     pub enabled: bool,
-    
+
     /// Maximum queries per second per connection
     pub max_qps_per_connection: usize,
-    
+
     /// Maximum queries per second globally
     pub max_qps_global: usize,
-    
+
     /// Burst capacity (tokens in bucket)
     pub burst_capacity: usize,
 }
@@ -324,19 +324,19 @@ impl Default for RateLimitConfig {
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     pub level: LogLevel,
-    
+
     /// Log format (json or text)
     pub format: LogFormat,
-    
+
     /// Log to file (path, or None for stdout only)
     pub file: Option<PathBuf>,
-    
+
     /// Enable log rotation
     pub rotation: bool,
-    
+
     /// Maximum log file size before rotation (bytes)
     pub max_file_size_bytes: u64,
-    
+
     /// Maximum number of rotated log files to keep
     pub max_files: usize,
 }
@@ -394,13 +394,13 @@ pub enum LogFormat {
 pub struct AuthConfig {
     /// Enable authentication (default: false for backward compatibility)
     pub enabled: bool,
-    
+
     /// Path to API keys file (YAML format)
     pub api_keys_file: Option<PathBuf>,
-    
+
     /// Path to usage stats export (CSV)
     pub usage_stats_file: PathBuf,
-    
+
     /// How often to export usage stats (seconds)
     pub usage_export_interval_secs: u64,
 }
@@ -425,10 +425,10 @@ impl Default for AuthConfig {
 pub struct TimeoutConfig {
     /// Cache tier timeout in milliseconds (default: 10ms)
     pub cache_ms: u64,
-    
+
     /// Hot tier timeout in milliseconds (default: 50ms)
     pub hot_tier_ms: u64,
-    
+
     /// Cold tier timeout in milliseconds (default: 1000ms)
     pub cold_tier_ms: u64,
 }
@@ -475,58 +475,56 @@ impl KyroDbConfig {
             .add_source(
                 config::Environment::with_prefix("KYRODB")
                     .separator("__")
-                    .try_parsing(true)
+                    .try_parsing(true),
             )
             .build()
             .context("Failed to build config")?;
-        
+
         settings
             .try_deserialize()
             .context("Failed to deserialize config")
     }
-    
+
     /// Load configuration with priority chain:
     /// 1. Environment variables (KYRODB_*)
     /// 2. Config file (if provided)
     /// 3. Built-in defaults
     pub fn load(config_file: Option<&str>) -> Result<Self> {
         let mut builder = config::Config::builder();
-        
+
         // Start with defaults (converted to config source)
         let defaults = Self::default();
-        let defaults_json = serde_json::to_string(&defaults)
-            .context("Failed to serialize defaults")?;
+        let defaults_json =
+            serde_json::to_string(&defaults).context("Failed to serialize defaults")?;
         builder = builder.add_source(config::File::from_str(
             &defaults_json,
             config::FileFormat::Json,
         ));
-        
+
         // Add config file if provided
         if let Some(path) = config_file {
             builder = builder.add_source(
-                config::File::with_name(path)
-                    .required(false) // Don't fail if file doesn't exist
+                config::File::with_name(path).required(false), // Don't fail if file doesn't exist
             );
         }
-        
+
         // Add environment variables (highest priority)
         builder = builder.add_source(
             config::Environment::with_prefix("KYRODB")
                 .separator("__")
-                .try_parsing(true)
+                .try_parsing(true),
         );
-        
-        let settings = builder.build()
-            .context("Failed to build config")?;
-        
+
+        let settings = builder.build().context("Failed to build config")?;
+
         let config: Self = settings
             .try_deserialize()
             .context("Failed to deserialize config")?;
-        
+
         config.validate()?;
         Ok(config)
     }
-    
+
     /// Validate configuration parameters
     pub fn validate(&self) -> Result<()> {
         // Server validation
@@ -535,7 +533,7 @@ impl KyroDbConfig {
             "Server port must be > 0, got {}",
             self.server.port
         );
-        
+
         // Validate HTTP port (auto-calculated or explicit)
         // Note: Since port is u16, it's automatically <= 65535
         // But we check for overflow when auto-calculating (port + 1000)
@@ -552,13 +550,13 @@ impl KyroDbConfig {
             http_port,
             self.server.port
         );
-        
+
         anyhow::ensure!(
             self.server.max_connections > 0,
             "max_connections must be > 0, got {}",
             self.server.max_connections
         );
-        
+
         // Cache validation
         anyhow::ensure!(
             self.cache.capacity > 0,
@@ -571,7 +569,8 @@ impl KyroDbConfig {
             self.cache.ab_test_split
         );
         anyhow::ensure!(
-            self.cache.min_training_samples > 0 && self.cache.min_training_samples <= self.cache.capacity,
+            self.cache.min_training_samples > 0
+                && self.cache.min_training_samples <= self.cache.capacity,
             "min_training_samples must be in range [1, {}], got {}",
             self.cache.capacity,
             self.cache.min_training_samples
@@ -581,7 +580,7 @@ impl KyroDbConfig {
             "training_interval_secs must be > 0, got {}",
             self.cache.training_interval_secs
         );
-        
+
         // HNSW validation - basic bounds
         anyhow::ensure!(
             self.hnsw.max_elements > 0,
@@ -608,7 +607,7 @@ impl KyroDbConfig {
             "HNSW dimension must be > 0, got {}",
             self.hnsw.dimension
         );
-        
+
         // HNSW parameter relationships
         anyhow::ensure!(
             self.hnsw.ef_construction >= self.hnsw.m,
@@ -616,7 +615,7 @@ impl KyroDbConfig {
             self.hnsw.ef_construction,
             self.hnsw.m
         );
-        
+
         // Warn if ef_search > ef_construction (not an error, but likely suboptimal)
         if self.hnsw.ef_search > self.hnsw.ef_construction {
             eprintln!(
@@ -624,7 +623,7 @@ impl KyroDbConfig {
                 self.hnsw.ef_search, self.hnsw.ef_construction
             );
         }
-        
+
         // Persistence validation
         anyhow::ensure!(
             !self.persistence.data_dir.as_os_str().is_empty(),
@@ -635,7 +634,7 @@ impl KyroDbConfig {
             "max_wal_size_bytes must be > 0, got {}",
             self.persistence.max_wal_size_bytes
         );
-        
+
         // SLO validation
         anyhow::ensure!(
             self.slo.p99_latency_ms > 0.0,
@@ -657,7 +656,7 @@ impl KyroDbConfig {
             "SLO availability must be in [0.0, 1.0], got {}",
             self.slo.availability
         );
-        
+
         // Rate limit validation
         if self.rate_limit.enabled {
             anyhow::ensure!(
@@ -671,7 +670,7 @@ impl KyroDbConfig {
                 self.rate_limit.max_qps_global
             );
         }
-        
+
         // Authentication validation
         if self.auth.enabled {
             anyhow::ensure!(
@@ -684,45 +683,45 @@ impl KyroDbConfig {
             "usage_export_interval_secs must be > 0, got {}",
             self.auth.usage_export_interval_secs
         );
-        
+
         Ok(())
     }
-    
+
     /// Get the HTTP observability port (auto-calculated if not set)
-    /// 
+    ///
     /// If http_port is not explicitly set, returns gRPC port + 1000.
     /// Note: Validation ensures this doesn't overflow (checked in validate()).
     pub fn http_port(&self) -> u16 {
-        self.server.http_port.unwrap_or_else(|| {
-            self.server.port.saturating_add(1000)
-        })
+        self.server
+            .http_port
+            .unwrap_or_else(|| self.server.port.saturating_add(1000))
     }
-    
+
     /// Get connection timeout as Duration
     pub fn connection_timeout(&self) -> Duration {
         Duration::from_secs(self.server.connection_timeout_secs)
     }
-    
+
     /// Get shutdown timeout as Duration
     pub fn shutdown_timeout(&self) -> Duration {
         Duration::from_secs(self.server.shutdown_timeout_secs)
     }
-    
+
     /// Get WAL flush interval as Duration
     pub fn wal_flush_interval(&self) -> Duration {
         Duration::from_millis(self.persistence.wal_flush_interval_ms)
     }
-    
+
     /// Get snapshot interval as Duration
     pub fn snapshot_interval(&self) -> Duration {
         Duration::from_secs(self.persistence.snapshot_interval_secs)
     }
-    
+
     /// Get cache training interval as Duration
     pub fn cache_training_interval(&self) -> Duration {
         Duration::from_secs(self.cache.training_interval_secs)
     }
-    
+
     /// Get usage export interval as Duration
     pub fn usage_export_interval(&self) -> Duration {
         Duration::from_secs(self.auth.usage_export_interval_secs)
@@ -734,7 +733,7 @@ impl KyroDbConfig {
 // ============================================================================
 
 /// Generate YAML config with default values (without explanatory comments).
-/// 
+///
 /// This outputs a valid YAML config file with default values only.
 /// For a fully-documented example with comments explaining each option,
 /// see `config.example.yaml` in the repository root.
@@ -749,7 +748,7 @@ pub fn generate_example_yaml() -> String {
 }
 
 /// Generate TOML config with default values (without explanatory comments).
-/// 
+///
 /// This outputs a valid TOML config file with default values only.
 /// For a fully-documented example with comments explaining each option,
 /// see `config.example.toml` in the repository root.
@@ -766,40 +765,40 @@ pub fn generate_example_toml() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_config_validates() {
         let config = KyroDbConfig::default();
         config.validate().expect("Default config should be valid");
     }
-    
+
     #[test]
     fn test_invalid_cache_capacity() {
         let mut config = KyroDbConfig::default();
         config.cache.capacity = 0;
         assert!(config.validate().is_err());
     }
-    
+
     #[test]
     fn test_invalid_ab_test_split() {
         let mut config = KyroDbConfig::default();
         config.cache.ab_test_split = 1.5;
         assert!(config.validate().is_err());
     }
-    
+
     #[test]
     fn test_http_port_auto_calculation() {
         let config = KyroDbConfig::default();
         assert_eq!(config.http_port(), 51051); // 50051 + 1000
     }
-    
+
     #[test]
     fn test_http_port_explicit() {
         let mut config = KyroDbConfig::default();
         config.server.http_port = Some(8080);
         assert_eq!(config.http_port(), 8080);
     }
-    
+
     #[test]
     fn test_duration_conversions() {
         let config = KyroDbConfig::default();
@@ -809,67 +808,73 @@ mod tests {
         assert_eq!(config.snapshot_interval(), Duration::from_secs(3600));
         assert_eq!(config.cache_training_interval(), Duration::from_secs(600));
     }
-    
+
     #[test]
     fn test_log_level_conversion() {
         assert_eq!(LogLevel::Info.as_str(), "info");
         assert_eq!(LogLevel::Debug.as_str(), "debug");
         assert_eq!(LogLevel::Error.as_str(), "error");
     }
-    
+
     // ===== New Validation Tests =====
-    
+
     #[test]
     fn test_port_collision_validation() {
         let mut config = KyroDbConfig::default();
         config.server.http_port = Some(50051); // Same as gRPC port
         assert!(config.validate().is_err(), "Should reject colliding ports");
     }
-    
+
     #[test]
     fn test_http_port_overflow() {
         let mut config = KyroDbConfig::default();
         config.server.port = 65000; // Would overflow (65000 + 1000 > 65535)
-        assert!(config.validate().is_err(), "Should reject port that would overflow");
+        assert!(
+            config.validate().is_err(),
+            "Should reject port that would overflow"
+        );
     }
-    
+
     #[test]
     fn test_cache_min_training_samples_validation() {
         let mut config = KyroDbConfig::default();
-        
+
         // Test: min_training_samples = 0 should fail
         config.cache.min_training_samples = 0;
         assert!(config.validate().is_err());
-        
+
         // Test: min_training_samples > capacity should fail
         config.cache.min_training_samples = config.cache.capacity + 1;
         assert!(config.validate().is_err());
     }
-    
+
     #[test]
     fn test_cache_training_interval_validation() {
         let mut config = KyroDbConfig::default();
         config.cache.training_interval_secs = 0;
-        assert!(config.validate().is_err(), "training_interval_secs must be > 0");
+        assert!(
+            config.validate().is_err(),
+            "training_interval_secs must be > 0"
+        );
     }
-    
+
     #[test]
     fn test_hnsw_m_parameter_range() {
         let mut config = KyroDbConfig::default();
-        
+
         // M too small
         config.hnsw.m = 4;
         assert!(config.validate().is_err(), "M < 5 should fail");
-        
+
         // M too large
         config.hnsw.m = 50;
         assert!(config.validate().is_err(), "M > 48 should fail");
-        
+
         // M in valid range
         config.hnsw.m = 16;
         assert!(config.validate().is_ok(), "M = 16 should pass");
     }
-    
+
     #[test]
     fn test_hnsw_ef_construction_vs_m() {
         let mut config = KyroDbConfig::default();
@@ -880,7 +885,7 @@ mod tests {
             "ef_construction < M should fail"
         );
     }
-    
+
     #[test]
     fn test_valid_config_passes_all_checks() {
         let config = KyroDbConfig::default();

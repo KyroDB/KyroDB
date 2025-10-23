@@ -35,24 +35,24 @@ struct DiskSpaceInfo {
 #[instrument(level = "trace", skip(path), fields(path = %path.as_ref().display()))]
 fn check_disk_space(path: impl AsRef<Path>) -> Result<DiskSpaceInfo> {
     let path = path.as_ref();
-    
+
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
         use std::ffi::CString;
-        
+        use std::os::unix::ffi::OsStrExt;
+
         // Use statvfs to get filesystem statistics
-        let c_path = CString::new(path.as_os_str().as_bytes())
-            .context("Invalid path for statvfs")?;
-        
+        let c_path =
+            CString::new(path.as_os_str().as_bytes()).context("Invalid path for statvfs")?;
+
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        
+
         let result = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
-        
+
         if result != 0 {
             anyhow::bail!("statvfs failed for path: {}", path.display());
         }
-        
+
         // Cast to u64 for arithmetic (f_blocks and f_bavail are platform-dependent types)
         let total_bytes = stat.f_blocks as u64 * stat.f_frsize;
         let available_bytes = stat.f_bavail as u64 * stat.f_frsize;
@@ -61,28 +61,28 @@ fn check_disk_space(path: impl AsRef<Path>) -> Result<DiskSpaceInfo> {
         } else {
             0.0
         };
-        
+
         Ok(DiskSpaceInfo {
             available_bytes,
             available_percent,
         })
     }
-    
+
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         use std::ffi::OsStr;
-        
+        use std::os::windows::ffi::OsStrExt;
+
         // Convert path to wide string for Windows API
         let wide_path: Vec<u16> = OsStr::new(path)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        
+
         let mut free_bytes: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut available_bytes: u64 = 0;
-        
+
         let result = unsafe {
             windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
                 wide_path.as_ptr(),
@@ -91,23 +91,23 @@ fn check_disk_space(path: impl AsRef<Path>) -> Result<DiskSpaceInfo> {
                 &mut free_bytes,
             )
         };
-        
+
         if result == 0 {
             anyhow::bail!("GetDiskFreeSpaceExW failed for path: {}", path.display());
         }
-        
+
         let available_percent = if total_bytes > 0 {
             available_bytes as f64 / total_bytes as f64
         } else {
             0.0
         };
-        
+
         Ok(DiskSpaceInfo {
             available_bytes,
             available_percent,
         })
     }
-    
+
     #[cfg(not(any(unix, windows)))]
     {
         // Fallback for unsupported platforms - assume sufficient space
@@ -129,7 +129,7 @@ fn check_disk_space(path: impl AsRef<Path>) -> Result<DiskSpaceInfo> {
 #[instrument(level = "trace", skip(path), fields(path = %path.as_ref().display()))]
 fn check_and_warn_disk_space(path: impl AsRef<Path>) -> Result<bool> {
     let info = check_disk_space(&path)?;
-    
+
     if info.available_percent < DISK_SPACE_CRITICAL_THRESHOLD {
         error!(
             available_gb = info.available_bytes / (1024 * 1024 * 1024),
@@ -140,7 +140,7 @@ fn check_and_warn_disk_space(path: impl AsRef<Path>) -> Result<bool> {
         );
         return Ok(false);
     }
-    
+
     if info.available_percent < DISK_SPACE_WARNING_THRESHOLD {
         warn!(
             available_gb = info.available_bytes / (1024 * 1024 * 1024),
@@ -150,7 +150,7 @@ fn check_and_warn_disk_space(path: impl AsRef<Path>) -> Result<bool> {
             "WARNING: disk space running low"
         );
     }
-    
+
     Ok(true)
 }
 
@@ -178,7 +178,8 @@ struct PersistenceState {
     wal: Arc<RwLock<WalWriter>>,
     inserts_since_snapshot: Arc<RwLock<usize>>,
     snapshot_interval: usize,
-}impl HnswBackend {
+}
+impl HnswBackend {
     /// Create new HNSW backend from pre-loaded embeddings (no persistence)
     ///
     /// # Parameters
@@ -316,12 +317,17 @@ struct PersistenceState {
                 Ok((snapshot, recovered_from_fallback)) => {
                     dimension = snapshot.dimension;
                     snapshot_timestamp = snapshot.timestamp;
-                    
+
                     // Restore embeddings preserving doc_id → index mapping
                     // Find max doc_id to size the vector correctly
-                    let max_doc_id = snapshot.documents.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
+                    let max_doc_id = snapshot
+                        .documents
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .max()
+                        .unwrap_or(0) as usize;
                     embeddings = vec![vec![0.0; dimension]; max_doc_id + 1];
-                    
+
                     for (doc_id, embedding) in snapshot.documents {
                         embeddings[doc_id as usize] = embedding;
                     }
@@ -368,7 +374,7 @@ struct PersistenceState {
                     );
                     continue;
                 }
-                
+
                 match entry.op {
                     WalOp::Insert => {
                         // Infer dimension from first entry if no snapshot
@@ -502,7 +508,11 @@ struct PersistenceState {
         // Validate embedding dimension against backend dimension
         let current_dim = self.dimension();
         if current_dim != 0 && embedding.len() != current_dim {
-            anyhow::bail!("embedding dimension mismatch: expected {} found {}", current_dim, embedding.len());
+            anyhow::bail!(
+                "embedding dimension mismatch: expected {} found {}",
+                current_dim,
+                embedding.len()
+            );
         }
 
         // Update in-memory index and embeddings
@@ -564,7 +574,7 @@ struct PersistenceState {
 
         let doc_count = documents.len();
         let snapshot = Snapshot::new(dimension, documents);
-        
+
         // Save snapshot with timestamp
         let snapshot_timestamp = Self::timestamp();
         let snapshot_name = format!("snapshot_{}.snap", snapshot_timestamp);
@@ -580,7 +590,11 @@ struct PersistenceState {
 
         // WAL Compaction: Delete old WAL segments that are fully captured in the snapshot
         // This prevents unbounded disk usage growth
-        let compacted = self.compact_old_wal_segments(&persistence.data_dir, snapshot_timestamp, &mut manifest)?;
+        let compacted = self.compact_old_wal_segments(
+            &persistence.data_dir,
+            snapshot_timestamp,
+            &mut manifest,
+        )?;
         if compacted > 0 {
             info!(
                 compacted_segments = compacted,
@@ -627,15 +641,15 @@ struct PersistenceState {
         if query.is_empty() {
             anyhow::bail!("query embedding cannot be empty");
         }
-        
+
         if k == 0 {
             anyhow::bail!("k must be greater than 0");
         }
-        
+
         if k > 10_000 {
             anyhow::bail!("k must be <= 10,000 (requested: {})", k);
         }
-        
+
         let backend_dim = self.dimension();
         if backend_dim != 0 && query.len() != backend_dim {
             anyhow::bail!(
@@ -730,7 +744,7 @@ struct PersistenceState {
                 Some(ts) if ts <= snapshot_timestamp => {
                     // This WAL segment is fully captured in snapshot - safe to delete
                     let wal_path = data_dir.join(wal_name);
-                    
+
                     match std::fs::remove_file(&wal_path) {
                         Ok(()) => {
                             debug!(
@@ -839,7 +853,7 @@ mod tests {
     #[test]
     fn test_wal_compaction_after_snapshot() {
         use tempfile::TempDir;
-        
+
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path();
 
@@ -863,11 +877,7 @@ mod tests {
         let snapshot_files: Vec<_> = std::fs::read_dir(data_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("snapshot_")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("snapshot_"))
             .collect();
 
         assert!(
@@ -878,7 +888,7 @@ mod tests {
         // Verify WAL compaction occurred (old WAL segments should be deleted)
         let manifest_path = data_dir.join("MANIFEST");
         let manifest = Manifest::load(&manifest_path).unwrap();
-        
+
         // Should only have the active WAL segment remaining after compaction
         // (old WAL segments captured in snapshot are deleted)
         assert!(
@@ -891,22 +901,24 @@ mod tests {
     #[test]
     fn test_disk_space_check() {
         use tempfile::TempDir;
-        
+
         let temp_dir = TempDir::new().unwrap();
-        
+
         // Check disk space for temp directory (should succeed on any system with >5% free)
         let space_check = check_and_warn_disk_space(temp_dir.path());
-        
+
         // Should succeed unless disk is critically full
         assert!(space_check.is_ok(), "Disk space check failed unexpectedly");
-        
+
         // Get space info
         let info = check_disk_space(temp_dir.path()).unwrap();
-        
+
         // Basic sanity checks
         assert!(info.available_bytes > 0, "Available bytes should be > 0");
-        assert!(info.available_percent >= 0.0 && info.available_percent <= 1.0,
-                "Available percent should be in [0, 1]");
+        assert!(
+            info.available_percent >= 0.0 && info.available_percent <= 1.0,
+            "Available percent should be in [0, 1]"
+        );
     }
 
     #[test]

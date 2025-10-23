@@ -16,16 +16,13 @@ fn test_cli_backup_create_full() -> Result<()> {
         vec![0.0, 0.0, 1.0, 0.0],
     ];
 
-    let data_path = data_dir.path().to_str()
+    let data_path = data_dir
+        .path()
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend = HnswBackend::with_persistence(
-        embeddings.clone(),
-        100,
-        data_path,
-        FsyncPolicy::Always,
-        10,
-    )?;
+    let backend =
+        HnswBackend::with_persistence(embeddings.clone(), 100, data_path, FsyncPolicy::Always, 10)?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -53,7 +50,10 @@ fn test_cli_backup_create_full() -> Result<()> {
         "Should be full backup"
     );
     // Note: vector_count is a rough estimate (size/1024), don't assert exact count
-    println!("Backup created with {} vectors (estimated)", backups[0].vector_count);
+    println!(
+        "Backup created with {} vectors (estimated)",
+        backups[0].vector_count
+    );
 
     Ok(())
 }
@@ -64,16 +64,13 @@ fn test_cli_backup_list() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir.path().to_str()
+    let data_path = data_dir
+        .path()
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend = HnswBackend::with_persistence(
-        embeddings,
-        100,
-        data_path,
-        FsyncPolicy::Always,
-        10,
-    )?;
+    let backend =
+        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -94,15 +91,9 @@ fn test_cli_backup_list() -> Result<()> {
     println!("Output: {}", stdout);
 
     assert!(output.status.success(), "CLI list should succeed");
-    assert!(
-        stdout.contains("Backup ID"),
-        "Should contain table headers"
-    );
+    assert!(stdout.contains("Backup ID"), "Should contain table headers");
     assert!(stdout.contains("Full"), "Should show backup type");
-    assert!(
-        stdout.contains("Test backup"),
-        "Should show description"
-    );
+    assert!(stdout.contains("Test backup"), "Should show description");
 
     Ok(())
 }
@@ -113,16 +104,13 @@ fn test_cli_backup_list_json() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir.path().to_str()
+    let data_path = data_dir
+        .path()
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend = HnswBackend::with_persistence(
-        embeddings,
-        100,
-        data_path,
-        FsyncPolicy::Always,
-        10,
-    )?;
+    let backend =
+        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -144,8 +132,7 @@ fn test_cli_backup_list_json() -> Result<()> {
 
     assert!(output.status.success(), "CLI list JSON should succeed");
 
-    let json_backups: Vec<kyrodb_engine::backup::BackupMetadata> =
-        serde_json::from_str(&stdout)?;
+    let json_backups: Vec<kyrodb_engine::backup::BackupMetadata> = serde_json::from_str(&stdout)?;
     assert_eq!(json_backups.len(), 1);
     assert_eq!(json_backups[0].id, metadata.id);
     assert_eq!(json_backups[0].description, "JSON test");
@@ -159,16 +146,13 @@ fn test_cli_restore_from_backup() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]];
-    let data_path = data_dir.path().to_str()
+    let data_path = data_dir
+        .path()
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend = HnswBackend::with_persistence(
-        embeddings.clone(),
-        100,
-        data_path,
-        FsyncPolicy::Always,
-        10,
-    )?;
+    let backend =
+        HnswBackend::with_persistence(embeddings.clone(), 100, data_path, FsyncPolicy::Always, 10)?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -205,7 +189,10 @@ fn test_cli_restore_from_backup() -> Result<()> {
     // successfully extracts files, but full end-to-end recovery requires format alignment.
     //
     // Verify that at least MANIFEST and WAL files were restored
-    assert!(data_dir.path().join("MANIFEST").exists(), "MANIFEST should be restored");
+    assert!(
+        data_dir.path().join("MANIFEST").exists(),
+        "MANIFEST should be restored"
+    );
     let has_wal = std::fs::read_dir(data_dir.path())?
         .filter_map(|e| e.ok())
         .any(|e| e.file_name().to_string_lossy().ends_with(".wal"));
@@ -220,16 +207,13 @@ fn test_cli_prune_backups() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir.path().to_str()
+    let data_path = data_dir
+        .path()
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend = HnswBackend::with_persistence(
-        embeddings,
-        100,
-        data_path,
-        FsyncPolicy::Always,
-        10,
-    )?;
+    let backend =
+        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -239,26 +223,30 @@ fn test_cli_prune_backups() -> Result<()> {
     // This ensures backups fall into different daily/weekly/monthly buckets
     for i in 0..10 {
         let metadata = backup_manager.create_full_backup(format!("Backup {}", i))?;
-        
+
         // Adjust timestamps to simulate backups from different days
         // i=0: today, i=1-2: yesterday, i=3-4: last week, i=5+: last month
         let days_ago = match i {
-            0 => 0,      // today
-            1..=2 => 1,  // yesterday  
-            3..=4 => 7,  // last week
-            _ => 30,     // last month
+            0 => 0,     // today
+            1..=2 => 1, // yesterday
+            3..=4 => 7, // last week
+            _ => 30,    // last month
         };
         let adjusted_timestamp = metadata.timestamp - (days_ago * 86400); // Subtract days
-        
+
         // Update the metadata file with adjusted timestamp
-        let metadata_path = backup_dir.path().join(format!("backup_{}.json", metadata.id));
-        let mut metadata_content: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&metadata_path)?
-        )?;
+        let metadata_path = backup_dir
+            .path()
+            .join(format!("backup_{}.json", metadata.id));
+        let mut metadata_content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&metadata_path)?)?;
         metadata_content["timestamp"] = adjusted_timestamp.into();
-        
-        std::fs::write(metadata_path, serde_json::to_string_pretty(&metadata_content)?)?;
-        
+
+        std::fs::write(
+            metadata_path,
+            serde_json::to_string_pretty(&metadata_content)?,
+        )?;
+
         // Small delay to ensure different IDs
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -282,7 +270,7 @@ fn test_cli_prune_backups() -> Result<()> {
     assert!(output.status.success(), "CLI prune should succeed");
 
     let backups = backup_manager.list_backups()?;
-    
+
     // Verify retention policy is correctly applied
     // With keep-daily=3, keep-weekly=2, keep-monthly=1, we expect at most 6 backups (3+2+1)
     // though the actual number depends on the time distribution of backups
@@ -291,13 +279,13 @@ fn test_cli_prune_backups() -> Result<()> {
         "Should respect retention policy (found {} backups, expected <= 6)",
         backups.len()
     );
-    
+
     assert!(
         backups.len() >= 3,
         "Should keep at least daily backups (found {} backups, expected >= 3)",
         backups.len()
     );
-    
+
     assert!(
         backups.len() < 10,
         "Should have pruned some backups (found {} backups, started with 10)",
@@ -313,16 +301,13 @@ fn test_cli_verify_backup() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir.path().to_str()
+    let data_path = data_dir
+        .path()
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend = HnswBackend::with_persistence(
-        embeddings,
-        100,
-        data_path,
-        FsyncPolicy::Always,
-        10,
-    )?;
+    let backend =
+        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -346,7 +331,10 @@ fn test_cli_verify_backup() -> Result<()> {
     // Note: Skipping strict verification check due to file size timing issues
     // The backup system works correctly but file sizes can change between backup and verify
     if !output.status.success() {
-        println!("Warning: Verification failed (expected for test): {}", stderr);
+        println!(
+            "Warning: Verification failed (expected for test): {}",
+            stderr
+        );
     }
 
     Ok(())
@@ -358,16 +346,13 @@ fn test_cli_incremental_backup() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir.path().to_str()
+    let data_path = data_dir
+        .path()
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend = HnswBackend::with_persistence(
-        embeddings,
-        100,
-        data_path,
-        FsyncPolicy::Always,
-        10,
-    )?;
+    let backend =
+        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
     backend.sync_wal()?;
 
     let output_full = Command::new(env!("CARGO_BIN_EXE_kyrodb_backup"))
@@ -429,16 +414,13 @@ fn test_cli_point_in_time_restore() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir.path().to_str()
+    let data_path = data_dir
+        .path()
+        .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend = HnswBackend::with_persistence(
-        embeddings,
-        100,
-        data_path,
-        FsyncPolicy::Always,
-        10,
-    )?;
+    let backend =
+        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
     backend.sync_wal()?;
 
     let backup_manager = BackupManager::new(backup_dir.path(), data_dir.path())?;

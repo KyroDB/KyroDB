@@ -44,7 +44,7 @@ pub struct TieredEngineStats {
     pub hot_tier_hit_rate: f64,
     pub hot_tier_size: usize,
     pub hot_tier_flushes: u64,
-    pub hot_tier_flush_failures: u64,   // NEW: Failed flush operations
+    pub hot_tier_flush_failures: u64, // NEW: Failed flush operations
     pub hot_tier_emergency_evictions: u64, // NEW: Emergency evictions due to hard limit
 
     /// Layer 3 (Cold Tier) statistics
@@ -63,9 +63,9 @@ pub struct TieredEngineStats {
     pub partial_results_returned: u64,
 
     /// Load shedding statistics
-    pub queries_rejected: u64,           // Queries rejected due to queue saturation
-    pub current_queue_depth: u64,         // Current in-flight queries
-    pub circuit_breaker_rejections: u64,  // Queries failed due to circuit breaker open
+    pub queries_rejected: u64, // Queries rejected due to queue saturation
+    pub current_queue_depth: u64,        // Current in-flight queries
+    pub circuit_breaker_rejections: u64, // Queries failed due to circuit breaker open
 }
 
 /// Configuration for tiered engine
@@ -116,9 +116,9 @@ impl Default for TieredEngineConfig {
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 10_000,
             flush_interval: Duration::from_secs(30),
-            cache_timeout_ms: 10,     // 10ms for cache
-            hot_tier_timeout_ms: 50,  // 50ms for hot tier
-            cold_tier_timeout_ms: 1000, // 1000ms (1s) for cold tier HNSW
+            cache_timeout_ms: 10,         // 10ms for cache
+            hot_tier_timeout_ms: 50,      // 50ms for hot tier
+            cold_tier_timeout_ms: 1000,   // 1000ms (1s) for cold tier HNSW
             max_concurrent_queries: 1000, // Load shedding threshold: max 1000 in-flight queries
         }
     }
@@ -291,7 +291,7 @@ impl TieredEngine {
             if let Some(cached) = cached_result {
                 // Cache hit - record success
                 self.cache_circuit_breaker.record_success();
-                
+
                 // Update stats (no other locks held)
                 {
                     let mut stats = self.stats.write();
@@ -307,7 +307,7 @@ impl TieredEngine {
 
                 return Some(cached.embedding);
             }
-            
+
             // Cache miss - not a failure, just continue to next tier
             {
                 let mut stats = self.stats.write();
@@ -319,7 +319,10 @@ impl TieredEngine {
                 let mut stats = self.stats.write();
                 stats.circuit_breaker_rejections += 1;
             }
-            debug!("Cache circuit breaker open, skipping cache layer for doc_id={}", doc_id);
+            debug!(
+                "Cache circuit breaker open, skipping cache layer for doc_id={}",
+                doc_id
+            );
         }
 
         // Layer 2: Check hot tier with circuit breaker protection
@@ -327,7 +330,7 @@ impl TieredEngine {
             if let Some(embedding) = self.hot_tier.get(doc_id) {
                 // Hot tier hit - record success
                 self.hot_tier_circuit_breaker.record_success();
-                
+
                 // Update stats (isolated)
                 {
                     let mut stats = self.stats.write();
@@ -360,7 +363,7 @@ impl TieredEngine {
 
                 return Some(embedding);
             }
-            
+
             // Hot tier miss - update stats (isolated)
             {
                 let mut stats = self.stats.write();
@@ -372,7 +375,10 @@ impl TieredEngine {
                 let mut stats = self.stats.write();
                 stats.circuit_breaker_rejections += 1;
             }
-            debug!("Hot tier circuit breaker open, skipping hot tier for doc_id={}", doc_id);
+            debug!(
+                "Hot tier circuit breaker open, skipping hot tier for doc_id={}",
+                doc_id
+            );
         }
 
         // Layer 3: Fetch from cold tier with circuit breaker protection
@@ -380,7 +386,7 @@ impl TieredEngine {
             if let Some(embedding) = self.cold_tier.fetch_document(doc_id) {
                 // Cold tier success - record it
                 self.cold_tier_circuit_breaker.record_success();
-                
+
                 // Update stats (isolated)
                 {
                     let mut stats = self.stats.write();
@@ -413,7 +419,7 @@ impl TieredEngine {
 
                 return Some(embedding);
             }
-            
+
             // Cold tier miss - this is normal (document doesn't exist)
         } else {
             // Circuit breaker open - fail fast
@@ -421,7 +427,10 @@ impl TieredEngine {
                 let mut stats = self.stats.write();
                 stats.circuit_breaker_rejections += 1;
             }
-            warn!("Cold tier circuit breaker open, cannot query doc_id={}", doc_id);
+            warn!(
+                "Cold tier circuit breaker open, cannot query doc_id={}",
+                doc_id
+            );
         }
 
         // Document not found in any tier
@@ -440,15 +449,15 @@ impl TieredEngine {
         if query.is_empty() {
             anyhow::bail!("query embedding cannot be empty");
         }
-        
+
         if k == 0 {
             anyhow::bail!("k must be greater than 0");
         }
-        
+
         if k > 10_000 {
             anyhow::bail!("k must be <= 10,000 (requested: {})", k);
         }
-        
+
         let backend_dim = self.cold_tier.dimension();
         if backend_dim != 0 && query.len() != backend_dim {
             anyhow::bail!(
@@ -515,7 +524,8 @@ impl TieredEngine {
         {
             let mut stats = self.stats.write();
             let available_permits = self.query_semaphore.available_permits();
-            stats.current_queue_depth = (self.config.max_concurrent_queries - available_permits) as u64;
+            stats.current_queue_depth =
+                (self.config.max_concurrent_queries - available_permits) as u64;
         }
 
         let mut results = Vec::new();
@@ -564,7 +574,10 @@ impl TieredEngine {
                     self.cold_tier_circuit_breaker.record_failure();
                     let mut stats = self.stats.write();
                     stats.cold_tier_timeouts += 1;
-                    warn!("Cold tier timed out after {}ms", self.config.cold_tier_timeout_ms);
+                    warn!(
+                        "Cold tier timed out after {}ms",
+                        self.config.cold_tier_timeout_ms
+                    );
                     partial = true;
                 }
             }
@@ -601,9 +614,7 @@ impl TieredEngine {
 
             Ok(results)
         } else {
-            Err(anyhow!(
-                "All layers failed or timed out with no results"
-            ))
+            Err(anyhow!("All layers failed or timed out with no results"))
         }
     }
 
@@ -630,21 +641,18 @@ impl TieredEngine {
             // Emergency flush: force flush regardless of normal thresholds
             match self.emergency_flush_hot_tier() {
                 Ok(flushed) => {
-                    info!(
-                        flushed_docs = flushed,
-                        "emergency flush completed"
-                    );
+                    info!(flushed_docs = flushed, "emergency flush completed");
                 }
                 Err(e) => {
                     error!(
                         error = %e,
                         "emergency flush failed; rejecting insert to prevent OOM"
                     );
-                    
+
                     // Update emergency eviction metric
                     let mut stats = self.stats.write();
                     stats.hot_tier_emergency_evictions += 1;
-                    
+
                     anyhow::bail!(
                         "insert rejected: hot tier at hard limit ({}) and emergency flush failed",
                         self.config.hot_tier_hard_limit
@@ -837,7 +845,7 @@ impl TieredEngine {
                     }
                     _ = shutdown_rx.recv() => {
                         info!("Flush task received shutdown signal, performing final flush");
-                        
+
                         // Final flush before shutdown
                         if self.hot_tier.needs_flush() {
                             match self.flush_hot_tier() {
@@ -852,7 +860,7 @@ impl TieredEngine {
                                 }
                             }
                         }
-                        
+
                         info!("Flush task stopped gracefully");
                         break;
                     }
@@ -1098,7 +1106,7 @@ mod tests {
         let results = engine.knn_search_with_timeouts(&query, 2).await.unwrap();
 
         assert_eq!(results.len(), 2);
-        
+
         // Verify cold tier was searched
         let stats = engine.stats();
         assert!(stats.cold_tier_searches > 0);
@@ -1128,7 +1136,7 @@ mod tests {
     async fn test_actual_timeout_triggers() {
         // Test that timeouts actually occur and are tracked
         let cache = LruCacheStrategy::new(10);
-        
+
         // Create larger dataset to potentially cause timeout with very short deadline
         let mut embeddings = Vec::new();
         for i in 0..1000 {
@@ -1183,28 +1191,30 @@ mod tests {
         // by observing that failures are recorded and timeouts occur
         let cache = LruCacheStrategy::new(10);
         let embeddings = vec![vec![1.0, 0.0, 0.0, 0.0]];
-        
+
         let config = TieredEngineConfig {
             cold_tier_timeout_ms: 1, // Very short timeout to trigger failures
             hnsw_max_elements: 100,
             data_dir: None,
             ..Default::default()
         };
-        
+
         let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
-        
+
         // Trigger multiple searches - some may timeout, some may succeed
         for _ in 0..10 {
-            let _ = engine.knn_search_with_timeouts(&vec![1.0, 0.0, 0.0, 0.0], 5).await;
+            let _ = engine
+                .knn_search_with_timeouts(&vec![1.0, 0.0, 0.0, 0.0], 5)
+                .await;
         }
-        
+
         // Verify that searches were attempted (stats should be non-zero)
         let stats = engine.stats();
         assert!(
             stats.cold_tier_searches + stats.cold_tier_timeouts > 0,
             "Searches should have been attempted (either succeeded or timed out)"
         );
-        
+
         // Note: Whether circuit breaker opens depends on actual timeout behavior,
         // which can vary based on system load. The key is that the integration
         // between TieredEngine and CircuitBreaker is functional.
@@ -1213,7 +1223,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_shedding_queue_saturation() {
         // Test that queries are rejected when semaphore is saturated
-        // 
+        //
         // Strategy: Use a barrier BEFORE the query to ensure permits are held
         // while we attempt the 3rd query
         let cache = LruCacheStrategy::new(10);
@@ -1261,13 +1271,23 @@ mod tests {
         let result = engine.knn_search_with_timeouts(&query, 5).await;
 
         // Should be rejected with queue saturation error
-        assert!(result.is_err(), "Expected query to be rejected due to queue saturation");
+        assert!(
+            result.is_err(),
+            "Expected query to be rejected due to queue saturation"
+        );
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("saturated"), "Error should mention saturation: {}", err);
+        assert!(
+            err.to_string().contains("saturated"),
+            "Error should mention saturation: {}",
+            err
+        );
 
         // Check stats
         let stats = engine.stats();
-        assert_eq!(stats.queries_rejected, 1, "Should have exactly 1 rejected query");
+        assert_eq!(
+            stats.queries_rejected, 1,
+            "Should have exactly 1 rejected query"
+        );
 
         // Release barrier to let background tasks finish
         barrier.wait().await;
@@ -1358,16 +1378,15 @@ mod tests {
         // Spawn a query and check depth during execution
         let engine_clone = Arc::clone(&engine);
         let query1 = vec![1.0, 2.0];
-        let handle = tokio::spawn(async move {
-            engine_clone.knn_search_with_timeouts(&query1, 3).await
-        });
+        let handle =
+            tokio::spawn(async move { engine_clone.knn_search_with_timeouts(&query1, 3).await });
 
         // Give time for query to acquire permit
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         // Queue depth should be non-zero during query execution
         // Note: This may be flaky if query completes very fast
-        
+
         // Wait for query to complete
         let _ = handle.await;
 
@@ -1410,7 +1429,7 @@ mod tests {
     fn test_hot_tier_flush_failure_recovery() {
         // Test that flush failures result in re-insertion to hot tier
         use tempfile::TempDir;
-        
+
         let temp_dir = TempDir::new().unwrap();
         let cache = LruCacheStrategy::new(10);
         let initial_embeddings = vec![vec![1.0, 0.0]; 5];
@@ -1434,11 +1453,11 @@ mod tests {
 
         // Attempt flush (should succeed normally)
         let flushed = engine.flush_hot_tier().unwrap();
-        
+
         // For this test, flush should succeed, so hot tier should be empty
         // (Testing actual failure requires disk-full simulation which is complex)
         assert!(engine.hot_tier.len() == 0 || flushed > 0);
-        
+
         // Verify stats include flush operations
         let stats = engine.stats();
         assert!(stats.hot_tier_flushes > 0 || stats.hot_tier_flush_failures >= 0);
@@ -1448,14 +1467,14 @@ mod tests {
     fn test_emergency_eviction_on_hard_limit() {
         // Test that emergency eviction triggers when hard limit reached
         use tempfile::TempDir;
-        
+
         let temp_dir = TempDir::new().unwrap();
         let cache = LruCacheStrategy::new(10);
         let initial_embeddings = vec![vec![1.0, 0.0]; 2];
 
         let config = TieredEngineConfig {
-            hot_tier_max_size: 3,    // Soft limit (very small for testing)
-            hot_tier_hard_limit: 6,  // Hard limit (2x soft limit)
+            hot_tier_max_size: 3,   // Soft limit (very small for testing)
+            hot_tier_hard_limit: 6, // Hard limit (2x soft limit)
             hnsw_max_elements: 100,
             data_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             snapshot_interval: 1000, // Don't snapshot during test
@@ -1468,14 +1487,9 @@ mod tests {
         // Hard limit is 6, so insert 6 documents
         for i in 10..16 {
             let result = engine.insert(i, vec![i as f32, 0.0]);
-            
+
             // Each insert should succeed (emergency eviction handles overflow)
-            assert!(
-                result.is_ok(),
-                "Insert {} failed: {:?}",
-                i,
-                result.err()
-            );
+            assert!(result.is_ok(), "Insert {} failed: {:?}", i, result.err());
         }
 
         // Verify that either:
@@ -1483,14 +1497,14 @@ mod tests {
         // 2. Normal flush prevented us from hitting hard limit
         let stats = engine.stats();
         let hot_tier_size = engine.hot_tier.len();
-        
+
         // The key invariant: hot tier should NEVER exceed hard limit
         assert!(
             hot_tier_size <= 6,
             "Hot tier size {} should be at or below hard limit 6",
             hot_tier_size
         );
-        
+
         // If we hit hard limit, emergency eviction counter should be > 0
         if stats.hot_tier_emergency_evictions > 0 {
             println!(
@@ -1504,23 +1518,20 @@ mod tests {
     fn test_hot_tier_reinsert_preserves_documents() {
         // Test that reinsert_failed_documents correctly restores documents to hot tier
         use std::time::Duration;
-        
+
         let hot_tier = HotTier::new(100, Duration::from_secs(60));
-        
+
         // Insert initial documents
         hot_tier.insert(1, vec![1.0, 0.0]);
         hot_tier.insert(2, vec![2.0, 0.0]);
-        
+
         assert_eq!(hot_tier.len(), 2);
-        
+
         // Simulate failed flush scenario: documents that couldn't be flushed
-        let failed_docs = vec![
-            (10, vec![10.0, 0.0]),
-            (11, vec![11.0, 0.0]),
-        ];
-        
+        let failed_docs = vec![(10, vec![10.0, 0.0]), (11, vec![11.0, 0.0])];
+
         hot_tier.reinsert_failed_documents(failed_docs);
-        
+
         // Verify all documents present
         assert_eq!(hot_tier.len(), 4);
         assert!(hot_tier.get(1).is_some());

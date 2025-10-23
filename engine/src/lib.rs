@@ -131,7 +131,7 @@ pub use access_logger::{hash_embedding, AccessLoggerStats, AccessPatternLogger};
 pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
 pub use cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy};
 pub use training_task::{spawn_training_task, TrainingConfig};
-pub use vector_cache::{CachedVector, CacheStatsSnapshot, VectorCache};
+pub use vector_cache::{CacheStatsSnapshot, CachedVector, VectorCache};
 
 // Quality metrics components
 pub use ndcg::{
@@ -152,7 +152,10 @@ pub use semantic_adapter::{SemanticAdapter, SemanticConfig, SemanticStats};
 pub use persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
 
 // Backup and restore components
-pub use backup::{BackupManager, BackupMetadata, BackupType, ClearDirectoryOptions, RestoreManager, RetentionPolicy, compute_backup_checksum};
+pub use backup::{
+    compute_backup_checksum, BackupManager, BackupMetadata, BackupType, ClearDirectoryOptions,
+    RestoreManager, RetentionPolicy,
+};
 
 // Hot tier components (Layer 2)
 pub use hot_tier::{HotTier, HotTierStats};
@@ -169,8 +172,8 @@ pub use metrics::{ErrorCategory, HealthStatus, MetricsCollector, SloStatus};
 // Configuration components
 pub use config::{
     AuthConfig, CacheConfig, CacheStrategy as ConfigCacheStrategy, DistanceMetric,
-    FsyncPolicy as ConfigFsyncPolicy, HnswConfig, KyroDbConfig, LogFormat, LogLevel,
-    LoggingConfig, PersistenceConfig, RateLimitConfig, ServerConfig, SloConfig,
+    FsyncPolicy as ConfigFsyncPolicy, HnswConfig, KyroDbConfig, LogFormat, LogLevel, LoggingConfig,
+    PersistenceConfig, RateLimitConfig, ServerConfig, SloConfig,
 };
 
 // Authentication and authorization components
