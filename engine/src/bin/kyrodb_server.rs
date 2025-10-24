@@ -410,7 +410,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 // TODO Phase 1: Support multiple distance metrics (L2, inner product)
                 let convert_distance_to_score = |dist: f32| -> f32 {
                     // Clamp to valid range to handle floating point errors
-                    (1.0 - dist).max(-1.0).min(1.0)
+                    (1.0 - dist).clamp(-1.0, 1.0)
                 };
 
                 // Filter by min_score if specified
@@ -771,16 +771,8 @@ async fn ready_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRes
 async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let slo = state.metrics.slo_status();
 
-    let any_breach = slo.p99_latency_breached
-        || slo.cache_hit_rate_breached
-        || slo.error_rate_breached
-        || slo.availability_breached;
-
-    let status_code = if any_breach {
-        StatusCode::OK // Still return 200, but include breach details
-    } else {
-        StatusCode::OK
-    };
+    // Always return 200 OK for SLO status (breaches reported in body)
+    let status_code = StatusCode::OK;
 
     let body = serde_json::json!({
         "slo_breaches": {

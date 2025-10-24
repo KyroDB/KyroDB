@@ -596,21 +596,12 @@ impl BackupManager {
 }
 
 /// Options for safely clearing data directory during restore operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ClearDirectoryOptions {
     /// Allow clearing without explicit confirmation (default: false for safety)
     pub allow_clear: bool,
     /// Enable dry-run mode to preview files that would be deleted (default: false)
     pub dry_run: bool,
-}
-
-impl Default for ClearDirectoryOptions {
-    fn default() -> Self {
-        Self {
-            allow_clear: false,
-            dry_run: false,
-        }
-    }
 }
 
 impl ClearDirectoryOptions {

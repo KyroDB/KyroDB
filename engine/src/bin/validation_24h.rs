@@ -408,7 +408,7 @@ async fn main() -> Result<()> {
 
         // With Zipf(1.1), expect top 20 docs to capture 10-40% of accesses
         // With Zipf(1.5), this would be 80%+ (too skewed for realistic workload)
-        if top_20_pct < 0.08 || top_20_pct > 0.50 {
+        if !(0.08..=0.50).contains(&top_20_pct) {
             bail!("Zipf distribution validation failed: top 20 docs should capture 8-50% of accesses, got {:.1}%", top_20_pct * 100.0);
         }
 
@@ -720,7 +720,7 @@ async fn main() -> Result<()> {
     );
     println!(
         "  Status:                {}",
-        if improvement >= 2.0 && improvement <= 3.5 {
+        if (2.0..=3.5).contains(&improvement) {
             "✅ PASS"
         } else {
             "❌ FAIL"
@@ -768,8 +768,8 @@ async fn main() -> Result<()> {
     println!();
 
     // Go/No-Go decision
-    let hit_rate_pass = learned_hit_rate >= 0.70 && learned_hit_rate <= 0.90;
-    let improvement_pass = improvement >= 2.0 && improvement <= 3.5;
+    let hit_rate_pass = (0.70..=0.90).contains(&learned_hit_rate);
+    let improvement_pass = (2.0..=3.5).contains(&improvement);
     let memory_pass = initial_memory == 0.0 || memory_growth_pct.abs() < 5.0;
     let training_pass = !training_crashed;
 

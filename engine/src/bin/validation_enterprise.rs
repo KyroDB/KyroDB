@@ -334,6 +334,7 @@ struct SpikeEvent {
 }
 
 impl TemporalWorkloadGenerator {
+    #[allow(clippy::too_many_arguments)] // Test binary - config struct overkill for one-time use
     fn new(
         corpus_size: usize,
         zipf_exponent: f64,
@@ -545,7 +546,7 @@ fn generate_mock_embeddings(corpus_size: usize, embedding_dim: usize) -> Vec<Vec
     }
 
     let noise_stddev = 0.05;
-    let noise = Normal::new(0.0, noise_stddev as f64).expect("valid noise distribution");
+    let noise = Normal::new(0.0, noise_stddev).expect("valid noise distribution");
 
     (0..corpus_size)
         .map(|doc_id| {
@@ -758,7 +759,7 @@ fn build_doc_to_queries_map(
     let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
 
     for (query_idx, &doc_id) in query_to_doc.iter().enumerate() {
-        map.entry(doc_id).or_insert_with(Vec::new).push(query_idx);
+        map.entry(doc_id).or_default().push(query_idx);
     }
 
     // Limit queries per document if needed
@@ -1083,8 +1084,8 @@ async fn main() -> Result<()> {
             // Check first 30 queries (should be for doc 0)
             if query_embeddings.len() >= 30 {
                 let mut doc0_hashes = HashSet::new();
-                for i in 0..30 {
-                    doc0_hashes.insert(hash_embedding(&query_embeddings[i]));
+                for embedding in query_embeddings.iter().take(30) {
+                    doc0_hashes.insert(hash_embedding(embedding));
                 }
                 println!(
                     "  First 30 queries (doc 0): {} unique hashes",

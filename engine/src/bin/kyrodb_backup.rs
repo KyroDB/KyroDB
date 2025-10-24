@@ -9,9 +9,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 #[cfg(feature = "cli-tools")]
 use tabled::{Table, Tabled};
 
-#[cfg(not(feature = "cli-tools"))]
-compile_error!("kyrodb_backup binary requires the 'cli-tools' feature. Build with: cargo build --bin kyrodb_backup --features cli-tools");
-
 #[derive(Parser)]
 #[command(name = "kyrodb-backup")]
 #[command(about = "KyroDB backup and restore operations", long_about = None)]

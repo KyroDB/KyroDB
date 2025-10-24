@@ -91,7 +91,6 @@ impl WalWriter {
 
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&path)
             .context("Failed to create WAL file")?;
@@ -366,9 +365,9 @@ impl WalErrorHandler {
                 _ => {
                     // Check for ENOSPC (disk full) in error message
                     let err_str = format!("{}", io_err);
-                    if err_str.contains("ENOSPC") || err_str.contains("No space left") {
-                        WalErrorKind::DiskFull
-                    } else if err_str.contains("EDQUOT") || err_str.contains("Quota exceeded") {
+                    if err_str.contains("ENOSPC") || err_str.contains("No space left")
+                        || err_str.contains("EDQUOT") || err_str.contains("Quota exceeded")
+                    {
                         WalErrorKind::DiskFull
                     } else {
                         WalErrorKind::Transient
@@ -378,9 +377,9 @@ impl WalErrorHandler {
         } else {
             // Check error message for disk full indicators
             let err_str = format!("{}", error);
-            if err_str.contains("ENOSPC") || err_str.contains("No space left") {
-                WalErrorKind::DiskFull
-            } else if err_str.contains("EDQUOT") || err_str.contains("Quota exceeded") {
+            if err_str.contains("ENOSPC") || err_str.contains("No space left")
+                || err_str.contains("EDQUOT") || err_str.contains("Quota exceeded")
+            {
                 WalErrorKind::DiskFull
             } else if err_str.contains("Permission denied") || err_str.contains("EACCES") {
                 WalErrorKind::PermissionDenied
@@ -720,6 +719,12 @@ pub struct Manifest {
     pub latest_snapshot: Option<String>,
     pub wal_segments: Vec<String>,
     pub last_updated: u64,
+}
+
+impl Default for Manifest {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Manifest {

@@ -25,7 +25,7 @@ use std::time::Duration;
 // ============================================================================
 
 /// Complete KyroDB configuration with all tunable parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct KyroDbConfig {
     /// Server configuration (gRPC and HTTP endpoints)
@@ -439,26 +439,6 @@ impl Default for TimeoutConfig {
             cache_ms: 10,
             hot_tier_ms: 50,
             cold_tier_ms: 1000,
-        }
-    }
-}
-
-// ============================================================================
-// Default Implementation
-// ============================================================================
-
-impl Default for KyroDbConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            cache: CacheConfig::default(),
-            hnsw: HnswConfig::default(),
-            persistence: PersistenceConfig::default(),
-            slo: SloConfig::default(),
-            rate_limit: RateLimitConfig::default(),
-            logging: LoggingConfig::default(),
-            auth: AuthConfig::default(),
-            timeouts: TimeoutConfig::default(),
         }
     }
 }

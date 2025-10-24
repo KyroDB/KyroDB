@@ -14,6 +14,27 @@ categories = ["database-implementations", "machine-learning"]
 name = "kyrodb_engine"
 path = "src/lib.rs"
 
+# CLI binaries require cli-tools feature
+[[bin]]
+name = "kyrodb_backup"
+path = "src/bin/kyrodb_backup.rs"
+required-features = ["cli-tools"]
+
+[[bin]]
+name = "kyrodb_load_tester"
+path = "src/bin/kyrodb_load_tester.rs"
+required-features = ["cli-tools"]
+
+[[bin]]
+name = "validation_24h"
+path = "src/bin/validation_24h.rs"
+required-features = ["cli-tools"]
+
+[[bin]]
+name = "validation_enterprise"
+path = "src/bin/validation_enterprise.rs"
+required-features = ["cli-tools"]
+
 [features]
 default = []
 # Phase 0 Week 3-8: Enable Hybrid Semantic Cache with RMI

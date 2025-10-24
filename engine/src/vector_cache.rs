@@ -137,9 +137,9 @@ impl VectorCache {
         let doc_id = cached_vector.doc_id;
         let mut state = self.state.write();
 
-        // Check if already in cache (update case)
-        if state.cache.contains_key(&doc_id) {
-            state.cache.insert(doc_id, cached_vector);
+        // Check if already in cache (update case) - use Entry API to avoid double lookup
+        if let std::collections::hash_map::Entry::Occupied(mut e) = state.cache.entry(doc_id) {
+            e.insert(cached_vector);
 
             // Update LRU position
             if let Some(pos) = state.lru_queue.iter().position(|&id| id == doc_id) {

@@ -235,7 +235,7 @@ impl UsageTracker {
         let mut writer = csv::Writer::from_writer(file);
 
         // Write header
-        writer.write_record(&[
+        writer.write_record([
             "tenant_id",
             "query_count",
             "insert_count",
@@ -258,7 +258,7 @@ impl UsageTracker {
         for (tenant_id, tracker) in usage.iter() {
             let snapshot = tracker.snapshot();
 
-            writer.write_record(&[
+            writer.write_record([
                 tenant_id,
                 &snapshot.query_count.to_string(),
                 &snapshot.insert_count.to_string(),
