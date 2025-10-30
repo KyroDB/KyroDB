@@ -68,6 +68,12 @@ pub mod cache_strategy; // CacheStrategy trait + LRU/Learned implementations + A
 pub mod training_task; // Background RMI training task (tokio::spawn, 60-second interval)
 pub mod vector_cache; // In-memory vector cache with LRU eviction
 
+// Query clustering: Semantic grouping for cache optimization
+pub mod query_clustering;
+
+// Prefetching: Co-access pattern learning for proactive caching
+pub mod prefetch;
+
 // Semantic layer: Hybrid cache decisions (frequency + similarity)
 pub mod semantic_adapter;
 
@@ -132,6 +138,15 @@ pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
 pub use cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy};
 pub use training_task::{spawn_training_task, TrainingConfig};
 pub use vector_cache::{CacheStatsSnapshot, CachedVector, VectorCache};
+
+// Query clustering components
+pub use query_clustering::{ClusterId, ClusterStats, QueryCluster, QueryClusterer};
+
+// Prefetching components
+pub use prefetch::{
+    spawn_prefetch_task, CoAccessGraph, CoAccessStats, PrefetchConfig, Prefetcher,
+    PrefetcherStats,
+};
 
 // Quality metrics components
 pub use ndcg::{

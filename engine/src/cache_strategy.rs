@@ -8,6 +8,8 @@
 //! - Learned + Semantic: Hybrid frequency + semantic similarity
 
 use crate::learned_cache::LearnedCachePredictor;
+use crate::prefetch::Prefetcher;
+use crate::query_clustering::QueryClusterer;
 use crate::semantic_adapter::SemanticAdapter;
 use crate::vector_cache::{CachedVector, VectorCache};
 use std::sync::Arc;
@@ -105,6 +107,8 @@ pub struct LearnedCacheStrategy {
     pub cache: Arc<VectorCache>,
     pub predictor: Arc<parking_lot::RwLock<LearnedCachePredictor>>,
     semantic_adapter: Arc<parking_lot::RwLock<Option<SemanticAdapter>>>,
+    query_clusterer: Arc<parking_lot::RwLock<Option<QueryClusterer>>>,
+    prefetcher: Arc<parking_lot::RwLock<Option<Arc<Prefetcher>>>>,
     name: String,
 }
 
@@ -122,6 +126,8 @@ impl LearnedCacheStrategy {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
             semantic_adapter: Arc::new(parking_lot::RwLock::new(None)),
+            query_clusterer: Arc::new(parking_lot::RwLock::new(None)),
+            prefetcher: Arc::new(parking_lot::RwLock::new(None)),
             name: "learned_rmi".to_string(),
         }
     }
@@ -144,8 +150,21 @@ impl LearnedCacheStrategy {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
             semantic_adapter: Arc::new(parking_lot::RwLock::new(Some(semantic_adapter))),
+            query_clusterer: Arc::new(parking_lot::RwLock::new(None)),
+            prefetcher: Arc::new(parking_lot::RwLock::new(None)),
             name: "learned_semantic".to_string(),
         }
+    }
+
+    /// Enable query clustering
+    pub fn enable_query_clustering(&self, similarity_threshold: f32) {
+        let clusterer = QueryClusterer::new(similarity_threshold);
+        *self.query_clusterer.write() = Some(clusterer);
+    }
+
+    /// Enable prefetching
+    pub fn enable_prefetching(&self, prefetcher: Arc<Prefetcher>) {
+        *self.prefetcher.write() = Some(prefetcher);
     }
 
     /// Update predictor (for periodic retraining)
@@ -181,6 +200,19 @@ impl CacheStrategy for LearnedCacheStrategy {
         {
             let mut predictor = self.predictor.write();
             predictor.calibrate_threshold(current_len);
+        }
+
+        // Query clustering: Add query to cluster for semantic grouping
+        if let Some(clusterer) = self.query_clusterer.read().as_ref() {
+            if !embedding.is_empty() {
+                let query_hash = crate::access_logger::hash_embedding(embedding);
+                clusterer.add_query(query_hash, embedding);
+            }
+        }
+
+        // Prefetching: Record access for co-access learning
+        if let Some(prefetcher) = self.prefetcher.read().as_ref() {
+            prefetcher.record_access(doc_id);
         }
 
         if current_len < self.cache.capacity() {
@@ -270,7 +302,30 @@ impl CacheStrategy for LearnedCacheStrategy {
     }
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
+        let doc_id = cached_vector.doc_id;
         self.cache.insert(cached_vector);
+
+        // Prefetching: Execute predictive prefetch after insertion
+        if let Some(prefetcher) = self.prefetcher.read().as_ref() {
+            let candidates = prefetcher.get_prefetch_candidates(doc_id);
+            for candidate_doc_id in candidates.into_iter().take(5) {
+                if self.cache.get(candidate_doc_id).is_none() {
+                    let predictor = self.predictor.read();
+                    let hotness = predictor.predict_hotness(candidate_doc_id);
+                    drop(predictor);
+
+                    if hotness >= 0.10 {
+                        prefetcher.record_prefetch();
+                        trace!(
+                            source_doc = doc_id,
+                            prefetch_doc = candidate_doc_id,
+                            hotness,
+                            "prefetch candidate (not yet cached)"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn name(&self) -> &str {

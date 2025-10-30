@@ -134,6 +134,21 @@ pub struct CacheConfig {
 
     /// Target cache utilization for auto-tuning (0.0-1.0)
     pub target_utilization: f32,
+
+    /// Enable query clustering for semantic cache optimization
+    pub enable_query_clustering: bool,
+
+    /// Cosine similarity threshold for query clustering (0.0-1.0)
+    pub clustering_similarity_threshold: f32,
+
+    /// Enable predictive prefetching
+    pub enable_prefetching: bool,
+
+    /// Prefetch threshold - minimum hotness score to prefetch (0.0-1.0)
+    pub prefetch_threshold: f32,
+
+    /// Maximum documents to prefetch per access
+    pub max_prefetch_per_doc: usize,
 }
 
 impl Default for CacheConfig {
@@ -150,6 +165,11 @@ impl Default for CacheConfig {
             admission_threshold: 0.15,
             auto_tune_threshold: true,
             target_utilization: 0.85,
+            enable_query_clustering: true,
+            clustering_similarity_threshold: 0.85,
+            enable_prefetching: true,
+            prefetch_threshold: 0.10,
+            max_prefetch_per_doc: 5,
         }
     }
 }
