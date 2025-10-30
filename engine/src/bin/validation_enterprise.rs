@@ -164,11 +164,11 @@ impl Default for Config {
             stats_csv: "validation_enterprise.csv".to_string(),
             results_json: "validation_enterprise.json".to_string(),
 
-            ms_marco_embeddings_path: Some("data/ms_marco/embeddings_100k.npy".to_string()),
-            ms_marco_passages_path: Some("data/ms_marco/passages_100k.txt".to_string()),
+            ms_marco_embeddings_path: None,
+            ms_marco_passages_path: None,
 
-            query_embeddings_path: Some("data/ms_marco/query_embeddings_100k.npy".to_string()),
-            query_to_doc_path: Some("data/ms_marco/query_to_doc.txt".to_string()),
+            query_embeddings_path: None,
+            query_to_doc_path: None,
             top_k_queries_per_doc: 10,
         }
     }
@@ -973,6 +973,33 @@ async fn main() -> Result<()> {
         semantic_adapter,
     ));
 
+    // Enable Week 3-4 features: Query Clustering
+    println!("Enabling query clustering (similarity threshold: 0.85)");
+    learned_strategy.enable_query_clustering(0.85);
+
+    // Enable Week 3-4 features: Predictive Prefetching
+    println!("Enabling predictive prefetching (threshold: 0.10, max per doc: 5)");
+    let prefetcher = Arc::new(kyrodb_engine::prefetch::Prefetcher::new(0.10));
+
+    // Create shutdown channel for prefetch task
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+    // Spawn prefetch background task
+    let prefetcher_clone = prefetcher.clone();
+    let prefetch_config = kyrodb_engine::prefetch::PrefetchConfig {
+        enabled: true,
+        interval: Duration::from_secs(5),
+        max_prefetch_per_doc: 5,
+        prefetch_threshold: 0.10,
+        prune_interval: Duration::from_secs(300),
+        max_pattern_age: Duration::from_secs(3600),
+    };
+    tokio::spawn(async move {
+        kyrodb_engine::prefetch::spawn_prefetch_task(prefetcher_clone, prefetch_config, shutdown_rx).await;
+    });
+
+    learned_strategy.enable_prefetching(prefetcher);
+
     let ab_splitter = AbTestSplitter::new(lru_strategy.clone(), learned_strategy.clone());
 
     let stats_persister = Arc::new(
@@ -1274,7 +1301,7 @@ async fn main() -> Result<()> {
 
         let strategy_id = if strategy_name == "lru_baseline" {
             StrategyId::LruBaseline
-        } else if strategy_name == "learned_rmi" {
+        } else if strategy_name == "learned_rmi" || strategy_name == "learned_semantic" {
             StrategyId::LearnedRmi
         } else {
             eprintln!("ERROR: Unknown strategy '{}'", strategy_name);

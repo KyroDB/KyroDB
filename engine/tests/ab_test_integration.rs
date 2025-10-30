@@ -240,8 +240,12 @@ async fn test_background_training_updates_predictor() {
     let config = TrainingConfig {
         interval: Duration::from_millis(500),
         window_duration: Duration::from_secs(3600),
+        recency_halflife: Duration::from_secs(1800),
         min_events_for_training: 100,
         rmi_capacity: 100,
+        admission_threshold: 0.15,
+        auto_tune_enabled: true,
+        target_utilization: 0.85,
     };
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);

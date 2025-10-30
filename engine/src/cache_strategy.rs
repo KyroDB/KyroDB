@@ -412,6 +412,28 @@ impl AbTestSplitter {
     }
 }
 
+impl CacheStrategy for AbTestSplitter {
+    fn name(&self) -> &str {
+        "ab_test"
+    }
+
+    fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
+        self.get_strategy(doc_id).should_cache(doc_id, embedding)
+    }
+
+    fn insert_cached(&self, vector: CachedVector) {
+        self.get_strategy(vector.doc_id).insert_cached(vector);
+    }
+
+    fn get_cached(&self, doc_id: u64) -> Option<CachedVector> {
+        self.get_strategy(doc_id).get_cached(doc_id)
+    }
+
+    fn stats(&self) -> String {
+        self.combined_stats()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

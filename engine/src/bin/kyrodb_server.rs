@@ -22,8 +22,10 @@
 
 use clap::Parser;
 use kyrodb_engine::{
-    ErrorCategory, FsyncPolicy, HealthStatus, LruCacheStrategy, MetricsCollector, SearchResult,
-    TieredEngine, TieredEngineConfig,
+    cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
+    prefetch::Prefetcher,
+    ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
+    SearchResult, SemanticAdapter, TieredEngine, TieredEngineConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -965,15 +967,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_queries: 1000, // Load shedding: max 1000 in-flight queries
     };
 
-    // Initialize or recover engine
-    info!("Initializing TieredEngine...");
+    // Create shutdown broadcast channel early for prefetch tasks
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(16);
 
-    // Create cache strategy (LRU for now, Learned in Phase 1)
-    let cache_strategy = Box::new(LruCacheStrategy::new(config.cache.capacity));
+    // Initialize or recover engine
+    info!("Initializing TieredEngine with A/B testing (LRU vs Learned with Week 1-4 features)...");
+
+    // Helper to create cache strategy with Week 1-4 features
+    let create_cache_strategy = || {
+        let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache.capacity));
+
+        let learned_predictor = LearnedCachePredictor::new(config.cache.capacity)
+            .expect("Failed to create Hybrid Semantic Cache predictor");
+        let semantic_adapter = SemanticAdapter::new();
+        let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
+            config.cache.capacity,
+            learned_predictor,
+            semantic_adapter,
+        ));
+
+        // Enable Week 3-4 features: Query Clustering
+        if config.cache.enable_query_clustering {
+            learned_strategy.enable_query_clustering(config.cache.clustering_similarity_threshold);
+        }
+
+        // Enable Week 3-4 features: Predictive Prefetching
+        if config.cache.enable_prefetching {
+            let prefetcher = Arc::new(Prefetcher::new(config.cache.prefetch_threshold));
+
+            let prefetcher_clone = prefetcher.clone();
+            let shutdown_rx = shutdown_tx.subscribe();
+            let prefetch_config = kyrodb_engine::prefetch::PrefetchConfig {
+                enabled: true,
+                interval: Duration::from_secs(5),
+                max_prefetch_per_doc: config.cache.max_prefetch_per_doc,
+                prefetch_threshold: config.cache.prefetch_threshold,
+                prune_interval: Duration::from_secs(300),
+                max_pattern_age: Duration::from_secs(3600),
+            };
+            tokio::spawn(async move {
+                kyrodb_engine::prefetch::spawn_prefetch_task(prefetcher_clone, prefetch_config, shutdown_rx).await;
+            });
+
+            learned_strategy.enable_prefetching(prefetcher);
+        }
+
+        Box::new(AbTestSplitter::new(
+            lru_strategy.clone(),
+            learned_strategy.clone(),
+        ))
+    };
+
+    info!(
+        "Week 1-4 features: clustering={}, prefetching={}",
+        config.cache.enable_query_clustering, config.cache.enable_prefetching
+    );
+
+    let cache_strategy = create_cache_strategy();
 
     let data_dir_path = config.persistence.data_dir.clone();
     let engine = if data_dir_path.exists() {
         info!("Data directory exists, attempting recovery...");
+
         match TieredEngine::recover(
             cache_strategy,
             data_dir_path.to_str().unwrap(),
@@ -985,31 +1040,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 warn!(error = %e, "Recovery failed, creating new engine");
-                let cache_strategy = Box::new(LruCacheStrategy::new(config.cache.capacity));
-                // WORKAROUND Phase 0: HnswBackend requires at least 1 embedding
-                // Phase 1 TODO: Support true empty database initialization
-                let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]]; // Zero vector with configured dimension
-                TieredEngine::new(cache_strategy, dummy_embedding, engine_config.clone())?
+                let fallback_cache_strategy = create_cache_strategy();
+                let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]];
+                TieredEngine::new(fallback_cache_strategy, dummy_embedding, engine_config.clone())?
             }
         }
     } else {
         info!("Creating new TieredEngine...");
-        // WORKAROUND Phase 0: HnswBackend requires at least 1 embedding
-        // Phase 1 TODO: Support true empty database initialization
-        let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]]; // Zero vector with configured dimension
+        let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]];
         TieredEngine::new(cache_strategy, dummy_embedding, engine_config.clone())?
     };
 
-    info!("TieredEngine initialized successfully");
+    info!("TieredEngine initialized successfully with Week 1-4 cache optimizations");
 
     // Wrap engine in Arc<RwLock> for concurrent access
     let engine_arc = Arc::new(RwLock::new(engine));
 
     // Create metrics collector
     let metrics = MetricsCollector::new();
-
-    // Create shutdown broadcast channel for graceful shutdown
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(16);
 
     // Spawn background flush task with graceful shutdown
     let mut flush_shutdown_rx = shutdown_tx.subscribe();
