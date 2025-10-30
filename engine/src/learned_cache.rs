@@ -104,6 +104,15 @@ pub struct LearnedCachePredictor {
     /// Exponential moving average factor for threshold calibration (0 = no smoothing)
     threshold_smoothing: f32,
 
+    /// Target cache utilization for auto-tuning (0.0-1.0)
+    target_utilization: f32,
+
+    /// Threshold adjustment rate for calibration (0.0-1.0)
+    threshold_adjustment_rate: f32,
+
+    /// Auto-tune threshold based on cache utilization
+    auto_tune_enabled: bool,
+
     /// Training window (how far back to consider accesses)
     training_window: Duration,
 
@@ -127,23 +136,27 @@ impl LearnedCachePredictor {
     /// - `capacity`: Maximum number of doc_ids to track (e.g., 10K-1M)
     ///
     /// # Defaults
-    /// - Cache threshold: 0.2 (calibrated with sqrt scaling)
-    /// - Training window: 24 hours
-    /// - Recency half-life: 1 hour
+    /// - Cache threshold: 0.15 (lower for Week 1-2, was 0.2)
+    /// - Training window: 1 hour (shorter for faster adaptation, was 24 hours)
+    /// - Recency half-life: 30 minutes (faster decay, was 1 hour)
     /// - Training interval: 10 minutes
+    /// - Auto-tune: ENABLED (target 85% utilization)
     pub fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
-            cache_threshold: 0.2, // Calibrated for sqrt-scaled hotness scores
+            cache_threshold: 0.15,
             admission_floor: 0.05,
             unseen_admission_chance: 0.10,
             target_hot_entries: capacity,
             threshold_smoothing: 0.6,
-            training_window: Duration::from_secs(24 * 3600), // 24 hours
-            recency_halflife: Duration::from_secs(3600),     // 1 hour
+            target_utilization: 0.85,
+            threshold_adjustment_rate: 0.05,
+            auto_tune_enabled: true,
+            training_window: Duration::from_secs(3600),
+            recency_halflife: Duration::from_secs(1800),
             capacity,
             last_trained: UNIX_EPOCH,
-            training_interval: Duration::from_secs(600), // 10 minutes
+            training_interval: Duration::from_secs(600),
         })
     }
 
@@ -163,6 +176,9 @@ impl LearnedCachePredictor {
             unseen_admission_chance: 0.10,
             target_hot_entries: capacity,
             threshold_smoothing: 0.6,
+            target_utilization: 0.85,
+            threshold_adjustment_rate: 0.05,
+            auto_tune_enabled: true,
             training_window,
             recency_halflife,
             capacity,
@@ -322,6 +338,59 @@ impl LearnedCachePredictor {
         }
     }
 
+    /// Auto-calibrate threshold based on current cache utilization
+    ///
+    /// Adjusts admission threshold to maintain target cache utilization (default: 85%).
+    /// Called periodically by cache strategy to dynamically tune threshold.
+    ///
+    /// # Parameters
+    /// - `current_cache_size`: Current number of entries in cache
+    ///
+    /// # Algorithm
+    /// - If utilization < 75%: Lower threshold by 5% (admit more)
+    /// - If utilization > 95%: Raise threshold by 5% (admit less)
+    /// - Clamped to [0.05, 0.95] bounds
+    pub fn calibrate_threshold(&mut self, current_cache_size: usize) {
+        if !self.auto_tune_enabled {
+            return;
+        }
+
+        let capacity = self.capacity;
+        if capacity == 0 {
+            return;
+        }
+
+        let current_utilization = current_cache_size as f32 / capacity as f32;
+        let target = self.target_utilization;
+        let rate = self.threshold_adjustment_rate;
+
+        let lower_bound = target * 0.9;
+        let upper_bound = target * 1.1;
+
+        if current_utilization < lower_bound {
+            let new_threshold = self.cache_threshold * (1.0 - rate);
+            self.cache_threshold = new_threshold.max(self.admission_floor);
+        } else if current_utilization > upper_bound {
+            let new_threshold = self.cache_threshold * (1.0 + rate);
+            self.cache_threshold = new_threshold.min(0.95);
+        }
+    }
+
+    /// Enable or disable auto-tuning
+    pub fn set_auto_tune(&mut self, enabled: bool) {
+        self.auto_tune_enabled = enabled;
+    }
+
+    /// Set target cache utilization (0.0-1.0)
+    pub fn set_target_utilization(&mut self, target: f32) {
+        self.target_utilization = target.clamp(0.1, 1.0);
+    }
+
+    /// Set threshold adjustment rate (0.0-1.0)
+    pub fn set_adjustment_rate(&mut self, rate: f32) {
+        self.threshold_adjustment_rate = rate.clamp(0.01, 0.5);
+    }
+
     /// Compute hotness scores from access events
     ///
     /// Hotness formula:
@@ -426,7 +495,7 @@ mod tests {
     fn test_learned_cache_basic() {
         let predictor = LearnedCachePredictor::new(1000).unwrap();
         assert_eq!(predictor.tracked_count(), 0);
-        assert!((predictor.cache_threshold() - 0.2).abs() < f32::EPSILON);
+        assert!((predictor.cache_threshold() - 0.15).abs() < f32::EPSILON); // Week 1-2: 0.15 default
     }
 
     #[test]

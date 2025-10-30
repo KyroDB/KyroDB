@@ -177,6 +177,12 @@ impl CacheStrategy for LearnedCacheStrategy {
     #[instrument(level = "trace", skip(self, embedding), fields(doc_id, dim = embedding.len()))]
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
         let current_len = self.cache.len();
+
+        {
+            let mut predictor = self.predictor.write();
+            predictor.calibrate_threshold(current_len);
+        }
+
         if current_len < self.cache.capacity() {
             trace!(
                 doc_id,

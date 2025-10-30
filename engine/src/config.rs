@@ -111,6 +111,12 @@ pub struct CacheConfig {
     /// Training interval for Hybrid Semantic Cache (seconds)
     pub training_interval_secs: u64,
 
+    /// Training window duration (seconds) - how far back to consider accesses
+    pub training_window_secs: u64,
+
+    /// Recency decay half-life (seconds) - exponential decay for old accesses
+    pub recency_halflife_secs: u64,
+
     /// Minimum access count before training
     pub min_training_samples: usize,
 
@@ -119,6 +125,15 @@ pub struct CacheConfig {
 
     /// A/B test traffic split (0.0-1.0, fraction for treatment group)
     pub ab_test_split: f64,
+
+    /// Admission threshold for cache (0.0-1.0)
+    pub admission_threshold: f32,
+
+    /// Auto-tune admission threshold based on utilization
+    pub auto_tune_threshold: bool,
+
+    /// Target cache utilization for auto-tuning (0.0-1.0)
+    pub target_utilization: f32,
 }
 
 impl Default for CacheConfig {
@@ -126,10 +141,15 @@ impl Default for CacheConfig {
         Self {
             capacity: 10_000,
             strategy: CacheStrategy::Learned,
-            training_interval_secs: 600, // 10 minutes
+            training_interval_secs: 600,
+            training_window_secs: 3600,
+            recency_halflife_secs: 1800,
             min_training_samples: 100,
             enable_ab_testing: false,
             ab_test_split: 0.5,
+            admission_threshold: 0.15,
+            auto_tune_threshold: true,
+            target_utilization: 0.85,
         }
     }
 }

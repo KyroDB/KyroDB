@@ -1124,6 +1124,10 @@ async fn main() -> Result<()> {
         window_duration: Duration::from_secs(3600),
         min_events_for_training: 100,
         rmi_capacity: config.cache_capacity,
+        recency_halflife: Duration::from_secs(1800), // Week 1-2: 30 min halflife
+        admission_threshold: 0.15,                   // Week 1-2: lower threshold
+        auto_tune_enabled: true,                     // Week 1-2: enable auto-tuning
+        target_utilization: 0.85,                    // Week 1-2: target 85% utilization
     };
 
     let training_cycles = Arc::new(AtomicU64::new(0));

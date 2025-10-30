@@ -21,23 +21,39 @@ pub struct TrainingConfig {
     /// Training interval (default: 10 minutes)
     pub interval: Duration,
 
-    /// Training window duration (default: 24 hours)
+    /// Training window duration (default: 1 hour, was 24 hours)
     pub window_duration: Duration,
+
+    /// Recency decay half-life (default: 30 minutes, was 1 hour)
+    pub recency_halflife: Duration,
 
     /// Minimum events required before training (default: 100)
     pub min_events_for_training: usize,
 
     /// RMI capacity (default: 10,000 documents)
     pub rmi_capacity: usize,
+
+    /// Admission threshold (default: 0.15, was 0.2)
+    pub admission_threshold: f32,
+
+    /// Auto-tune threshold based on utilization
+    pub auto_tune_enabled: bool,
+
+    /// Target cache utilization for auto-tuning
+    pub target_utilization: f32,
 }
 
 impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(600),              // 10 minutes
-            window_duration: Duration::from_secs(24 * 3600), // 24 hours
+            interval: Duration::from_secs(600),
+            window_duration: Duration::from_secs(3600),
+            recency_halflife: Duration::from_secs(1800),
             min_events_for_training: 100,
             rmi_capacity: 10_000,
+            admission_threshold: 0.15,
+            auto_tune_enabled: true,
+            target_utilization: 0.85,
         }
     }
 }
@@ -106,7 +122,7 @@ pub async fn spawn_training_task(
                     }
 
                     // Train new predictor
-                    match train_predictor(&events, config.rmi_capacity) {
+                    match train_predictor(&events, config.rmi_capacity, &config) {
                         Ok(new_predictor) => {
                             // Update learned strategy atomically
                             learned_strategy.update_predictor(new_predictor);
@@ -137,8 +153,17 @@ pub async fn spawn_training_task(
 fn train_predictor(
     events: &[crate::learned_cache::AccessEvent],
     capacity: usize,
+    config: &TrainingConfig,
 ) -> Result<LearnedCachePredictor> {
-    let mut predictor = LearnedCachePredictor::new(capacity)?;
+    let mut predictor = LearnedCachePredictor::with_config(
+        capacity,
+        config.admission_threshold,
+        config.window_duration,
+        config.recency_halflife,
+        config.interval,
+    )?;
+    predictor.set_auto_tune(config.auto_tune_enabled);
+    predictor.set_target_utilization(config.target_utilization);
     predictor.train_from_accesses(events)?;
     Ok(predictor)
 }
@@ -333,6 +358,7 @@ mod tests {
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100,
             rmi_capacity: 100,
+            ..TrainingConfig::default()
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -370,6 +396,7 @@ mod tests {
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100, // More than we have
             rmi_capacity: 100,
+            ..TrainingConfig::default()
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -406,6 +433,7 @@ mod tests {
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100,
             rmi_capacity: 100,
+            ..TrainingConfig::default()
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -433,8 +461,11 @@ mod tests {
             events.push(event);
         }
 
+        // Create config with Week 1-2 defaults
+        let config = TrainingConfig::default();
+
         // Train predictor
-        let result = train_predictor(&events, 100);
+        let result = train_predictor(&events, 100, &config);
         assert!(result.is_ok());
 
         let predictor = result.unwrap();
@@ -447,7 +478,8 @@ mod tests {
     async fn test_train_predictor_empty_events() {
         // Empty events should not panic
         let events = Vec::new();
-        let result = train_predictor(&events, 100);
+        let config = TrainingConfig::default();
+        let result = train_predictor(&events, 100, &config);
 
         // Training with no events should succeed (predictor just won't be useful)
         assert!(result.is_ok());
@@ -457,9 +489,13 @@ mod tests {
     async fn test_config_default() {
         let config = TrainingConfig::default();
         assert_eq!(config.interval, Duration::from_secs(600));
-        assert_eq!(config.window_duration, Duration::from_secs(24 * 3600));
+        assert_eq!(config.window_duration, Duration::from_secs(3600)); // Week 1-2: 1 hour
         assert_eq!(config.min_events_for_training, 100);
         assert_eq!(config.rmi_capacity, 10_000);
+        assert_eq!(config.recency_halflife, Duration::from_secs(1800)); // Week 1-2: 30 min
+        assert_eq!(config.admission_threshold, 0.15); // Week 1-2: lower threshold
+        assert_eq!(config.auto_tune_enabled, true); // Week 1-2: auto-tune enabled
+        assert_eq!(config.target_utilization, 0.85); // Week 1-2: 85% target
     }
 
     #[tokio::test]
@@ -507,6 +543,7 @@ mod tests {
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100,
             rmi_capacity: 100,
+            ..TrainingConfig::default()
         };
 
         let metrics = MetricsCollector::new();
@@ -550,6 +587,7 @@ mod tests {
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100,
             rmi_capacity: 100,
+            ..TrainingConfig::default()
         };
 
         let metrics = MetricsCollector::new();
