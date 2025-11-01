@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Minimum cosine similarity threshold for query clustering
-const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.85;
+const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.75;
 
 /// Maximum cluster size to prevent unbounded growth
 const MAX_CLUSTER_SIZE: usize = 50;
@@ -163,6 +163,33 @@ impl QueryClusterer {
             .find(|c| c.id == cluster_id)
             .map(|c| c.member_hashes.clone())
             .unwrap_or_default()
+    }
+
+    /// Get cluster hotness score for a query (0.0-1.0)
+    ///
+    /// Hotness is computed based on:
+    /// - Cluster access count (normalized by total accesses)
+    /// - Cluster size (larger clusters are more active)
+    ///
+    /// Returns None if query is not in any cluster.
+    pub fn get_cluster_hotness(&self, query_hash: u64) -> Option<f32> {
+        let cluster_id = self.get_cluster_id(query_hash)?;
+
+        let clusters = self.clusters.read();
+        let cluster = clusters.iter().find(|c| c.id == cluster_id)?;
+
+        // Compute total access count across all clusters
+        let total_accesses: u64 = clusters.iter().map(|c| c.access_count).sum();
+        if total_accesses == 0 {
+            return Some(0.0);
+        }
+
+        // Hotness = access frequency (70%) + cluster size factor (30%)
+        let access_ratio = cluster.access_count as f32 / total_accesses as f32;
+        let size_factor = (cluster.member_hashes.len() as f32 / MAX_CLUSTER_SIZE as f32).min(1.0);
+        let hotness = (access_ratio * 0.7 + size_factor * 0.3).min(1.0);
+
+        Some(hotness)
     }
 
     /// Check if two queries belong to the same cluster

@@ -19,7 +19,7 @@ const MIN_COOCCURRENCE_COUNT: u32 = 3;
 const MAX_COOCCURRENCE_PER_DOC: usize = 20;
 
 /// Prefetch if hotness score exceeds this threshold
-const DEFAULT_PREFETCH_THRESHOLD: f32 = 0.10;
+const DEFAULT_PREFETCH_THRESHOLD: f32 = 0.05;
 
 /// Time window for co-access pattern detection
 const COOCCURRENCE_WINDOW: Duration = Duration::from_secs(60);
@@ -224,6 +224,15 @@ impl Prefetcher {
     /// Get prefetch candidates for a document
     pub fn get_prefetch_candidates(&self, doc_id: u64) -> Vec<u64> {
         self.coaccesses.get_prefetch_candidates(doc_id)
+    }
+
+    /// Check if a document should be prefetched
+    ///
+    /// Returns true if the document has strong co-access patterns
+    /// (frequently accessed with other documents).
+    pub fn should_prefetch(&self, doc_id: u64) -> bool {
+        let candidates = self.get_prefetch_candidates(doc_id);
+        !candidates.is_empty()
     }
 
     /// Record that a prefetch was executed

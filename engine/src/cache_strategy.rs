@@ -120,7 +120,7 @@ impl LearnedCacheStrategy {
     /// - `predictor`: Trained RMI frequency predictor
     pub fn new(capacity: usize, mut predictor: LearnedCachePredictor) -> Self {
         predictor.set_target_hot_entries(capacity);
-        predictor.set_threshold_smoothing(0.6);
+        predictor.set_threshold_smoothing(0.5);
 
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
@@ -144,7 +144,7 @@ impl LearnedCacheStrategy {
         semantic_adapter: SemanticAdapter,
     ) -> Self {
         predictor.set_target_hot_entries(capacity);
-        predictor.set_threshold_smoothing(0.6);
+        predictor.set_threshold_smoothing(0.5);
 
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
@@ -171,7 +171,7 @@ impl LearnedCacheStrategy {
     pub fn update_predictor(&self, new_predictor: LearnedCachePredictor) {
         let mut predictor = new_predictor;
         predictor.set_target_hot_entries(self.cache.capacity());
-        predictor.set_threshold_smoothing(0.6);
+        predictor.set_threshold_smoothing(0.5);
         *self.predictor.write() = predictor;
     }
 
@@ -234,35 +234,59 @@ impl CacheStrategy for LearnedCacheStrategy {
         }
 
         // Compute frequency-based score
-        let freq_score = if let Some(score) = predictor.lookup_hotness(doc_id) {
-            score
+        let (freq_score, is_unseen) = if let Some(score) = predictor.lookup_hotness(doc_id) {
+            (score, false)
         } else {
-            // Unseen document: use baseline admission chance
+            // Unseen document: start with baseline score
             let fill_ratio = current_len as f32 / self.cache.capacity() as f32;
-            let unseen_chance =
-                predictor.unseen_admission_chance() * (1.0 - fill_ratio).clamp(0.1, 1.0);
-            drop(predictor);
-            let admit = rand::random::<f32>() < unseen_chance;
-            trace!(
-                doc_id,
-                fill_ratio,
-                unseen_chance,
-                admit,
-                "unseen doc admission decision"
-            );
-            return admit;
+            let baseline_score = predictor.unseen_admission_chance() * (1.0 - fill_ratio).clamp(0.1, 1.0);
+            (baseline_score, true)
         };
 
         let threshold = predictor.cache_threshold().max(predictor.admission_floor());
         drop(predictor);
 
-        // Check if semantic adapter is enabled
-        let semantic_adapter_guard = self.semantic_adapter.read();
-        if let Some(semantic_adapter) = semantic_adapter_guard.as_ref() {
-            let should_cache = semantic_adapter.should_cache(freq_score, embedding);
+        // Boost score based on query clustering
+        let mut boosted_score = freq_score;
+        if let Some(clusterer) = self.query_clusterer.read().as_ref() {
+            if !embedding.is_empty() {
+                let query_hash = crate::access_logger::hash_embedding(embedding);
+                if let Some(cluster_boost) = clusterer.get_cluster_hotness(query_hash) {
+                    boosted_score = (freq_score * 0.40 + cluster_boost * 0.60).min(1.0);
+                }
+            }
+        }
+
+        // Boost score based on prefetch prediction
+        if let Some(prefetcher) = self.prefetcher.read().as_ref() {
+            if prefetcher.should_prefetch(doc_id) {
+                boosted_score = (boosted_score + 0.4).min(1.0);
+            }
+        }
+
+        // For unseen documents with no frequency history, clustering and prefetch are critical!
+        // If boosting made a significant difference, treat as seen document
+        if is_unseen && (boosted_score - freq_score).abs() < 0.01 {
+            // No significant boost from clustering/prefetch, use probabilistic admission
+            let admit = rand::random::<f32>() < boosted_score;
             trace!(
                 doc_id,
                 freq_score,
+                boosted_score,
+                admit,
+                "unseen doc: probabilistic admission after cluster/prefetch check"
+            );
+            return admit;
+        }
+
+        // Check if semantic adapter is enabled
+        let semantic_adapter_guard = self.semantic_adapter.read();
+        if let Some(semantic_adapter) = semantic_adapter_guard.as_ref() {
+            let should_cache = semantic_adapter.should_cache(boosted_score, embedding);
+            trace!(
+                doc_id,
+                freq_score,
+                boosted_score,
                 threshold,
                 should_cache,
                 "semantic adapter decision"
@@ -308,19 +332,19 @@ impl CacheStrategy for LearnedCacheStrategy {
         // Prefetching: Execute predictive prefetch after insertion
         if let Some(prefetcher) = self.prefetcher.read().as_ref() {
             let candidates = prefetcher.get_prefetch_candidates(doc_id);
-            for candidate_doc_id in candidates.into_iter().take(5) {
+            for candidate_doc_id in candidates.into_iter().take(10) {
                 if self.cache.get(candidate_doc_id).is_none() {
                     let predictor = self.predictor.read();
                     let hotness = predictor.predict_hotness(candidate_doc_id);
                     drop(predictor);
 
-                    if hotness >= 0.10 {
+                    if hotness >= 0.05 {
                         prefetcher.record_prefetch();
                         trace!(
                             source_doc = doc_id,
                             prefetch_doc = candidate_doc_id,
                             hotness,
-                            "prefetch candidate (not yet cached)"
+                            "prefetch candidate"
                         );
                     }
                 }

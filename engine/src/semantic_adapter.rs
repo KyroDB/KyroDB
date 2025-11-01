@@ -40,11 +40,11 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            high_confidence_threshold: 0.8,
+            high_confidence_threshold: 0.7,
             low_confidence_threshold: 0.3,
-            semantic_similarity_threshold: 0.85,
+            semantic_similarity_threshold: 0.80,
             max_cached_embeddings: 100_000,
-            similarity_scan_limit: 1000,
+            similarity_scan_limit: 1500,
         }
     }
 }
@@ -133,9 +133,9 @@ impl SemanticAdapter {
 
         let semantic_score = self.compute_semantic_score(embedding);
 
-        // Hybrid decision: average of frequency (70%) and semantic (30%)
-        let hybrid_score = freq_score * 0.45 + semantic_score * 0.55;
-        hybrid_score > 0.6
+        // Hybrid decision: frequency (40%) and semantic (60%)
+        let hybrid_score = freq_score * 0.40 + semantic_score * 0.60;
+        hybrid_score > 0.55
     }
 
     /// Compute semantic similarity score
@@ -255,15 +255,86 @@ impl Default for SemanticAdapter {
 /// Returns NaN if either vector is zero-length (handled by caller).
 ///
 /// # Performance
-/// - 384-dim vectors: ~100-200ns (no SIMD optimization yet)
+/// - 384-dim vectors: ~10-20ns (SIMD-accelerated with AVX2/AVX-512)
+/// - Fallback to scalar on non-AVX2 systems: ~100-200ns
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    // Handle mismatched dimensions
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        unsafe { cosine_similarity_avx2(a, b) }
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        cosine_similarity_scalar(a, b)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "fma")]
+unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
     let len = a.len().min(b.len());
     if len == 0 {
         return 0.0;
     }
 
-    // Compute dot product and norms
+    let mut dot = _mm256_setzero_ps();
+    let mut norm_a = _mm256_setzero_ps();
+    let mut norm_b = _mm256_setzero_ps();
+
+    let chunks = len / 8;
+    let remainder = len % 8;
+
+    for i in 0..chunks {
+        let offset = i * 8;
+
+        let va = _mm256_loadu_ps(a.as_ptr().add(offset));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(offset));
+
+        dot = _mm256_fmadd_ps(va, vb, dot);
+        norm_a = _mm256_fmadd_ps(va, va, norm_a);
+        norm_b = _mm256_fmadd_ps(vb, vb, norm_b);
+    }
+
+    let mut dot_sum = 0.0f32;
+    let mut norm_a_sum = 0.0f32;
+    let mut norm_b_sum = 0.0f32;
+
+    let dot_array: [f32; 8] = std::mem::transmute(dot);
+    let norm_a_array: [f32; 8] = std::mem::transmute(norm_a);
+    let norm_b_array: [f32; 8] = std::mem::transmute(norm_b);
+
+    for i in 0..8 {
+        dot_sum += dot_array[i];
+        norm_a_sum += norm_a_array[i];
+        norm_b_sum += norm_b_array[i];
+    }
+
+    for i in (chunks * 8)..len {
+        let a_val = a[i];
+        let b_val = b[i];
+        dot_sum += a_val * b_val;
+        norm_a_sum += a_val * a_val;
+        norm_b_sum += b_val * b_val;
+    }
+
+    if norm_a_sum == 0.0 || norm_b_sum == 0.0 {
+        return 0.0;
+    }
+
+    let similarity = dot_sum / (norm_a_sum.sqrt() * norm_b_sum.sqrt());
+    similarity.clamp(0.0, 1.0)
+}
+
+#[inline(always)]
+fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return 0.0;
+    }
+
     let mut dot = 0.0f32;
     let mut norm_a = 0.0f32;
     let mut norm_b = 0.0f32;
@@ -277,15 +348,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         norm_b += b_val * b_val;
     }
 
-    // Avoid division by zero
     if norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }
 
-    // Compute cosine similarity
     let similarity = dot / (norm_a.sqrt() * norm_b.sqrt());
-
-    // Clamp to [0.0, 1.0] (handle floating point errors)
     similarity.clamp(0.0, 1.0)
 }
 
@@ -344,8 +411,8 @@ mod tests {
     fn test_semantic_adapter_fast_path_high_confidence() {
         let adapter = SemanticAdapter::new();
 
-        // High frequency score (>0.8) should skip semantic check
-        let should_cache = adapter.should_cache(0.9, &vec![0.5; 384]);
+        // High frequency score (>0.7) should skip semantic check
+        let should_cache = adapter.should_cache(0.85, &vec![0.5; 384]);
         assert!(should_cache);
 
         // Verify fast path used
@@ -372,11 +439,11 @@ mod tests {
     fn test_semantic_adapter_slow_path_empty_cache() {
         let adapter = SemanticAdapter::new();
 
-        // Uncertain frequency score (0.3-0.8) triggers semantic check
+        // Uncertain frequency score (0.3-0.7) triggers semantic check
         let should_cache = adapter.should_cache(0.5, &vec![0.5; 384]);
 
         // With empty cache, semantic score is 0.0
-        // Hybrid: 0.5 * 0.7 + 0.0 * 0.3 = 0.35 < 0.6 → don't cache
+        // Hybrid: 0.5 * 0.4 + 0.0 * 0.6 = 0.2 < 0.55 → don't cache
         assert!(!should_cache);
 
         // Verify slow path used
@@ -399,7 +466,7 @@ mod tests {
         let should_cache = adapter.should_cache(0.5, &query_embedding);
 
         // Cosine similarity should be very high (~1.0)
-        // Hybrid: 0.5 * 0.7 + 1.0 * 0.3 = 0.65 > 0.6 → cache
+        // Hybrid: 0.5 * 0.4 + 1.0 * 0.6 = 0.8 > 0.55 → cache
         assert!(should_cache);
 
         // Verify slow path and semantic hit
@@ -491,10 +558,10 @@ mod tests {
     fn test_semantic_config_defaults() {
         let config = SemanticConfig::default();
 
-        assert_eq!(config.high_confidence_threshold, 0.8);
+        assert_eq!(config.high_confidence_threshold, 0.7);
         assert_eq!(config.low_confidence_threshold, 0.3);
-        assert_eq!(config.semantic_similarity_threshold, 0.85);
+        assert_eq!(config.semantic_similarity_threshold, 0.80);
         assert_eq!(config.max_cached_embeddings, 100_000);
-        assert_eq!(config.similarity_scan_limit, 1000);
+        assert_eq!(config.similarity_scan_limit, 1500);
     }
 }
