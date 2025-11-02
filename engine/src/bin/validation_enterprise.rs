@@ -973,13 +973,13 @@ async fn main() -> Result<()> {
         semantic_adapter,
     ));
 
-    // Enable Week 3-4 features: Query Clustering
-    println!("Enabling query clustering (similarity threshold: 0.85)");
-    learned_strategy.enable_query_clustering(0.85);
+    // Enable query clustering with optimized threshold
+    println!("Enabling query clustering (similarity threshold: 0.75)");
+    learned_strategy.enable_query_clustering(0.75);
 
-    // Enable Week 3-4 features: Predictive Prefetching
-    println!("Enabling predictive prefetching (threshold: 0.10, max per doc: 5)");
-    let prefetcher = Arc::new(kyrodb_engine::prefetch::Prefetcher::new(0.10));
+    // Enable predictive prefetching with optimized threshold
+    println!("Enabling predictive prefetching (threshold: 0.05, max per doc: 10)");
+    let prefetcher = Arc::new(kyrodb_engine::prefetch::Prefetcher::new(0.05));
 
     // Create shutdown channel for prefetch task
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);

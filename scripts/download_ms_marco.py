@@ -40,8 +40,14 @@ def download_passages(output_dir: Path, num_passages: int = 100_000):
         print("Loading dataset (this may take a few minutes)...")
         ds = load_dataset('microsoft/ms_marco', 'v2.1', split='train')
         
-        # MS MARCO v2.1 structure:
-        # {'query': str, 'passages': [{'is_selected': int, 'passage_text': str, 'url': str}]}
+    # MS MARCO v2.1 structure (columnar nested dict under 'passages'):
+    # {'query': str,
+    #  'passages': {
+    #      'is_selected': List[int],
+    #      'passage_text': List[str],
+    #      'url': List[str]
+    #  }
+    # }
         passages = []
         doc_ids = []
         seen_passages = set()  # Deduplicate passages
@@ -54,17 +60,21 @@ def download_passages(output_dir: Path, num_passages: int = 100_000):
             if len(passages) >= num_passages:
                 break
             
-            # Each row has multiple passages
-            for passage_dict in row.get('passages', []):
+            # Each row has multiple passages; in this dataset, 'passages' is a dict of lists
+            p = row.get('passages', {})
+            # Safely obtain the aligned list of passage texts
+            p_texts = p.get('passage_text', []) if isinstance(p, dict) else []
+
+            for passage_text in p_texts:
                 if len(passages) >= num_passages:
                     break
-                
-                passage_text = passage_dict.get('passage_text', '').strip()
-                
+
+                passage_text = (passage_text or '').strip()
+
                 # Skip empty or duplicate passages
                 if not passage_text or passage_text in seen_passages:
                     continue
-                
+
                 seen_passages.add(passage_text)
                 passages.append(passage_text)
                 doc_ids.append(str(len(passages) - 1))  # Use index as doc_id

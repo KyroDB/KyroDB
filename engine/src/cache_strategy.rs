@@ -120,7 +120,7 @@ impl LearnedCacheStrategy {
     /// - `predictor`: Trained RMI frequency predictor
     pub fn new(capacity: usize, mut predictor: LearnedCachePredictor) -> Self {
         predictor.set_target_hot_entries(capacity);
-        predictor.set_threshold_smoothing(0.5);
+        predictor.set_threshold_smoothing(0.3);
 
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
@@ -144,7 +144,7 @@ impl LearnedCacheStrategy {
         semantic_adapter: SemanticAdapter,
     ) -> Self {
         predictor.set_target_hot_entries(capacity);
-        predictor.set_threshold_smoothing(0.5);
+        predictor.set_threshold_smoothing(0.3);
 
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
@@ -171,7 +171,7 @@ impl LearnedCacheStrategy {
     pub fn update_predictor(&self, new_predictor: LearnedCachePredictor) {
         let mut predictor = new_predictor;
         predictor.set_target_hot_entries(self.cache.capacity());
-        predictor.set_threshold_smoothing(0.5);
+        predictor.set_threshold_smoothing(0.3);
         *self.predictor.write() = predictor;
     }
 
@@ -252,7 +252,7 @@ impl CacheStrategy for LearnedCacheStrategy {
             if !embedding.is_empty() {
                 let query_hash = crate::access_logger::hash_embedding(embedding);
                 if let Some(cluster_boost) = clusterer.get_cluster_hotness(query_hash) {
-                    boosted_score = (freq_score * 0.40 + cluster_boost * 0.60).min(1.0);
+                    boosted_score = (freq_score * 0.50 + cluster_boost * 0.50).min(1.0);
                 }
             }
         }
@@ -260,7 +260,7 @@ impl CacheStrategy for LearnedCacheStrategy {
         // Boost score based on prefetch prediction
         if let Some(prefetcher) = self.prefetcher.read().as_ref() {
             if prefetcher.should_prefetch(doc_id) {
-                boosted_score = (boosted_score + 0.4).min(1.0);
+                boosted_score = (boosted_score + 0.35).min(1.0);
             }
         }
 

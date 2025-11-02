@@ -136,21 +136,29 @@ impl LearnedCachePredictor {
     /// - `capacity`: Maximum number of doc_ids to track (e.g., 10K-1M)
     ///
     /// # Defaults
-    /// - Cache threshold: 0.25 (more selective admission)
-    /// - Training window: 1 hour (shorter for faster adaptation)
+    /// - Cache threshold: adaptive based on capacity
+    /// - Training window: 1 hour (faster adaptation)
     /// - Recency half-life: 30 minutes (faster decay)
     /// - Training interval: 10 minutes
-    /// - Auto-tune: ENABLED (target 90% utilization)
+    /// - Auto-tune: ENABLED (target 80% utilization for learning headroom)
     pub fn new(capacity: usize) -> Result<Self> {
+        let initial_threshold = if capacity < 100 {
+            0.10
+        } else if capacity <= 1000 {
+            0.15
+        } else {
+            0.20
+        };
+
         Ok(Self {
             hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
-            cache_threshold: 0.25,
-            admission_floor: 0.08,
-            unseen_admission_chance: 0.15,
+            cache_threshold: initial_threshold,
+            admission_floor: 0.05,
+            unseen_admission_chance: 0.20,
             target_hot_entries: capacity,
-            threshold_smoothing: 0.5,
-            target_utilization: 0.90,
-            threshold_adjustment_rate: 0.08,
+            threshold_smoothing: 0.3,
+            target_utilization: 0.80,
+            threshold_adjustment_rate: 0.10,
             auto_tune_enabled: true,
             training_window: Duration::from_secs(3600),
             recency_halflife: Duration::from_secs(1800),
@@ -495,7 +503,7 @@ mod tests {
     fn test_learned_cache_basic() {
         let predictor = LearnedCachePredictor::new(1000).unwrap();
         assert_eq!(predictor.tracked_count(), 0);
-        assert!((predictor.cache_threshold() - 0.25).abs() < f32::EPSILON);
+        assert!((predictor.cache_threshold() - 0.15).abs() < f32::EPSILON);
     }
 
     #[test]

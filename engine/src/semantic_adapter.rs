@@ -40,11 +40,11 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            high_confidence_threshold: 0.7,
-            low_confidence_threshold: 0.3,
-            semantic_similarity_threshold: 0.80,
+            high_confidence_threshold: 0.75,
+            low_confidence_threshold: 0.25,
+            semantic_similarity_threshold: 0.82,
             max_cached_embeddings: 100_000,
-            similarity_scan_limit: 1500,
+            similarity_scan_limit: 2000,
         }
     }
 }
@@ -133,9 +133,9 @@ impl SemanticAdapter {
 
         let semantic_score = self.compute_semantic_score(embedding);
 
-        // Hybrid decision: frequency (40%) and semantic (60%)
-        let hybrid_score = freq_score * 0.40 + semantic_score * 0.60;
-        hybrid_score > 0.55
+        // Hybrid decision: frequency (50%) and semantic (50%)
+        let hybrid_score = freq_score * 0.50 + semantic_score * 0.50;
+        hybrid_score > 0.50
     }
 
     /// Compute semantic similarity score
@@ -411,7 +411,7 @@ mod tests {
     fn test_semantic_adapter_fast_path_high_confidence() {
         let adapter = SemanticAdapter::new();
 
-        // High frequency score (>0.7) should skip semantic check
+        // High frequency score (>0.75) should skip semantic check
         let should_cache = adapter.should_cache(0.85, &vec![0.5; 384]);
         assert!(should_cache);
 
@@ -439,11 +439,11 @@ mod tests {
     fn test_semantic_adapter_slow_path_empty_cache() {
         let adapter = SemanticAdapter::new();
 
-        // Uncertain frequency score (0.3-0.7) triggers semantic check
+        // Uncertain frequency score (0.25-0.75) triggers semantic check
         let should_cache = adapter.should_cache(0.5, &vec![0.5; 384]);
 
         // With empty cache, semantic score is 0.0
-        // Hybrid: 0.5 * 0.4 + 0.0 * 0.6 = 0.2 < 0.55 → don't cache
+        // Hybrid: 0.5 * 0.5 + 0.0 * 0.5 = 0.25 < 0.50 → don't cache
         assert!(!should_cache);
 
         // Verify slow path used
@@ -466,7 +466,7 @@ mod tests {
         let should_cache = adapter.should_cache(0.5, &query_embedding);
 
         // Cosine similarity should be very high (~1.0)
-        // Hybrid: 0.5 * 0.4 + 1.0 * 0.6 = 0.8 > 0.55 → cache
+        // Hybrid: 0.5 * 0.5 + 1.0 * 0.5 = 0.75 > 0.50 → cache
         assert!(should_cache);
 
         // Verify slow path and semantic hit
@@ -558,10 +558,10 @@ mod tests {
     fn test_semantic_config_defaults() {
         let config = SemanticConfig::default();
 
-        assert_eq!(config.high_confidence_threshold, 0.7);
-        assert_eq!(config.low_confidence_threshold, 0.3);
-        assert_eq!(config.semantic_similarity_threshold, 0.80);
+        assert_eq!(config.high_confidence_threshold, 0.75);
+        assert_eq!(config.low_confidence_threshold, 0.25);
+        assert_eq!(config.semantic_similarity_threshold, 0.82);
         assert_eq!(config.max_cached_embeddings, 100_000);
-        assert_eq!(config.similarity_scan_limit, 1500);
+        assert_eq!(config.similarity_scan_limit, 2000);
     }
 }
