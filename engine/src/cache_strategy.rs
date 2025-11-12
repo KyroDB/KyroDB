@@ -197,10 +197,12 @@ impl CacheStrategy for LearnedCacheStrategy {
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
         let current_len = self.cache.len();
 
-        {
-            let mut predictor = self.predictor.write();
-            predictor.calibrate_threshold(current_len);
-        }
+        // DISABLED: Runtime auto-tuning on every query causes instability
+        // Let the training pipeline (training_task.rs) own threshold tuning
+        // {
+        //     let mut predictor = self.predictor.write();
+        //     predictor.calibrate_threshold(current_len);
+        // }
 
         // Query clustering: Add query to cluster for semantic grouping
         if let Some(clusterer) = self.query_clusterer.read().as_ref() {

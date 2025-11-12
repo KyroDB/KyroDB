@@ -142,12 +142,14 @@ impl LearnedCachePredictor {
     /// - Training interval: 10 minutes
     /// - Auto-tune: ENABLED (target 80% utilization for learning headroom)
     pub fn new(capacity: usize) -> Result<Self> {
+        // TUNED: Tightened thresholds to reduce false positives (over-prediction of hotness)
+        // For small caches (50-100 slots), must be very selective to avoid thrashing
         let initial_threshold = if capacity < 100 {
-            0.10
+            0.50  // Was 0.10 - dramatically tightened for tiny caches
         } else if capacity <= 1000 {
-            0.15
+            0.40  // Was 0.15 - tightened for small caches
         } else {
-            0.20
+            0.25  // Was 0.20 - slight tightening for large caches
         };
 
         Ok(Self {

@@ -40,9 +40,9 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            high_confidence_threshold: 0.75,
-            low_confidence_threshold: 0.25,
-            semantic_similarity_threshold: 0.82,
+            high_confidence_threshold: 0.60,  // Lowered from 0.75 to trigger semantic check more often
+            low_confidence_threshold: 0.35,    // Raised from 0.25 to widen uncertainty band
+            semantic_similarity_threshold: 0.70,  // Lowered from 0.82 to catch more paraphrases
             max_cached_embeddings: 100_000,
             similarity_scan_limit: 2000,
         }
@@ -108,6 +108,7 @@ impl SemanticAdapter {
     /// Hybrid cache admission decision
     ///
     /// Combines frequency-based prediction with semantic similarity.
+    /// During cold-start (empty semantic cache), falls back to frequency-only.
     ///
     /// # Parameters
     /// - `freq_score`: Frequency-based hotness score from RMI (0.0-1.0)
@@ -129,13 +130,28 @@ impl SemanticAdapter {
         }
 
         // Slow path: uncertain frequency, check semantic similarity
+        // REMOVED: Cold-start bypass that defeated hybrid strategy during warmup
+        let cache_size = self.cache_size();
         self.stats.write().slow_path_decisions += 1;
 
         let semantic_score = self.compute_semantic_score(embedding);
 
-        // Hybrid decision: frequency (50%) and semantic (50%)
-        let hybrid_score = freq_score * 0.50 + semantic_score * 0.50;
-        hybrid_score > 0.50
+        // Hybrid decision: frequency (70%) and semantic (30%) during warm-up
+        // Semantic is a BOOSTER, not a gatekeeper
+        let hybrid_score = if cache_size < 1000 {
+            freq_score * 0.70 + semantic_score * 0.30
+        } else {
+            freq_score * 0.50 + semantic_score * 0.50
+        };
+
+        // Adaptive threshold based on warm-up progress
+        let threshold = if cache_size < 1000 {
+            0.35
+        } else {
+            0.45
+        };
+
+        hybrid_score > threshold
     }
 
     /// Compute semantic similarity score
@@ -439,34 +455,37 @@ mod tests {
     fn test_semantic_adapter_slow_path_empty_cache() {
         let adapter = SemanticAdapter::new();
 
-        // Uncertain frequency score (0.25-0.75) triggers semantic check
+        // Uncertain frequency score (0.25-0.75) with empty cache
         let should_cache = adapter.should_cache(0.5, &vec![0.5; 384]);
 
-        // With empty cache, semantic score is 0.0
-        // Hybrid: 0.5 * 0.5 + 0.0 * 0.5 = 0.25 < 0.50 → don't cache
-        assert!(!should_cache);
+        // With empty cache (< 100 embeddings), falls back to freq-only: 0.5 > 0.40 → cache
+        assert!(should_cache);
 
-        // Verify slow path used
+        // Verify fast path used (cold-start bypass)
         let stats = adapter.stats();
-        assert_eq!(stats.fast_path_decisions, 0);
-        assert_eq!(stats.slow_path_decisions, 1);
-        assert_eq!(stats.semantic_misses, 1);
+        assert_eq!(stats.fast_path_decisions, 1);
+        assert_eq!(stats.slow_path_decisions, 0);
     }
 
     #[test]
     fn test_semantic_adapter_slow_path_with_similar_embedding() {
         let adapter = SemanticAdapter::new();
 
-        // Cache an embedding
+        // Cache 100 embeddings to get past cold-start threshold
+        for i in 0..100 {
+            adapter.cache_embedding(i, vec![i as f32 / 100.0; 384]);
+        }
+
+        // Cache a similar embedding
         let cached_embedding = vec![1.0; 384];
-        adapter.cache_embedding(1, cached_embedding.clone());
+        adapter.cache_embedding(100, cached_embedding.clone());
 
         // Query with very similar embedding
         let query_embedding = vec![0.99; 384];
         let should_cache = adapter.should_cache(0.5, &query_embedding);
 
         // Cosine similarity should be very high (~1.0)
-        // Hybrid: 0.5 * 0.5 + 1.0 * 0.5 = 0.75 > 0.50 → cache
+        // Warm-up phase (< 1000): 0.5 * 0.7 + 1.0 * 0.3 = 0.65 > 0.35 → cache
         assert!(should_cache);
 
         // Verify slow path and semantic hit
