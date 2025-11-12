@@ -127,13 +127,14 @@ impl VectorCache {
     /// Insert vector into cache
     ///
     /// If cache is full, evicts least recently used entry.
+    /// Returns the evicted doc_id if an eviction occurred (for feedback tracking).
     ///
     /// # Performance
     /// O(1) hashmap insert + O(1) LRU queue push
     ///
     /// # Atomicity
     /// Single lock ensures cache and LRU queue remain synchronized.
-    pub fn insert(&self, cached_vector: CachedVector) {
+    pub fn insert(&self, cached_vector: CachedVector) -> Option<u64> {
         let doc_id = cached_vector.doc_id;
         let mut state = self.state.write();
 
@@ -150,20 +151,27 @@ impl VectorCache {
                 state.lru_queue.push_back(doc_id);
             }
 
-            return;
+            return None;  // No eviction on update
         }
 
         // Evict if at capacity
-        if state.cache.len() >= self.capacity {
+        let evicted_doc_id = if state.cache.len() >= self.capacity {
             if let Some(evict_id) = state.lru_queue.pop_front() {
                 state.cache.remove(&evict_id);
                 self.stats.write().evictions += 1;
+                Some(evict_id)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // Insert new entry
         state.cache.insert(doc_id, cached_vector);
         state.lru_queue.push_back(doc_id);
+
+        evicted_doc_id
     }
 
     /// Get cache statistics

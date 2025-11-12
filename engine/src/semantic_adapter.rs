@@ -129,9 +129,16 @@ impl SemanticAdapter {
             return false;
         }
 
-        // Slow path: uncertain frequency, check semantic similarity
-        // REMOVED: Cold-start bypass that defeated hybrid strategy during warmup
+        // Cold-start bypass: Bootstrap with RMI-only for first 50 embeddings
+        // After that, semantic similarity has enough data to be useful
+        // CRITICAL: Lets cache fill quickly with RMI's best predictions during warmup
         let cache_size = self.cache_size();
+        if cache_size < 50 {
+            self.stats.write().fast_path_decisions += 1;
+            return freq_score > 0.25;  // Use same threshold as RMI (0.25 for small caches)
+        }
+
+        // Slow path: uncertain frequency, check semantic similarity
         self.stats.write().slow_path_decisions += 1;
 
         let semantic_score = self.compute_semantic_score(embedding);

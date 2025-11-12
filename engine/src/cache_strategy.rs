@@ -79,7 +79,7 @@ impl CacheStrategy for LruCacheStrategy {
 
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
-        self.cache.insert(cached_vector);
+        let _ = self.cache.insert(cached_vector);  // Ignore evictions for baseline
     }
 
     fn name(&self) -> &str {
@@ -189,6 +189,13 @@ impl CacheStrategy for LearnedCacheStrategy {
             trace!(doc_id, strategy = %self.name, "cache hit");
         } else {
             trace!(doc_id, strategy = %self.name, "cache miss");
+
+            // FEEDBACK LOOP: Track false negatives (cache miss for docs RMI predicted as cold)
+            let predictor = self.predictor.read();
+            if let Some(hotness) = predictor.lookup_hotness(doc_id) {
+                predictor.record_cache_miss(doc_id, hotness);
+            }
+            drop(predictor);
         }
         hit
     }
@@ -197,12 +204,12 @@ impl CacheStrategy for LearnedCacheStrategy {
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
         let current_len = self.cache.len();
 
-        // DISABLED: Runtime auto-tuning on every query causes instability
-        // Let the training pipeline (training_task.rs) own threshold tuning
-        // {
-        //     let mut predictor = self.predictor.write();
-        //     predictor.calibrate_threshold(current_len);
-        // }
+        // RATE-LIMITED AUTO-TUNING: Calibrate threshold based on cache utilization
+        // Rate limiting (60s) prevents per-query instability while allowing gradual adaptation
+        {
+            let mut predictor = self.predictor.write();
+            predictor.calibrate_threshold(current_len);
+        }
 
         // Query clustering: Add query to cluster for semantic grouping
         if let Some(clusterer) = self.query_clusterer.read().as_ref() {
@@ -329,7 +336,14 @@ impl CacheStrategy for LearnedCacheStrategy {
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
         let doc_id = cached_vector.doc_id;
-        self.cache.insert(cached_vector);
+        let evicted_doc_id = self.cache.insert(cached_vector);
+
+        // FEEDBACK LOOP: Track evictions (false positives - cached but not re-accessed)
+        if let Some(evicted_id) = evicted_doc_id {
+            let predictor = self.predictor.read();
+            predictor.record_eviction(evicted_id);
+            drop(predictor);
+        }
 
         // Prefetching: Execute predictive prefetch after insertion
         if let Some(prefetcher) = self.prefetcher.read().as_ref() {

@@ -137,4 +137,6 @@ other_docs/
 docs/visiondocument.md
 docs/CONFIGURATION_IMPLEMENTATION_SUMMARY.md
 CLAUDE.md
-.venv/                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+.venv/          
+analysis_phase1.py              
+PHASE1_ROOT_CAUSE_ANALYSIS.md                                                                                                                                                                                                                                                                                                                                                                                                                                      

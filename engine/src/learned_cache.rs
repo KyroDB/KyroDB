@@ -127,6 +127,17 @@ pub struct LearnedCachePredictor {
 
     /// Training interval (how often to retrain)
     training_interval: Duration,
+
+    /// Last calibration timestamp (for rate-limited auto-tuning)
+    last_calibration: Arc<parking_lot::RwLock<SystemTime>>,
+
+    /// FEEDBACK LOOP: Track false positives (predicted hot but evicted without re-access)
+    /// doc_id → number of times evicted from cache
+    false_positives: Arc<RwLock<HashMap<u64, u32>>>,
+
+    /// FEEDBACK LOOP: Track false negatives (predicted cold but was accessed)
+    /// doc_id → number of cache misses
+    false_negatives: Arc<RwLock<HashMap<u64, u32>>>,
 }
 
 impl LearnedCachePredictor {
@@ -142,14 +153,15 @@ impl LearnedCachePredictor {
     /// - Training interval: 10 minutes
     /// - Auto-tune: ENABLED (target 80% utilization for learning headroom)
     pub fn new(capacity: usize) -> Result<Self> {
-        // TUNED: Tightened thresholds to reduce false positives (over-prediction of hotness)
-        // For small caches (50-100 slots), must be very selective to avoid thrashing
+        // FIXED: Use RMI as WIDE NET (recall-focused), semantic adapter filters false positives
+        // Threshold balances recall (don't reject hot docs) vs precision (don't admit cold docs)
+        // Target: Predict 5-6x cache capacity as "potentially hot" for semantic filtering
         let initial_threshold = if capacity < 100 {
-            0.50  // Was 0.10 - dramatically tightened for tiny caches
+            0.30  // Tiny caches: admit ~300 docs (6x capacity of 50)
         } else if capacity <= 1000 {
-            0.40  // Was 0.15 - tightened for small caches
+            0.25  // Small caches: admit ~250 docs (5x capacity of 50) - CRITICAL VALUE
         } else {
-            0.25  // Was 0.20 - slight tightening for large caches
+            0.22  // Large caches: admit proportionally fewer per slot
         };
 
         Ok(Self {
@@ -167,6 +179,9 @@ impl LearnedCachePredictor {
             capacity,
             last_trained: UNIX_EPOCH,
             training_interval: Duration::from_secs(600),
+            last_calibration: Arc::new(parking_lot::RwLock::new(UNIX_EPOCH)),
+            false_positives: Arc::new(RwLock::new(HashMap::new())),
+            false_negatives: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -194,6 +209,9 @@ impl LearnedCachePredictor {
             capacity,
             last_trained: UNIX_EPOCH,
             training_interval,
+            last_calibration: Arc::new(parking_lot::RwLock::new(UNIX_EPOCH)),
+            false_positives: Arc::new(RwLock::new(HashMap::new())),
+            false_negatives: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -252,7 +270,12 @@ impl LearnedCachePredictor {
         }
 
         // Compute hotness scores (frequency + recency weighted)
-        let hotness_map = self.compute_hotness_scores(accesses);
+        let mut hotness_map = self.compute_hotness_scores(accesses);
+
+        // FEEDBACK LOOP: Apply corrections based on false positives/negatives
+        // Penalize docs that were cached but evicted (false positives)
+        // Boost docs that were accessed but not cached (false negatives)
+        self.apply_feedback_corrections(&mut hotness_map);
 
         // Sort by hotness (descending) to keep hottest documents
         let mut hotness_vec: Vec<(u64, f32)> = hotness_map.into_iter().collect();
@@ -365,6 +388,18 @@ impl LearnedCachePredictor {
             return;
         }
 
+        // RATE LIMITING: Only calibrate once every 60 seconds to prevent per-query instability
+        const CALIBRATION_INTERVAL_SECS: u64 = 60;
+        let now = SystemTime::now();
+        let mut last_cal = self.last_calibration.write();
+        if let Ok(elapsed) = now.duration_since(*last_cal) {
+            if elapsed.as_secs() < CALIBRATION_INTERVAL_SECS {
+                return;  // Too soon, skip calibration
+            }
+        }
+        *last_cal = now;
+        drop(last_cal);
+
         let capacity = self.capacity;
         if capacity == 0 {
             return;
@@ -476,6 +511,49 @@ impl LearnedCachePredictor {
         let smoothed = self.cache_threshold * self.threshold_smoothing
             + target_threshold * (1.0 - self.threshold_smoothing);
         self.cache_threshold = smoothed.clamp(self.admission_floor, 1.0);
+    }
+
+    /// FEEDBACK LOOP: Called when cache evicts a document that wasn't re-accessed
+    /// This indicates RMI predicted the doc as hot, but it turned out to be a false positive
+    pub fn record_eviction(&self, doc_id: u64) {
+        *self.false_positives.write().entry(doc_id).or_insert(0) += 1;
+    }
+
+    /// FEEDBACK LOOP: Called when cache misses a document (predicted cold but accessed)
+    /// This indicates RMI missed a hot document (false negative)
+    pub fn record_cache_miss(&self, doc_id: u64, predicted_hotness: f32) {
+        if predicted_hotness < self.cache_threshold {
+            *self.false_negatives.write().entry(doc_id).or_insert(0) += 1;
+        }
+    }
+
+    /// FEEDBACK LOOP: During training, penalize false positives and boost false negatives
+    /// This corrects RMI predictions based on actual cache behavior
+    /// - False positives (evicted without re-access): 10% penalty per eviction
+    /// - False negatives (accessed but not cached): +0.1 per miss
+    pub fn apply_feedback_corrections(&self, hotness_scores: &mut HashMap<u64, f32>) {
+        let fps = self.false_positives.read();
+        let fns = self.false_negatives.read();
+
+        // Penalize false positives (was cached but not re-accessed)
+        for (doc_id, evictions) in fps.iter() {
+            if let Some(score) = hotness_scores.get_mut(doc_id) {
+                *score *= 0.9_f32.powi(*evictions as i32);  // 10% penalty per eviction
+            }
+        }
+
+        // Boost false negatives (was accessed but not cached)
+        for (doc_id, misses) in fns.iter() {
+            if let Some(score) = hotness_scores.get_mut(doc_id) {
+                *score = (*score + 0.1 * *misses as f32).min(1.0);  // +0.1 per miss, capped at 1.0
+            }
+        }
+
+        // Clear feedback after applying (fresh start for next cycle)
+        drop(fps);
+        drop(fns);
+        self.false_positives.write().clear();
+        self.false_negatives.write().clear();
     }
 }
 
