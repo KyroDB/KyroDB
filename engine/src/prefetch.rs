@@ -4,7 +4,6 @@
 //! prefetches likely-to-be-accessed documents into cache, reducing latency
 //! for subsequent queries.
 
-
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

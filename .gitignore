@@ -139,4 +139,6 @@ docs/CONFIGURATION_IMPLEMENTATION_SUMMARY.md
 CLAUDE.md
 .venv/          
 analysis_phase1.py              
-PHASE1_ROOT_CAUSE_ANALYSIS.md                                                                                                                                                                                                                                                                                                                                                                                                                                      
+PHASE1_ROOT_CAUSE_ANALYSIS.md        
+docs/EPISODIC_MEMORY_IMPLEMENTATION.md   
+analyze_failure.py                                                                                                                                                                                                                                                                                                                                                                                                                           

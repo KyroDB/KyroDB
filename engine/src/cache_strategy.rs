@@ -79,7 +79,7 @@ impl CacheStrategy for LruCacheStrategy {
 
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
-        let _ = self.cache.insert(cached_vector);  // Ignore evictions for baseline
+        let _ = self.cache.insert(cached_vector); // Ignore evictions for baseline
     }
 
     fn name(&self) -> &str {
@@ -119,7 +119,7 @@ impl LearnedCacheStrategy {
     /// - `capacity`: Cache capacity
     /// - `predictor`: Trained RMI frequency predictor
     pub fn new(capacity: usize, mut predictor: LearnedCachePredictor) -> Self {
-        predictor.set_target_hot_entries(capacity);
+        predictor.set_target_hot_entries(capacity.saturating_mul(5));
         predictor.set_threshold_smoothing(0.3);
 
         Self {
@@ -143,7 +143,7 @@ impl LearnedCacheStrategy {
         mut predictor: LearnedCachePredictor,
         semantic_adapter: SemanticAdapter,
     ) -> Self {
-        predictor.set_target_hot_entries(capacity);
+        predictor.set_target_hot_entries(capacity.saturating_mul(5));
         predictor.set_threshold_smoothing(0.3);
 
         Self {
@@ -170,7 +170,7 @@ impl LearnedCacheStrategy {
     /// Update predictor (for periodic retraining)
     pub fn update_predictor(&self, new_predictor: LearnedCachePredictor) {
         let mut predictor = new_predictor;
-        predictor.set_target_hot_entries(self.cache.capacity());
+        predictor.set_target_hot_entries(self.cache.capacity().saturating_mul(5));
         predictor.set_threshold_smoothing(0.3);
         *self.predictor.write() = predictor;
     }
@@ -248,7 +248,8 @@ impl CacheStrategy for LearnedCacheStrategy {
         } else {
             // Unseen document: start with baseline score
             let fill_ratio = current_len as f32 / self.cache.capacity() as f32;
-            let baseline_score = predictor.unseen_admission_chance() * (1.0 - fill_ratio).clamp(0.1, 1.0);
+            let baseline_score =
+                predictor.unseen_admission_chance() * (1.0 - fill_ratio).clamp(0.1, 1.0);
             (baseline_score, true)
         };
 

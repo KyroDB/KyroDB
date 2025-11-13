@@ -144,8 +144,7 @@ pub use query_clustering::{ClusterId, ClusterStats, QueryCluster, QueryClusterer
 
 // Prefetching components
 pub use prefetch::{
-    spawn_prefetch_task, CoAccessGraph, CoAccessStats, PrefetchConfig, Prefetcher,
-    PrefetcherStats,
+    spawn_prefetch_task, CoAccessGraph, CoAccessStats, PrefetchConfig, Prefetcher, PrefetcherStats,
 };
 
 // Quality metrics components

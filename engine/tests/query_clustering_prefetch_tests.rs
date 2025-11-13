@@ -77,7 +77,10 @@ fn test_query_clustering_with_prefetching() {
 
     // Verify both systems are active
     let prefetch_stats = prefetcher.stats();
-    assert!(prefetch_stats.coaccesses.total_source_docs > 0 || prefetch_stats.coaccesses.total_patterns >= 0);
+    assert!(
+        prefetch_stats.coaccesses.total_source_docs > 0
+            || prefetch_stats.coaccesses.total_patterns >= 0
+    );
 }
 
 #[tokio::test]
@@ -99,12 +102,7 @@ async fn test_prefetch_background_task() {
     };
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-    let handle = kyrodb_engine::spawn_prefetch_task(
-        prefetcher.clone(),
-        config,
-        shutdown_rx,
-    )
-    .await;
+    let handle = kyrodb_engine::spawn_prefetch_task(prefetcher.clone(), config, shutdown_rx).await;
 
     // Let task run briefly
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

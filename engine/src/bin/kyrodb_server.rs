@@ -1006,7 +1006,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_pattern_age: Duration::from_secs(3600),
             };
             tokio::spawn(async move {
-                kyrodb_engine::prefetch::spawn_prefetch_task(prefetcher_clone, prefetch_config, shutdown_rx).await;
+                kyrodb_engine::prefetch::spawn_prefetch_task(
+                    prefetcher_clone,
+                    prefetch_config,
+                    shutdown_rx,
+                )
+                .await;
             });
 
             learned_strategy.enable_prefetching(prefetcher);
@@ -1042,7 +1047,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warn!(error = %e, "Recovery failed, creating new engine");
                 let fallback_cache_strategy = create_cache_strategy();
                 let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]];
-                TieredEngine::new(fallback_cache_strategy, dummy_embedding, engine_config.clone())?
+                TieredEngine::new(
+                    fallback_cache_strategy,
+                    dummy_embedding,
+                    engine_config.clone(),
+                )?
             }
         }
     } else {

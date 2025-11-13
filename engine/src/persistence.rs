@@ -365,8 +365,10 @@ impl WalErrorHandler {
                 _ => {
                     // Check for ENOSPC (disk full) in error message
                     let err_str = format!("{}", io_err);
-                    if err_str.contains("ENOSPC") || err_str.contains("No space left")
-                        || err_str.contains("EDQUOT") || err_str.contains("Quota exceeded")
+                    if err_str.contains("ENOSPC")
+                        || err_str.contains("No space left")
+                        || err_str.contains("EDQUOT")
+                        || err_str.contains("Quota exceeded")
                     {
                         WalErrorKind::DiskFull
                     } else {
@@ -377,8 +379,10 @@ impl WalErrorHandler {
         } else {
             // Check error message for disk full indicators
             let err_str = format!("{}", error);
-            if err_str.contains("ENOSPC") || err_str.contains("No space left")
-                || err_str.contains("EDQUOT") || err_str.contains("Quota exceeded")
+            if err_str.contains("ENOSPC")
+                || err_str.contains("No space left")
+                || err_str.contains("EDQUOT")
+                || err_str.contains("Quota exceeded")
             {
                 WalErrorKind::DiskFull
             } else if err_str.contains("Permission denied") || err_str.contains("EACCES") {

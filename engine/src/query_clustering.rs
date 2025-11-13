@@ -214,7 +214,11 @@ impl QueryClusterer {
             0.0
         };
 
-        let max_cluster_size = clusters.iter().map(|c| c.member_hashes.len()).max().unwrap_or(0);
+        let max_cluster_size = clusters
+            .iter()
+            .map(|c| c.member_hashes.len())
+            .max()
+            .unwrap_or(0);
 
         ClusterStats {
             total_clusters,

@@ -40,11 +40,11 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            high_confidence_threshold: 0.60,  // Lowered from 0.75 to trigger semantic check more often
-            low_confidence_threshold: 0.35,    // Raised from 0.25 to widen uncertainty band
-            semantic_similarity_threshold: 0.70,  // Lowered from 0.82 to catch more paraphrases
+            high_confidence_threshold: 0.50, // Admit earlier based on frequency alone
+            low_confidence_threshold: 0.15,  // Allow semantic layer to rescue low-frequency docs
+            semantic_similarity_threshold: 0.65, // Catch close paraphrases without flooding cache
             max_cached_embeddings: 100_000,
-            similarity_scan_limit: 2000,
+            similarity_scan_limit: 512,
         }
     }
 }
@@ -123,42 +123,33 @@ impl SemanticAdapter {
             return true;
         }
 
-        // Fast path: low confidence (definitely cold)
-        if freq_score <= self.config.low_confidence_threshold {
+        let cache_size = self.cache_size();
+
+        // Bootstrap while semantic cache is still empty
+        if cache_size < 50 {
             self.stats.write().fast_path_decisions += 1;
+            return freq_score > 0.15;
+        }
+
+        // Slow path: evaluate semantic similarity to rescue low-frequency docs
+        self.stats.write().slow_path_decisions += 1;
+        let semantic_score = self.compute_semantic_score(embedding);
+
+        if freq_score <= self.config.low_confidence_threshold
+            && semantic_score < self.config.semantic_similarity_threshold
+        {
             return false;
         }
 
-        // Cold-start bypass: Bootstrap with RMI-only for first 50 embeddings
-        // After that, semantic similarity has enough data to be useful
-        // CRITICAL: Lets cache fill quickly with RMI's best predictions during warmup
-        let cache_size = self.cache_size();
-        if cache_size < 50 {
-            self.stats.write().fast_path_decisions += 1;
-            return freq_score > 0.25;  // Use same threshold as RMI (0.25 for small caches)
-        }
-
-        // Slow path: uncertain frequency, check semantic similarity
-        self.stats.write().slow_path_decisions += 1;
-
-        let semantic_score = self.compute_semantic_score(embedding);
-
-        // Hybrid decision: frequency (70%) and semantic (30%) during warm-up
-        // Semantic is a BOOSTER, not a gatekeeper
-        let hybrid_score = if cache_size < 1000 {
-            freq_score * 0.70 + semantic_score * 0.30
+        // Hybrid decision: frequency complemented by semantic score
+        let (freq_weight, semantic_weight, threshold) = if cache_size < 1000 {
+            (0.65, 0.35, 0.32)
         } else {
-            freq_score * 0.50 + semantic_score * 0.50
+            (0.50, 0.50, 0.40)
         };
 
-        // Adaptive threshold based on warm-up progress
-        let threshold = if cache_size < 1000 {
-            0.35
-        } else {
-            0.45
-        };
-
-        hybrid_score > threshold
+        let hybrid_score = freq_score * freq_weight + semantic_score * semantic_weight;
+        hybrid_score >= threshold
     }
 
     /// Compute semantic similarity score

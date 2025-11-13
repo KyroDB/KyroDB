@@ -151,7 +151,7 @@ impl VectorCache {
                 state.lru_queue.push_back(doc_id);
             }
 
-            return None;  // No eviction on update
+            return None; // No eviction on update
         }
 
         // Evict if at capacity

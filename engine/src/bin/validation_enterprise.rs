@@ -995,7 +995,12 @@ async fn main() -> Result<()> {
         max_pattern_age: Duration::from_secs(3600),
     };
     tokio::spawn(async move {
-        kyrodb_engine::prefetch::spawn_prefetch_task(prefetcher_clone, prefetch_config, shutdown_rx).await;
+        kyrodb_engine::prefetch::spawn_prefetch_task(
+            prefetcher_clone,
+            prefetch_config,
+            shutdown_rx,
+        )
+        .await;
     });
 
     learned_strategy.enable_prefetching(prefetcher);

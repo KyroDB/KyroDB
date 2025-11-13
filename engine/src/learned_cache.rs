@@ -157,23 +157,23 @@ impl LearnedCachePredictor {
         // Threshold balances recall (don't reject hot docs) vs precision (don't admit cold docs)
         // Target: Predict 5-6x cache capacity as "potentially hot" for semantic filtering
         let initial_threshold = if capacity < 100 {
-            0.30  // Tiny caches: admit ~300 docs (6x capacity of 50)
+            0.22 // Tiny caches: admit ~300 docs (6x capacity of 50)
         } else if capacity <= 1000 {
-            0.25  // Small caches: admit ~250 docs (5x capacity of 50) - CRITICAL VALUE
+            0.15 // Small caches: widen candidate pool for semantic layer
         } else {
-            0.22  // Large caches: admit proportionally fewer per slot
+            0.18 // Large caches: maintain moderate recall bias
         };
 
         Ok(Self {
             hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
             cache_threshold: initial_threshold,
-            admission_floor: 0.05,
-            unseen_admission_chance: 0.20,
+            admission_floor: 0.10,
+            unseen_admission_chance: 0.25,
             target_hot_entries: capacity,
             threshold_smoothing: 0.3,
             target_utilization: 0.80,
             threshold_adjustment_rate: 0.10,
-            auto_tune_enabled: true,
+            auto_tune_enabled: false,
             training_window: Duration::from_secs(3600),
             recency_halflife: Duration::from_secs(1800),
             capacity,
@@ -193,17 +193,17 @@ impl LearnedCachePredictor {
         recency_halflife: Duration,
         training_interval: Duration,
     ) -> Result<Self> {
-        let admission_floor = 0.05;
+        let admission_floor = 0.10;
         Ok(Self {
             hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
             cache_threshold: cache_threshold.clamp(admission_floor, 1.0),
             admission_floor,
-            unseen_admission_chance: 0.10,
+            unseen_admission_chance: 0.20,
             target_hot_entries: capacity,
             threshold_smoothing: 0.6,
             target_utilization: 0.85,
             threshold_adjustment_rate: 0.05,
-            auto_tune_enabled: true,
+            auto_tune_enabled: false,
             training_window,
             recency_halflife,
             capacity,
@@ -394,7 +394,7 @@ impl LearnedCachePredictor {
         let mut last_cal = self.last_calibration.write();
         if let Ok(elapsed) = now.duration_since(*last_cal) {
             if elapsed.as_secs() < CALIBRATION_INTERVAL_SECS {
-                return;  // Too soon, skip calibration
+                return; // Too soon, skip calibration
             }
         }
         *last_cal = now;
@@ -529,8 +529,8 @@ impl LearnedCachePredictor {
 
     /// FEEDBACK LOOP: During training, penalize false positives and boost false negatives
     /// This corrects RMI predictions based on actual cache behavior
-    /// - False positives (evicted without re-access): 10% penalty per eviction
-    /// - False negatives (accessed but not cached): +0.1 per miss
+    /// - False positives (evicted without re-access): up to 30% multiplicative penalty
+    /// - False negatives (accessed but not cached): +0.02 per miss (capped)
     pub fn apply_feedback_corrections(&self, hotness_scores: &mut HashMap<u64, f32>) {
         let fps = self.false_positives.read();
         let fns = self.false_negatives.read();
@@ -538,14 +538,17 @@ impl LearnedCachePredictor {
         // Penalize false positives (was cached but not re-accessed)
         for (doc_id, evictions) in fps.iter() {
             if let Some(score) = hotness_scores.get_mut(doc_id) {
-                *score *= 0.9_f32.powi(*evictions as i32);  // 10% penalty per eviction
+                let penalty = (0.10 * *evictions as f32).min(0.30);
+                let adjusted = *score * (1.0 - penalty);
+                *score = adjusted.max(self.admission_floor);
             }
         }
 
         // Boost false negatives (was accessed but not cached)
         for (doc_id, misses) in fns.iter() {
             if let Some(score) = hotness_scores.get_mut(doc_id) {
-                *score = (*score + 0.1 * *misses as f32).min(1.0);  // +0.1 per miss, capped at 1.0
+                let boost = (0.02 * *misses as f32).min(0.20);
+                *score = (*score + boost).min(1.0);
             }
         }
 
