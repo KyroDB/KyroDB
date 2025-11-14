@@ -37,7 +37,7 @@ use kyrodb_engine::{
     training_task::{spawn_training_task, TrainingConfig},
     vector_cache::CachedVector,
 };
-use rand::{Rng, SeedableRng};
+use rand::{seq::SliceRandom, Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Normal, Zipf};
 use serde::{Deserialize, Serialize};
@@ -118,10 +118,26 @@ struct Config {
     /// Top-K queries per document for semantic sampling (default: 10)
     #[serde(default = "default_top_k_queries")]
     top_k_queries_per_doc: usize,
+
+    /// Minimum paraphrases per document generated for semantic workload
+    #[serde(default = "default_min_paraphrases")]
+    min_paraphrases_per_doc: usize,
+
+    /// Multiplier for learned cache capacity (experimentation aid)
+    #[serde(default = "default_learned_cache_multiplier")]
+    learned_cache_multiplier: f64,
 }
 
 fn default_top_k_queries() -> usize {
     10
+}
+
+fn default_min_paraphrases() -> usize {
+    30
+}
+
+fn default_learned_cache_multiplier() -> f64 {
+    1.0
 }
 
 impl Default for Config {
@@ -170,6 +186,8 @@ impl Default for Config {
             query_embeddings_path: None,
             query_to_doc_path: None,
             top_k_queries_per_doc: 10,
+            min_paraphrases_per_doc: default_min_paraphrases(),
+            learned_cache_multiplier: default_learned_cache_multiplier(),
         }
     }
 }
@@ -219,6 +237,12 @@ impl Config {
         if self.working_set_churn <= 0.0 || self.working_set_churn > 1.0 {
             bail!("working_set_churn must be in (0, 1]");
         }
+        if self.min_paraphrases_per_doc == 0 {
+            bail!("min_paraphrases_per_doc must be > 0");
+        }
+        if self.learned_cache_multiplier < 1.0 {
+            bail!("learned_cache_multiplier must be >= 1.0");
+        }
         Ok(())
     }
 
@@ -230,6 +254,13 @@ impl Config {
         let rolling_estimate =
             (self.cache_capacity as f64 * self.working_set_multiplier).round() as usize;
         zipf_estimate.max(rolling_estimate).min(self.corpus_size)
+    }
+
+    fn learned_cache_capacity(&self) -> usize {
+        let scaled = (self.cache_capacity as f64 * self.learned_cache_multiplier)
+            .round()
+            .max(self.cache_capacity as f64);
+        scaled as usize
     }
 }
 
@@ -274,6 +305,14 @@ struct ValidationResults {
     expected_training_cycles: u64,
     actual_training_cycles: u64,
     training_task_crashed: bool,
+
+    // Predictor stats
+    predictor_tracked_docs: usize,
+    predictor_hot_docs: usize,
+    predictor_cache_threshold: f64,
+    predictor_avg_hotness: f64,
+    predictor_last_trained: SystemTime,
+    learned_cache_capacity: usize,
 
     // Temporal pattern stats
     topic_rotations: u64,
@@ -636,13 +675,11 @@ fn parse_numpy_embeddings(data: &[u8]) -> Result<Vec<Vec<f32>>> {
 
 struct SemanticWorkloadGenerator {
     doc_sampler: Arc<RwLock<ZipfSampler>>,
-    query_embeddings: Arc<Vec<Vec<f32>>>,
-    doc_to_queries: Arc<HashMap<u64, Vec<usize>>>,
-    #[allow(dead_code)]
+    paraphrase_pools: Arc<HashMap<u64, Vec<u64>>>,
     rng: Arc<RwLock<ChaCha8Rng>>,
-    /// Per-document paraphrase counters for deterministic cycling
-    /// Map: doc_id → current paraphrase index
-    doc_paraphrase_counters: Arc<RwLock<HashMap<u64, usize>>>,
+    corpus_size: u64,
+    cold_traffic_ratio: f64,
+    cold_query_count: Arc<AtomicU64>,
 }
 
 impl SemanticWorkloadGenerator {
@@ -652,6 +689,8 @@ impl SemanticWorkloadGenerator {
         query_to_doc: Vec<u64>,
         zipf_exponent: f64,
         _top_k: usize,
+        cold_traffic_ratio: f64,
+        min_paraphrases_per_doc: usize,
     ) -> Result<Self> {
         if query_embeddings.is_empty() {
             bail!("Query embeddings cannot be empty.");
@@ -682,14 +721,37 @@ impl SemanticWorkloadGenerator {
             start.elapsed().as_secs_f64()
         );
 
+        let desired = min_paraphrases_per_doc.max(1);
+        let paraphrase_pools = build_paraphrase_pools(
+            &doc_to_queries,
+            &query_embeddings,
+            corpus_size as u64,
+            desired,
+        );
+
+        let mut pool_sizes: Vec<usize> = paraphrase_pools.values().map(|v| v.len()).collect();
+        pool_sizes.sort_unstable();
+        if !pool_sizes.is_empty() {
+            let avg_pool = pool_sizes.iter().sum::<usize>() as f64 / pool_sizes.len() as f64;
+            println!(
+                "  Paraphrase pools: min {} | p50 {} | max {} | avg {:.1}",
+                pool_sizes.first().copied().unwrap_or(0),
+                pool_sizes[pool_sizes.len() / 2],
+                pool_sizes.last().copied().unwrap_or(0),
+                avg_pool
+            );
+        }
+
         let doc_sampler = ZipfSampler::new(corpus_size, zipf_exponent, 0x5EEDFACE)?;
+        let cold_ratio = cold_traffic_ratio.max(0.0).min(1.0);
 
         Ok(Self {
             doc_sampler: Arc::new(RwLock::new(doc_sampler)),
-            query_embeddings,
-            doc_to_queries: Arc::new(doc_to_queries),
+            paraphrase_pools: Arc::new(paraphrase_pools),
             rng: Arc::new(RwLock::new(ChaCha8Rng::seed_from_u64(0xFACEFEED))),
-            doc_paraphrase_counters: Arc::new(RwLock::new(HashMap::new())),
+            corpus_size: corpus_size as u64,
+            cold_traffic_ratio: cold_ratio,
+            cold_query_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -702,50 +764,57 @@ impl SemanticWorkloadGenerator {
         static FALLBACK_COUNT: FallbackCounter = FallbackCounter::new(0);
         static TOTAL_COUNT: FallbackCounter = FallbackCounter::new(0);
 
+        {
+            let mut rng = self.rng.write().await;
+            if rng.gen::<f64>() < self.cold_traffic_ratio {
+                let doc_id = rng.gen_range(0..self.corpus_size) as u64;
+                let query_hash = rng.gen::<u64>();
+                drop(rng);
+                self.cold_query_count.fetch_add(1, Ordering::Relaxed);
+                TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                return (query_hash, doc_id);
+            }
+        }
+
         let doc_id = {
             let mut sampler = self.doc_sampler.write().await;
             sampler.sample()
         };
 
-        let total = TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
+        TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(paraphrases) = self.doc_to_queries.get(&doc_id) {
-            if !paraphrases.is_empty() {
-                // DETERMINISTIC CYCLING: Cycle through all 30 paraphrases in order
-                // This creates MAXIMUM stress for LRU: every access to a hot document
-                // uses a DIFFERENT query hash, forcing constant evictions.
-                // Hybrid Semantic Cache can predict document-level hotness and cache ANY paraphrase.
-                let query_idx = {
-                    let mut counters = self.doc_paraphrase_counters.write().await;
-                    let counter = counters.entry(doc_id).or_insert(0);
-                    let idx = *counter % paraphrases.len();
-                    *counter += 1;
-                    paraphrases[idx]
-                };
-
-                // CRITICAL FIX: Compute hash without cloning embedding
-                // This eliminates 71K × 1.5KB = 107MB of allocations per test
-                let query_hash = hash_embedding(&self.query_embeddings[query_idx]);
+        if let Some(pool) = self.paraphrase_pools.get(&doc_id) {
+            if !pool.is_empty() {
+                let mut rng = self.rng.write().await;
+                let idx = rng.gen_range(0..pool.len());
+                let query_hash = pool[idx];
+                drop(rng);
                 return (query_hash, doc_id);
             }
         }
 
-        // Fallback (should rarely happen)
+        // Synthetic paraphrase fallback (should rarely happen)
+        let synthetic_hash = synthetic_query_hash(doc_id, 0);
         let fallback_count = FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         if fallback_count == 0 {
             eprintln!("WARNING: Using fallback embedding for doc_id {}", doc_id);
         }
-        if (fallback_count + 1) % 1000 == 0 && total > 0 {
+        if (fallback_count + 1) % 1000 == 0 {
             eprintln!(
                 "WARNING: Fallback used {} times out of {} total samples ({:.1}%)",
                 fallback_count + 1,
-                total + 1,
-                (fallback_count + 1) as f64 / (total + 1) as f64 * 100.0
+                TOTAL_COUNT.load(Ordering::Relaxed),
+                (fallback_count + 1) as f64
+                    / TOTAL_COUNT.load(Ordering::Relaxed).max(1) as f64
+                    * 100.0
             );
         }
 
-        // Fallback: hash doc_id directly
-        (doc_id, doc_id)
+        (synthetic_hash, doc_id)
+    }
+
+    fn get_cold_query_count(&self) -> u64 {
+        self.cold_query_count.load(Ordering::Relaxed)
     }
 }
 
@@ -770,6 +839,56 @@ fn build_doc_to_queries_map(
     }
 
     map
+}
+
+fn build_paraphrase_pools(
+    doc_to_queries: &HashMap<u64, Vec<usize>>,
+    query_embeddings: &[Vec<f32>],
+    corpus_size: u64,
+    min_paraphrases: usize,
+) -> HashMap<u64, Vec<u64>> {
+    let mut pools: HashMap<u64, Vec<u64>> = HashMap::with_capacity(corpus_size as usize);
+    let mut rng = ChaCha8Rng::seed_from_u64(0xCA7ED0Cu64);
+
+    for doc_id in 0..corpus_size {
+        let mut hashes = Vec::new();
+        if let Some(indices) = doc_to_queries.get(&(doc_id as u64)) {
+            for &idx in indices {
+                if let Some(embedding) = query_embeddings.get(idx) {
+                    hashes.push(hash_embedding(embedding));
+                }
+            }
+        }
+
+        hashes.sort_unstable();
+        hashes.dedup();
+
+        let mut slot = 0u64;
+        while hashes.len() < min_paraphrases {
+            hashes.push(synthetic_query_hash(doc_id as u64, slot));
+            slot += 1;
+        }
+
+        if hashes.is_empty() {
+            hashes.push(synthetic_query_hash(doc_id as u64, 0));
+        }
+
+        hashes.shuffle(&mut rng);
+        pools.insert(doc_id as u64, hashes);
+    }
+
+    pools
+}
+
+fn synthetic_query_hash(doc_id: u64, slot: u64) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    doc_id.hash(&mut hasher);
+    slot.hash(&mut hasher);
+    0x9E3779B97F4A7C15u64.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Hash embedding vector to u64 for cache key
@@ -875,6 +994,7 @@ async fn main() -> Result<()> {
     println!("╔════════════════════════════════════════════════════════════════╗");
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
+    let learned_cache_capacity = config.learned_cache_capacity();
     println!("Configuration:");
     println!("  Duration:          {} hours", config.duration_hours);
     println!("  Target QPS:        {}", config.target_qps);
@@ -887,6 +1007,13 @@ async fn main() -> Result<()> {
         config.cache_capacity,
         (config.cache_capacity as f64 / config.corpus_size as f64 * 100.0)
     );
+    if learned_cache_capacity != config.cache_capacity {
+        println!(
+            "  Learned capacity:  {} vectors ({:.1}× baseline)",
+            learned_cache_capacity,
+            learned_cache_capacity as f64 / config.cache_capacity as f64
+        );
+    }
     println!(
         "  Zipf exponent:     {} (real-world distribution)",
         config.zipf_exponent
@@ -964,36 +1091,38 @@ async fn main() -> Result<()> {
 
     let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache_capacity));
 
-    // Predictor capacity expanded (16x cache) for broader candidate recall; training every config interval
-    let predictor_capacity = config
-        .cache_capacity
-        .saturating_mul(16)
+    // Predictor capacity expanded (8x cache) for broader candidate recall; training every config interval
+    let predictor_capacity = learned_cache_capacity
+        .saturating_mul(8)
         .min(config.corpus_size.max(config.cache_capacity));
     let mut learned_predictor = LearnedCachePredictor::with_config(
         predictor_capacity,
-        0.22,                     // initial threshold aligns with compressed scores
+        0.18,                     // tighter threshold for precision
         Duration::from_secs(300), // training window (5m)
-        Duration::from_secs(120), // recency half-life (2m)
+        Duration::from_secs(150), // recency half-life (150s)
         Duration::from_secs(config.training_interval_secs as u64),
     )
     .context("Failed to create Hybrid Semantic Cache predictor")?;
     let diversity = predictor_capacity
         .checked_next_power_of_two()
         .unwrap_or(predictor_capacity)
-        .max(64)
-        .min(1024);
+        .max(128)
+        .min(2048);
     learned_predictor.set_diversity_buckets(diversity);
-    learned_predictor.set_target_hot_entries(
-        predictor_capacity
-            .min(config.cache_capacity.saturating_mul(8))
-            .max(config.cache_capacity),
-    );
-    learned_predictor.set_threshold_smoothing(0.12);
-    learned_predictor.set_miss_demotion_threshold(4);
-    learned_predictor.set_miss_penalty_rate(0.4);
+    let hot_target = learned_cache_capacity
+        .saturating_mul(4)
+        .min(predictor_capacity)
+        .max(learned_cache_capacity);
+    learned_predictor.set_target_hot_entries(hot_target);
+    learned_predictor.set_threshold_smoothing(0.05);
+    learned_predictor.set_auto_tune(true);
+    learned_predictor.set_target_utilization(0.65);
+    learned_predictor.set_adjustment_rate(0.12);
+    learned_predictor.set_miss_demotion_threshold(2);
+    learned_predictor.set_miss_penalty_rate(0.45);
     let semantic_adapter = SemanticAdapter::new();
     let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
-        config.cache_capacity,
+        learned_cache_capacity,
         learned_predictor,
         semantic_adapter,
     ));
@@ -1148,13 +1277,13 @@ async fn main() -> Result<()> {
     println!("Spawning background training task...");
     let training_config = TrainingConfig {
         interval: Duration::from_secs(config.training_interval_secs),
-        window_duration: Duration::from_secs(3600),
+        window_duration: Duration::from_secs(1800),
         min_events_for_training: 100,
-        rmi_capacity: config.cache_capacity,
-        recency_halflife: Duration::from_secs(1800), // Week 1-2: 30 min halflife
-        admission_threshold: 0.15,                   // Week 1-2: lower threshold
-        auto_tune_enabled: true,                     // Week 1-2: enable auto-tuning
-        target_utilization: 0.85,                    // Week 1-2: target 85% utilization
+        rmi_capacity: predictor_capacity,
+        recency_halflife: Duration::from_secs(600),
+        admission_threshold: 0.08,
+        auto_tune_enabled: true,
+        target_utilization: 0.92,
     };
 
     let training_cycles = Arc::new(AtomicU64::new(0));
@@ -1200,7 +1329,7 @@ async fn main() -> Result<()> {
         fn get_cold_query_count(&self) -> u64 {
             match self {
                 WorkloadGenerator::Temporal(gen) => gen.get_cold_query_count(),
-                WorkloadGenerator::Semantic(_) => 0, // Semantic gen doesn't track cold queries
+                WorkloadGenerator::Semantic(gen) => gen.get_cold_query_count(),
             }
         }
 
@@ -1222,6 +1351,8 @@ async fn main() -> Result<()> {
                 query_doc_map.clone(),
                 config.zipf_exponent,
                 config.top_k_queries_per_doc,
+                config.cold_traffic_ratio,
+                config.min_paraphrases_per_doc,
             )?;
             WorkloadGenerator::Semantic(semantic_gen)
         } else {
@@ -1308,7 +1439,12 @@ async fn main() -> Result<()> {
             continue;
         };
 
-        let cached_vec = strategy.get_cached(cache_key);
+        let strategy_key = match strategy_id {
+            StrategyId::LruBaseline => doc_id,
+            StrategyId::LearnedRmi => doc_id,
+        };
+
+        let cached_vec = strategy.get_cached(strategy_key);
 
         let (embedding, cache_hit) = if let Some(vec) = cached_vec {
             (vec.embedding, true)
@@ -1327,9 +1463,8 @@ async fn main() -> Result<()> {
                         true
                     } else {
                         // Use RMI predictor after training
-                        // CRITICAL FIX: Use cache_key (query hash) not doc_id
-                        // The RMI is trained on query hashes, not document IDs
-                        strategy.should_cache(cache_key, &embedding)
+                        // Learned strategy operates on doc-level IDs to collapse paraphrases
+                        strategy.should_cache(strategy_key, &embedding)
                     }
                 }
             };
@@ -1339,7 +1474,7 @@ async fn main() -> Result<()> {
                 static INSERT_COUNT: InsertCounter = InsertCounter::new(0);
 
                 let cached = CachedVector {
-                    doc_id: cache_key,
+                    doc_id: strategy_key,
                     embedding: embedding.clone(),
                     distance: 0.5,
                     cached_at: Instant::now(),
@@ -1362,7 +1497,7 @@ async fn main() -> Result<()> {
                     lru_hits += 1;
 
                     // Track: How many times was this doc accessed while in cache?
-                    *lru_cache_doc_accesses.entry(cache_key).or_insert(0) += 1;
+                    *lru_cache_doc_accesses.entry(strategy_key).or_insert(0) += 1;
                 }
                 // Note: We don't track misses - only docs that WERE cached matter for quality
             }
@@ -1371,24 +1506,24 @@ async fn main() -> Result<()> {
                 if cache_hit {
                     learned_hits += 1;
 
-                    *learned_cache_doc_accesses.entry(cache_key).or_insert(0) += 1;
+                    *learned_cache_doc_accesses.entry(strategy_key).or_insert(0) += 1;
                 }
             }
         }
 
         {
             let logger = access_logger.write().await;
-            logger.log_access(cache_key, &embedding);
+            logger.log_access(doc_id, &embedding);
         }
 
         if cache_hit {
             stats_persister
-                .log_hit(strategy_name, cache_key, 0)
+                .log_hit(strategy_name, strategy_key, 0)
                 .await
                 .ok();
         } else {
             stats_persister
-                .log_miss(strategy_name, cache_key, 0)
+                .log_miss(strategy_name, strategy_key, 0)
                 .await
                 .ok();
         }
@@ -1616,6 +1751,25 @@ async fn main() -> Result<()> {
     println!("  LRU Recall@10:   {:.4}", lru_recall_at_10);
     println!("  Learned Recall@10: {:.4}", learned_recall_at_10);
 
+    let predictor_stats = {
+        let predictor_guard = learned_strategy.predictor.read();
+        predictor_guard.stats()
+    };
+
+    println!(
+        "Predictor: {} tracked, {} hot, threshold {:.3}, avg hotness {:.3}",
+        predictor_stats.tracked_docs,
+        predictor_stats.hot_docs,
+        predictor_stats.cache_threshold,
+        predictor_stats.avg_hotness
+    );
+
+    if predictor_stats.last_trained == SystemTime::UNIX_EPOCH {
+        println!("  Predictor has not completed training yet");
+    } else if let Ok(age) = SystemTime::now().duration_since(predictor_stats.last_trained) {
+        println!("  Last trained {:.1}s ago", age.as_secs_f64());
+    }
+
     let results = ValidationResults {
         config: config.clone(),
         test_duration_secs: actual_duration,
@@ -1645,6 +1799,13 @@ async fn main() -> Result<()> {
             .round() as u64,
         actual_training_cycles,
         training_task_crashed: training_crashed,
+
+        predictor_tracked_docs: predictor_stats.tracked_docs,
+        predictor_hot_docs: predictor_stats.hot_docs,
+        predictor_cache_threshold: predictor_stats.cache_threshold as f64,
+        predictor_avg_hotness: predictor_stats.avg_hotness as f64,
+        predictor_last_trained: predictor_stats.last_trained,
+        learned_cache_capacity,
 
         topic_rotations,
         spike_events,

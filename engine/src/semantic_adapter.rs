@@ -4,7 +4,7 @@
 //! Adds semantic awareness to frequency-based prediction:
 //! - Cosine similarity for semantic matching
 //! - Bounded embedding cache (100K recent embeddings)
-//! - Hybrid decision: frequency (70%) + semantic (30%)
+//! - Hybrid decision: frequency (55%) + semantic (45%)
 //!
 //! Performance characteristics:
 //! - Fast path (high/low confidence): 4-8ns (frequency check only)
@@ -136,25 +136,36 @@ impl SemanticAdapter {
         self.stats.write().slow_path_decisions += 1;
         let semantic_score = self.compute_semantic_score(embedding);
 
-        // Semantic rescue: high similarity can save docs slightly below predictor threshold
-        if semantic_score >= self.config.semantic_similarity_threshold && freq_score >= 0.12
-        // Just below predictor floor
-        {
+        // Strong semantic matches can override frequency in two tiers:
+        // 1. Extremely similar embeddings (>=0.96) skip frequency checks entirely
+        // 2. Above semantic threshold (default 0.82) can admit with relaxed freq floor
+        if semantic_score >= 0.96 {
+            return true;
+        }
+
+        if semantic_score >= self.config.semantic_similarity_threshold && freq_score >= 0.10 {
             return true;
         }
 
         // Definite reject: both frequency and semantic low
-        if freq_score <= self.config.low_confidence_threshold && semantic_score < 0.40 {
+        if freq_score <= self.config.low_confidence_threshold && semantic_score < 0.38 {
             return false;
         }
 
-        // Hybrid boost: semantic can push borderline docs over the edge
-        // But we don't impose a NEW threshold higher than predictor's
-        let hybrid_score = freq_score * 0.70 + semantic_score * 0.30;
+        // Hybrid boost: rescale semantic similarity so that 0.35 maps to 0
+        // and 1.0 maps to 1.0, then weight semantic contribution at 45%
+        let semantic_floor = 0.35;
+        let normalized_semantic = if semantic_score <= semantic_floor {
+            0.0
+        } else {
+            ((semantic_score - semantic_floor) / (1.0 - semantic_floor)).clamp(0.0, 1.0)
+        };
 
-        // Use predictor's natural threshold (passed via freq_score context)
-        // Essentially: if freq_score passed predictor gate, semantic can only boost
-        hybrid_score >= 0.15 // Align with predictor admission floor
+        let hybrid_score = freq_score * 0.55 + normalized_semantic * 0.45;
+
+        // Keep admission floor aligned with predictor defaults while allowing
+        // high-semantic matches to boost borderline frequency scores.
+        hybrid_score >= 0.18
     }
 
     /// Compute semantic similarity score
