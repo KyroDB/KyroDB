@@ -37,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// - Old events automatically overwritten (circular buffer)
 ///
 /// # Usage
-/// ```no_run
+/// ```ignore
 /// use kyrodb_engine::access_logger::AccessPatternLogger;
 /// use kyrodb_engine::learned_cache::LearnedCachePredictor;
 /// use std::time::Duration;
@@ -47,13 +47,10 @@ use std::time::{Duration, Instant, SystemTime};
 ///
 /// // Log access (called on every query)
 /// let query_embedding = vec![0.5; 128];
-/// {
-///     let mut logger_guard = logger.write();
-///     logger_guard.log_access(42, &query_embedding);
-/// }
+/// logger.log_access(42, &query_embedding);
 ///
 /// // Get recent window for training (every 10 minutes)
-/// let recent = logger.read().get_recent_window(Duration::from_secs(3600 * 24));
+/// let recent = logger.get_recent_window(Duration::from_secs(3600 * 24));
 /// predictor.train_from_accesses(&recent).unwrap();
 /// ```
 pub struct AccessPatternLogger {

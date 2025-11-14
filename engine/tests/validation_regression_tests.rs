@@ -7,7 +7,7 @@
 
 use kyrodb_engine::{
     AbTestSplitter, AccessEvent, AccessPatternLogger, AccessType, CacheStrategy, CachedVector,
-    LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy,
+    LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, SemanticAdapter,
 };
 use rand::distributions::Distribution;
 use rand_distr::Zipf;
@@ -356,7 +356,12 @@ fn test_full_ab_validation_simulation() {
     // Initialize strategies
     let lru = Arc::new(LruCacheStrategy::new(cache_capacity));
     let predictor = LearnedCachePredictor::new(cache_capacity).unwrap();
-    let learned = Arc::new(LearnedCacheStrategy::new(cache_capacity, predictor));
+    let semantic_adapter = SemanticAdapter::new();
+    let learned = Arc::new(LearnedCacheStrategy::new_with_semantic(
+        cache_capacity,
+        predictor,
+        semantic_adapter,
+    ));
     let splitter = AbTestSplitter::new(lru.clone(), learned.clone());
 
     // Access logger for training

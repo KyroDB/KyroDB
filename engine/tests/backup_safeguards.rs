@@ -1,9 +1,16 @@
 use kyrodb_engine::backup::{BackupManager, ClearDirectoryOptions, RestoreManager};
 use std::fs;
+use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
+
+fn backup_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static BACKUP_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    BACKUP_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
 
 #[test]
 fn test_clear_directory_requires_confirmation() {
+    let _guard = backup_env_guard();
     // Ensure BACKUP_ALLOW_CLEAR is not set to "true" - override it if necessary
     // This handles the case where parallel tests might have set it
     std::env::set_var("BACKUP_ALLOW_CLEAR", "false");
@@ -43,6 +50,7 @@ fn test_clear_directory_requires_confirmation() {
 
 #[test]
 fn test_clear_directory_with_explicit_allow() {
+    let _guard = backup_env_guard();
     let data_dir = TempDir::new().unwrap();
     let backup_dir = TempDir::new().unwrap();
 
@@ -70,6 +78,7 @@ fn test_clear_directory_with_explicit_allow() {
 
 #[test]
 fn test_clear_directory_environment_variable() {
+    let _guard = backup_env_guard();
     // Clean up any previous state and use a guard to ensure cleanup even on panic
     struct EnvGuard;
     impl Drop for EnvGuard {
@@ -110,6 +119,7 @@ fn test_clear_directory_environment_variable() {
 
 #[test]
 fn test_dry_run_mode() {
+    let _guard = backup_env_guard();
     let data_dir = TempDir::new().unwrap();
     let backup_dir = TempDir::new().unwrap();
 
@@ -145,6 +155,7 @@ fn test_dry_run_mode() {
 
 #[test]
 fn test_clear_empty_directory() {
+    let _guard = backup_env_guard();
     let data_dir = TempDir::new().unwrap();
     let backup_dir = TempDir::new().unwrap();
 
@@ -163,6 +174,7 @@ fn test_clear_empty_directory() {
 
 #[test]
 fn test_clear_nonexistent_directory() {
+    let _guard = backup_env_guard();
     let backup_dir = TempDir::new().unwrap();
     let nonexistent = backup_dir.path().join("does_not_exist");
 
@@ -179,6 +191,7 @@ fn test_clear_nonexistent_directory() {
 
 #[test]
 fn test_restore_from_backup_requires_confirmation() {
+    let _guard = backup_env_guard();
     let data_dir = TempDir::new().unwrap();
     let backup_dir = TempDir::new().unwrap();
 
@@ -200,6 +213,7 @@ fn test_restore_from_backup_requires_confirmation() {
 
 #[test]
 fn test_restore_with_dry_run() {
+    let _guard = backup_env_guard();
     let data_dir = TempDir::new().unwrap();
     let backup_dir = TempDir::new().unwrap();
 
@@ -225,6 +239,7 @@ fn test_restore_with_dry_run() {
 
 #[test]
 fn test_point_in_time_restore_requires_confirmation() {
+    let _guard = backup_env_guard();
     let data_dir = TempDir::new().unwrap();
     let backup_dir = TempDir::new().unwrap();
 

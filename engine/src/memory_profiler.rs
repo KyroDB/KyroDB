@@ -8,7 +8,7 @@
 //! - Zero overhead when feature disabled
 //!
 //! Usage:
-//! ```
+//! ```text
 //! cargo build --features jemalloc-profiling
 //! MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:19" ./target/debug/validation_enterprise
 //! ```

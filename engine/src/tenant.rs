@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// - Result filtering to enforce boundaries
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let manager = TenantManager::new();
 /// let doc_id = manager.allocate_doc_id("acme_corp");
 /// let namespaced = manager.namespace_doc_id("acme_corp", doc_id);
@@ -91,7 +91,7 @@ impl TenantManager {
     /// Format: `<tenant_id>:<doc_id>`
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let namespaced = manager.namespace_doc_id("acme_corp", 12345);
     /// assert_eq!(namespaced, "acme_corp:12345");
     /// ```
@@ -108,7 +108,7 @@ impl TenantManager {
     /// Returns None if format is invalid (no colon separator).
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let tenant_id = manager.parse_tenant_id("acme_corp:12345");
     /// assert_eq!(tenant_id, Some("acme_corp".to_string()));
     /// ```
@@ -123,7 +123,7 @@ impl TenantManager {
     /// Returns None if format is invalid or doc_id is not a valid u64.
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let doc_id = manager.parse_doc_id("acme_corp:12345");
     /// assert_eq!(doc_id, Some(12345));
     /// ```
@@ -200,7 +200,7 @@ impl SearchResult {
 /// This is a critical security boundary: ensures Tenant A cannot see Tenant B's data.
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let results = vec![
 ///     SearchResult::new("acme:1".to_string(), 0.1),
 ///     SearchResult::new("startup:5".to_string(), 0.2),

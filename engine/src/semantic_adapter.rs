@@ -40,11 +40,11 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            high_confidence_threshold: 0.50, // Admit earlier based on frequency alone
-            low_confidence_threshold: 0.15,  // Allow semantic layer to rescue low-frequency docs
-            semantic_similarity_threshold: 0.65, // Catch close paraphrases without flooding cache
+            high_confidence_threshold: 0.75,
+            low_confidence_threshold: 0.25,
+            semantic_similarity_threshold: 0.82,
             max_cached_embeddings: 100_000,
-            similarity_scan_limit: 512,
+            similarity_scan_limit: 2_000,
         }
     }
 }
@@ -125,31 +125,36 @@ impl SemanticAdapter {
 
         let cache_size = self.cache_size();
 
-        // Bootstrap while semantic cache is still empty
-        if cache_size < 50 {
+        // Bootstrap: seed semantic cache with top docs during warmup
+        if cache_size == 0 {
             self.stats.write().fast_path_decisions += 1;
-            return freq_score > 0.15;
+            return freq_score > 0.20; // Align with predictor admission floor
         }
 
-        // Slow path: evaluate semantic similarity to rescue low-frequency docs
+        // After bootstrap: TRUST the predictor's learned threshold
+        // Semantic layer acts as BOOSTER only, not a second gatekeeper
         self.stats.write().slow_path_decisions += 1;
         let semantic_score = self.compute_semantic_score(embedding);
 
-        if freq_score <= self.config.low_confidence_threshold
-            && semantic_score < self.config.semantic_similarity_threshold
+        // Semantic rescue: high similarity can save docs slightly below predictor threshold
+        if semantic_score >= self.config.semantic_similarity_threshold && freq_score >= 0.12
+        // Just below predictor floor
         {
+            return true;
+        }
+
+        // Definite reject: both frequency and semantic low
+        if freq_score <= self.config.low_confidence_threshold && semantic_score < 0.40 {
             return false;
         }
 
-        // Hybrid decision: frequency complemented by semantic score
-        let (freq_weight, semantic_weight, threshold) = if cache_size < 1000 {
-            (0.65, 0.35, 0.32)
-        } else {
-            (0.50, 0.50, 0.40)
-        };
+        // Hybrid boost: semantic can push borderline docs over the edge
+        // But we don't impose a NEW threshold higher than predictor's
+        let hybrid_score = freq_score * 0.70 + semantic_score * 0.30;
 
-        let hybrid_score = freq_score * freq_weight + semantic_score * semantic_weight;
-        hybrid_score >= threshold
+        // Use predictor's natural threshold (passed via freq_score context)
+        // Essentially: if freq_score passed predictor gate, semantic can only boost
+        hybrid_score >= 0.15 // Align with predictor admission floor
     }
 
     /// Compute semantic similarity score

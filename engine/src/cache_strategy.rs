@@ -119,8 +119,7 @@ impl LearnedCacheStrategy {
     /// - `capacity`: Cache capacity
     /// - `predictor`: Trained RMI frequency predictor
     pub fn new(capacity: usize, mut predictor: LearnedCachePredictor) -> Self {
-        predictor.set_target_hot_entries(capacity.saturating_mul(5));
-        predictor.set_threshold_smoothing(0.3);
+        Self::configure_predictor_defaults(&mut predictor, capacity);
 
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
@@ -143,8 +142,7 @@ impl LearnedCacheStrategy {
         mut predictor: LearnedCachePredictor,
         semantic_adapter: SemanticAdapter,
     ) -> Self {
-        predictor.set_target_hot_entries(capacity.saturating_mul(5));
-        predictor.set_threshold_smoothing(0.3);
+        Self::configure_predictor_defaults(&mut predictor, capacity);
 
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
@@ -170,7 +168,8 @@ impl LearnedCacheStrategy {
     /// Update predictor (for periodic retraining)
     pub fn update_predictor(&self, new_predictor: LearnedCachePredictor) {
         let mut predictor = new_predictor;
-        predictor.set_target_hot_entries(self.cache.capacity().saturating_mul(5));
+        let hot_target = self.cache.capacity() + self.cache.capacity() / 2;
+        predictor.set_target_hot_entries(hot_target.max(1));
         predictor.set_threshold_smoothing(0.3);
         *self.predictor.write() = predictor;
     }
@@ -179,192 +178,88 @@ impl LearnedCacheStrategy {
     pub fn has_semantic(&self) -> bool {
         self.semantic_adapter.read().is_some()
     }
+
+    fn configure_predictor_defaults(predictor: &mut LearnedCachePredictor, cache_capacity: usize) {
+        let predictor_cap = predictor.capacity_limit().max(1);
+        let desired = cache_capacity
+            .saturating_mul(8)
+            .clamp(cache_capacity.max(1), predictor_cap);
+        predictor.set_target_hot_entries(desired);
+        predictor.set_threshold_smoothing(0.12);
+
+        let diversity_pow2 = desired.checked_next_power_of_two().unwrap_or(desired);
+        let diversity = diversity_pow2.max(32).min(1024);
+        predictor.set_diversity_buckets(diversity);
+    }
 }
 
 impl CacheStrategy for LearnedCacheStrategy {
     #[instrument(level = "trace", skip(self), fields(doc_id))]
     fn get_cached(&self, doc_id: u64) -> Option<CachedVector> {
-        let hit = self.cache.get(doc_id);
-        if hit.is_some() {
-            trace!(doc_id, strategy = %self.name, "cache hit");
-        } else {
-            trace!(doc_id, strategy = %self.name, "cache miss");
-
-            // FEEDBACK LOOP: Track false negatives (cache miss for docs RMI predicted as cold)
-            let predictor = self.predictor.read();
-            if let Some(hotness) = predictor.lookup_hotness(doc_id) {
-                predictor.record_cache_miss(doc_id, hotness);
+        match self.cache.get(doc_id) {
+            Some(vec) => {
+                trace!(doc_id, strategy = %self.name, "cache hit");
+                let predictor = self.predictor.read();
+                if predictor.is_trained() {
+                    predictor.record_cache_hit(doc_id);
+                }
+                Some(vec)
             }
-            drop(predictor);
+            None => {
+                trace!(doc_id, strategy = %self.name, "cache miss");
+                let predictor = self.predictor.read();
+                if predictor.is_trained() {
+                    let predicted = predictor.lookup_hotness(doc_id).unwrap_or(0.0);
+                    predictor.record_cache_miss(doc_id, predicted);
+                }
+                None
+            }
         }
-        hit
     }
 
     #[instrument(level = "trace", skip(self, embedding), fields(doc_id, dim = embedding.len()))]
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
-        let current_len = self.cache.len();
-
-        // RATE-LIMITED AUTO-TUNING: Calibrate threshold based on cache utilization
-        // Rate limiting (60s) prevents per-query instability while allowing gradual adaptation
-        {
-            let mut predictor = self.predictor.write();
-            predictor.calibrate_threshold(current_len);
-        }
-
-        // Query clustering: Add query to cluster for semantic grouping
-        if let Some(clusterer) = self.query_clusterer.read().as_ref() {
-            if !embedding.is_empty() {
-                let query_hash = crate::access_logger::hash_embedding(embedding);
-                clusterer.add_query(query_hash, embedding);
-            }
-        }
-
-        // Prefetching: Record access for co-access learning
-        if let Some(prefetcher) = self.prefetcher.read().as_ref() {
-            prefetcher.record_access(doc_id);
-        }
-
-        if current_len < self.cache.capacity() {
-            trace!(
-                doc_id,
-                current_len,
-                capacity = self.cache.capacity(),
-                "admit (cache not full)"
-            );
-            return true;
-        }
-
         let predictor = self.predictor.read();
 
-        // Bootstrap mode until predictor is trained
         if !predictor.is_trained() {
-            trace!(doc_id, "admit (bootstrap untrained predictor)");
+            trace!(doc_id, strategy = %self.name, "bootstrap admit (untrained predictor)");
             return true;
         }
 
         // Compute frequency-based score
-        let (freq_score, is_unseen) = if let Some(score) = predictor.lookup_hotness(doc_id) {
-            (score, false)
-        } else {
-            // Unseen document: start with baseline score
-            let fill_ratio = current_len as f32 / self.cache.capacity() as f32;
-            let baseline_score =
-                predictor.unseen_admission_chance() * (1.0 - fill_ratio).clamp(0.1, 1.0);
-            (baseline_score, true)
-        };
-
+        let freq_score = predictor.lookup_hotness(doc_id).unwrap_or(0.0);
         let threshold = predictor.cache_threshold().max(predictor.admission_floor());
         drop(predictor);
-
-        // Boost score based on query clustering
-        let mut boosted_score = freq_score;
-        if let Some(clusterer) = self.query_clusterer.read().as_ref() {
-            if !embedding.is_empty() {
-                let query_hash = crate::access_logger::hash_embedding(embedding);
-                if let Some(cluster_boost) = clusterer.get_cluster_hotness(query_hash) {
-                    boosted_score = (freq_score * 0.50 + cluster_boost * 0.50).min(1.0);
-                }
-            }
-        }
-
-        // Boost score based on prefetch prediction
-        if let Some(prefetcher) = self.prefetcher.read().as_ref() {
-            if prefetcher.should_prefetch(doc_id) {
-                boosted_score = (boosted_score + 0.35).min(1.0);
-            }
-        }
-
-        // For unseen documents with no frequency history, clustering and prefetch are critical!
-        // If boosting made a significant difference, treat as seen document
-        if is_unseen && (boosted_score - freq_score).abs() < 0.01 {
-            // No significant boost from clustering/prefetch, use probabilistic admission
-            let admit = rand::random::<f32>() < boosted_score;
-            trace!(
-                doc_id,
-                freq_score,
-                boosted_score,
-                admit,
-                "unseen doc: probabilistic admission after cluster/prefetch check"
-            );
-            return admit;
-        }
-
-        // Check if semantic adapter is enabled
-        let semantic_adapter_guard = self.semantic_adapter.read();
-        if let Some(semantic_adapter) = semantic_adapter_guard.as_ref() {
-            let should_cache = semantic_adapter.should_cache(boosted_score, embedding);
-            trace!(
-                doc_id,
-                freq_score,
-                boosted_score,
-                threshold,
-                should_cache,
-                "semantic adapter decision"
-            );
-            if should_cache {
-                semantic_adapter.cache_embedding(doc_id, embedding.to_vec());
-            }
-            return should_cache;
-        }
-        drop(semantic_adapter_guard);
 
         if freq_score >= threshold {
             trace!(doc_id, freq_score, threshold, "admit (freq >= threshold)");
             return true;
         }
 
-        // Soft admission: probabilistic caching below threshold
-        let soft_probability = (freq_score / threshold).clamp(0.0, 1.0) * 0.25;
-        if soft_probability > 0.0 && rand::random::<f32>() < soft_probability {
-            trace!(
-                doc_id,
-                freq_score,
-                threshold,
-                soft_probability,
-                "admit (soft probability)"
-            );
-            return true;
+        if let Some(adapter) = self.semantic_adapter.read().as_ref() {
+            let decision = adapter.should_cache(freq_score, embedding);
+            if decision {
+                trace!(doc_id, freq_score, threshold, "admit via semantic adapter");
+            } else {
+                trace!(doc_id, freq_score, threshold, "reject via semantic adapter");
+            }
+            return decision;
         }
-        trace!(
-            doc_id,
-            freq_score,
-            threshold,
-            soft_probability,
-            "reject (below threshold)"
-        );
+
+        trace!(doc_id, freq_score, threshold, "reject (below threshold, no semantic adapter)");
         false
     }
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
-        let doc_id = cached_vector.doc_id;
-        let evicted_doc_id = self.cache.insert(cached_vector);
-
-        // FEEDBACK LOOP: Track evictions (false positives - cached but not re-accessed)
-        if let Some(evicted_id) = evicted_doc_id {
-            let predictor = self.predictor.read();
-            predictor.record_eviction(evicted_id);
-            drop(predictor);
+        if let Some(adapter) = self.semantic_adapter.read().as_ref() {
+            adapter.cache_embedding(cached_vector.doc_id, cached_vector.embedding.clone());
         }
 
-        // Prefetching: Execute predictive prefetch after insertion
-        if let Some(prefetcher) = self.prefetcher.read().as_ref() {
-            let candidates = prefetcher.get_prefetch_candidates(doc_id);
-            for candidate_doc_id in candidates.into_iter().take(10) {
-                if self.cache.get(candidate_doc_id).is_none() {
-                    let predictor = self.predictor.read();
-                    let hotness = predictor.predict_hotness(candidate_doc_id);
-                    drop(predictor);
-
-                    if hotness >= 0.05 {
-                        prefetcher.record_prefetch();
-                        trace!(
-                            source_doc = doc_id,
-                            prefetch_doc = candidate_doc_id,
-                            hotness,
-                            "prefetch candidate"
-                        );
-                    }
-                }
+        let evicted_doc_id = self.cache.insert(cached_vector);
+        if let Some(evicted) = evicted_doc_id {
+            let predictor = self.predictor.read();
+            if predictor.is_trained() {
+                predictor.record_eviction(evicted);
             }
         }
     }

@@ -1,3 +1,5 @@
+#![cfg(feature = "cli-tools")]
+
 use anyhow::Result;
 use kyrodb_engine::backup::{BackupManager, BackupType, RestoreManager, RetentionPolicy};
 use kyrodb_engine::hnsw_backend::HnswBackend;

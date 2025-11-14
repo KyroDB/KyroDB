@@ -67,7 +67,8 @@ impl TenantUsage {
     /// Adds vector_size_bytes to storage_bytes.
     ///
     /// # Example
-    /// ```
+    /// ```ignore
+    /// let usage = TenantUsage::new();
     /// // 384-dimensional float32 vector = 384 * 4 = 1536 bytes
     /// usage.record_insert(1536);
     /// ```

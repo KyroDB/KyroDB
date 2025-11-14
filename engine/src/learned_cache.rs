@@ -19,6 +19,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const DEFAULT_DIVERSITY_BUCKETS: usize = 256;
+const MAX_DIVERSITY_BUCKETS: usize = 4096;
+const MISS_DEMOTION_THRESHOLD: u32 = 6;
+const MISS_PENALTY_RATE: f32 = 0.35;
+
 /// Access event for training Hybrid Semantic Cache predictor
 ///
 #[derive(Debug, Clone)]
@@ -138,6 +143,24 @@ pub struct LearnedCachePredictor {
     /// FEEDBACK LOOP: Track false negatives (predicted cold but was accessed)
     /// doc_id → number of cache misses
     false_negatives: Arc<RwLock<HashMap<u64, u32>>>,
+
+    /// Diversity guardrails: number of hash buckets for hotset selection
+    diversity_bucket_count: usize,
+
+    /// Miss counters for consecutive cache misses (used for demotion)
+    miss_counters: Arc<RwLock<HashMap<u64, MissStats>>>,
+
+    /// Threshold (in consecutive misses) before applying demotion penalty
+    miss_demotion_threshold: u32,
+
+    /// Penalty rate applied per miss streak when demoting hot candidates
+    miss_penalty_rate: f32,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct MissStats {
+    consecutive: u32,
+    total: u32,
 }
 
 impl LearnedCachePredictor {
@@ -182,6 +205,10 @@ impl LearnedCachePredictor {
             last_calibration: Arc::new(parking_lot::RwLock::new(UNIX_EPOCH)),
             false_positives: Arc::new(RwLock::new(HashMap::new())),
             false_negatives: Arc::new(RwLock::new(HashMap::new())),
+            diversity_bucket_count: DEFAULT_DIVERSITY_BUCKETS,
+            miss_counters: Arc::new(RwLock::new(HashMap::new())),
+            miss_demotion_threshold: MISS_DEMOTION_THRESHOLD,
+            miss_penalty_rate: MISS_PENALTY_RATE,
         })
     }
 
@@ -212,6 +239,10 @@ impl LearnedCachePredictor {
             last_calibration: Arc::new(parking_lot::RwLock::new(UNIX_EPOCH)),
             false_positives: Arc::new(RwLock::new(HashMap::new())),
             false_negatives: Arc::new(RwLock::new(HashMap::new())),
+            diversity_bucket_count: DEFAULT_DIVERSITY_BUCKETS,
+            miss_counters: Arc::new(RwLock::new(HashMap::new())),
+            miss_demotion_threshold: MISS_DEMOTION_THRESHOLD,
+            miss_penalty_rate: MISS_PENALTY_RATE,
         })
     }
 
@@ -285,18 +316,17 @@ impl LearnedCachePredictor {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Truncate to capacity (keep only top K hottest documents)
-        if hotness_vec.len() > self.capacity {
-            hotness_vec.truncate(self.capacity);
-        }
+        // Truncate to target_hot_entries with diversity guardrails
+        let limit = self.target_hot_entries.min(hotness_vec.len());
+        let selected = self.select_with_diversity(&hotness_vec, limit);
 
-        self.recalibrate_threshold(&hotness_vec);
+        self.recalibrate_threshold(&selected);
 
         // Update HashMap atomically
         {
             let mut map = self.hotness_map.write();
             map.clear();
-            map.extend(hotness_vec);
+            map.extend(selected);
         }
 
         self.last_trained = SystemTime::now();
@@ -436,6 +466,27 @@ impl LearnedCachePredictor {
         self.threshold_adjustment_rate = rate.clamp(0.01, 0.5);
     }
 
+    /// Maximum number of documents this predictor can track
+    pub fn capacity_limit(&self) -> usize {
+        self.capacity
+    }
+
+    /// Configure diversity bucket count for hotset selection
+    pub fn set_diversity_buckets(&mut self, buckets: usize) {
+        let bounded = buckets.clamp(1, MAX_DIVERSITY_BUCKETS);
+        self.diversity_bucket_count = bounded;
+    }
+
+    /// Set miss demotion threshold (consecutive misses before penalty applies)
+    pub fn set_miss_demotion_threshold(&mut self, threshold: u32) {
+        self.miss_demotion_threshold = threshold.max(1);
+    }
+
+    /// Set miss penalty rate (per-miss multiplier)
+    pub fn set_miss_penalty_rate(&mut self, rate: f32) {
+        self.miss_penalty_rate = rate.clamp(0.05, 1.0);
+    }
+
     /// Compute hotness scores from access events
     ///
     /// Hotness formula:
@@ -450,38 +501,29 @@ impl LearnedCachePredictor {
 
         // Compute cutoff timestamp (training window)
         let cutoff = now.checked_sub(self.training_window).unwrap_or(UNIX_EPOCH);
+        let halflife_seconds = self.recency_halflife.as_secs_f32().max(1.0);
 
         for access in accesses {
-            // Skip accesses outside training window
             if access.timestamp < cutoff {
                 continue;
             }
 
-            // Compute recency weight with exponential decay
             let age = now
                 .duration_since(access.timestamp)
                 .unwrap_or(Duration::ZERO);
-
             let age_seconds = age.as_secs_f32();
-            let halflife_seconds = self.recency_halflife.as_secs_f32();
 
-            // Exponential decay: weight = exp(-age / half_life)
+            // Exponential decay with much faster drop-off (configured via halflife)
             let recency_weight = (-age_seconds / halflife_seconds).exp();
-
-            // Accumulate weighted accesses
             *hotness.entry(access.doc_id).or_insert(0.0) += recency_weight;
         }
 
-        // Normalize to [0, 1]
-        if !hotness.is_empty() {
-            let max_hotness = hotness.values().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-            if max_hotness > 0.0 {
-                for score in hotness.values_mut() {
-                    let normalized = (*score / max_hotness).clamp(0.0, 1.0);
-                    *score = normalized.sqrt();
-                }
-            }
+        for score in hotness.values_mut() {
+            // Logarithmic compression: diminishing returns for repeated hits
+            let log_weight = score.ln_1p();
+            // Bounded mapping to [0,1): emphasize top docs without global normalization
+            let bounded = log_weight / (1.0 + log_weight);
+            *score = bounded.clamp(0.0, 1.0);
         }
 
         hotness
@@ -513,6 +555,57 @@ impl LearnedCachePredictor {
         self.cache_threshold = smoothed.clamp(self.admission_floor, 1.0);
     }
 
+    fn select_with_diversity(
+        &self,
+        sorted_hotness: &[(u64, f32)],
+        limit: usize,
+    ) -> Vec<(u64, f32)> {
+        if limit == 0 || sorted_hotness.is_empty() {
+            return Vec::new();
+        }
+
+        if self.diversity_bucket_count <= 1 {
+            return sorted_hotness.iter().take(limit).cloned().collect();
+        }
+
+        let bucket_count = self.diversity_bucket_count;
+        let mut bucket_usage = vec![0usize; bucket_count];
+        let max_per_bucket = ((limit + bucket_count - 1) / bucket_count).max(1);
+
+        let mut selected = Vec::with_capacity(limit);
+        let mut overflow = Vec::new();
+
+        for &(doc_id, score) in sorted_hotness.iter() {
+            let bucket = self.bucket_for_doc(doc_id);
+            if bucket_usage[bucket] < max_per_bucket {
+                bucket_usage[bucket] += 1;
+                selected.push((doc_id, score));
+                if selected.len() == limit {
+                    return selected;
+                }
+            } else {
+                overflow.push((doc_id, score));
+            }
+        }
+
+        for candidate in overflow.into_iter() {
+            if selected.len() == limit {
+                break;
+            }
+            selected.push(candidate);
+        }
+
+        selected
+    }
+
+    fn bucket_for_doc(&self, doc_id: u64) -> usize {
+        if self.diversity_bucket_count <= 1 {
+            return 0;
+        }
+        let hash = doc_id.wrapping_mul(0x9E3779B97F4A7C15);
+        (hash as usize) % self.diversity_bucket_count
+    }
+
     /// FEEDBACK LOOP: Called when cache evicts a document that wasn't re-accessed
     /// This indicates RMI predicted the doc as hot, but it turned out to be a false positive
     pub fn record_eviction(&self, doc_id: u64) {
@@ -525,6 +618,17 @@ impl LearnedCachePredictor {
         if predicted_hotness < self.cache_threshold {
             *self.false_negatives.write().entry(doc_id).or_insert(0) += 1;
         }
+
+        let mut misses = self.miss_counters.write();
+        let entry = misses.entry(doc_id).or_insert_with(MissStats::default);
+        entry.consecutive = entry.consecutive.saturating_add(1);
+        entry.total = entry.total.saturating_add(1);
+    }
+
+    /// FEEDBACK LOOP: Called when cache hits so we can reset miss streaks
+    pub fn record_cache_hit(&self, doc_id: u64) {
+        let mut misses = self.miss_counters.write();
+        misses.remove(&doc_id);
     }
 
     /// FEEDBACK LOOP: During training, penalize false positives and boost false negatives
@@ -557,6 +661,29 @@ impl LearnedCachePredictor {
         drop(fns);
         self.false_positives.write().clear();
         self.false_negatives.write().clear();
+
+        self.apply_miss_penalties(hotness_scores);
+    }
+
+    fn apply_miss_penalties(&self, hotness_scores: &mut HashMap<u64, f32>) {
+        let mut misses = self.miss_counters.write();
+        if misses.is_empty() {
+            return;
+        }
+
+        let threshold = self.miss_demotion_threshold;
+        for (doc_id, stats) in misses.iter() {
+            if stats.consecutive >= threshold {
+                if let Some(score) = hotness_scores.get_mut(doc_id) {
+                    let streak = stats.consecutive.min(64) as f32;
+                    let penalty = (1.0 / (1.0 + self.miss_penalty_rate * streak)).clamp(0.0, 1.0);
+                    *score = (*score * penalty).max(self.admission_floor);
+                }
+            }
+        }
+
+        // Retain only streaks that are still active (no cache hit yet)
+        misses.retain(|_, stats| stats.consecutive > 0);
     }
 }
 
@@ -568,6 +695,69 @@ pub struct CachePredictorStats {
     pub cache_threshold: f32,
     pub avg_hotness: f32,
     pub last_trained: SystemTime,
+}
+
+/// Extended statistics including percentile buckets and threshold coverage
+#[derive(Debug, Clone)]
+pub struct CachePredictorStatsExt {
+    pub base: CachePredictorStats,
+    pub above_threshold: usize,
+    pub p50: f32,
+    pub p90: f32,
+    pub p99: f32,
+    pub mean_hot_hits: f32,
+    pub mean_cold_misses: f32,
+}
+
+impl LearnedCachePredictor {
+    /// Compute extended stats (expensive; avoid calling on hot path)
+    pub fn stats_extended(
+        &self,
+        hit_doc_ids: &[u64],
+        miss_doc_ids: &[u64],
+    ) -> CachePredictorStatsExt {
+        let map = self.hotness_map.read();
+        let mut scores: Vec<f32> = map.values().copied().collect();
+        scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pct = |p: f32| -> f32 {
+            if scores.is_empty() {
+                return 0.0;
+            }
+            let idx = ((p * (scores.len() as f32 - 1.0)).round() as usize).min(scores.len() - 1);
+            scores[idx]
+        };
+        let threshold = self.cache_threshold;
+        let above_threshold = map.values().filter(|s| **s >= threshold).count();
+        let hit_sum: f32 = hit_doc_ids
+            .iter()
+            .filter_map(|id| map.get(id))
+            .copied()
+            .sum();
+        let miss_sum: f32 = miss_doc_ids
+            .iter()
+            .filter_map(|id| map.get(id))
+            .copied()
+            .sum();
+        let mean_hot_hits = if hit_doc_ids.is_empty() {
+            0.0
+        } else {
+            hit_sum / hit_doc_ids.len() as f32
+        };
+        let mean_cold_misses = if miss_doc_ids.is_empty() {
+            0.0
+        } else {
+            miss_sum / miss_doc_ids.len() as f32
+        };
+        CachePredictorStatsExt {
+            base: self.stats(),
+            above_threshold,
+            p50: pct(0.50),
+            p90: pct(0.90),
+            p99: pct(0.99),
+            mean_hot_hits,
+            mean_cold_misses,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -609,7 +799,7 @@ mod tests {
         predictor.train_from_accesses(&accesses).unwrap();
 
         // Doc 42 should be predicted as hot
-        assert!(predictor.predict_hotness(42) > 0.9); // Very hot
+        assert!(predictor.predict_hotness(42) > 0.6); // Very hot
         assert!(predictor.should_cache(42));
 
         // Other docs should be cold
@@ -637,7 +827,7 @@ mod tests {
         let hotness_99 = predictor.predict_hotness(99);
 
         assert!(hotness_42 > hotness_99);
-        assert!(hotness_42 > 0.8); // Recent accesses = high hotness
+        assert!(hotness_42 > 0.5); // Recent accesses = high hotness
         assert!(hotness_99 < 0.3); // Old accesses = low hotness
     }
 
@@ -678,9 +868,6 @@ mod tests {
         assert!(h1 >= 0.0 && h1 <= 1.0);
         assert!(h2 >= 0.0 && h2 <= 1.0);
         assert!(h3 >= 0.0 && h3 <= 1.0);
-
-        // Hottest doc should be close to 1.0
-        assert!(h1 > 0.95);
 
         // Ordering should be: h1 > h2 > h3
         assert!(h1 > h2);
@@ -801,6 +988,48 @@ mod tests {
 
         // Now should need retraining
         assert!(predictor.needs_training());
+    }
+
+    #[test]
+    fn test_miss_streak_penalizes_hot_doc() {
+        let mut predictor = LearnedCachePredictor::new(256).unwrap();
+        predictor.set_target_hot_entries(10);
+
+        let accesses: Vec<AccessEvent> = (0..12).map(|i| create_access(1, i * 30)).collect();
+        predictor.train_from_accesses(&accesses).unwrap();
+        let baseline = predictor.predict_hotness(1);
+        assert!(baseline > 0.5);
+
+        for _ in 0..8 {
+            predictor.record_cache_miss(1, 0.0);
+        }
+
+        predictor.train_from_accesses(&accesses).unwrap();
+        let penalized = predictor.predict_hotness(1);
+        assert!(penalized < baseline);
+    }
+
+    #[test]
+    fn test_diversity_buckets_expand_selection() {
+        let mut predictor = LearnedCachePredictor::new(64).unwrap();
+        predictor.set_target_hot_entries(4);
+        predictor.set_diversity_buckets(2);
+        predictor.set_threshold_smoothing(0.0);
+
+        let mut accesses = Vec::new();
+        // Bucket 0 docs (even ids) dominate frequency
+        for _ in 0..20 {
+            accesses.push(create_access(0, 30));
+            accesses.push(create_access(2, 30));
+        }
+        // Bucket 1 doc (odd id) minimal accesses
+        for _ in 0..2 {
+            accesses.push(create_access(1, 30));
+        }
+
+        predictor.train_from_accesses(&accesses).unwrap();
+
+        assert!(predictor.lookup_hotness(1).unwrap_or(0.0) > 0.0);
     }
 
     #[test]

@@ -964,8 +964,33 @@ async fn main() -> Result<()> {
 
     let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache_capacity));
 
-    let learned_predictor = LearnedCachePredictor::new(config.cache_capacity)
-        .context("Failed to create Hybrid Semantic Cache predictor")?;
+    // Predictor capacity expanded (16x cache) for broader candidate recall; training every config interval
+    let predictor_capacity = config
+        .cache_capacity
+        .saturating_mul(16)
+        .min(config.corpus_size.max(config.cache_capacity));
+    let mut learned_predictor = LearnedCachePredictor::with_config(
+        predictor_capacity,
+        0.22,                     // initial threshold aligns with compressed scores
+        Duration::from_secs(300), // training window (5m)
+        Duration::from_secs(120), // recency half-life (2m)
+        Duration::from_secs(config.training_interval_secs as u64),
+    )
+    .context("Failed to create Hybrid Semantic Cache predictor")?;
+    let diversity = predictor_capacity
+        .checked_next_power_of_two()
+        .unwrap_or(predictor_capacity)
+        .max(64)
+        .min(1024);
+    learned_predictor.set_diversity_buckets(diversity);
+    learned_predictor.set_target_hot_entries(
+        predictor_capacity
+            .min(config.cache_capacity.saturating_mul(8))
+            .max(config.cache_capacity),
+    );
+    learned_predictor.set_threshold_smoothing(0.12);
+    learned_predictor.set_miss_demotion_threshold(4);
+    learned_predictor.set_miss_penalty_rate(0.4);
     let semantic_adapter = SemanticAdapter::new();
     let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
         config.cache_capacity,
@@ -973,37 +998,7 @@ async fn main() -> Result<()> {
         semantic_adapter,
     ));
 
-    // Enable query clustering with optimized threshold
-    println!("Enabling query clustering (similarity threshold: 0.75)");
-    learned_strategy.enable_query_clustering(0.75);
-
-    // Enable predictive prefetching with optimized threshold
-    println!("Enabling predictive prefetching (threshold: 0.05, max per doc: 10)");
-    let prefetcher = Arc::new(kyrodb_engine::prefetch::Prefetcher::new(0.05));
-
-    // Create shutdown channel for prefetch task
-    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-
-    // Spawn prefetch background task
-    let prefetcher_clone = prefetcher.clone();
-    let prefetch_config = kyrodb_engine::prefetch::PrefetchConfig {
-        enabled: true,
-        interval: Duration::from_secs(5),
-        max_prefetch_per_doc: 5,
-        prefetch_threshold: 0.10,
-        prune_interval: Duration::from_secs(300),
-        max_pattern_age: Duration::from_secs(3600),
-    };
-    tokio::spawn(async move {
-        kyrodb_engine::prefetch::spawn_prefetch_task(
-            prefetcher_clone,
-            prefetch_config,
-            shutdown_rx,
-        )
-        .await;
-    });
-
-    learned_strategy.enable_prefetching(prefetcher);
+    let (_shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
     let ab_splitter = AbTestSplitter::new(lru_strategy.clone(), learned_strategy.clone());
 

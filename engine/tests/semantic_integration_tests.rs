@@ -52,6 +52,9 @@ fn test_semantic_adapter_integration_with_learned_strategy() {
     let hot_embedding = vec![1.0; 384];
     let should_cache_hot = strategy.should_cache(1, &hot_embedding);
     assert!(should_cache_hot, "Hot document should be cached");
+    if should_cache_hot {
+        strategy.insert_cached(create_test_vector(1, hot_embedding.clone()));
+    }
 
     // Test cold document (low frequency, but semantically similar to hot)
     let similar_embedding = vec![0.99; 384]; // Very similar to hot_embedding
@@ -59,16 +62,30 @@ fn test_semantic_adapter_integration_with_learned_strategy() {
 
     // Without semantic: cold doc would likely be rejected
     // With semantic: cold doc might be accepted due to similarity
-    println!(
-        "Should cache similar (cold freq, high semantic): {}",
-        should_cache_similar
+    assert!(
+        should_cache_similar,
+        "Semantic adapter should admit cold document with high similarity"
     );
 }
 
 #[test]
 fn test_semantic_boost_for_cold_documents() {
-    // Create predictor with no training (all docs are cold)
-    let predictor = LearnedCachePredictor::new(100).unwrap();
+    // Create predictor and train basic distribution so hybrid logic engages
+    let mut predictor = LearnedCachePredictor::new(100).unwrap();
+    let mut events = vec![];
+    for _ in 0..100 {
+        events.push(AccessEvent {
+            doc_id: 1,
+            timestamp: SystemTime::now(),
+            access_type: AccessType::Read,
+        });
+    }
+    events.push(AccessEvent {
+        doc_id: 2,
+        timestamp: SystemTime::now(),
+        access_type: AccessType::Read,
+    });
+    predictor.train_from_accesses(&events).unwrap();
 
     // Create semantic adapter
     let semantic_adapter = SemanticAdapter::new();
@@ -78,25 +95,30 @@ fn test_semantic_boost_for_cold_documents() {
 
     // Cache a hot embedding
     let hot_embedding = vec![1.0; 384];
-    strategy.should_cache(1, &hot_embedding);
+    if strategy.should_cache(1, &hot_embedding) {
+        strategy.insert_cached(create_test_vector(1, hot_embedding.clone()));
+    }
 
     // Try to cache a very similar embedding (different doc_id)
     // Frequency score is low (unseen), but semantic score is high
     let similar_embedding = vec![0.99; 384];
     let should_cache = strategy.should_cache(2, &similar_embedding);
+    if should_cache {
+        strategy.insert_cached(create_test_vector(2, similar_embedding.clone()));
+    }
 
-    println!(
-        "Cold doc with high semantic similarity should cache: {}",
-        should_cache
+    assert!(
+        should_cache,
+        "Semantic adapter should admit cold document with high similarity"
     );
 
     // Very different embedding should not benefit from semantic boost
     let different_embedding = vec![-1.0; 384];
     let should_not_cache = strategy.should_cache(3, &different_embedding);
 
-    println!(
-        "Cold doc with low semantic similarity: {}",
-        should_not_cache
+    assert!(
+        !should_not_cache,
+        "Semantic adapter should reject dissimilar cold document"
     );
 }
 

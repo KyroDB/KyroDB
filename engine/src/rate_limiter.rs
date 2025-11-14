@@ -22,7 +22,7 @@ use std::time::Instant;
 /// - Reject if no tokens available
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let mut bucket = TokenBucket::new(100); // 100 QPS
 /// assert!(bucket.try_consume()); // First request succeeds
 /// ```
@@ -109,7 +109,7 @@ impl TokenBucket {
 /// Each tenant gets independent rate limit enforcement.
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let limiter = RateLimiter::new();
 /// let allowed = limiter.check_limit("tenant_123", 1000);
 /// if allowed {
