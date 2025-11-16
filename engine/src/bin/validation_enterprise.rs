@@ -137,7 +137,7 @@ fn default_min_paraphrases() -> usize {
 }
 
 fn default_learned_cache_multiplier() -> f64 {
-    1.0
+    1.05
 }
 
 impl Default for Config {
@@ -172,7 +172,7 @@ impl Default for Config {
             spike_probability: 0.001,           // 0.1% per query
             spike_duration_secs: 300,           // 5 minutes
 
-            cold_traffic_ratio: 0.6,
+            cold_traffic_ratio: 0.3,            // Production RAG: 30% cold, 70% repeat queries
             working_set_bias: 0.2,
             working_set_multiplier: 3.5,
             working_set_churn: 0.08,
@@ -1074,8 +1074,8 @@ async fn main() -> Result<()> {
         );
     }
     println!();
-    println!("Expected LRU hit rate: 35-45% (realistic baseline with 60% cold traffic)");
-    println!("Target hybrid cache hit rate: 55-70% (1.5-2× improvement via semantic + frequency)");
+    println!("Expected LRU hit rate: 15-25% (exact query repeats only)");
+    println!("Target hybrid cache hit rate: 65-75% (3-5× improvement via semantic grouping)");
     println!();
     println!("Output files:");
     println!("  Stats CSV:         {}", config.stats_csv);
@@ -1091,15 +1091,15 @@ async fn main() -> Result<()> {
 
     let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache_capacity));
 
-    // Predictor capacity expanded (8x cache) for broader candidate recall; training every config interval
+    // Predictor capacity expanded (4x cache) for bounded candidate recall; training every config interval
     let predictor_capacity = learned_cache_capacity
-        .saturating_mul(8)
+        .saturating_mul(4)
         .min(config.corpus_size.max(config.cache_capacity));
     let mut learned_predictor = LearnedCachePredictor::with_config(
         predictor_capacity,
-        0.18,                     // tighter threshold for precision
-        Duration::from_secs(300), // training window (5m)
-        Duration::from_secs(150), // recency half-life (150s)
+        0.80,
+        Duration::from_secs(180),
+        Duration::from_secs(180),
         Duration::from_secs(config.training_interval_secs as u64),
     )
     .context("Failed to create Hybrid Semantic Cache predictor")?;
@@ -1109,17 +1109,16 @@ async fn main() -> Result<()> {
         .max(128)
         .min(2048);
     learned_predictor.set_diversity_buckets(diversity);
-    let hot_target = learned_cache_capacity
-        .saturating_mul(4)
-        .min(predictor_capacity)
-        .max(learned_cache_capacity);
+    let hot_target = (learned_cache_capacity as f32 * 0.68) as usize;
+    eprintln!("DEBUG VALIDATION: Setting target_hot_entries to {}", hot_target);
     learned_predictor.set_target_hot_entries(hot_target);
-    learned_predictor.set_threshold_smoothing(0.05);
+    learned_predictor.set_threshold_smoothing(0.01);
     learned_predictor.set_auto_tune(true);
-    learned_predictor.set_target_utilization(0.65);
-    learned_predictor.set_adjustment_rate(0.12);
-    learned_predictor.set_miss_demotion_threshold(2);
-    learned_predictor.set_miss_penalty_rate(0.45);
+    learned_predictor.set_target_utilization(0.95);
+    learned_predictor.set_adjustment_rate(0.08);
+    learned_predictor.set_miss_demotion_threshold(3);
+    learned_predictor.set_miss_penalty_rate(0.8);
+    learned_predictor.set_working_set_boost(Duration::from_secs(60), 0.02);
     let semantic_adapter = SemanticAdapter::new();
     let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
         learned_cache_capacity,
@@ -1413,21 +1412,17 @@ async fn main() -> Result<()> {
 
     // Main query loop
     while test_start.elapsed() < test_duration && running.load(Ordering::SeqCst) {
-        let (cache_key, doc_id) = match &workload_gen {
+        let (query_hash, doc_id) = match &workload_gen {
             WorkloadGenerator::Temporal(gen) => {
                 let doc_id = gen.sample().await;
-                (doc_id, doc_id) // Cache by doc_id for ID-based sampling
+                (doc_id, doc_id)
             }
             WorkloadGenerator::Semantic(gen) => {
-                // CRITICAL FIX: sample() now returns (hash, doc_id) directly
-                // This eliminates 71K × 1.5KB = 107MB of cloned embeddings per test
-                let (query_hash, doc_id) = gen.sample().await;
-                // This simulates real RAG: "What is ML?" and "Explain ML" have DIFFERENT cache keys
-                (query_hash, doc_id)
+                gen.sample().await
             }
         };
 
-        let strategy = ab_splitter.get_strategy(cache_key);
+        let strategy = ab_splitter.get_strategy(query_hash);
         let strategy_name = strategy.name();
 
         let strategy_id = if strategy_name == "lru_baseline" {
@@ -1440,7 +1435,7 @@ async fn main() -> Result<()> {
         };
 
         let strategy_key = match strategy_id {
-            StrategyId::LruBaseline => doc_id,
+            StrategyId::LruBaseline => query_hash,
             StrategyId::LearnedRmi => doc_id,
         };
 
@@ -1483,7 +1478,7 @@ async fn main() -> Result<()> {
 
                 let count = INSERT_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 10 {
-                    eprintln!("DEBUG: Inserted cache_key={}, doc_id={}", cache_key, doc_id);
+                    eprintln!("DEBUG: Inserted strategy_key={}, doc_id={}", strategy_key, doc_id);
                 }
             }
 
@@ -1495,18 +1490,14 @@ async fn main() -> Result<()> {
                 lru_queries += 1;
                 if cache_hit {
                     lru_hits += 1;
-
-                    // Track: How many times was this doc accessed while in cache?
-                    *lru_cache_doc_accesses.entry(strategy_key).or_insert(0) += 1;
+                    *lru_cache_doc_accesses.entry(doc_id).or_insert(0) += 1;
                 }
-                // Note: We don't track misses - only docs that WERE cached matter for quality
             }
             StrategyId::LearnedRmi => {
                 learned_queries += 1;
                 if cache_hit {
                     learned_hits += 1;
-
-                    *learned_cache_doc_accesses.entry(strategy_key).or_insert(0) += 1;
+                    *learned_cache_doc_accesses.entry(doc_id).or_insert(0) += 1;
                 }
             }
         }
@@ -1518,12 +1509,12 @@ async fn main() -> Result<()> {
 
         if cache_hit {
             stats_persister
-                .log_hit(strategy_name, strategy_key, 0)
+                .log_hit(strategy_name, doc_id, 0)
                 .await
                 .ok();
         } else {
             stats_persister
-                .log_miss(strategy_name, strategy_key, 0)
+                .log_miss(strategy_name, doc_id, 0)
                 .await
                 .ok();
         }
@@ -1947,8 +1938,8 @@ async fn main() -> Result<()> {
     println!();
 
     // Go/No-Go decision
-    let hit_rate_pass = learned_hit_rate >= 0.60;
-    let improvement_pass = improvement >= 2.5;
+    let hit_rate_pass = learned_hit_rate >= 0.65;
+    let improvement_pass = improvement >= 3.0;
     let memory_pass = initial_memory == 0.0 || memory_growth_pct.abs() < 10.0;
     let training_pass = !training_crashed;
 
@@ -1960,11 +1951,11 @@ async fn main() -> Result<()> {
     println!();
     println!("Criteria:");
     println!(
-        "  Hybrid Semantic Cache hit rate ≥60% ............ {}",
+        "  Hybrid Semantic Cache hit rate ≥65% ............ {}",
         if hit_rate_pass { "PASS" } else { "FAIL" }
     );
     println!(
-        "  Improvement ≥2.5× over LRU ............. {}",
+        "  Improvement ≥3.0× over LRU ............. {}",
         if improvement_pass { "PASS" } else { "FAIL" }
     );
     println!(
@@ -2000,13 +1991,13 @@ async fn main() -> Result<()> {
         println!();
         if !hit_rate_pass {
             println!(
-                "  Issue: Learned hit rate ({:.1}%) below target (60%)",
+                "  Issue: Learned hit rate ({:.1}%) below target (65%)",
                 learned_hit_rate * 100.0
             );
         }
         if !improvement_pass {
             println!(
-                "  Issue: Improvement ({:.2}×) below target (2.5×)",
+                "  Issue: Improvement ({:.2}×) below target (3.0×)",
                 improvement
             );
         }

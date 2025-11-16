@@ -166,12 +166,16 @@ impl LearnedCacheStrategy {
     }
 
     /// Update predictor (for periodic retraining)
-    pub fn update_predictor(&self, new_predictor: LearnedCachePredictor) {
-        let mut predictor = new_predictor;
-        let hot_target = self.cache.capacity() + self.cache.capacity() / 2;
-        predictor.set_target_hot_entries(hot_target.max(1));
-        predictor.set_threshold_smoothing(0.3);
-        *self.predictor.write() = predictor;
+    pub fn update_predictor(&self, mut new_predictor: LearnedCachePredictor) {
+        // Preserve critical tuning parameters from old predictor
+        let (preserved_target, preserved_smoothing) = {
+            let old = self.predictor.read();
+            (old.target_hot_entries(), old.threshold_smoothing())
+        };
+        
+        new_predictor.set_target_hot_entries(preserved_target);
+        new_predictor.set_threshold_smoothing(preserved_smoothing);
+        *self.predictor.write() = new_predictor;
     }
 
     /// Check if semantic adapter is enabled
@@ -180,13 +184,20 @@ impl LearnedCacheStrategy {
     }
 
     fn configure_predictor_defaults(predictor: &mut LearnedCachePredictor, cache_capacity: usize) {
+        // NOTE: target_hot_entries is now configured externally in validation_enterprise.rs
+        // Do NOT override it here as it breaks custom tuning
+        // let predictor_cap = predictor.capacity_limit().max(1);
+        // let desired = cache_capacity
+        //     .saturating_mul(8)
+        //     .clamp(cache_capacity.max(1), predictor_cap);
+        // predictor.set_target_hot_entries(desired);
+        
+        predictor.set_threshold_smoothing(0.12);
+
         let predictor_cap = predictor.capacity_limit().max(1);
         let desired = cache_capacity
             .saturating_mul(8)
             .clamp(cache_capacity.max(1), predictor_cap);
-        predictor.set_target_hot_entries(desired);
-        predictor.set_threshold_smoothing(0.12);
-
         let diversity_pow2 = desired.checked_next_power_of_two().unwrap_or(desired);
         let diversity = diversity_pow2.max(32).min(1024);
         predictor.set_diversity_buckets(diversity);

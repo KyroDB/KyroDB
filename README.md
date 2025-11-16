@@ -3,11 +3,11 @@
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
 
-**Status**: Phase 0 in progress (Weeks 1-16 complete). Three-tier architecture implemented with Hybrid Semantic Cache showing 2.18x hit rate improvement over LRU baseline.
+**Status**: Phase 0 Weeks 17-20 in progress. Hybrid Semantic Cache architecture under active optimization for long-term 70%+ hit rate targets.
 
-KyroDB is a vector database optimized for RAG workloads, featuring a **Hybrid Semantic Cache** that combines RMI frequency prediction with semantic similarity scoring. The three-layer architecture (Cache → Hot Tier → HNSW) is complete and validated end-to-end.
+KyroDB is a vector database optimized for RAG workloads, featuring a **Hybrid Semantic Cache** that combines learned frequency prediction (RMI) with semantic similarity scoring. The system is in active development with a focus on long-term architecture and performance.
 
-> **Development Status**: Research and development project. Core architecture validated.
+> **Development Status**: Research and development project. Core architecture implemented, performance optimization in progress.
 
 ## Mission
 
@@ -17,39 +17,40 @@ Build the highest read-speed vector database on the planet, optimized for RAG wo
 
 ### Hybrid Semantic Cache (HSC)
 
-KyroDB implements a novel cache admission policy combining two signals:
-- **RMI frequency prediction**: Document-level hotness prediction using Recursive Model Index
-- **Semantic similarity scoring**: Query-level embedding cosine similarity
-- **Hybrid admission**: Cache documents predicted hot AND semantically similar to recent queries
+KyroDB implements a learned cache admission policy combining two signals:
+- **RMI frequency prediction**: Learned index predicts document-level hotness from access patterns
+- **Semantic similarity scoring**: Optional query-level embedding cosine similarity (currently disabled in testing)
+- **Admission policy**: Documents with predicted hotness above learned threshold are cached
 
-**Validated Results** (October 2025):
-- LRU baseline: 20.7% hit rate on MS MARCO dataset
-- Hybrid Semantic Cache: 45.1% hit rate
-- Improvement: 2.18x over baseline
-- Cache diversity: 5.6x more unique documents cached vs LRU
-- Memory stability: 2% growth over 6-minute sustained load
+**Current Focus**:
+- Maintain a clear improvement over naive LRU baselines while we iterate on cache design
+- Use Hybrid Semantic Cache as a long-term mechanism to target 70%+ hit rates on realistic RAG workloads
+- Keep the cache layer architecture flexible enough for future tuning and algorithmic upgrades
+
+**Technical Direction**:
+- RMI-based predictors for document-level hotness
+- Optional semantic adapters for query-level similarity
+- Periodic retraining and adaptive thresholding based on observed access patterns
 
 ### Three-Tier Architecture
 
-Complete implementation of layered query routing:
-- **Layer 1 (Cache)**: RMI-predicted hot documents with semantic filtering, 70-90% target hit rate
+**Implementation Status**: Core architecture complete, undergoing iterative performance tuning.
+
+- **Layer 1 (Cache)**: Learned predictor identifies hot documents with a long-term goal of 70%+ hit rates on RAG workloads
 - **Layer 2 (Hot Tier)**: Recent writes buffer (HashMap), handles 1000-doc working set
 - **Layer 3 (Cold Tier)**: HNSW vector index with WAL and snapshot persistence, <1ms P99 search
 
+**Key Challenge**: Achieving stable 60%+ cache hit rate requires precise threshold calibration to avoid:
+- **Score clustering**: All tracked documents scoring similarly → threshold too permissive
+- **Over-tracking**: Tracking 9,000+ documents when only top 100 are truly hot
+- **Threshold drift**: Training cycles resetting tuned parameters
+
 ## Current Performance
 
-| Component | Status | Result |
-|-----------|--------|--------|
-| **Hybrid Cache Hit Rate** | Validated | 45.1% (2.18x over 20.7% LRU baseline) |
-| **Cache Diversity** | Validated | 79 unique docs (5.6x over 14 for LRU) |
-| **HNSW Recall@10** | Validated | >95% on MS MARCO dataset |
-| **Memory Efficiency** | Validated | 2% growth over 6-minute sustained load |
-| **Training Stability** | Validated | 6 training cycles, no crashes |
-| **Three-Tier Architecture** | Complete | All layers implemented and tested |
-| **Persistence Layer** | Complete | WAL and snapshot recovery working |
-| **NDCG@10 Quality** | Validated | 1.0 perfect ranking by access frequency |
-
-**Next Milestones**: Scale validation to 1 hour, tune cache parameters for 60%+ hit rate, beta customer deployments
+KyroDB’s performance work is ongoing and focused on:
+- Keeping HNSW recall and latency within strict SLOs
+- Using the cache layer to significantly outperform simple LRU baselines
+- Iteratively tuning and evolving the Hybrid Semantic Cache to approach 70%+ hit rates on production-like RAG workloads
 
 ## Development Roadmap
 
@@ -64,13 +65,13 @@ Complete implementation of layered query routing:
 - NDCG@10 quality metrics for cache admission validation
 - Memory profiling with jemalloc integration
 
-**Key Achievement**: Hybrid Semantic Cache achieves 45.1% hit rate (2.18x over 20.7% LRU baseline) while caching 5.6x more diverse documents.
+**Key Direction**: The Hybrid Semantic Cache is the primary lever for long-term read performance, with a clear goal of achieving 70%+ hit rates on realistic RAG workloads through tuning, algorithmic improvements, and architectural refinements.
 
 ### Phase 0 Weeks 17-20 (Current Focus)
-- Scale validation from 6 minutes to 1 hour sustained load
-- Tune cache parameters (threshold, capacity, training frequency) for 75%+ hit rate target
-- Performance optimization: hot path profiling, SIMD vectorization
-- Integration testing under concurrent load
+- Performance tuning of the cache layer and three-tier architecture
+- Validation and load testing under realistic RAG scenarios
+- Instrumentation and observability for long-term cache behavior
+- Preparing the system for future phases targeting sustained 70%+ cache hit rates
 
 ## Configuration
 
@@ -117,16 +118,16 @@ Validation binary demonstrates end-to-end three-tier architecture:
 # Build the validation binary
 cargo build --release --bin validation_enterprise
 
-# Run 6-minute validation with three-tier query flow
+# Run validation with three-tier query flow
 ./target/release/validation_enterprise
 
-# Expected output:
-# - LRU baseline: 20.7% hit rate, 14 unique docs cached
-# - Hybrid Semantic Cache: 45.1% hit rate, 79 unique docs cached (5.6x diversity)
-# - Improvement: 2.18x hit rate gain
-# - Memory stability: 2% growth over sustained load
-# - Training cycles: 6 successful, no crashes
-# - NDCG@10: 1.0 (perfect ranking quality)
+# Demonstrates:
+# - A/B testing between LRU baseline and Hybrid Semantic Cache
+# - Three-tier architecture with automatic cache admission
+# - RMI-based frequency prediction and adaptive thresholding
+# - Memory stability under sustained load
+# - Automatic retraining cycles
+# - Cache quality metrics (NDCG@10)
 ```
 
 **Implemented Features**:
@@ -235,19 +236,16 @@ Most vector databases treat all documents equally. RAG workloads exhibit distinc
 1. **Document-level frequency**: RMI predicts which documents will be hot (based on historical access patterns)
 2. **Query-level semantics**: Semantic adapter scores documents by embedding similarity to recent queries
 
-**Result**: 2.18x hit rate improvement over LRU baseline while caching 5.6x more diverse documents.
+**Approach**: The cache layer demonstrates significant improvements over naive LRU baselines by learning access patterns and adapting to workload characteristics. Ongoing tuning targets 70%+ hit rates on production RAG workloads.
 
 ### Performance Characteristics
 
-Based on validation with MS MARCO dataset (71,878 queries, 10K corpus):
-
-| Metric | LRU Baseline | Hybrid Semantic Cache | Improvement |
-|--------|--------------|----------------------|-------------|
-| Hit rate | 20.7% | 45.1% | 2.18x |
-| Unique docs cached | 14 | 79 | 5.6x |
-| Cache diversity | Low (concentrated) | High (distributed) | Semantic clustering |
-| NDCG@10 quality | 1.0 | 1.0 | Both rank correctly |
-| Memory stability | Stable | Stable (2% growth) | Efficient |
+The Hybrid Semantic Cache is designed to:
+- **Outperform LRU**: Learn from access patterns rather than simple recency
+- **Cache diversity**: Track semantically diverse documents rather than just frequent repeats
+- **Quality preservation**: Maintain ranking quality (NDCG@10) while improving hit rates
+- **Memory efficiency**: Stable memory usage under sustained load
+- **Adaptive learning**: Automatic retraining to track workload shifts
 
 **Target Use Cases**:
 - Customer support RAG systems (FAQ retrieval)
@@ -331,20 +329,20 @@ cargo clippy
 **Phase**: Phase 0 Weeks 17-20 (Production hardening and optimization)
 
 **Completed** (Phase 0 Weeks 1-16):
-- HNSW vector search with >95% recall validation
+- HNSW vector search with high recall validation
 - Hybrid Semantic Cache (RMI frequency + semantic similarity)
 - Three-tier architecture (Cache → Hot Tier → HNSW)
 - WAL and snapshot persistence
-- A/B testing framework showing 2.18x improvement
+- A/B testing framework demonstrating improvements over LRU baseline
 - Access pattern logging and automatic RMI retraining
 - NDCG@10 quality metrics
 - Memory profiling with jemalloc
 
 **Current Focus**:
-- Scale validation from 6 minutes to 1 hour
-- Tune cache parameters for 60%+ hit rate target
+- Extended validation under realistic RAG workloads
+- Cache parameter tuning for long-term 70%+ hit rate targets
 - Performance optimization (hot path profiling, SIMD)
-- Concurrent load testing
+- Concurrent load testing and stress scenarios
 
 **Next Milestones**:
 - Chaos engineering and crash recovery testing

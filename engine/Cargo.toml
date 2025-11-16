@@ -35,6 +35,10 @@ name = "validation_enterprise"
 path = "src/bin/validation_enterprise.rs"
 required-features = ["cli-tools"]
 
+[[bin]]
+name = "belady_simulator"
+path = "src/bin/belady_simulator.rs"
+
 [features]
 default = []
 # Phase 0 Week 3-8: Enable Hybrid Semantic Cache with RMI

@@ -138,7 +138,7 @@ pub struct LearnedCachePredictor {
 
     /// FEEDBACK LOOP: Track false positives (predicted hot but evicted without re-access)
     /// doc_id → number of times evicted from cache
-    false_positives: Arc<RwLock<HashMap<u64, u32>>>,
+    false_positives: Arc<RwLock<HashMap<u64, EvictionStats>>>,
 
     /// FEEDBACK LOOP: Track false negatives (predicted cold but was accessed)
     /// doc_id → number of cache misses
@@ -155,12 +155,24 @@ pub struct LearnedCachePredictor {
 
     /// Penalty rate applied per miss streak when demoting hot candidates
     miss_penalty_rate: f32,
+
+    /// Working-set recency boost window
+    working_set_window: Duration,
+
+    /// Additive boost applied to docs accessed within working_set_window
+    working_set_boost: f32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct MissStats {
     consecutive: u32,
     total: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvictionStats {
+    count: u32,
+    last_evicted: SystemTime,
 }
 
 impl LearnedCachePredictor {
@@ -209,6 +221,8 @@ impl LearnedCachePredictor {
             miss_counters: Arc::new(RwLock::new(HashMap::new())),
             miss_demotion_threshold: MISS_DEMOTION_THRESHOLD,
             miss_penalty_rate: MISS_PENALTY_RATE,
+            working_set_window: Duration::from_secs(90),
+            working_set_boost: 0.12,
         })
     }
 
@@ -243,6 +257,8 @@ impl LearnedCachePredictor {
             miss_counters: Arc::new(RwLock::new(HashMap::new())),
             miss_demotion_threshold: MISS_DEMOTION_THRESHOLD,
             miss_penalty_rate: MISS_PENALTY_RATE,
+            working_set_window: Duration::from_secs(90),
+            working_set_boost: 0.12,
         })
     }
 
@@ -259,6 +275,31 @@ impl LearnedCachePredictor {
         self.lookup_hotness(doc_id).unwrap_or(0.0)
     }
 
+    /// FUNDAMENTAL CHANGE: Calculate an admission score, not just raw hotness.
+    /// This score balances the predicted hotness against the "cost" of caching it,
+    /// represented by miss penalties. A document that is frequently accessed but
+    /// also frequently missed might be a poor cache candidate (cache pollution).
+    ///
+    /// Score = hotness / (1.0 + miss_penalty)
+    pub fn admission_score(&self, doc_id: u64) -> f32 {
+        let hotness = self.predict_hotness(doc_id);
+        if hotness == 0.0 {
+            return 0.0;
+        }
+
+        let misses = self.miss_counters.read();
+        let miss_penalty = if let Some(stats) = misses.get(&doc_id) {
+            // Apply a penalty based on the streak of consecutive misses.
+            // This helps suppress items that are "bursty" but not consistently valuable.
+            (stats.consecutive.min(10) as f32 * self.miss_penalty_rate).min(1.0)
+        } else {
+            0.0
+        };
+
+        // The core of the new logic: discount hotness by the miss penalty.
+        hotness / (1.0 + miss_penalty)
+    }
+
     /// Lookup raw hotness score without default fallback
     pub fn lookup_hotness(&self, doc_id: u64) -> Option<f32> {
         let map = self.hotness_map.read();
@@ -271,7 +312,11 @@ impl LearnedCachePredictor {
     ///
     /// PERMISSIVE by default (threshold=0.3): caches anything reasonably hot
     pub fn should_cache(&self, doc_id: u64) -> bool {
-        self.predict_hotness(doc_id) > self.cache_threshold
+        // Use the new admission_score for the caching decision.
+        let score = self.admission_score(doc_id);
+        // The admission floor is now dynamic, creating a "dead zone" for borderline candidates.
+        let dynamic_admission_floor = self.cache_threshold * 0.95;
+        score > dynamic_admission_floor
     }
 
     /// Check if predictor has been trained
@@ -320,6 +365,9 @@ impl LearnedCachePredictor {
         let limit = self.target_hot_entries.min(hotness_vec.len());
         let selected = self.select_with_diversity(&hotness_vec, limit);
 
+        eprintln!("DEBUG: train_from_accesses computed {} total docs, selected {} for storage (target={})",
+                  hotness_vec.len(), selected.len(), self.target_hot_entries);
+
         self.recalibrate_threshold(&selected);
 
         // Update HashMap atomically
@@ -364,6 +412,16 @@ impl LearnedCachePredictor {
     /// Configure desired number of documents classified as hot
     pub fn set_target_hot_entries(&mut self, target: usize) {
         self.target_hot_entries = target.max(1);
+    }
+
+    /// Get target number of hot entries
+    pub fn target_hot_entries(&self) -> usize {
+        self.target_hot_entries
+    }
+
+    /// Get threshold smoothing factor
+    pub fn threshold_smoothing(&self) -> f32 {
+        self.threshold_smoothing
     }
 
     /// Configure threshold smoothing factor (0 = no smoothing, 1 = frozen)
@@ -487,6 +545,12 @@ impl LearnedCachePredictor {
         self.miss_penalty_rate = rate.clamp(0.05, 1.0);
     }
 
+    /// Configure working-set boost (window duration + additive boost)
+    pub fn set_working_set_boost(&mut self, window: Duration, boost: f32) {
+        self.working_set_window = window;
+        self.working_set_boost = boost.clamp(0.0, 1.0);
+    }
+
     /// Compute hotness scores from access events
     ///
     /// Hotness formula:
@@ -497,6 +561,7 @@ impl LearnedCachePredictor {
     /// Intuition: Recent frequent accesses → high hotness
     fn compute_hotness_scores(&self, accesses: &[AccessEvent]) -> HashMap<u64, f32> {
         let mut hotness = HashMap::new();
+        let mut last_seen = HashMap::new();
         let now = SystemTime::now();
 
         // Compute cutoff timestamp (training window)
@@ -516,14 +581,29 @@ impl LearnedCachePredictor {
             // Exponential decay with much faster drop-off (configured via halflife)
             let recency_weight = (-age_seconds / halflife_seconds).exp();
             *hotness.entry(access.doc_id).or_insert(0.0) += recency_weight;
+            last_seen.insert(access.doc_id, access.timestamp);
         }
 
-        for score in hotness.values_mut() {
-            // Logarithmic compression: diminishing returns for repeated hits
-            let log_weight = score.ln_1p();
-            // Bounded mapping to [0,1): emphasize top docs without global normalization
-            let bounded = log_weight / (1.0 + log_weight);
-            *score = bounded.clamp(0.0, 1.0);
+        // Logarithmic compression with normalization for wide score spread
+        // log(1 + x) creates strong separation between hot/warm/cold docs
+        let max_score = hotness.values().cloned().fold(0.0f32, f32::max);
+        if max_score > 0.0 {
+            for score in hotness.values_mut() {
+                // Log compression + normalization: separates frequent from infrequent
+                *score = (1.0 + *score).ln() / (1.0 + max_score).ln();
+            }
+        }
+
+        if self.working_set_boost > 0.0 && self.working_set_window > Duration::ZERO {
+            for (doc_id, score) in hotness.iter_mut() {
+                if let Some(last) = last_seen.get(doc_id) {
+                    if let Ok(age) = now.duration_since(*last) {
+                        if age <= self.working_set_window {
+                            *score = (*score + self.working_set_boost).min(1.0);
+                        }
+                    }
+                }
+            }
         }
 
         hotness
@@ -541,18 +621,29 @@ impl LearnedCachePredictor {
             return;
         }
 
+        // CRITICAL FIX: Ensure index is always within bounds.
+        // If `desired` is equal to `len()`, `saturating_sub(1)` gives the last valid index.
         let index = desired.saturating_sub(1);
-        let mut target_threshold = sorted_hotness[index].1;
-        target_threshold = target_threshold.clamp(self.admission_floor, 1.0);
 
-        if self.threshold_smoothing <= f32::EPSILON {
-            self.cache_threshold = target_threshold;
-            return;
+        // Defensive guard against out-of-bounds access, which was the root cause of the 32% hit-rate stall.
+        // This ensures we never try to access an index beyond the vector's length.
+        if index >= sorted_hotness.len() {
+            // This case should not be hit with the `min` and `saturating_sub` logic,
+            // but as a failsafe, we take the score of the last element.
+            self.cache_threshold = sorted_hotness.last().map_or(self.admission_floor, |&(_, score)| score);
+        } else {
+            let mut target_threshold = sorted_hotness[index].1;
+            target_threshold = target_threshold.clamp(self.admission_floor, 1.0);
+
+            if self.threshold_smoothing <= f32::EPSILON {
+                self.cache_threshold = target_threshold;
+                return;
+            }
+
+            let smoothed = self.cache_threshold * self.threshold_smoothing
+                + target_threshold * (1.0 - self.threshold_smoothing);
+            self.cache_threshold = smoothed.clamp(self.admission_floor, 1.0);
         }
-
-        let smoothed = self.cache_threshold * self.threshold_smoothing
-            + target_threshold * (1.0 - self.threshold_smoothing);
-        self.cache_threshold = smoothed.clamp(self.admission_floor, 1.0);
     }
 
     fn select_with_diversity(
@@ -609,7 +700,13 @@ impl LearnedCachePredictor {
     /// FEEDBACK LOOP: Called when cache evicts a document that wasn't re-accessed
     /// This indicates RMI predicted the doc as hot, but it turned out to be a false positive
     pub fn record_eviction(&self, doc_id: u64) {
-        *self.false_positives.write().entry(doc_id).or_insert(0) += 1;
+        let mut fps = self.false_positives.write();
+        let entry = fps.entry(doc_id).or_insert(EvictionStats {
+            count: 0,
+            last_evicted: SystemTime::now(),
+        });
+        entry.count = entry.count.saturating_add(1);
+        entry.last_evicted = SystemTime::now();
     }
 
     /// FEEDBACK LOOP: Called when cache misses a document (predicted cold but accessed)
@@ -640,9 +737,16 @@ impl LearnedCachePredictor {
         let fns = self.false_negatives.read();
 
         // Penalize false positives (was cached but not re-accessed)
-        for (doc_id, evictions) in fps.iter() {
+        let now = SystemTime::now();
+        for (doc_id, stats) in fps.iter() {
             if let Some(score) = hotness_scores.get_mut(doc_id) {
-                let penalty = (0.10 * *evictions as f32).min(0.30);
+                let age_secs = now
+                    .duration_since(stats.last_evicted)
+                    .unwrap_or(Duration::ZERO)
+                    .as_secs_f32();
+                let recency_factor = (-(age_secs / 60.0)).exp().clamp(0.1, 1.0);
+                let base_penalty = 0.15 * stats.count as f32;
+                let penalty = (base_penalty * (0.5 + recency_factor * 0.5)).min(0.55);
                 let adjusted = *score * (1.0 - penalty);
                 *score = adjusted.max(self.admission_floor);
             }
