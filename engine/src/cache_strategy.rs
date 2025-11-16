@@ -1,16 +1,16 @@
 //! Cache Strategy Trait and Implementations
 //!
-//! Cache strategy framework: A/B testing for LRU vs. Hybrid Semantic Cache
+//! Cache strategy framework: A/B testing for LRU vs. Learned Cache
 //!
 //! Provides pluggable cache strategies:
 //! - LRU baseline: Always cache, LRU eviction
 //! - Learned: RMI-predicted hotness-based admission
-//! - Learned + Semantic: Hybrid frequency + semantic similarity
+//!
+//! Two-level cache architecture:
+//! - L1a (this module): Document-level cache with RMI frequency prediction
+//! - L1b (query_hash_cache): Query-level cache with semantic similarity
 
 use crate::learned_cache::LearnedCachePredictor;
-use crate::prefetch::Prefetcher;
-use crate::query_clustering::QueryClusterer;
-use crate::semantic_adapter::SemanticAdapter;
 use crate::vector_cache::{CachedVector, VectorCache};
 use std::sync::Arc;
 use tracing::{instrument, trace};
@@ -98,22 +98,21 @@ impl CacheStrategy for LruCacheStrategy {
     }
 }
 
-/// Hybrid Semantic Cache strategy
+/// Learned Cache strategy (RMI frequency-based)
 ///
-/// Uses RMI predictor (frequency) + optional semantic adapter (similarity)
-/// to decide cache admission based on hybrid scoring.
+/// Uses RMI predictor to decide cache admission based on predicted hotness.
+/// This is L1a (document-level cache) in the two-level architecture.
+///
+/// L1b (query-level cache) is handled separately by QueryHashCache.
 ///
 pub struct LearnedCacheStrategy {
     pub cache: Arc<VectorCache>,
     pub predictor: Arc<parking_lot::RwLock<LearnedCachePredictor>>,
-    semantic_adapter: Arc<parking_lot::RwLock<Option<SemanticAdapter>>>,
-    query_clusterer: Arc<parking_lot::RwLock<Option<QueryClusterer>>>,
-    prefetcher: Arc<parking_lot::RwLock<Option<Arc<Prefetcher>>>>,
     name: String,
 }
 
 impl LearnedCacheStrategy {
-    /// Create new Hybrid Semantic Cache strategy (frequency-only mode)
+    /// Create new Learned Cache strategy (RMI frequency-based)
     ///
     /// # Parameters
     /// - `capacity`: Cache capacity
@@ -124,45 +123,8 @@ impl LearnedCacheStrategy {
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
-            semantic_adapter: Arc::new(parking_lot::RwLock::new(None)),
-            query_clusterer: Arc::new(parking_lot::RwLock::new(None)),
-            prefetcher: Arc::new(parking_lot::RwLock::new(None)),
             name: "learned_rmi".to_string(),
         }
-    }
-
-    /// Create new Hybrid Semantic Cache strategy (full hybrid mode)
-    ///
-    /// # Parameters
-    /// - `capacity`: Cache capacity
-    /// - `predictor`: Trained RMI frequency predictor
-    /// - `semantic_adapter`: Semantic adapter for hybrid decisions
-    pub fn new_with_semantic(
-        capacity: usize,
-        mut predictor: LearnedCachePredictor,
-        semantic_adapter: SemanticAdapter,
-    ) -> Self {
-        Self::configure_predictor_defaults(&mut predictor, capacity);
-
-        Self {
-            cache: Arc::new(VectorCache::new(capacity)),
-            predictor: Arc::new(parking_lot::RwLock::new(predictor)),
-            semantic_adapter: Arc::new(parking_lot::RwLock::new(Some(semantic_adapter))),
-            query_clusterer: Arc::new(parking_lot::RwLock::new(None)),
-            prefetcher: Arc::new(parking_lot::RwLock::new(None)),
-            name: "learned_semantic".to_string(),
-        }
-    }
-
-    /// Enable query clustering
-    pub fn enable_query_clustering(&self, similarity_threshold: f32) {
-        let clusterer = QueryClusterer::new(similarity_threshold);
-        *self.query_clusterer.write() = Some(clusterer);
-    }
-
-    /// Enable prefetching
-    pub fn enable_prefetching(&self, prefetcher: Arc<Prefetcher>) {
-        *self.prefetcher.write() = Some(prefetcher);
     }
 
     /// Update predictor (for periodic retraining)
@@ -172,15 +134,10 @@ impl LearnedCacheStrategy {
             let old = self.predictor.read();
             (old.target_hot_entries(), old.threshold_smoothing())
         };
-        
+
         new_predictor.set_target_hot_entries(preserved_target);
         new_predictor.set_threshold_smoothing(preserved_smoothing);
         *self.predictor.write() = new_predictor;
-    }
-
-    /// Check if semantic adapter is enabled
-    pub fn has_semantic(&self) -> bool {
-        self.semantic_adapter.read().is_some()
     }
 
     fn configure_predictor_defaults(predictor: &mut LearnedCachePredictor, cache_capacity: usize) {
@@ -228,8 +185,8 @@ impl CacheStrategy for LearnedCacheStrategy {
         }
     }
 
-    #[instrument(level = "trace", skip(self, embedding), fields(doc_id, dim = embedding.len()))]
-    fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
+    #[instrument(level = "trace", skip(self, _embedding), fields(doc_id))]
+    fn should_cache(&self, doc_id: u64, _embedding: &[f32]) -> bool {
         let predictor = self.predictor.read();
 
         if !predictor.is_trained() {
@@ -237,35 +194,22 @@ impl CacheStrategy for LearnedCacheStrategy {
             return true;
         }
 
-        // Compute frequency-based score
+        // Pure frequency-based admission (RMI only)
         let freq_score = predictor.lookup_hotness(doc_id).unwrap_or(0.0);
         let threshold = predictor.cache_threshold().max(predictor.admission_floor());
-        drop(predictor);
 
-        if freq_score >= threshold {
+        let should_admit = freq_score >= threshold;
+
+        if should_admit {
             trace!(doc_id, freq_score, threshold, "admit (freq >= threshold)");
-            return true;
+        } else {
+            trace!(doc_id, freq_score, threshold, "reject (freq < threshold)");
         }
 
-        if let Some(adapter) = self.semantic_adapter.read().as_ref() {
-            let decision = adapter.should_cache(freq_score, embedding);
-            if decision {
-                trace!(doc_id, freq_score, threshold, "admit via semantic adapter");
-            } else {
-                trace!(doc_id, freq_score, threshold, "reject via semantic adapter");
-            }
-            return decision;
-        }
-
-        trace!(doc_id, freq_score, threshold, "reject (below threshold, no semantic adapter)");
-        false
+        should_admit
     }
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
-        if let Some(adapter) = self.semantic_adapter.read().as_ref() {
-            adapter.cache_embedding(cached_vector.doc_id, cached_vector.embedding.clone());
-        }
-
         let evicted_doc_id = self.cache.insert(cached_vector);
         if let Some(evicted) = evicted_doc_id {
             let predictor = self.predictor.read();
@@ -282,32 +226,14 @@ impl CacheStrategy for LearnedCacheStrategy {
     fn stats(&self) -> String {
         let stats = self.cache.stats();
         let predictor = self.predictor.read();
-        let base_stats = format!(
+        format!(
             "Learned: {} hits, {} misses, {:.2}% hit rate, {} evictions, {} tracked docs",
             stats.hits,
             stats.misses,
             stats.hit_rate * 100.0,
             stats.evictions,
             predictor.tracked_count()
-        );
-        drop(predictor);
-
-        // Add semantic stats if enabled
-        let semantic_adapter_guard = self.semantic_adapter.read();
-        if let Some(semantic_adapter) = semantic_adapter_guard.as_ref() {
-            let sem_stats = semantic_adapter.stats();
-            format!(
-                "{} | Semantic: {} fast, {} slow, {} hits, {} misses, {} cached embeddings",
-                base_stats,
-                sem_stats.fast_path_decisions,
-                sem_stats.slow_path_decisions,
-                sem_stats.semantic_hits,
-                sem_stats.semantic_misses,
-                sem_stats.cached_embeddings
-            )
-        } else {
-            base_stats
-        }
+        )
     }
 }
 

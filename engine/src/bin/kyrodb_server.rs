@@ -25,7 +25,7 @@ use kyrodb_engine::{
     cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
     prefetch::Prefetcher,
     ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
-    SearchResult, SemanticAdapter, TieredEngine, TieredEngineConfig,
+    SearchResult, TieredEngine, TieredEngineConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -973,49 +973,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize or recover engine
     info!("Initializing TieredEngine with A/B testing (LRU vs Learned with Week 1-4 features)...");
 
-    // Helper to create cache strategy with Week 1-4 features
+    // Helper to create cache strategy (Two-level cache architecture)
     let create_cache_strategy = || {
         let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache.capacity));
 
         let learned_predictor = LearnedCachePredictor::new(config.cache.capacity)
             .expect("Failed to create Hybrid Semantic Cache predictor");
-        let semantic_adapter = SemanticAdapter::new();
-        let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
+
+        // NOTE: Semantic logic moved to QueryHashCache (L1b) in two-level architecture
+        let learned_strategy = Arc::new(LearnedCacheStrategy::new(
             config.cache.capacity,
             learned_predictor,
-            semantic_adapter,
         ));
 
-        // Enable Week 3-4 features: Query Clustering
-        if config.cache.enable_query_clustering {
-            learned_strategy.enable_query_clustering(config.cache.clustering_similarity_threshold);
-        }
-
-        // Enable Week 3-4 features: Predictive Prefetching
-        if config.cache.enable_prefetching {
-            let prefetcher = Arc::new(Prefetcher::new(config.cache.prefetch_threshold));
-
-            let prefetcher_clone = prefetcher.clone();
-            let shutdown_rx = shutdown_tx.subscribe();
-            let prefetch_config = kyrodb_engine::prefetch::PrefetchConfig {
-                enabled: true,
-                interval: Duration::from_secs(5),
-                max_prefetch_per_doc: config.cache.max_prefetch_per_doc,
-                prefetch_threshold: config.cache.prefetch_threshold,
-                prune_interval: Duration::from_secs(300),
-                max_pattern_age: Duration::from_secs(3600),
-            };
-            tokio::spawn(async move {
-                kyrodb_engine::prefetch::spawn_prefetch_task(
-                    prefetcher_clone,
-                    prefetch_config,
-                    shutdown_rx,
-                )
-                .await;
-            });
-
-            learned_strategy.enable_prefetching(prefetcher);
-        }
+        // NOTE: Query clustering and prefetching moved to separate layers in two-level architecture
+        // Prefetching will be re-enabled as a separate service layer in future updates
 
         Box::new(AbTestSplitter::new(
             lru_strategy.clone(),
