@@ -121,8 +121,16 @@ pub async fn spawn_training_task(
                         continue;
                     }
 
+                    // Preserve target_hot_entries from current predictor (CRITICAL FIX)
+                    // Root cause: Each retraining cycle was resetting target to RMI capacity (212)
+                    // This caused all 212 docs to be marked hot instead of the configured 132
+                    let current_target = {
+                        let predictor = learned_strategy.predictor.read();
+                        predictor.target_hot_entries()
+                    };
+
                     // Train new predictor
-                    match train_predictor(&events, config.rmi_capacity, &config) {
+                    match train_predictor(&events, config.rmi_capacity, &config, current_target) {
                         Ok(new_predictor) => {
                             // Update learned strategy atomically
                             learned_strategy.update_predictor(new_predictor);
@@ -154,6 +162,7 @@ fn train_predictor(
     events: &[crate::learned_cache::AccessEvent],
     capacity: usize,
     config: &TrainingConfig,
+    target_hot_entries: usize, // CRITICAL: Preserve from previous predictor
 ) -> Result<LearnedCachePredictor> {
     let mut predictor = LearnedCachePredictor::with_config(
         capacity,
@@ -164,6 +173,9 @@ fn train_predictor(
     )?;
     predictor.set_auto_tune(config.auto_tune_enabled);
     predictor.set_target_utilization(config.target_utilization);
+    // CRITICAL FIX: Set target_hot_entries BEFORE training
+    // This ensures threshold calibration uses the correct target (132, not 212)
+    predictor.set_target_hot_entries(target_hot_entries);
     predictor.train_from_accesses(events)?;
     Ok(predictor)
 }

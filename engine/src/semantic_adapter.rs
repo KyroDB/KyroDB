@@ -40,7 +40,10 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            high_confidence_threshold: 0.75,
+            // FIX B: Lower from 0.75 to engage semantic layer for mid-tier docs
+            // Root cause: Fast-path was bypassing semantic checks for docs with score 0.75+
+            // This prevented semantic rescue of borderline hot docs
+            high_confidence_threshold: 0.60,
             low_confidence_threshold: 0.25,
             semantic_similarity_threshold: 0.82,
             max_cached_embeddings: 100_000,
