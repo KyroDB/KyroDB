@@ -21,7 +21,7 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 
 **Advanced topics:**
 1. [**Authentication**](AUTHENTICATION.md) - Multi-tenant API keys, rate limiting
-2. [**Three-Tier Implementation**](THREE_TIER_IMPLEMENTATION.md) - Cache → Hot → Cold architecture
+2. [**Two-Level Hybrid Semantic Cache (Layer 1)**](TWO_LEVEL_CACHE_ARCHITECTURE.md) - Current Cache → Hot → Cold architecture with Hybrid Semantic Cache at Layer 1 (two-level L1 design)
 3. [**NDCG Implementation**](NDCG_IMPLEMENTATION.md) - Search quality metrics
 4. [**Concurrency**](CONCURRENCY.md) - Lock-free reads, atomic swaps
 
@@ -37,7 +37,7 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 → [Operations Guide](OPERATIONS.md)
 
 ### "I want to understand how it works"
-→ [Architecture](ARCHITECTURE.md) → [Three-Tier Implementation](THREE_TIER_IMPLEMENTATION.md)
+→ [Architecture](ARCHITECTURE.md) → [Two-Level Hybrid Semantic Cache (Layer 1)](TWO_LEVEL_CACHE_ARCHITECTURE.md)
 
 ### "I need API documentation"
 → [API Reference](API_REFERENCE.md)

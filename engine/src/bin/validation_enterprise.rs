@@ -1340,7 +1340,7 @@ async fn main() -> Result<()> {
         AbStatsPersister::new(&config.stats_csv).context("Failed to create stats persister")?,
     );
 
-    println!("\n🔧 Loading corpus embeddings...");
+    println!("\nLoading corpus embeddings...");
     let corpus_embeddings: Vec<Vec<f32>> = match (
         &config.ms_marco_embeddings_path,
         &config.ms_marco_passages_path,
@@ -1366,12 +1366,12 @@ async fn main() -> Result<()> {
             generate_mock_embeddings(config.corpus_size, 768)
         }
     };
-    println!("✅ Loaded {} corpus embeddings", corpus_embeddings.len());
+    println!("Loaded {} corpus embeddings", corpus_embeddings.len());
 
     // Create TieredEngine (combines L1a + L1b + L2 + L3)
     // Note: TieredEngine will own its own LearnedCacheStrategy instance,
     // but it shares the same predictor via Arc, so training updates will be visible
-    println!("\n🔧 Building TieredEngine (two-level cache architecture)...");
+    println!("\nBuilding TieredEngine (two-level cache architecture)...");
     let tiered_config = TieredEngineConfig {
         hot_tier_max_size: 1000,
         hot_tier_hard_limit: 2000,
@@ -1424,7 +1424,7 @@ async fn main() -> Result<()> {
     engine.set_access_logger(access_logger.clone());
 
     let engine = Arc::new(engine);
-    println!("✅ TieredEngine ready with two-level cache (L1a: Document Cache, L1b: Query Cache)");
+    println!("TieredEngine ready with two-level cache (L1a: Document Cache, L1b: Query Cache)");
 
     let (query_embeddings, query_to_doc) = match (
         &config.query_embeddings_path,

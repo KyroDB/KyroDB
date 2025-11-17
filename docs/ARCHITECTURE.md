@@ -4,7 +4,7 @@ Understand how KyroDB works internally.
 
 ## System Overview
 
-KyroDB is a three-tier vector database optimized for read speed:
+KyroDB is a vector database with **two-level L1 cache** optimized for RAG workloads:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -15,19 +15,27 @@ KyroDB is a three-tier vector database optimized for read speed:
 ┌─────────────────────────────────────────────────────────┐
 │                     KyroDB Server                        │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │     Layer 1: Hybrid Semantic Cache (RMI)           │ │
-│  │  • Predicts hot documents                          │ │
-│  │  • 70-90% hit rate target                          │ │
-│  │  • < 5ns prediction latency                        │ │
+│  │   Layer 1a: Document Cache (RMI Frequency)         │ │
+│  │  • Predicts hot documents via learned index        │ │
+│  │  • 50% hit rate (validated)                        │ │
+│  │  • <10ns prediction latency                        │ │
 │  └────────────────────────────────────────────────────┘ │
-│                         │                                │
-│                         │ Cache miss                     │
+│                         │ miss                           │
 │                         ▼                                │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │          Layer 2: Hot Tier (BTree)                 │ │
-│  │  • Recent writes (last 10 minutes)                 │ │
-│  │  • Fast exact lookups                              │ │
-│  │  • Flushes to cold tier periodically               │ │
+│  │   Layer 1b: Query Cache (Semantic Similarity)      │ │
+│  │  • Caches paraphrased queries                      │ │
+│  │  • 21% additional hit rate (validated)            │ │
+│  │  • <1μs similarity scan                            │ │
+│  └────────────────────────────────────────────────────┘ │
+│                         │ Combined L1: 71.7% hit rate    │
+│                         │ miss                           │
+│                         ▼                                │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │          Layer 2: Hot Tier (HashMap)               │ │
+│  │  • Recent writes buffer                            │ │
+│  │  • Fast exact lookups (<200ns)                     │ │
+│  │  • Periodic flush to cold tier                     │ │
 │  └────────────────────────────────────────────────────┘ │
 │                         │                                │
 │                         │ Not in hot tier                │
@@ -36,7 +44,7 @@ KyroDB is a three-tier vector database optimized for read speed:
 │  │          Layer 3: Cold Tier (HNSW)                 │ │
 │  │  • Bulk of data (millions of vectors)              │ │
 │  │  • k-NN approximate search                         │ │
-│  │  • < 1ms P99 latency @ 10M vectors                 │ │
+│  │  • <1ms P99 latency @ 10M vectors                  │ │
 │  └────────────────────────────────────────────────────┘ │
 │                                                          │
 │  ┌────────────────────────────────────────────────────┐ │
@@ -71,42 +79,56 @@ KyroDB is a three-tier vector database optimized for read speed:
    ├─► Validate embedding dimension
    ├─► Extract query vector
    │
-3. Layer 1: Check Hybrid Semantic Cache
+3. Layer 1a: Check Document Cache (RMI Frequency)
    │
-   ├─► RMI predicts if vector is "hot"
+   ├─► RMI predicts if document is "hot" by doc_id
    ├─► If predicted hot: check cache
    │   │
-   │   ├─► Cache hit (70-90% of queries)
-   │   │   └─► Return cached vector (< 10ns)
+   │   ├─► Cache hit (50% of queries)
+   │   │   └─► Return cached vector (<10ns)
    │   │
-   │   └─► Cache miss (false positive)
+   │   └─► Cache miss
+   │       └─► Continue to Layer 1b
+   │
+4. Layer 1b: Check Query Cache (Semantic Similarity)
+   │
+   ├─► Hash query embedding, check for similar cached queries
+   │   │
+   │   ├─► Exact match or similarity >0.25
+   │   │   └─► Return cached result (21% additional hit rate, <1μs)
+   │   │
+   │   └─► Query cache miss
    │       └─► Continue to Layer 2
    │
-4. Layer 2: Check Hot Tier
+5. Layer 2: Check Hot Tier
    │
-   ├─► BTree lookup for recent writes
+   ├─► HashMap lookup for recent writes
    │   │
    │   ├─► Found in hot tier
-   │   │   └─► Return vector (< 100ns)
+   │   │   └─► Return vector (<200ns)
    │   │
    │   └─► Not in hot tier
    │       └─► Continue to Layer 3
    │
-5. Layer 3: HNSW Search
+6. Layer 3: HNSW Search
    │
    ├─► k-NN approximate search
    ├─► Returns top-k nearest neighbors
    ├─► Sorted by cosine similarity
-   │   └─► Return results (< 1ms P99)
+   │   └─► Return results (<1ms P99)
    │
-6. Log access pattern
+7. Cache admission decisions
    │
-   └─► Feed to RMI trainer (every 10 min)
+   ├─► L1a: RMI predictor decides if doc should be cached
+   ├─► L1b: Always cache query→doc mapping
+   └─► Log access for RMI training (every 15 sec)
 
 Total latency:
-• Cache hit: < 10ns
-• Hot tier: < 100ns
-• Cold tier: < 1ms (P99)
+• L1a hit: <10ns (50% of queries)
+• L1b hit: <1μs (21% of queries)
+• Combined L1: 71.7% hit rate
+• Hot tier: <200ns
+• Cold tier: <1ms (P99)
 ```
 
 ---
@@ -219,7 +241,7 @@ Recovery time:
 
 ---
 
-## Training Flow (Hybrid Semantic Cache)
+## Training Flow (L1a Document Cache)
 
 **How the RMI cache predictor learns:**
 
@@ -229,7 +251,7 @@ Access Logger (continuous):
 ├─► Every query logs: (doc_id, timestamp)
 └─► Ring buffer (bounded memory, 17.6ns overhead)
 
-Training Task (every 10 minutes):
+Training Task (every 15 seconds in validation, 10 min in production):
 │
 1. Collect access logs from last window
    │
@@ -251,10 +273,12 @@ Training Task (every 10 minutes):
    │
 5. Measure accuracy
    │
-   ├─► Track hit rate over next 10 min
-   └─► Export metrics to Prometheus
+   ├─► Track L1a hit rate over next training cycle
+   └─► Export metrics (L1a, L1b, combined)
 
-Expected accuracy: 80-95%
+Validated L1a accuracy: 50.2% hit rate (Phase 0 Week 12)
+Validated L1b performance: 21.4% additional hit rate
+Combined L1 hit rate: 71.7%
 ```
 
 ---

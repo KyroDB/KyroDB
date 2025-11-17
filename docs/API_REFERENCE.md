@@ -183,11 +183,19 @@ curl http://localhost:51051/metrics
 ```
 # HELP kyrodb_query_latency_p99_ms Query latency P99 in milliseconds
 # TYPE kyrodb_query_latency_p99_ms gauge
-kyrodb_query_latency_p99_ms 2.5
+kyrodb_query_latency_p99_ms 0.9
 
-# HELP kyrodb_cache_hit_rate Cache hit rate (0-1)
-# TYPE kyrodb_cache_hit_rate gauge
-kyrodb_cache_hit_rate 0.451
+# HELP kyrodb_l1_combined_hit_rate Combined L1 cache hit rate (L1a + L1b)
+# TYPE kyrodb_l1_combined_hit_rate gauge
+kyrodb_l1_combined_hit_rate 0.717
+
+# HELP kyrodb_l1a_hit_rate L1a document cache hit rate (RMI frequency)
+# TYPE kyrodb_l1a_hit_rate gauge
+kyrodb_l1a_hit_rate 0.502
+
+# HELP kyrodb_l1b_hit_rate L1b query cache hit rate (semantic similarity)
+# TYPE kyrodb_l1b_hit_rate gauge
+kyrodb_l1b_hit_rate 0.214
 
 # HELP kyrodb_hnsw_vector_count Total vectors in HNSW index
 # TYPE kyrodb_hnsw_vector_count gauge
@@ -212,12 +220,14 @@ curl http://localhost:51051/slo
 {
   "status": "ok",
   "metrics": {
-    "p99_latency_ms": 2.5,
-    "cache_hit_rate": 0.451
+    "p99_latency_ms": 0.9,
+    "l1_combined_hit_rate": 0.717,
+    "l1a_hit_rate": 0.502,
+    "l1b_hit_rate": 0.214
   },
   "thresholds": {
-    "p99_latency_ms": 10.0,
-    "cache_hit_rate": 0.40
+    "p99_latency_ms": 1.0,
+    "l1_combined_hit_rate": 0.70
   },
   "breaches": []
 }

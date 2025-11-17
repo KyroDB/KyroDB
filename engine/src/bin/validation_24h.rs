@@ -725,9 +725,9 @@ async fn main() -> Result<()> {
     println!(
         "  Status:                {}",
         if (2.0..=3.5).contains(&improvement) {
-            "✅ PASS"
+            "PASS"
         } else {
-            "❌ FAIL"
+            "FAIL"
         }
     );
     println!();
@@ -740,9 +740,9 @@ async fn main() -> Result<()> {
     println!(
         "  Task crashed:    {}",
         if training_crashed {
-            "❌ YES"
+            "YES"
         } else {
-            "✅ NO"
+            "NO"
         }
     );
     println!();
@@ -758,11 +758,11 @@ async fn main() -> Result<()> {
         println!(
             "  Status:          {}",
             if memory_growth_pct.abs() < 5.0 {
-                "✅ PASS"
+                "PASS"
             } else if memory_growth_pct.abs() < 10.0 {
-                "⚠️  WARN"
+                "WARN"
             } else {
-                "❌ FAIL"
+                "FAIL"
             }
         );
     } else {
@@ -787,38 +787,38 @@ async fn main() -> Result<()> {
     println!(
         "  ✓ Hybrid Semantic Cache hit rate 70-90%:       {}",
         if hit_rate_pass {
-            "✅ PASS"
+            "PASS"
         } else {
-            "❌ FAIL"
+            "FAIL"
         }
     );
     println!(
         "  ✓ Improvement 2.0-3.0× over LRU:       {}",
         if improvement_pass {
-            "✅ PASS"
+            "PASS"
         } else {
-            "❌ FAIL"
+            "FAIL"
         }
     );
     println!(
         "  ✓ Memory growth < 5%:                  {}",
-        if memory_pass { "✅ PASS" } else { "❌ FAIL" }
+        if memory_pass { "PASS" } else { "FAIL" }
     );
     println!(
         "  ✓ Training task stable:                {}",
         if training_pass {
-            "✅ PASS"
+            "PASS"
         } else {
-            "❌ FAIL"
+            "FAIL"
         }
     );
     println!();
     println!(
         "Decision: {}",
         if go_decision {
-            "✅ GO for Week 13-16"
+            "GO for Week 13-16"
         } else {
-            "❌ NO-GO - needs investigation"
+            "NO-GO - needs investigation"
         }
     );
     println!();

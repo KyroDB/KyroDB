@@ -325,8 +325,8 @@ impl KyroDbService for KyroDBServiceImpl {
                     } else {
                         vec![]
                     },
-                    metadata: HashMap::new(), // TODO: Phase 1
-                    served_from: query_response::Tier::Unknown as i32, // TODO: Track tier
+                    metadata: HashMap::new(),
+                    served_from: query_response::Tier::Unknown as i32,
                     error: String::new(),
                 }))
             }
@@ -435,7 +435,7 @@ impl KyroDbService for KyroDBServiceImpl {
                                 doc_id: r.doc_id,
                                 score: convert_distance_to_score(r.distance),
                                 embedding,
-                                metadata: HashMap::new(), // TODO: Phase 1
+                                metadata: HashMap::new(),
                             }
                         })
                         .collect()
@@ -446,7 +446,7 @@ impl KyroDbService for KyroDBServiceImpl {
                             doc_id: r.doc_id,
                             score: convert_distance_to_score(r.distance),
                             embedding: vec![],
-                            metadata: HashMap::new(), // TODO: Phase 1
+                            metadata: HashMap::new(),
                         })
                         .collect()
                 };
@@ -465,7 +465,7 @@ impl KyroDbService for KyroDBServiceImpl {
                     results: search_results.clone(),
                     total_found: search_results.len() as u32,
                     search_latency_ms: latency_ms as f32,
-                    search_path: search_response::SearchPath::Unknown as i32, // TODO: Track path
+                    search_path: search_response::SearchPath::Unknown as i32,
                     error: String::new(),
                 }))
             }
@@ -487,7 +487,7 @@ impl KyroDbService for KyroDBServiceImpl {
         &self,
         _request: Request<Streaming<SearchRequest>>,
     ) -> Result<Response<Self::BulkSearchStream>, Status> {
-        // TODO: Phase 1 - implement bulk search with batching
+        // Bulk search with batching is not yet implemented
         Err(Status::unimplemented("bulk_search not yet implemented"))
     }
 
@@ -574,7 +574,7 @@ impl KyroDbService for KyroDBServiceImpl {
             cache_hits: stats.cache_hits,
             cache_misses: stats.cache_misses,
             cache_hit_rate: stats.cache_hit_rate * 100.0,
-            cache_size: 0, // TODO: Expose from cache strategy
+            cache_size: 0,
 
             // Hot tier metrics
             hot_tier_hits: stats.hot_tier_hits,
@@ -587,16 +587,16 @@ impl KyroDbService for KyroDBServiceImpl {
             cold_tier_searches: stats.cold_tier_searches,
             cold_tier_size: stats.cold_tier_size as u64,
 
-            // Performance metrics (TODO: Add histogram tracking)
+            // Performance metrics
             p50_latency_ms: 0.0,
             p95_latency_ms: 0.0,
             p99_latency_ms: 0.0,
             total_queries: stats.total_queries,
             total_inserts: stats.total_inserts,
-            queries_per_second: 0.0, // TODO: Track windowed QPS
-            inserts_per_second: 0.0, // TODO: Track windowed IPS
+            queries_per_second: 0.0,
+            inserts_per_second: 0.0,
 
-            // System metrics (TODO: Add jemalloc integration)
+            // System metrics
             memory_usage_bytes: 0,
             disk_usage_bytes: 0,
             cpu_usage_percent: 0.0,
@@ -655,7 +655,7 @@ impl KyroDbService for KyroDBServiceImpl {
         &self,
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
-        // TODO: Phase 1 - implement manual snapshots
+        // Manual snapshot triggering is not yet implemented
         Err(Status::unimplemented("create_snapshot not yet implemented"))
     }
 
@@ -970,7 +970,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(16);
 
     // Initialize or recover engine
-    info!("Initializing TieredEngine with A/B testing (LRU vs Learned with Week 1-4 features)...");
+    info!("Initializing TieredEngine with A/B testing (LRU vs learned strategy)...");
 
     // Helper to create cache strategy (Two-level cache architecture)
     let create_cache_strategy = || {
@@ -995,7 +995,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     info!(
-        "Week 1-4 features: clustering={}, prefetching={}",
+        "Features: clustering={}, prefetching={}",
         config.cache.enable_query_clustering, config.cache.enable_prefetching
     );
 
@@ -1045,7 +1045,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?
     };
 
-    info!("TieredEngine initialized successfully with Week 1-4 cache optimizations");
+    info!("TieredEngine initialized successfully with configured cache optimizations");
 
     // Wrap engine in Arc<RwLock> for concurrent access
     let engine_arc = Arc::new(RwLock::new(engine));

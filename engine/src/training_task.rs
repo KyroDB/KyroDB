@@ -473,7 +473,7 @@ mod tests {
             events.push(event);
         }
 
-        // Create config with Week 1-2 defaults
+        // Create config with baseline defaults
         let config = TrainingConfig::default();
 
         // Train predictor
@@ -501,13 +501,13 @@ mod tests {
     async fn test_config_default() {
         let config = TrainingConfig::default();
         assert_eq!(config.interval, Duration::from_secs(600));
-        assert_eq!(config.window_duration, Duration::from_secs(3600)); // Week 1-2: 1 hour
+        assert_eq!(config.window_duration, Duration::from_secs(3600));
         assert_eq!(config.min_events_for_training, 100);
         assert_eq!(config.rmi_capacity, 10_000);
-        assert_eq!(config.recency_halflife, Duration::from_secs(1800)); // Week 1-2: 30 min
-        assert_eq!(config.admission_threshold, 0.15); // Week 1-2: lower threshold
-        assert_eq!(config.auto_tune_enabled, true); // Week 1-2: auto-tune enabled
-        assert_eq!(config.target_utilization, 0.85); // Week 1-2: 85% target
+        assert_eq!(config.recency_halflife, Duration::from_secs(1800));
+        assert_eq!(config.admission_threshold, 0.15);
+        assert_eq!(config.auto_tune_enabled, true);
+        assert_eq!(config.target_utilization, 0.85);
     }
 
     #[tokio::test]

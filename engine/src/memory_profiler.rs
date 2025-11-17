@@ -189,7 +189,7 @@ impl MemoryProfiler {
 
             // Flag potential leaks
             if detect_memory_leak(&self.initial, stats, 100.0) {
-                println!("  ⚠️  WARNING: Potential memory leak detected (>100 MB growth)");
+                println!("  WARNING: Potential memory leak detected (>100 MB growth)");
             }
         }
     }
