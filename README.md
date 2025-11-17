@@ -130,6 +130,23 @@ cargo build --release --bin validation_enterprise
 # - Cache quality metrics (NDCG@10)
 ```
 
+You can override the validation workload without editing JSON configs:
+
+```bash
+./target/release/validation_enterprise \
+     --cache-capacity 80 \
+     --working-set-multiplier 2.0 \
+     --query-reuse-probability 0.75 \
+     --min-reuse-pool-size 8
+```
+
+- `--cache-capacity` increases the physical document cache (Layer 1a) slots.
+- `--working-set-multiplier` shrinks/expands the modeled hot set so the cache/WS ratio stays above the 60% warning threshold.
+- `--query-reuse-probability` tunes how often semantic paraphrases reuse the sticky query for a document.
+- `--min-reuse-pool-size` enforces a minimum paraphrase pool before sticky reuse engages, making experiments reproducible.
+
+The banner now reports both the expected working set size and the cache/WS ratio; if it drops below 60 %, the run is flagged so SLO failures are never misdiagnosed as predictor bugs.
+
 **Implemented Features**:
 - Three-tier query flow (Cache → Hot Tier → HNSW)
 - Hybrid Semantic Cache with RMI frequency prediction and semantic similarity

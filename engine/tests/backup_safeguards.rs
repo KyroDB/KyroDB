@@ -5,7 +5,10 @@ use tempfile::TempDir;
 
 fn backup_env_guard() -> std::sync::MutexGuard<'static, ()> {
     static BACKUP_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    BACKUP_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    BACKUP_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
 }
 
 #[test]

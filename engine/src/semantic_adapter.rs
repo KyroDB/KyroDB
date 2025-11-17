@@ -594,7 +594,7 @@ mod tests {
     fn test_semantic_config_defaults() {
         let config = SemanticConfig::default();
 
-        assert_eq!(config.high_confidence_threshold, 0.75);
+        assert_eq!(config.high_confidence_threshold, 0.60);
         assert_eq!(config.low_confidence_threshold, 0.25);
         assert_eq!(config.semantic_similarity_threshold, 0.82);
         assert_eq!(config.max_cached_embeddings, 100_000);

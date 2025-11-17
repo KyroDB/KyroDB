@@ -633,7 +633,9 @@ impl LearnedCachePredictor {
         if index >= sorted_hotness.len() {
             // This case should not be hit with the `min` and `saturating_sub` logic,
             // but as a failsafe, we take the score of the last element.
-            self.cache_threshold = sorted_hotness.last().map_or(self.admission_floor, |&(_, score)| score);
+            self.cache_threshold = sorted_hotness
+                .last()
+                .map_or(self.admission_floor, |&(_, score)| score);
         } else {
             let mut target_threshold = sorted_hotness[index].1;
             target_threshold = target_threshold.clamp(self.admission_floor, 1.0);

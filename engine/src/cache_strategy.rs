@@ -148,7 +148,7 @@ impl LearnedCacheStrategy {
         //     .saturating_mul(8)
         //     .clamp(cache_capacity.max(1), predictor_cap);
         // predictor.set_target_hot_entries(desired);
-        
+
         predictor.set_threshold_smoothing(0.12);
 
         let predictor_cap = predictor.capacity_limit().max(1);

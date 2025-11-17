@@ -6,12 +6,12 @@ use crate::cache_strategy::LearnedCacheStrategy;
 use crate::learned_cache::LearnedCachePredictor;
 use crate::metrics::MetricsCollector;
 use anyhow::Result;
+use parking_lot::RwLock;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -112,7 +112,7 @@ pub async fn spawn_training_task(
                 _ = interval.tick() => {
                     // Fetch recent access events
                     let events = {
-                        let logger = access_logger.read().await;
+                        let logger = access_logger.read();
                         logger.get_recent_window(config.window_duration)
                     };
 
@@ -477,7 +477,7 @@ mod tests {
         let config = TrainingConfig::default();
 
         // Train predictor
-        let result = train_predictor(&events, 100, &config);
+        let result = train_predictor(&events, 100, &config, 50); // target_hot_entries
         assert!(result.is_ok());
 
         let predictor = result.unwrap();
@@ -491,7 +491,7 @@ mod tests {
         // Empty events should not panic
         let events = Vec::new();
         let config = TrainingConfig::default();
-        let result = train_predictor(&events, 100, &config);
+        let result = train_predictor(&events, 100, &config, 50); // target_hot_entries
 
         // Training with no events should succeed (predictor just won't be useful)
         assert!(result.is_ok());
@@ -534,8 +534,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_training_supervisor_clean_abort() {
-        use std::sync::atomic::AtomicBool;
-
         // Create logger with sufficient data
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {

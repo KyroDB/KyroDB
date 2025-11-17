@@ -23,9 +23,8 @@
 use clap::Parser;
 use kyrodb_engine::{
     cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
-    prefetch::Prefetcher,
     ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
-    SearchResult, TieredEngine, TieredEngineConfig,
+    QueryHashCache, SearchResult, TieredEngine, TieredEngineConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1002,12 +1001,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cache_strategy = create_cache_strategy();
 
+    // Create query cache (L1b) - semantic similarity-based
+    let query_cache = Arc::new(kyrodb_engine::QueryHashCache::new(
+        100,  // capacity: 100 query hashes
+        0.82, // similarity threshold from SemanticConfig default
+    ));
+
     let data_dir_path = config.persistence.data_dir.clone();
     let engine = if data_dir_path.exists() {
         info!("Data directory exists, attempting recovery...");
 
         match TieredEngine::recover(
             cache_strategy,
+            query_cache.clone(),
             data_dir_path.to_str().unwrap(),
             engine_config.clone(),
         ) {
@@ -1018,9 +1024,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 warn!(error = %e, "Recovery failed, creating new engine");
                 let fallback_cache_strategy = create_cache_strategy();
+                let query_cache_fallback = Arc::new(kyrodb_engine::QueryHashCache::new(100, 0.82));
                 let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]];
                 TieredEngine::new(
                     fallback_cache_strategy,
+                    query_cache_fallback,
                     dummy_embedding,
                     engine_config.clone(),
                 )?
@@ -1029,7 +1037,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("Creating new TieredEngine...");
         let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]];
-        TieredEngine::new(cache_strategy, dummy_embedding, engine_config.clone())?
+        TieredEngine::new(
+            cache_strategy,
+            query_cache.clone(),
+            dummy_embedding,
+            engine_config.clone(),
+        )?
     };
 
     info!("TieredEngine initialized successfully with Week 1-4 cache optimizations");

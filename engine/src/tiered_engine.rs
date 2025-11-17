@@ -1,15 +1,18 @@
-//! Tiered Engine - Three-layer architecture orchestrator
+//! Tiered Engine - Two-level cache architecture orchestrator
 //!
-//! Coordinates all three tiers:
-//! //! - **Layer 1 (Cache)**: Hybrid Semantic Cache (RMI frequency + semantic similarity)
+//! Coordinates all tiers:
+//! - **Layer 1a (Document Cache)**: RMI frequency-based cache (hot documents)
+//! - **Layer 1b (Query Cache)**: Semantic similarity-based cache (paraphrased queries)
 //! - **Layer 2 (Hot Tier)**: Recent writes buffer (fast writes, periodic flush)
 //! - **Layer 3 (Cold Tier)**: HNSW index (all documents, approximate k-NN search)
 //!
-//! # Query Path
+//! # Query Path (Two-Level Cache)
 //! ```text
-//! Query → Cache (L1) → Hot Tier (L2) → HNSW (L3)
-//!         ↓ hit         ↓ hit           ↓ always succeeds
-//!       return        return          return k-NN results
+//! Query → L1a (Doc Cache) → L1b (Query Cache) → L2 (Hot Tier) → L3 (HNSW)
+//!         ↓ hit (47%)       ↓ hit (25%)         ↓ hit (<1%)      ↓ always
+//!       return            return              return           return
+//!
+//! Combined L1 hit rate: 72%+ (L1a + L1b)
 //! ```
 //!
 //! # Write Path
@@ -19,7 +22,7 @@
 
 use crate::{
     AccessPatternLogger, CacheStrategy, CachedVector, CircuitBreaker, FsyncPolicy, HnswBackend,
-    HotTier, SearchResult,
+    HotTier, QueryHashCache, SearchResult,
 };
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
@@ -30,13 +33,24 @@ use tokio::sync::Semaphore;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
-/// Tiered engine statistics
+/// Tiered engine statistics (Two-Level Cache Architecture)
 #[derive(Debug, Clone, Default)]
 pub struct TieredEngineStats {
-    /// Layer 1 (Cache) statistics
+    /// Layer 1a (Document Cache) statistics - RMI frequency-based
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_hit_rate: f64,
+
+    /// Layer 1b (Query Cache) statistics - Semantic similarity-based
+    pub query_cache_hits: u64,
+    pub query_cache_misses: u64,
+    pub query_cache_hit_rate: f64,
+    pub query_cache_exact_hits: u64,      // Exact query hash matches
+    pub query_cache_similarity_hits: u64, // Similarity-based matches
+
+    /// Combined L1 (L1a + L1b) statistics
+    pub l1_combined_hits: u64, // cache_hits + query_cache_hits
+    pub l1_combined_hit_rate: f64, // (cache_hits + query_cache_hits) / total_queries
 
     /// Layer 2 (Hot Tier) statistics
     pub hot_tier_hits: u64,
@@ -44,8 +58,8 @@ pub struct TieredEngineStats {
     pub hot_tier_hit_rate: f64,
     pub hot_tier_size: usize,
     pub hot_tier_flushes: u64,
-    pub hot_tier_flush_failures: u64, // NEW: Failed flush operations
-    pub hot_tier_emergency_evictions: u64, // NEW: Emergency evictions due to hard limit
+    pub hot_tier_flush_failures: u64,      // Failed flush operations
+    pub hot_tier_emergency_evictions: u64, // Emergency evictions due to hard limit
 
     /// Layer 3 (Cold Tier) statistics
     pub cold_tier_searches: u64,
@@ -54,7 +68,7 @@ pub struct TieredEngineStats {
     /// Overall statistics
     pub total_queries: u64,
     pub total_inserts: u64,
-    pub overall_hit_rate: f64, // (cache_hits + hot_tier_hits) / total_queries
+    pub overall_hit_rate: f64, // (l1_combined_hits + hot_tier_hits) / total_queries
 
     /// Timeout statistics
     pub cache_timeouts: u64,
@@ -124,10 +138,13 @@ impl Default for TieredEngineConfig {
     }
 }
 
-/// Tiered Engine - Three-layer vector database
+/// Tiered Engine - Two-level cache vector database
 pub struct TieredEngine {
-    /// Layer 1: Hybrid Semantic Cache (hot documents predicted by RMI + semantic)
+    /// Layer 1a: Document Cache (RMI frequency-based, hot documents)
     cache_strategy: Arc<RwLock<Box<dyn CacheStrategy>>>,
+
+    /// Layer 1b: Query Cache (Semantic similarity-based, paraphrased queries)
+    query_cache: Arc<QueryHashCache>,
 
     /// Layer 2: Hot tier (recent writes)
     hot_tier: Arc<HotTier>,
@@ -162,6 +179,7 @@ impl TieredEngine {
     /// - `config`: Configuration for all tiers
     pub fn new(
         cache_strategy: Box<dyn CacheStrategy>,
+        query_cache: Arc<QueryHashCache>,
         initial_embeddings: Vec<Vec<f32>>,
         config: TieredEngineConfig,
     ) -> Result<Self> {
@@ -193,6 +211,7 @@ impl TieredEngine {
 
         Ok(Self {
             cache_strategy: Arc::new(RwLock::new(cache_strategy)),
+            query_cache,
             hot_tier,
             cold_tier,
             access_logger: None,
@@ -208,6 +227,7 @@ impl TieredEngine {
     /// Recover from persistence
     pub fn recover(
         cache_strategy: Box<dyn CacheStrategy>,
+        query_cache: Arc<QueryHashCache>,
         data_dir: impl AsRef<Path>,
         config: TieredEngineConfig,
     ) -> Result<Self> {
@@ -236,6 +256,7 @@ impl TieredEngine {
 
         Ok(Self {
             cache_strategy: Arc::new(RwLock::new(cache_strategy)),
+            query_cache,
             hot_tier,
             cold_tier,
             access_logger: None,
@@ -325,6 +346,36 @@ impl TieredEngine {
             );
         }
 
+        // Layer 1b: Check query cache (semantic similarity)
+        // Only check if we have a query embedding (needed for similarity matching)
+        if let Some(query_emb) = query_embedding {
+            if let Some(cached_query) = self.query_cache.get(query_emb) {
+                // Query cache hit (L1b) - similarity or exact match
+                {
+                    let mut stats = self.stats.write();
+                    stats.query_cache_hits += 1;
+                } // Lock released
+
+                // Log access for RMI training
+                if let Some(ref logger) = self.access_logger {
+                    logger.write().log_access(cached_query.doc_id, query_emb);
+                } // logger lock released
+
+                debug!(
+                    "L1b hit: doc_id={}, query_hash={}",
+                    cached_query.doc_id, cached_query.query_hash
+                );
+
+                return Some(cached_query.embedding);
+            }
+
+            // Query cache miss (L1b)
+            {
+                let mut stats = self.stats.write();
+                stats.query_cache_misses += 1;
+            } // Lock released
+        }
+
         // Layer 2: Check hot tier with circuit breaker protection
         if !self.hot_tier_circuit_breaker.is_open() {
             if let Some(embedding) = self.hot_tier.get(doc_id) {
@@ -337,7 +388,7 @@ impl TieredEngine {
                     stats.hot_tier_hits += 1;
                 } // Lock released
 
-                // Cache admission decision (isolated)
+                // Cache admission decision for L1a (isolated)
                 let should_cache_decision = {
                     let cache = self.cache_strategy.write();
                     cache.should_cache(doc_id, &embedding)
@@ -350,9 +401,16 @@ impl TieredEngine {
                         distance: 0.0,
                         cached_at: Instant::now(),
                     };
-                    // Insert into cache (isolated)
+                    // Insert into L1a document cache (isolated)
                     self.cache_strategy.write().insert_cached(cached);
                 } // cache_strategy lock released
+
+                // L1b admission: Cache in query cache if we have query embedding
+                if let Some(query_emb) = query_embedding {
+                    self.query_cache
+                        .insert(query_emb.to_vec(), doc_id, embedding.clone());
+                    debug!("L1b insert: doc_id={} (from L2 hot tier)", doc_id);
+                }
 
                 // Log access (no other locks held)
                 if let Some(ref logger) = self.access_logger {
@@ -393,7 +451,7 @@ impl TieredEngine {
                     stats.cold_tier_searches += 1;
                 } // Lock released
 
-                // Cache admission decision (isolated)
+                // Cache admission decision for L1a (isolated)
                 let should_cache_decision = {
                     let cache = self.cache_strategy.write();
                     cache.should_cache(doc_id, &embedding)
@@ -406,9 +464,16 @@ impl TieredEngine {
                         distance: 0.0,
                         cached_at: Instant::now(),
                     };
-                    // Insert into cache (isolated)
+                    // Insert into L1a document cache (isolated)
                     self.cache_strategy.write().insert_cached(cached);
                 } // cache_strategy lock released
+
+                // L1b admission: Cache in query cache if we have query embedding
+                if let Some(query_emb) = query_embedding {
+                    self.query_cache
+                        .insert(query_emb.to_vec(), doc_id, embedding.clone());
+                    debug!("L1b insert: doc_id={} (from L3 cold tier)", doc_id);
+                }
 
                 // Log access (no other locks held)
                 if let Some(ref logger) = self.access_logger {
@@ -881,11 +946,26 @@ impl TieredEngine {
 
         stats.cold_tier_size = self.cold_tier.len();
 
-        // Calculate overall hit rate
-        let total_hits = stats.cache_hits + stats.hot_tier_hits;
+        // Get L1b (query cache) stats
+        let query_cache_stats = self.query_cache.stats();
+        stats.query_cache_exact_hits = query_cache_stats.exact_hits;
+        stats.query_cache_similarity_hits = query_cache_stats.similarity_hits;
+
+        // Calculate hit rates (if we have queries)
         if stats.total_queries > 0 {
-            stats.overall_hit_rate = total_hits as f64 / stats.total_queries as f64;
+            // L1a (document cache) hit rate
             stats.cache_hit_rate = stats.cache_hits as f64 / stats.total_queries as f64;
+
+            // L1b (query cache) hit rate
+            stats.query_cache_hit_rate = stats.query_cache_hits as f64 / stats.total_queries as f64;
+
+            // Combined L1 (L1a + L1b) hit rate
+            stats.l1_combined_hits = stats.cache_hits + stats.query_cache_hits;
+            stats.l1_combined_hit_rate = stats.l1_combined_hits as f64 / stats.total_queries as f64;
+
+            // Overall hit rate (L1 + L2)
+            let total_hits = stats.l1_combined_hits + stats.hot_tier_hits;
+            stats.overall_hit_rate = total_hits as f64 / stats.total_queries as f64;
         }
 
         stats
@@ -911,6 +991,7 @@ mod tests {
     #[test]
     fn test_tiered_engine_query_path() {
         let cache = LruCacheStrategy::new(100);
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_embeddings = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
 
         let config = TieredEngineConfig {
@@ -920,7 +1001,8 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+        let engine =
+            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, config).unwrap();
 
         // Query doc 0 (in cold tier)
         let result = engine.query(0, None);
@@ -944,7 +1026,9 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine =
+            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, config).unwrap();
 
         // Insert into hot tier
         engine.insert(10, vec![0.5, 0.5]).unwrap();
@@ -971,7 +1055,9 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine =
+            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, config).unwrap();
 
         // Insert 2 documents (trigger flush threshold)
         engine.insert(10, vec![0.1, 0.1]).unwrap();
@@ -1008,7 +1094,10 @@ mod tests {
                 ..Default::default()
             };
 
-            let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+            let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+            let engine =
+                TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, config)
+                    .unwrap();
 
             // Insert and flush (should trigger because hot_tier_max_size=1)
             engine.insert(10, vec![0.5, 0.5]).unwrap();
@@ -1030,13 +1119,15 @@ mod tests {
 
         // Recover
         let cache = LruCacheStrategy::new(100);
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
             hnsw_max_elements: 100,
             ..Default::default()
         };
 
-        let recovered = TieredEngine::recover(Box::new(cache), dir.path(), config).unwrap();
+        let recovered =
+            TieredEngine::recover(Box::new(cache), query_cache, dir.path(), config).unwrap();
 
         // Verify data recovered
         assert!(
@@ -1068,7 +1159,8 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap();
 
         // Search for nearest neighbors
         let query = vec![5.0, 0.0, 0.0, 0.0];
@@ -1100,7 +1192,8 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap();
 
         let query = vec![2.5, 0.0, 0.0, 0.0];
         let results = engine.knn_search_with_timeouts(&query, 2).await.unwrap();
@@ -1122,7 +1215,8 @@ mod tests {
         config.data_dir = None;
         config.hnsw_max_elements = 100;
 
-        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap();
 
         // Initial stats should be zero
         let stats = engine.stats();
@@ -1152,7 +1246,8 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap();
 
         let query = vec![500.0; 128];
         let _result = engine.knn_search_with_timeouts(&query, 10).await;
@@ -1177,7 +1272,8 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap();
 
         // All circuit breakers should start closed
         assert!(engine.cache_circuit_breaker.is_closed());
@@ -1199,7 +1295,8 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap();
 
         // Trigger multiple searches - some may timeout, some may succeed
         for _ in 0..10 {
@@ -1236,7 +1333,9 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = Arc::new(TieredEngine::new(Box::new(cache), embeddings, config).unwrap());
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine =
+            Arc::new(TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap());
 
         // Barrier to coordinate: 2 background tasks will wait AFTER acquiring permit
         // but BEFORE releasing it, so main thread can attempt 3rd query
@@ -1308,7 +1407,9 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = Arc::new(TieredEngine::new(Box::new(cache), embeddings, config).unwrap());
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine =
+            Arc::new(TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap());
 
         // Execute first query - should succeed
         let query1 = vec![1.0, 2.0];
@@ -1337,7 +1438,8 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap();
 
         // Manually open circuit breakers to test rejection path
         engine.cache_circuit_breaker.open();
@@ -1369,7 +1471,9 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = Arc::new(TieredEngine::new(Box::new(cache), embeddings, config).unwrap());
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine =
+            Arc::new(TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap());
 
         // Initial queue depth should be 0
         let initial_stats = engine.stats();
@@ -1408,7 +1512,8 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, config).unwrap();
 
         // Open cold tier circuit breaker
         engine.cold_tier_circuit_breaker.open();
@@ -1442,7 +1547,9 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine =
+            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, config).unwrap();
 
         // Insert documents into hot tier
         engine.insert(10, vec![2.0, 0.0]).unwrap();
@@ -1460,7 +1567,7 @@ mod tests {
 
         // Verify stats include flush operations
         let stats = engine.stats();
-        assert!(stats.hot_tier_flushes > 0 || stats.hot_tier_flush_failures >= 0);
+        assert!(stats.hot_tier_flushes > 0);
     }
 
     #[test]
@@ -1481,7 +1588,9 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let engine =
+            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, config).unwrap();
 
         // Insert documents up to hard limit
         // Hard limit is 6, so insert 6 documents

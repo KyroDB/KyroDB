@@ -65,9 +65,9 @@ pub mod access_logger;
 // A/B testing: Framework for cache strategy comparison
 pub mod ab_stats; // Metrics persistence (CSV format)
 pub mod cache_strategy; // CacheStrategy trait + LRU/Learned implementations + A/B splitter
+pub mod query_hash_cache;
 pub mod training_task; // Background RMI training task (tokio::spawn, 60-second interval)
-pub mod vector_cache; // In-memory vector cache with LRU eviction
-pub mod query_hash_cache; // Query hash cache (L1b): Semantic similarity-based query caching
+pub mod vector_cache; // In-memory vector cache with LRU eviction // Query hash cache (L1b): Semantic similarity-based query caching
 
 // Query clustering: Semantic grouping for cache optimization
 pub mod query_clustering;
@@ -137,9 +137,9 @@ pub use access_logger::{hash_embedding, AccessLoggerStats, AccessPatternLogger};
 // A/B testing components
 pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
 pub use cache_strategy::{AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy};
+pub use query_hash_cache::{CachedQueryResult, QueryCacheStats, QueryHashCache};
 pub use training_task::{spawn_training_task, TrainingConfig};
 pub use vector_cache::{CacheStatsSnapshot, CachedVector, VectorCache};
-pub use query_hash_cache::{CachedQueryResult, QueryCacheStats, QueryHashCache};
 
 // Query clustering components
 pub use query_clustering::{ClusterId, ClusterStats, QueryCluster, QueryClusterer};

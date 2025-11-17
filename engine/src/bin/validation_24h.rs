@@ -352,8 +352,12 @@ async fn main() -> Result<()> {
     let training_config = TrainingConfig {
         interval: Duration::from_secs(config.training_interval_secs),
         window_duration: Duration::from_secs(24 * 3600),
+        recency_halflife: Duration::from_secs(1800), // 30 min
         min_events_for_training: 100,
         rmi_capacity: config.cache_capacity,
+        admission_threshold: 0.15,
+        auto_tune_enabled: true,
+        target_utilization: 0.85,
     };
 
     // Create shutdown channel (unused in validation, but required for API)

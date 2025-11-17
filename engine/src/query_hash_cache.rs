@@ -22,11 +22,11 @@
 //! - Memory: ~154 KB for 100 queries × 384-dim embeddings
 
 use parking_lot::RwLock;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Cached query result
 ///
@@ -479,7 +479,8 @@ mod tests {
     fn create_test_embedding(seed: u64, dim: usize) -> Vec<f32> {
         let mut emb = vec![0.0; dim];
         for (i, val) in emb.iter_mut().enumerate() {
-            *val = ((seed as f32 + i as f32) % 1.0) / dim as f32;
+            // Use seed to create unique patterns
+            *val = ((seed * 1000 + i as u64) as f32).sin();
         }
         // Normalize
         let mag: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -556,13 +557,29 @@ mod tests {
         let cache = QueryHashCache::new(3, 0.85);
 
         // Fill cache
-        cache.insert(create_test_embedding(1, 128), 1, create_test_embedding(101, 128));
-        cache.insert(create_test_embedding(2, 128), 2, create_test_embedding(102, 128));
-        cache.insert(create_test_embedding(3, 128), 3, create_test_embedding(103, 128));
+        cache.insert(
+            create_test_embedding(1, 128),
+            1,
+            create_test_embedding(101, 128),
+        );
+        cache.insert(
+            create_test_embedding(2, 128),
+            2,
+            create_test_embedding(102, 128),
+        );
+        cache.insert(
+            create_test_embedding(3, 128),
+            3,
+            create_test_embedding(103, 128),
+        );
         assert_eq!(cache.len(), 3);
 
         // Insert 4th query, should evict query 1 (oldest)
-        cache.insert(create_test_embedding(4, 128), 4, create_test_embedding(104, 128));
+        cache.insert(
+            create_test_embedding(4, 128),
+            4,
+            create_test_embedding(104, 128),
+        );
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.stats().evictions, 1);
 
@@ -638,8 +655,16 @@ mod tests {
     fn test_query_cache_clear() {
         let cache = QueryHashCache::new(10, 0.85);
 
-        cache.insert(create_test_embedding(1, 128), 1, create_test_embedding(101, 128));
-        cache.insert(create_test_embedding(2, 128), 2, create_test_embedding(102, 128));
+        cache.insert(
+            create_test_embedding(1, 128),
+            1,
+            create_test_embedding(101, 128),
+        );
+        cache.insert(
+            create_test_embedding(2, 128),
+            2,
+            create_test_embedding(102, 128),
+        );
 
         assert_eq!(cache.len(), 2);
         cache.get(&create_test_embedding(1, 128));
