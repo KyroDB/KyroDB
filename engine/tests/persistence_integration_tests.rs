@@ -67,7 +67,7 @@ fn test_snapshot_save_load() {
         (2, vec![0.0, 0.0, 1.0, 0.0]),
     ];
 
-    let metadata = documents.iter().map(|(id, _)| (*id, std::collections::HashMap::new())).collect();
+    let metadata = documents.iter().map(|(id, _)| (*id, HashMap::new())).collect();
     let snapshot = Snapshot::new(4, documents, metadata).unwrap();
     snapshot.save(&snapshot_path).unwrap();
 
@@ -77,6 +77,9 @@ fn test_snapshot_save_load() {
     assert_eq!(loaded.dimension, 4);
     assert_eq!(loaded.doc_count, 3);
     assert_eq!(loaded.documents.len(), 3);
+    assert_eq!(loaded.metadata.len(), 3);
+    // Metadata is a Vec, check length matches
+    assert!(loaded.metadata.len() >= 3);
     assert_eq!(loaded.documents[0].0, 0);
     assert_eq!(loaded.documents[0].1, vec![1.0, 0.0, 0.0, 0.0]);
 }
@@ -90,6 +93,7 @@ fn test_hnsw_backend_persistence() {
 
     let backend = HnswBackend::with_persistence(
         initial_embeddings.clone(),
+        vec![HashMap::new(); 2],
         100,
         dir.path(),
         FsyncPolicy::Always,
@@ -98,8 +102,8 @@ fn test_hnsw_backend_persistence() {
     .unwrap();
 
     // Insert new documents
-    backend.insert(2, vec![0.0, 0.0, 1.0, 0.0]).unwrap();
-    backend.insert(3, vec![0.0, 0.0, 0.0, 1.0]).unwrap();
+    backend.insert(2, vec![0.0, 0.0, 1.0, 0.0], HashMap::new()).unwrap();
+    backend.insert(3, vec![0.0, 0.0, 0.0, 1.0], HashMap::new()).unwrap();
 
     // Verify documents exist
     let doc2 = backend.fetch_document(2).unwrap();
@@ -146,6 +150,7 @@ fn test_crash_recovery_wal_only() {
     {
         let backend = HnswBackend::with_persistence(
             initial_embeddings.clone(),
+            vec![HashMap::new(); 2],
             100,
             dir.path(),
             FsyncPolicy::Always,
@@ -154,7 +159,7 @@ fn test_crash_recovery_wal_only() {
         .unwrap();
 
         // Insert without snapshot
-        backend.insert(2, vec![0.5, 0.5]).unwrap();
+        backend.insert(2, vec![0.5, 0.5], HashMap::new()).unwrap();
 
         // Simulate crash (drop without clean shutdown)
     }
@@ -178,6 +183,7 @@ fn test_automatic_snapshot_creation() {
 
     let backend = HnswBackend::with_persistence(
         initial_embeddings,
+        vec![HashMap::new(); 1],
         100,
         dir.path(),
         FsyncPolicy::Always,
@@ -186,9 +192,9 @@ fn test_automatic_snapshot_creation() {
     .unwrap();
 
     // Insert 3 documents (should trigger snapshot)
-    backend.insert(1, vec![0.9, 0.1]).unwrap();
-    backend.insert(2, vec![0.8, 0.2]).unwrap();
-    backend.insert(3, vec![0.7, 0.3]).unwrap();
+    backend.insert(1, vec![0.9, 0.1], HashMap::new()).unwrap();
+    backend.insert(2, vec![0.8, 0.2], HashMap::new()).unwrap();
+    backend.insert(3, vec![0.7, 0.3], HashMap::new()).unwrap();
 
     // Check that snapshot was created
     let manifest_path = dir.path().join("MANIFEST");
@@ -214,6 +220,7 @@ fn test_knn_search_after_recovery() {
 
         let backend = HnswBackend::with_persistence(
             initial_embeddings,
+            vec![HashMap::new(); 3],
             100,
             dir.path(),
             FsyncPolicy::Always,
@@ -246,10 +253,10 @@ fn test_fsync_policy_never() {
     let initial_embeddings = vec![vec![1.0, 0.0]];
 
     let backend =
-        HnswBackend::with_persistence(initial_embeddings, 100, dir.path(), FsyncPolicy::Never, 5)
+        HnswBackend::with_persistence(initial_embeddings, vec![HashMap::new(); 1], 100, dir.path(), FsyncPolicy::Never, 5)
             .unwrap();
 
-    backend.insert(1, vec![0.9, 0.1]).unwrap();
+    backend.insert(1, vec![0.9, 0.1], HashMap::new()).unwrap();
     backend.create_snapshot().unwrap();
 
     // Recovery should still work

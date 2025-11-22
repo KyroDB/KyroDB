@@ -203,7 +203,7 @@ impl Default for Config {
             ms_marco_embeddings_path: None,
             ms_marco_passages_path: None,
 
-            // CRITICAL: Must load query embeddings for production-realistic semantic variance
+            // Load query embeddings for production-realistic semantic variance
             query_embeddings_path: Some("data/ms_marco/query_embeddings_100k.npy".to_string()),
             query_to_doc_path: Some("data/ms_marco/query_to_doc.txt".to_string()),
             top_k_queries_per_doc: 10,
@@ -1307,9 +1307,7 @@ async fn main() -> Result<()> {
         .max(128)
         .min(2048);
     learned_predictor.set_diversity_buckets(diversity);
-    // FIX A: Increase target to 2.5× cache capacity for better coverage
-    // Root cause: With Zipf 1.4, ~175 docs are hot, but we were only targeting 36
-    // This caused RMI to be too restrictive, rejecting docs ranked 37-175
+    // Target 2.5× cache capacity (~175 docs) for Zipf 1.4 distribution
     let hot_target = (learned_cache_capacity as f32 * 2.5) as usize;
     eprintln!(
         "DEBUG VALIDATION: Setting target_hot_entries to {}",

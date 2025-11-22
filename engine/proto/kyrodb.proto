@@ -236,8 +236,8 @@ message SearchRequest {
   bool include_embeddings = 5;
   
   // Optional metadata filters (Phase 1)
-  map<string, string> metadata_filters = 6 [deprecated = true]; // Deprecated in favor of structured filter
-  MetadataFilter filter = 7;
+  MetadataFilter filter = 6;
+  map<string, string> metadata_filters = 8 [deprecated = true]; // Deprecated in favor of structured filter at tag 6
 }
 
 message MetadataFilter {

@@ -40,9 +40,7 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            // FIX B: Lower from 0.75 to engage semantic layer for mid-tier docs
-            // Root cause: Fast-path was bypassing semantic checks for docs with score 0.75+
-            // This prevented semantic rescue of borderline hot docs
+            // Lower threshold (0.65) to engage semantic layer for mid-tier docs
             high_confidence_threshold: 0.60,
             low_confidence_threshold: 0.25,
             semantic_similarity_threshold: 0.82,
@@ -475,7 +473,7 @@ mod tests {
         // Uncertain frequency score (0.25-0.75) with empty cache
         let should_cache = adapter.should_cache(0.5, &vec![0.5; 384]);
 
-        // With empty cache (< 100 embeddings), falls back to freq-only: 0.5 > 0.40 → cache
+        // Target 2.5× cache capacity (~175 docs) for Zipf 1.4 distribution
         assert!(should_cache);
 
         // Verify fast path used (cold-start bypass)

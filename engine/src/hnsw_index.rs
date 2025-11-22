@@ -1,10 +1,7 @@
-//! HNSW vector index implementation for k-NN search
+//! HNSW vector index for k-NN search
 //!
-//! HNSW k-NN vector search index (hnswlib-rs wrapper)
-//!
-//! This module wraps hnsw_rs with a clean Rust API optimized for RAG workloads.
-//! HNSW (Hierarchical Navigable Small World) provides approximate nearest neighbor search
-//! with >95% recall@10 and sub-millisecond P99 latency on 10M vectors.
+//! Thin wrapper around hnsw_rs optimized for RAG: cosine similarity,
+//! type-safe u64 doc IDs, >95% recall@10, P99 <1ms on 10M vectors.
 
 use anyhow::Result;
 use hnsw_rs::prelude::*;
@@ -19,10 +16,7 @@ pub struct SearchResult {
 
 /// HNSW vector index for approximate k-NN search
 ///
-/// This is a thin wrapper around hnsw_rs that provides:
-/// - Type-safe API (u64 doc IDs, not usize indices)
-/// - Anyhow error handling
-/// - RAG-optimized defaults (cosine similarity, ef=200)
+/// RAG-optimized defaults: cosine similarity, ef=200, M=16
 ///
 /// # Example
 /// ```no_run
@@ -45,19 +39,10 @@ impl HnswVectorIndex {
     /// Create new HNSW index
     ///
     /// # Parameters
-    /// - `dimension`: Vector dimension (e.g., 128, 768, 1536 for common embeddings)
-    /// - `max_elements`: Maximum number of vectors to store
+    /// - `dimension`: Vector dimension
+    /// - `max_elements`: Maximum capacity
     ///
-    /// # HNSW Parameters (RAG-optimized defaults)
-    /// - max_nb_connection = 16: Graph connectivity (higher = better recall, more memory)
-    /// - ef_construction = 200: Build quality (higher = better recall, slower inserts)
-    /// - max_layer = auto-calculated from max_elements
-    /// - metric = Cosine: Best for normalized embeddings
-    ///
-    /// # Performance Targets
-    /// - P99 search < 1ms on 10M vectors
-    /// - P50 search < 100µs on 10M vectors
-    /// - Recall@10 > 95% vs brute force
+    /// Uses M=16, ef_construction=200 (RAG-optimized)
     pub fn new(dimension: usize, max_elements: usize) -> Result<Self> {
         // RAG-optimized parameters
         let max_nb_connection = 16; // Graph connectivity (M parameter)
@@ -82,16 +67,7 @@ impl HnswVectorIndex {
         })
     }
 
-    /// Add vector to index
-    ///
-    /// # Parameters
-    /// - `doc_id`: Unique document identifier (u64)
-    /// - `embedding`: Dense vector (must be `dimension` length)
-    ///
-    /// # Errors
-    /// - If embedding length != dimension
-    /// - If doc_id already exists (no upserts yet)
-    /// - If max_elements capacity reached
+    /// Add vector to index (no upserts, errors if full or wrong dimension)
     pub fn add_vector(&mut self, doc_id: u64, embedding: &[f32]) -> Result<()> {
         if embedding.len() != self.dimension {
             anyhow::bail!(
@@ -118,19 +94,7 @@ impl HnswVectorIndex {
         Ok(())
     }
 
-    /// k-NN search with cosine similarity
-    ///
-    /// # Parameters
-    /// - `query`: Query vector (must be `dimension` length)
-    /// - `k`: Number of nearest neighbors to return
-    ///
-    /// # Returns
-    /// Vector of SearchResult ordered by distance (closest first)
-    ///
-    /// # Performance
-    /// - ef_search = 200 (RAG-optimized, can be tuned per query)
-    /// - P99 < 1ms on 10M vectors (target)
-    /// - Recall@10 > 95% (target)
+    /// k-NN search with cosine similarity (ef_search=200, auto-tuned for small indexes)
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         if query.len() != self.dimension {
             anyhow::bail!(
@@ -163,24 +127,8 @@ impl HnswVectorIndex {
             })
             .collect::<Vec<_>>();
 
-        // For very small indexes the underlying search may occasionally return fewer than k
-        // neighbors. For correctness (tests expect at least k when available), pad via brute
-        // force linear scan. This path is only taken for tiny indexes (<= 1024) and when
-        // results are incomplete, so it does not impact large-scale performance targets.
-        if results.len() < k && self.current_count <= 1024 {
-            let mut present: std::collections::HashSet<u64> =
-                results.iter().map(|r| r.doc_id).collect();
-            // Linear scan over all inserted vectors requires access to raw data; hnsw_rs does not
-            // expose stored vectors, so we cannot reconstruct embeddings here. Instead, we accept
-            // the smaller result set. (Future: maintain optional side array of embeddings if strict
-            // k guarantee is required.)
-            // NOTE: Returning fewer neighbors is acceptable for recall benchmarks, but tests that
-            // require strict length have been updated to handle this scenario if needed.
-            // (If strict padding becomes necessary, store embeddings externally.)
-            // Leaving logic placeholder to document design decision.
-            let _ = &mut present; // silence unused warning if optimization removes code
-        }
-
+        // For small indexes, HNSW may return fewer results
+        // Accepted tradeoff: no external embedding storage overhead
         Ok(results)
     }
 
@@ -201,19 +149,7 @@ impl HnswVectorIndex {
         self.max_elements
     }
 
-    /// Estimate memory usage in bytes
-    ///
-    /// # Components
-    /// - Vector data: current_count × dimension × sizeof(f32)
-    /// - Graph structure: current_count × max_nb_connection × 2 × sizeof(usize)
-    ///   (Each node has ~16 neighbors per layer, 2 layers average)
-    /// - Metadata overhead: ~10% of total
-    ///
-    /// # Note
-    /// This is an estimate. Actual memory may be higher due to:
-    /// - hnsw_rs internal allocations
-    /// - Rust collection overhead (Vec capacity != length)
-    /// - Memory fragmentation
+    /// Estimate memory usage assuming M=16, avg 2 layers/node, +10% overhead
     pub fn estimate_memory_bytes(&self) -> usize {
         if self.current_count == 0 {
             return 0;

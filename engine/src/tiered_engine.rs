@@ -287,7 +287,7 @@ impl TieredEngine {
     /// 5. Log access for training
     ///
     /// # Lock Ordering Discipline
-    /// **CRITICAL**: To prevent deadlocks, locks MUST be acquired in this order:
+    /// **Lock Ordering**: Always acquire locks in this order to prevent deadlocks:
     /// 1. cache_strategy (read/write)
     /// 2. stats (write)
     /// 3. access_logger (write)

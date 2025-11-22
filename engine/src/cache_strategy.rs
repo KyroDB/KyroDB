@@ -227,12 +227,11 @@ impl CacheStrategy for LearnedCacheStrategy {
     }
 
     fn invalidate(&self, doc_id: u64) {
-        if self.cache.remove(doc_id) {
-            let predictor = self.predictor.read();
-            if predictor.is_trained() {
-                predictor.record_eviction(doc_id);
-            }
-        }
+        // NOTE: Do NOT record as eviction - invalidations are forced removals due to
+        // data updates/deletions, NOT cache-pressure evictions. Recording invalidations
+        // as evictions would contaminate the predictor's training signal since invalidated
+        // items will never be requested again (they've been deleted from the source).
+        self.cache.remove(doc_id);
     }
 
     fn name(&self) -> &str {

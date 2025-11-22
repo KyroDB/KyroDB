@@ -63,7 +63,7 @@ fn estimate_selectivity(filter_type: &FilterType) -> usize {
                 / or_filter.filters.len().max(1);
             
             // OR filters are typically less selective
-            (avg_selectivity * 2).max(2).min(20)
+            (avg_selectivity * 2).clamp(2, 20)
         }
         
         // NOT: very low selectivity (inverts the filter)
@@ -72,7 +72,7 @@ fn estimate_selectivity(filter_type: &FilterType) -> usize {
                 if let Some(ref inner_type) = inner_filter.filter_type {
                     let inner_selectivity = estimate_selectivity(inner_type);
                     // Invert: if inner is highly selective (2x), NOT is very unselective (25x)
-                    (50 / inner_selectivity).min(50).max(10)
+                    (50 / inner_selectivity).clamp(10, 50)
                 } else {
                     20
                 }

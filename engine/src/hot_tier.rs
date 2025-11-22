@@ -114,28 +114,28 @@ impl HotTier {
 
     /// Bulk fetch documents from hot tier (if present)
     pub fn bulk_fetch(&self, doc_ids: &[u64]) -> Vec<Option<(Vec<f32>, HashMap<String, String>)>> {
-        let docs = self.documents.read();
-        let mut hits = 0;
-        let mut misses = 0;
+        // Take snapshot to avoid holding read lock during cloning
+        let snapshot: Vec<Option<(Vec<f32>, HashMap<String, String>)>> = {
+            let docs = self.documents.read();
+            doc_ids.iter().map(|id| {
+                docs.get(id).map(|doc| (doc.embedding.clone(), doc.metadata.clone()))
+            }).collect()
+        };
         
-        let results: Vec<_> = doc_ids.iter().map(|id| {
-            if let Some(doc) = docs.get(id) {
-                hits += 1;
-                Some((doc.embedding.clone(), doc.metadata.clone()))
-            } else {
-                misses += 1;
-                None
-            }
-        }).collect();
+        let hits = snapshot.iter().filter(|opt| opt.is_some()).count() as u64;
+        let misses = snapshot.len() as u64 - hits;
         
         let mut stats = self.stats.write();
         stats.total_hits += hits;
         stats.total_misses += misses;
         
-        results
+        snapshot
     }
 
     /// Check if a document exists in the hot tier without cloning its embedding
+    ///
+    /// Note: This is a lightweight existence check that does NOT update hit/miss stats.
+    /// Use `get()` or `bulk_fetch()` if you need stats tracking.
     pub fn exists(&self, doc_id: u64) -> bool {
         self.documents.read().contains_key(&doc_id)
     }

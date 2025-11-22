@@ -743,7 +743,7 @@ impl HnswBackend {
         
         doc_ids.iter().map(|&id| {
             let id_usize = id as usize;
-            if id_usize < embeddings.len() {
+            if id_usize < embeddings.len() && id_usize < metadata.len() {
                 let emb = &embeddings[id_usize];
                 // Check for tombstone (all zeros)
                 if emb.iter().all(|&x| x == 0.0) {

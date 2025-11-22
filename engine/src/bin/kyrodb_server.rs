@@ -202,7 +202,7 @@ impl KyroDbService for KyroDBServiceImpl {
         let mut last_error = String::new();
         let mut batch_count = 0u64;
 
-        // CRITICAL FIX: Acquire lock per-operation to prevent deadlock
+        // Acquire lock per-operation to prevent deadlock
         // Holding write lock across stream.message().await causes deadlock
         while let Some(req) = stream.message().await? {
             batch_count += 1;
@@ -618,6 +618,8 @@ impl KyroDbService for KyroDBServiceImpl {
         let results_vec = engine.bulk_query(&req.doc_ids, req.include_embeddings);
 
         if results_vec.len() != req.doc_ids.len() {
+            self.state.metrics.record_query_failure();
+            self.state.metrics.record_error(ErrorCategory::Internal);
             error!(
                 requested = req.doc_ids.len(),
                 returned = results_vec.len(),

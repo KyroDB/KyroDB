@@ -1,5 +1,4 @@
-// Background training task: Periodic RMI retraining for cache predictor
-// Periodically retrains RMI predictor using access logs
+//! Background task: Periodic RMI retraining for cache predictor
 
 use crate::access_logger::AccessPatternLogger;
 use crate::cache_strategy::LearnedCacheStrategy;
@@ -21,10 +20,10 @@ pub struct TrainingConfig {
     /// Training interval (default: 10 minutes)
     pub interval: Duration,
 
-    /// Training window duration (default: 1 hour, was 24 hours)
+    /// Training window duration (default: 1 hour)
     pub window_duration: Duration,
 
-    /// Recency decay half-life (default: 30 minutes, was 1 hour)
+    /// Recency decay half-life (default: 30 minutes)
     pub recency_halflife: Duration,
 
     /// Minimum events required before training (default: 100)
@@ -33,7 +32,7 @@ pub struct TrainingConfig {
     /// RMI capacity (default: 10,000 documents)
     pub rmi_capacity: usize,
 
-    /// Admission threshold (default: 0.15, was 0.2)
+    /// Admission threshold (default: 0.15)
     pub admission_threshold: f32,
 
     /// Auto-tune threshold based on utilization
@@ -58,45 +57,10 @@ impl Default for TrainingConfig {
     }
 }
 
-/// Spawns a background task that periodically retrains the Hybrid Semantic Cache predictor
+/// Spawns background task that periodically retrain RMI predictor
 ///
-/// The task runs every `config.interval` seconds and:
-/// 1. Fetches recent access events from the logger
-/// 2. Trains a new RMI predictor on those events
-/// 3. Updates the Hybrid Semantic Cache strategy with the new predictor
-///
-/// # Arguments
-/// * `access_logger` - Shared access pattern logger (tracks query accesses)
-/// * `learned_strategy` - Shared Hybrid Semantic Cache strategy (will be updated with new predictor)
-/// * `config` - Training configuration (interval, window, capacity)
-/// * `cycle_counter` - Optional counter to track training cycles
-/// * `mut shutdown_rx` - Broadcast receiver for graceful shutdown signal
-///
-/// # Returns
-/// JoinHandle for the background task (can be used to cancel or await completion)
-///
-/// # Example
-/// ```no_run
-/// use kyrodb_engine::{AccessPatternLogger, LearnedCacheStrategy, LearnedCachePredictor, VectorCache};
-/// use kyrodb_engine::training_task::{spawn_training_task, TrainingConfig};
-/// use std::sync::Arc;
-/// use tokio::sync::{RwLock, broadcast};
-///
-/// #[tokio::main]
-/// async fn main() {
-///     let logger = Arc::new(RwLock::new(AccessPatternLogger::new(100_000)));
-///     let predictor = LearnedCachePredictor::new(10_000).unwrap();
-///     let strategy = Arc::new(LearnedCacheStrategy::new(10_000, predictor));
-///     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-///     
-///     let config = TrainingConfig::default();
-///     let handle = spawn_training_task(logger, strategy, config, None, shutdown_rx).await;
-///     
-///     // Task runs in background...
-///     shutdown_tx.send(()).unwrap(); // Signal shutdown
-///     handle.await.unwrap(); // Wait for graceful termination
-/// }
-/// ```
+/// Runs every `config.interval`, fetches recent access events, trains new predictor,
+/// and updates the cache strategy.
 pub async fn spawn_training_task(
     access_logger: Arc<RwLock<AccessPatternLogger>>,
     learned_strategy: Arc<LearnedCacheStrategy>,
@@ -121,9 +85,7 @@ pub async fn spawn_training_task(
                         continue;
                     }
 
-                    // Preserve target_hot_entries from current predictor (CRITICAL FIX)
-                    // Root cause: Each retraining cycle was resetting target to RMI capacity (212)
-                    // This caused all 212 docs to be marked hot instead of the configured 132
+                    // Preserve target_hot_entries from current predictor to avoid resetting to RMI capacity
                     let current_target = {
                         let predictor = learned_strategy.predictor.read();
                         predictor.target_hot_entries()
@@ -162,7 +124,7 @@ fn train_predictor(
     events: &[crate::learned_cache::AccessEvent],
     capacity: usize,
     config: &TrainingConfig,
-    target_hot_entries: usize, // CRITICAL: Preserve from previous predictor
+    target_hot_entries: usize, // Preserve from previous predictor
 ) -> Result<LearnedCachePredictor> {
     let mut predictor = LearnedCachePredictor::with_config(
         capacity,
@@ -173,8 +135,7 @@ fn train_predictor(
     )?;
     predictor.set_auto_tune(config.auto_tune_enabled);
     predictor.set_target_utilization(config.target_utilization);
-    // CRITICAL FIX: Set target_hot_entries BEFORE training
-    // This ensures threshold calibration uses the correct target (132, not 212)
+    // Set target_hot_entries before training to preserve threshold calibration
     predictor.set_target_hot_entries(target_hot_entries);
     predictor.train_from_accesses(events)?;
     Ok(predictor)

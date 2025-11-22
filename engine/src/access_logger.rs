@@ -117,7 +117,7 @@ impl AccessPatternLogger {
     /// - `doc_id`: Document ID that was accessed
     #[inline]
     pub fn log_access(&self, doc_id: u64, _query_embedding: &[f32]) {
-        // CRITICAL FIX: Removed embedding storage to fix 107MB memory leak
+        // Store doc_id only (embeddings removed to prevent memory leak)
         // RMI training only needs doc_id and timestamp, not the full embedding
         // This reduces AccessEvent from ~1568 bytes to ~32 bytes (48× reduction!)
         let event = AccessEvent {
@@ -128,7 +128,7 @@ impl AccessPatternLogger {
 
         // Write lock - push event (overwrites oldest if full)
         let mut events = self.events.write();
-        // CRITICAL: Use push_overwrite to ensure FIFO behavior when buffer is full
+        // Use push_overwrite to ensure FIFO behavior when buffer is full
         // try_push returns Err when full without overwriting, which caused test_access_logger_enforces_capacity to fail
         events.push_overwrite(event);
         drop(events);
