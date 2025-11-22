@@ -353,7 +353,7 @@ mod tests {
         // Create logger with some access events
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {
-            let log = logger.write().await;
+            let log = logger.write();
             for i in 0..200 {
                 let embedding = vec![i as f32; 128];
                 log.log_access(i % 10, &embedding); // 10 documents, 20 accesses each
@@ -391,7 +391,7 @@ mod tests {
         // Create logger with too few events
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {
-            let log = logger.write().await;
+            let log = logger.write();
             for i in 0..50 {
                 let embedding = vec![i as f32; 128];
                 log.log_access(i, &embedding);
@@ -428,7 +428,7 @@ mod tests {
         // Create logger with valid events
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {
-            let log = logger.write().await;
+            let log = logger.write();
             for i in 0..200 {
                 let embedding = vec![i as f32; 128];
                 log.log_access(i % 10, &embedding);
@@ -537,7 +537,7 @@ mod tests {
         // Create logger with sufficient data
         let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
         {
-            let log = logger.write().await;
+            let log = logger.write();
             for i in 0..200 {
                 let embedding = vec![i as f32; 128];
                 log.log_access(i % 10, &embedding);

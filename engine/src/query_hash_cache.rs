@@ -324,6 +324,38 @@ impl QueryHashCache {
         self.capacity
     }
 
+    /// Remove cached queries that resolve to the specified document ID.
+    ///
+    /// Complexity: O(cache_size) because we scan/rebuild the internal maps. Deletes are expected
+    /// to be far less frequent than reads; if profiling ever shows this path dominating runtime,
+    /// consider maintaining a doc_id→hash index to achieve near O(k) invalidation.
+    ///
+    /// Returns the number of invalidated entries to aid profiling.
+    pub fn invalidate_doc(&self, doc_id: u64) -> usize {
+        let mut cache = self.cache.write();
+        let mut query_embs = self.query_embeddings.write();
+        let mut lru = self.lru_queue.write();
+
+        let mut removed_hashes = Vec::new();
+        cache.retain(|&hash, entry| {
+            if entry.doc_id == doc_id {
+                removed_hashes.push(hash);
+                false
+            } else {
+                true
+            }
+        });
+
+        for hash in &removed_hashes {
+            query_embs.remove(hash);
+            if let Some(pos) = lru.iter().position(|&h| h == *hash) {
+                lru.remove(pos);
+            }
+        }
+
+        removed_hashes.len()
+    }
+
     /// Set similarity threshold
     pub fn set_similarity_threshold(&mut self, threshold: f32) {
         self.similarity_threshold = threshold.clamp(0.0, 1.0);

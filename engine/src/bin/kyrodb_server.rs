@@ -24,7 +24,7 @@ use clap::Parser;
 use kyrodb_engine::{
     cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
     ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
-    QueryHashCache, SearchResult, TieredEngine, TieredEngineConfig,
+    TieredEngine, TieredEngineConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,9 +46,9 @@ use axum::{
 use tower_http::trace::TraceLayer;
 
 // Generated protobuf code
-pub mod kyrodb {
-    tonic::include_proto!("kyrodb.v1");
-}
+// Generated protobuf code
+
+use kyrodb_engine::proto as kyrodb;
 
 use kyrodb::{
     kyro_db_service_server::{KyroDbService, KyroDbServiceServer},
@@ -150,7 +150,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.write().await;
 
-        match engine.insert(req.doc_id, req.embedding) {
+        match engine.insert(req.doc_id, req.embedding, req.metadata) {
             Ok(_) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 self.state.metrics.record_insert(true);
@@ -161,9 +161,9 @@ impl KyroDbService for KyroDBServiceImpl {
                     "Document inserted successfully"
                 );
 
-                // FIXME Phase 1: Tier reporting is currently hardcoded as HotTier
-                // TieredEngine.insert() should return which tier was used
-                // For now, all inserts go to hot tier by design
+                // Note: Tier reporting is currently hardcoded as HotTier.
+                // TieredEngine.insert() will be updated to return which tier was used in future iterations.
+                // Currently, all inserts go to hot tier by design.
                 Ok(Response::new(InsertResponse {
                     success: true,
                     error: String::new(),
@@ -238,7 +238,7 @@ impl KyroDbService for KyroDBServiceImpl {
             // Short-lived lock per insert operation
             {
                 let engine = self.state.engine.write().await;
-                match engine.insert(req.doc_id, req.embedding) {
+                match engine.insert(req.doc_id, req.embedding, req.metadata) {
                     Ok(_) => total_inserted += 1,
                     Err(e) => {
                         total_failed += 1;
@@ -259,7 +259,7 @@ impl KyroDbService for KyroDBServiceImpl {
             "Bulk insert completed"
         );
 
-        // FIXME Phase 1: Tier reporting hardcoded (see insert() method comment)
+        // Note: Tier reporting hardcoded (see insert() method comment)
         Ok(Response::new(InsertResponse {
             success: total_failed == 0,
             error: last_error,
@@ -273,17 +273,112 @@ impl KyroDbService for KyroDBServiceImpl {
         }))
     }
 
-    #[instrument(skip(self, _request))]
+    #[instrument(skip(self, request))]
     async fn delete(
         &self,
-        _request: Request<DeleteRequest>,
+        request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        // Phase 1: Deletion not yet implemented (requires tombstone tracking)
-        warn!("Delete operation not yet implemented");
+        let start = Instant::now();
+        let req = request.into_inner();
 
-        Err(Status::unimplemented(
-            "Delete operation will be implemented in Phase 1 (requires WAL tombstones)",
-        ))
+        if req.doc_id == 0 {
+            return Err(Status::invalid_argument("doc_id must be non-zero"));
+        }
+
+        tracing::Span::current().record("doc_id", req.doc_id);
+
+        let engine = self.state.engine.write().await;
+
+        match engine.delete(req.doc_id) {
+            Ok(existed) => {
+                let latency_ns = start.elapsed().as_nanos() as u64;
+                
+                if existed {
+                    info!(
+                        doc_id = req.doc_id,
+                        latency_ns = latency_ns,
+                        "Document deleted"
+                    );
+                } else {
+                    info!(
+                        doc_id = req.doc_id,
+                        latency_ns = latency_ns,
+                        "Document not found for deletion"
+                    );
+                }
+
+                Ok(Response::new(DeleteResponse {
+                    success: true,
+                    error: String::new(),
+                    existed,
+                }))
+            }
+            Err(e) => {
+                self.state.metrics.record_error(ErrorCategory::Internal);
+                error!(
+                    doc_id = req.doc_id,
+                    error = %e,
+                    "Delete failed"
+                );
+                Err(Status::internal(format!("Delete failed: {}", e)))
+            }
+        }
+    }
+
+    #[instrument(skip(self, request), fields(doc_id, merge))]
+    async fn update_metadata(
+        &self,
+        request: Request<kyrodb::UpdateMetadataRequest>,
+    ) -> Result<Response<kyrodb::UpdateMetadataResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+
+        if req.doc_id == 0 {
+            return Err(Status::invalid_argument("doc_id must be non-zero"));
+        }
+
+        tracing::Span::current().record("doc_id", req.doc_id);
+        tracing::Span::current().record("merge", req.merge);
+
+        let engine = self.state.engine.write().await;
+
+        match engine.update_metadata(req.doc_id, req.metadata, req.merge) {
+            Ok(existed) => {
+                let latency_ns = start.elapsed().as_nanos() as u64;
+                // Record as query operation (generic operation metric)
+                self.state.metrics.record_query_latency(latency_ns);
+
+                if existed {
+                    info!(
+                        doc_id = req.doc_id,
+                        merge = req.merge,
+                        latency_ns = latency_ns,
+                        "Metadata updated successfully"
+                    );
+                } else {
+                    warn!(
+                        doc_id = req.doc_id,
+                        "Document not found for metadata update"
+                    );
+                }
+
+                Ok(Response::new(kyrodb::UpdateMetadataResponse {
+                    success: true,
+                    error: String::new(),
+                    existed,
+                }))
+            }
+            Err(e) => {
+                self.state.metrics.record_query_failure();
+                self.state.metrics.record_error(ErrorCategory::Internal);
+                error!(
+                    doc_id = req.doc_id,
+                    error = %e,
+                    "Metadata update failed"
+                );
+                Err(Status::internal(format!("Metadata update failed: {}", e)))
+            }
+        }
     }
 
     // ============================================================================
@@ -395,7 +490,16 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.read().await;
 
-        match engine.knn_search(&req.query_embedding, req.k as usize) {
+        // Adaptive oversampling based on filter complexity
+        let has_filter = req.filter.is_some();
+        let oversampling_factor = if let Some(ref filter) = req.filter {
+            kyrodb_engine::adaptive_oversampling::calculate_oversampling_factor(filter)
+        } else {
+            1
+        };
+        let search_k = (req.k as usize).saturating_mul(oversampling_factor).min(10_000);
+
+        match engine.knn_search(&req.query_embedding, search_k) {
             Ok(results) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
 
@@ -404,66 +508,66 @@ impl KyroDbService for KyroDBServiceImpl {
                 self.state.metrics.record_hnsw_search(latency_ns);
 
                 // Convert distance to similarity score
-                // CRITICAL: Assumes cosine distance metric from HNSW
-                // - Cosine distance: 0 = identical, 2 = opposite vectors
-                // - Similarity score: 1 = identical, -1 = opposite (more intuitive for API)
-                // - Formula: score = 1 - distance
-                // TODO Phase 1: Support multiple distance metrics (L2, inner product)
                 let convert_distance_to_score = |dist: f32| -> f32 {
-                    // Clamp to valid range to handle floating point errors
                     (1.0 - dist).clamp(-1.0, 1.0)
                 };
 
-                // Filter by min_score if specified
-                let filtered_results: Vec<SearchResult> = if req.min_score > 0.0 {
-                    results
-                        .into_iter()
-                        .filter(|r| convert_distance_to_score(r.distance) >= req.min_score)
-                        .collect()
-                } else {
-                    results
-                };
+                let mut final_results = Vec::new();
+                let mut candidates = results.into_iter();
 
-                // Get embeddings if requested (requires additional query)
-                let search_results: Vec<kyrodb::SearchResult> = if req.include_embeddings {
-                    // Need to query each doc_id to get embedding
-                    filtered_results
-                        .into_iter()
-                        .map(|r| {
-                            let embedding = engine.query(r.doc_id, None).unwrap_or_default();
-                            kyrodb::SearchResult {
-                                doc_id: r.doc_id,
-                                score: convert_distance_to_score(r.distance),
-                                embedding,
-                                metadata: HashMap::new(),
-                            }
-                        })
-                        .collect()
-                } else {
-                    filtered_results
-                        .into_iter()
-                        .map(|r| kyrodb::SearchResult {
-                            doc_id: r.doc_id,
-                            score: convert_distance_to_score(r.distance),
-                            embedding: vec![],
-                            metadata: HashMap::new(),
-                        })
-                        .collect()
-                };
+                // Iterate candidates until we fill k results or run out
+                while final_results.len() < req.k as usize {
+                    let candidate = match candidates.next() {
+                        Some(c) => c,
+                        None => break, // No more candidates
+                    };
+
+                    // Check min_score first (cheap)
+                    let score = convert_distance_to_score(candidate.distance);
+                    if req.min_score > 0.0 && score < req.min_score {
+                        continue;
+                    }
+
+                    // Fetch metadata (needed for filtering and/or response)
+                    let metadata = engine.get_metadata(candidate.doc_id).unwrap_or_default();
+
+                    // Apply metadata filter if present
+                    if let Some(filter) = &req.filter {
+                        if !kyrodb_engine::metadata_filter::matches(filter, &metadata) {
+                            continue;
+                        }
+                    }
+
+                    // Fetch embedding if requested (expensive, do only for final results)
+                    let embedding = if req.include_embeddings {
+                        engine.query(candidate.doc_id, None).unwrap_or_default()
+                    } else {
+                        vec![]
+                    };
+
+                    final_results.push(kyrodb::SearchResult {
+                        doc_id: candidate.doc_id,
+                        score,
+                        embedding,
+                        metadata,
+                    });
+                }
 
                 let latency_ms = latency_ns as f64 / 1_000_000.0;
 
                 info!(
                     k = req.k,
-                    results_found = search_results.len(),
+                    requested_k = search_k,
+                    results_found = final_results.len(),
                     latency_ns = latency_ns,
                     min_score = req.min_score,
+                    has_filter = has_filter,
                     "Search completed successfully"
                 );
 
                 Ok(Response::new(SearchResponse {
-                    results: search_results.clone(),
-                    total_found: search_results.len() as u32,
+                    results: final_results.clone(),
+                    total_found: final_results.len() as u32,
                     search_latency_ms: latency_ms as f32,
                     search_path: search_response::SearchPath::Unknown as i32,
                     error: String::new(),
@@ -489,6 +593,134 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<Self::BulkSearchStream>, Status> {
         // Bulk search with batching is not yet implemented
         Err(Status::unimplemented("bulk_search not yet implemented"))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn bulk_query(
+        &self,
+        request: Request<BulkQueryRequest>,
+    ) -> Result<Response<BulkQueryResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        
+        let total_requested = req.doc_ids.len() as u32;
+        if total_requested > MAX_BATCH_SIZE as u32 {
+             return Err(Status::invalid_argument(format!(
+                "Batch size {} exceeds maximum {}",
+                total_requested,
+                MAX_BATCH_SIZE
+            )));
+        }
+
+        let engine = self.state.engine.read().await;
+        
+        // Use the new bulk_query which returns metadata too
+        let results_vec = engine.bulk_query(&req.doc_ids, req.include_embeddings);
+
+        if results_vec.len() != req.doc_ids.len() {
+            error!(
+                requested = req.doc_ids.len(),
+                returned = results_vec.len(),
+                "Bulk query length mismatch"
+            );
+            return Err(Status::internal("Internal error: bulk query result length mismatch"));
+        }
+        
+        let mut query_responses = Vec::with_capacity(results_vec.len());
+        let mut total_found = 0;
+        
+        for (i, result) in results_vec.into_iter().enumerate() {
+            let doc_id = req.doc_ids[i];
+            let found = result.is_some();
+            if found {
+                total_found += 1;
+            }
+            
+            let (embedding, metadata) = result.unwrap_or_default();
+            
+            query_responses.push(QueryResponse {
+                found,
+                doc_id,
+                embedding,
+                metadata,
+                served_from: query_response::Tier::Unknown as i32,
+                error: String::new(),
+            });
+        }
+        
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        info!(
+            requested = total_requested,
+            found = total_found,
+            latency_ms = latency_ms,
+            "Bulk query completed"
+        );
+
+        Ok(Response::new(BulkQueryResponse {
+            results: query_responses,
+            total_found,
+            total_requested,
+            error: String::new(),
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn batch_delete(
+        &self,
+        request: Request<BatchDeleteRequest>,
+    ) -> Result<Response<BatchDeleteResponse>, Status> {
+        let start = Instant::now();
+        let req = request.into_inner();
+        
+        let engine = self.state.engine.write().await;
+        
+        let result = match req.delete_criteria {
+            Some(batch_delete_request::DeleteCriteria::Ids(id_list)) => {
+                if id_list.doc_ids.len() > MAX_BATCH_SIZE {
+                    return Err(Status::invalid_argument(format!(
+                        "Batch size {} exceeds maximum {}",
+                        id_list.doc_ids.len(),
+                        MAX_BATCH_SIZE
+                    )));
+                }
+                engine.batch_delete(&id_list.doc_ids)
+            }
+            Some(batch_delete_request::DeleteCriteria::Filter(filter)) => {
+                // Use the existing metadata filter logic
+                engine.batch_delete_by_filter(|meta| {
+                    kyrodb_engine::metadata_filter::matches(&filter, meta)
+                })
+            }
+            None => {
+                return Err(Status::invalid_argument("No delete criteria provided"));
+            }
+        };
+        
+        match result {
+            Ok(count) => {
+                let latency_ns = start.elapsed().as_nanos() as u64;
+                // Record metrics for observability
+                self.state.metrics.record_query_latency(latency_ns);
+                
+                info!(
+                    deleted = count,
+                    latency_ms = latency_ns as f64 / 1_000_000.0,
+                    "Batch delete completed"
+                );
+                
+                Ok(Response::new(BatchDeleteResponse {
+                    success: true,
+                    deleted_count: count,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => {
+                self.state.metrics.record_query_failure();
+                self.state.metrics.record_error(ErrorCategory::Internal);
+                error!(error = %e, "Batch delete failed");
+                Err(Status::internal(format!("Batch delete failed: {}", e)))
+            }
+        }
     }
 
     // ============================================================================
@@ -1030,6 +1262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fallback_cache_strategy,
                     query_cache_fallback,
                     dummy_embedding,
+                    vec![HashMap::new()],
                     engine_config.clone(),
                 )?
             }
@@ -1041,6 +1274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_strategy,
             query_cache.clone(),
             dummy_embedding,
+            vec![HashMap::new()],
             engine_config.clone(),
         )?
     };

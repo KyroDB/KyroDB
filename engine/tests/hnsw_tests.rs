@@ -1,6 +1,6 @@
 //! Property tests for HNSW vector index
 //!
-//! Phase 0 Week 1-2: Validate recall@10 > 95% guarantee
+//! Validate recall@10 > 95% guarantee
 //!
 //! These tests use proptest to generate random vectors and verify:
 //! 1. HNSW recall matches brute force (>95% recall@10)

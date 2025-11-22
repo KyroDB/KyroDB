@@ -31,9 +31,8 @@ pub struct AccessEvent {
     pub doc_id: u64,
     pub timestamp: SystemTime,
     pub access_type: AccessType,
-    // CRITICAL: Removed embedding field to fix 107MB memory leak
-    // Embeddings are not used in RMI training (only doc_id matters)
-    // This reduces AccessEvent from ~1568 bytes to ~32 bytes (48× smaller!)
+    // Embeddings are not used in RMI training (only doc_id matters).
+    // Keeping this struct small (~32 bytes) is critical for memory efficiency.
 }
 
 impl Default for AccessEvent {
@@ -188,9 +187,9 @@ impl LearnedCachePredictor {
     /// - Training interval: 10 minutes
     /// - Auto-tune: ENABLED (target 80% utilization for learning headroom)
     pub fn new(capacity: usize) -> Result<Self> {
-        // FIXED: Use RMI as WIDE NET (recall-focused), semantic adapter filters false positives
-        // Threshold balances recall (don't reject hot docs) vs precision (don't admit cold docs)
-        // Target: Predict 5-6x cache capacity as "potentially hot" for semantic filtering
+        // Use RMI as WIDE NET (recall-focused), semantic adapter filters false positives.
+        // Threshold balances recall (don't reject hot docs) vs precision (don't admit cold docs).
+        // Target: Predict 5-6x cache capacity as "potentially hot" for semantic filtering.
         let initial_threshold = if capacity < 100 {
             0.22 // Tiny caches: admit ~300 docs (6x capacity of 50)
         } else if capacity <= 1000 {
@@ -203,9 +202,8 @@ impl LearnedCachePredictor {
             hotness_map: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
             cache_threshold: initial_threshold,
             admission_floor: 0.10,
-            // FIX C: Increase from 0.25 to 0.35 for faster cold-start warmup
-            // Root cause: Conservative bootstrap admission slowed working set discovery
-            // This reduces early-test miss penalty by 1-2%
+            // Higher chance (0.35) for faster cold-start warmup.
+            // Prevents conservative bootstrap admission from slowing working set discovery.
             unseen_admission_chance: 0.35,
             target_hot_entries: capacity,
             threshold_smoothing: 0.3,
@@ -278,10 +276,9 @@ impl LearnedCachePredictor {
         self.lookup_hotness(doc_id).unwrap_or(0.0)
     }
 
-    /// FUNDAMENTAL CHANGE: Calculate an admission score, not just raw hotness.
-    /// This score balances the predicted hotness against the "cost" of caching it,
-    /// represented by miss penalties. A document that is frequently accessed but
-    /// also frequently missed might be a poor cache candidate (cache pollution).
+    /// Calculate an admission score, balancing predicted hotness against miss penalties.
+    /// A document that is frequently accessed but also frequently missed might be a poor
+    /// cache candidate (cache pollution).
     ///
     /// Score = hotness / (1.0 + miss_penalty)
     pub fn admission_score(&self, doc_id: u64) -> f32 {
@@ -624,12 +621,10 @@ impl LearnedCachePredictor {
             return;
         }
 
-        // CRITICAL FIX: Ensure index is always within bounds.
-        // If `desired` is equal to `len()`, `saturating_sub(1)` gives the last valid index.
+        // Ensure index is always within bounds using saturating_sub.
         let index = desired.saturating_sub(1);
 
-        // Defensive guard against out-of-bounds access, which was the root cause of the 32% hit-rate stall.
-        // This ensures we never try to access an index beyond the vector's length.
+        // Defensive guard against out-of-bounds access.
         if index >= sorted_hotness.len() {
             // This case should not be hit with the `min` and `saturating_sub` logic,
             // but as a failsafe, we take the score of the last element.

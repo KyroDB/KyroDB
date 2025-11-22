@@ -26,8 +26,8 @@ fn test_three_tier_query_journey() {
 
     let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
 
-    // Phase 1: Query existing documents (should hit cold tier)
-    println!("\n=== Phase 1: Cold tier queries ===");
+    // Step 1: Query existing documents (should hit cold tier)
+    println!("\n=== Step 1: Cold tier queries ===");
     for i in 0..5 {
         let result = engine.query(i, None);
         assert!(result.is_some(), "Doc {} should exist in cold tier", i);
@@ -40,8 +40,8 @@ fn test_three_tier_query_journey() {
     assert_eq!(stats.cache_hits, 0); // Cache empty initially
     println!("Cold tier stats: {} searches", stats.cold_tier_searches);
 
-    // Phase 2: Insert new documents (should go to hot tier)
-    println!("\n=== Phase 2: Hot tier inserts ===");
+    // Step 2: Insert new documents (should go to hot tier)
+    println!("\n=== Step 2: Hot tier inserts ===");
     engine.insert(100, vec![0.25, 0.75]).unwrap();
     engine.insert(101, vec![0.30, 0.70]).unwrap();
 
@@ -53,8 +53,8 @@ fn test_three_tier_query_journey() {
     assert_eq!(stats.hot_tier_hits, 1, "Expected 1 hot tier hit");
     println!("Hot tier hit: doc 100");
 
-    // Phase 3: Flush hot tier to cold tier
-    println!("\n=== Phase 3: Flushing to cold tier ===");
+    // Step 3: Flush hot tier to cold tier
+    println!("\n=== Step 3: Flushing to cold tier ===");
     // Insert one more to trigger flush (hot_tier_max_size=3)
     engine.insert(102, vec![0.35, 0.65]).unwrap();
     let flushed = engine.flush_hot_tier().unwrap();
@@ -80,8 +80,8 @@ fn test_three_tier_query_journey() {
     );
     println!("Doc 101 found in cold tier after flush");
 
-    // Phase 4: Test cache behavior
-    println!("\n=== Phase 4: Cache layer ===");
+    // Step 4: Test cache behavior
+    println!("\n=== Step 4: Cache layer ===");
 
     // Repeatedly query same document to trigger caching
     for _ in 0..5 {
@@ -101,8 +101,8 @@ fn test_three_tier_query_journey() {
         "Cache should be active"
     );
 
-    // Phase 5: K-NN search across all tiers
-    println!("\n=== Phase 5: K-NN search ===");
+    // Step 5: K-NN search across all tiers
+    println!("\n=== Step 5: K-NN search ===");
     let query = vec![0.5, 0.5];
     let results = engine.knn_search(&query, 5).unwrap();
 
@@ -134,7 +134,7 @@ fn test_three_tier_query_journey() {
 fn test_persistence_across_all_tiers() {
     let dir = TempDir::new().unwrap();
 
-    // Phase 1: Create engine with persistence
+    // Step 1: Create engine with persistence
     {
         let initial_embeddings = vec![vec![1.0, 0.0], vec![0.8, 0.2], vec![0.6, 0.4]];
 
@@ -150,7 +150,7 @@ fn test_persistence_across_all_tiers() {
 
         let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
 
-        println!("\n=== Phase 1: Writing data ===");
+        println!("\n=== Step 1: Writing data ===");
 
         // Insert to hot tier and flush
         engine.insert(10, vec![0.4, 0.6]).unwrap();
@@ -174,9 +174,9 @@ fn test_persistence_across_all_tiers() {
         println!("Snapshot created");
     }
 
-    // Phase 2: Recover and verify
+    // Step 2: Recover and verify
     {
-        println!("\n=== Phase 2: Recovery ===");
+        println!("\n=== Step 2: Recovery ===");
 
         let cache = LruCacheStrategy::new(10);
         let config = TieredEngineConfig {

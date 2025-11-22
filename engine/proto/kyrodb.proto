@@ -22,8 +22,11 @@ service KyroDBService {
   rpc BulkInsert(stream InsertRequest) returns (InsertResponse);
   
   // Delete a document by ID
-  // Note: Soft delete in hot tier, physical delete on next compaction
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+  
+  // Update document metadata without changing embedding
+  // Supports merge (extend existing) or replace (overwrite all) semantics
+  rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse);
   
   // ============================================================================
   // READ OPERATIONS
@@ -42,6 +45,12 @@ service KyroDBService {
   // Bulk search: multiple queries in one request (streaming)
   // Use for batch inference workloads
   rpc BulkSearch(stream SearchRequest) returns (stream SearchResponse);
+
+  // Bulk query: retrieve multiple documents by ID
+  rpc BulkQuery(BulkQueryRequest) returns (BulkQueryResponse);
+
+  // Batch delete: delete documents by ID or metadata filter
+  rpc BatchDelete(BatchDeleteRequest) returns (BatchDeleteResponse);
   
   // ============================================================================
   // HEALTH & OBSERVABILITY
@@ -122,6 +131,52 @@ message DeleteResponse {
   bool existed = 3;  // Was the document present before deletion?
 }
 
+message UpdateMetadataRequest {
+  uint64 doc_id = 1;
+  map<string, string> metadata = 2;
+  bool merge = 3;  // true = merge with existing, false = replace
+  string namespace = 4;  // Optional namespace
+}
+
+message UpdateMetadataResponse {
+  bool success = 1;
+  string error = 2;
+  bool existed = 3;  // Was the document present before update?
+}
+
+message BulkQueryRequest {
+  repeated uint64 doc_ids = 1;
+  bool include_embeddings = 2;
+  string namespace = 3;
+}
+
+message BulkQueryResponse {
+  repeated QueryResponse results = 1;
+  uint32 total_found = 2;
+  uint32 total_requested = 3;
+  string error = 4;
+}
+
+message BatchDeleteRequest {
+  oneof delete_criteria {
+    // Delete specific IDs
+    IdList ids = 1;
+    // Delete by metadata filter
+    MetadataFilter filter = 2;
+  }
+  string namespace = 3;
+}
+
+message IdList {
+  repeated uint64 doc_ids = 1;
+}
+
+message BatchDeleteResponse {
+  bool success = 1;
+  uint64 deleted_count = 2;
+  string error = 3;
+}
+
 // ============================================================================
 // READ OPERATION MESSAGES
 // ============================================================================
@@ -181,7 +236,51 @@ message SearchRequest {
   bool include_embeddings = 5;
   
   // Optional metadata filters (Phase 1)
-  map<string, string> metadata_filters = 6;
+  map<string, string> metadata_filters = 6 [deprecated = true]; // Deprecated in favor of structured filter
+  MetadataFilter filter = 7;
+}
+
+message MetadataFilter {
+  oneof filter_type {
+    ExactMatch exact = 1;
+    RangeMatch range = 2;
+    InMatch in_match = 3;
+    AndFilter and_filter = 4;
+    OrFilter or_filter = 5;
+    NotFilter not_filter = 6;
+  }
+}
+
+message ExactMatch {
+  string key = 1;
+  string value = 2;
+}
+
+message RangeMatch {
+  string key = 1;
+  oneof bound {
+    string gte = 2;  // >=
+    string lte = 3;  // <=
+    string gt = 4;   // >
+    string lt = 5;   // <
+  }
+}
+
+message InMatch {
+  string key = 1;
+  repeated string values = 2;
+}
+
+message AndFilter {
+  repeated MetadataFilter filters = 1;
+}
+
+message OrFilter {
+  repeated MetadataFilter filters = 2;
+}
+
+message NotFilter {
+  MetadataFilter filter = 1;
 }
 
 message SearchResult {

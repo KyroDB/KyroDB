@@ -1,6 +1,6 @@
 //! Integration tests for Access Pattern Logger and Hybrid Semantic Cache Pipeline
 //!
-//! Phase 0 Week 5-8: Validate end-to-end flow from access logging to cache prediction
+//! Validate end-to-end flow from access logging to cache prediction
 //!
 //! Test scenarios:
 //! 1. Log accesses → flush → train predictor → verify predictions
@@ -182,7 +182,7 @@ fn test_periodic_retraining() {
 
     let embedding = vec![0.5; 128];
 
-    // Phase 1: Doc 1 is hot
+    // Step 1: Doc 1 is hot
     for _ in 0..100 {
         logger.log_access(1, &embedding);
     }
@@ -197,10 +197,10 @@ fn test_periodic_retraining() {
 
     assert!(
         score_1_phase1 > score_2_phase1,
-        "Phase 1: Doc 1 should be hotter"
+        "Step 1: Doc 1 should be hotter"
     );
 
-    // Phase 2: Doc 2 becomes hot (shift in access pattern)
+    // Step 2: Doc 2 becomes hot (shift in access pattern)
     for _ in 0..100 {
         logger.log_access(2, &embedding);
     }
@@ -218,7 +218,7 @@ fn test_periodic_retraining() {
     // This test validates that retraining updates predictions
 
     println!(
-        "Retraining validation:\n  Phase 1: doc1={:.3}, doc2={:.3}\n  Phase 2: doc1={:.3}, doc2={:.3}",
+        "Retraining validation:\n  Step 1: doc1={:.3}, doc2={:.3}\n  Step 2: doc1={:.3}, doc2={:.3}",
         score_1_phase1, score_2_phase1, score_1_phase2, score_2_phase2
     );
 

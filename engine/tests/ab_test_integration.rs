@@ -1,4 +1,4 @@
-// Phase 0 Week 9-12: Integration tests for A/B testing framework
+// Integration tests for A/B testing framework
 // Tests the full query flow: HNSW search → cache check → A/B split → stats persistence
 
 use kyrodb_engine::{

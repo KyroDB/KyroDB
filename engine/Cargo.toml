@@ -41,7 +41,7 @@ path = "src/bin/belady_simulator.rs"
 
 [features]
 default = []
-# Phase 0 Week 3-8: Enable Hybrid Semantic Cache with RMI
+# Enable Hybrid Semantic Cache with RMI
 hybrid-cache = []
 # Benchmarking: disable metrics for zero-overhead measurements
 bench-no-metrics = []
@@ -55,13 +55,13 @@ s3-backup = ["aws-config", "aws-sdk-s3"]
 loom = ["dep:loom"]
 
 [dependencies]
-# Phase 0 Week 1-2: HNSW vector search
+# HNSW vector search
 hnsw_rs = "0.3"
 anyhow = "1.0"
 
-# Phase 0 Week 3-8: RMI for Hybrid Semantic Cache (no external deps, pure Rust)
+# RMI for Hybrid Semantic Cache (no external deps, pure Rust)
 
-# Phase 0 Week 9-12: A/B testing framework + minimal persistence
+# A/B testing framework + minimal persistence
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "signal", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -71,9 +71,9 @@ rand = "0.8"  # For Zipf distribution sampling
 rand_chacha = "0.3"  # Deterministic per-doc embeddings
 rand_distr = "0.4"  # Gaussian noise for semantic clusters
 zipf = "7.0"  # Proper Zipf distribution for validation tests
-rayon = "1.10"  # Phase 0.5.2: Parallel doc-to-queries map building
+rayon = "1.10"  # Parallel doc-to-queries map building
 
-# Phase 0 Week 17+: gRPC server for production deployment
+# gRPC server for production deployment
 # tonic 0.10 requires prost 0.12 (must match versions)
 tonic = "0.10"
 prost = "0.12"
@@ -131,7 +131,7 @@ loom = { version = "0.7", optional = true }
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-# Phase 0 Week 1-2: Testing HNSW recall guarantees
+# Testing HNSW recall guarantees
 proptest = "1.0"
 tempfile = "3.8"  # For testing file persistence
 

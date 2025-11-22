@@ -257,7 +257,11 @@ fn test_snapshot_corruption_metrics() {
     // Create a valid snapshot
     let documents = vec![(0, vec![1.0, 0.0, 0.0, 0.0]), (1, vec![0.0, 1.0, 0.0, 0.0])];
 
-    let snapshot = Snapshot::new(4, documents.clone());
+    let metadata = documents
+        .iter()
+        .map(|(id, _)| (*id, std::collections::HashMap::new()))
+        .collect();
+    let snapshot = Snapshot::new(4, documents.clone(), metadata).unwrap();
 
     snapshot.save(&snapshot_path).unwrap();
 

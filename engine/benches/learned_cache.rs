@@ -1,6 +1,4 @@
 //! Benchmarks for Hybrid Semantic Cache Predictor
-//!
-//!
 //! Targets:
 //! - Hotness prediction: <100ns P99
 //! - Training: <100ms for 10M doc_ids

@@ -218,6 +218,18 @@ impl VectorCache {
         self.state.read().cache.is_empty()
     }
 
+    /// Remove cached vector by doc_id (if present)
+    pub fn remove(&self, doc_id: u64) -> bool {
+        let mut state = self.state.write();
+        let removed = state.cache.remove(&doc_id).is_some();
+        if removed {
+            if let Some(pos) = state.lru_queue.iter().position(|&id| id == doc_id) {
+                state.lru_queue.remove(pos);
+            }
+        }
+        removed
+    }
+
     /// Get maximum capacity
     pub fn capacity(&self) -> usize {
         self.capacity

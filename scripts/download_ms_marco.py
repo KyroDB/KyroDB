@@ -2,7 +2,7 @@
 """
 Download and prepare MS MARCO dataset for KyroDB validation.
 
-Phase 0.5.1: Dataset Integration
+Dataset Integration
 - Downloads 100K passages from MS MARCO v2.1 (passage ranking)
 - Generates embeddings using Sentence-BERT (all-MiniLM-L6-v2)
 - Saves passages, doc IDs, and embeddings for validation tests

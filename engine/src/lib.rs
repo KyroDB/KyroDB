@@ -3,7 +3,7 @@
 //! **Hybrid Semantic Cache**: Combines RMI-based frequency prediction with semantic similarity
 //! for intelligent cache admission decisions in RAG workloads.
 //!
-//! See Implementation.md for roadmap and IMPLEMENTATION_UPDATE_ANALYSIS.md for current status.
+
 
 // Deadlock detection in debug builds (parking_lot feature)
 #[cfg(debug_assertions)]
@@ -47,6 +47,17 @@ pub fn init_deadlock_detection() {
 
 // ===== Core modules =====
 
+// Generated protobuf code
+pub mod proto {
+    tonic::include_proto!("kyrodb.v1");
+}
+
+// Metadata filtering logic
+pub mod metadata_filter;
+
+// Adaptive oversampling for filtered search
+pub mod adaptive_oversampling;
+
 // Vector search: HNSW k-NN index
 pub mod hnsw_index;
 
@@ -65,9 +76,9 @@ pub mod access_logger;
 // A/B testing: Framework for cache strategy comparison
 pub mod ab_stats; // Metrics persistence (CSV format)
 pub mod cache_strategy; // CacheStrategy trait + LRU/Learned implementations + A/B splitter
-pub mod query_hash_cache;
+pub mod query_hash_cache; // Query hash cache (L1b): Semantic similarity-based query caching
 pub mod training_task; // Background RMI training task (tokio::spawn, 60-second interval)
-pub mod vector_cache; // In-memory vector cache with LRU eviction // Query hash cache (L1b): Semantic similarity-based query caching
+pub mod vector_cache; // In-memory vector cache with LRU eviction
 
 // Query clustering: Semantic grouping for cache optimization
 pub mod query_clustering;

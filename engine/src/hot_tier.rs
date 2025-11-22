@@ -32,6 +32,7 @@ pub struct HotTierStats {
 #[derive(Debug, Clone)]
 struct HotDocument {
     embedding: Vec<f32>,
+    metadata: HashMap<String, String>,
     inserted_at: Instant,
 }
 
@@ -76,9 +77,10 @@ impl HotTier {
     /// Insert document into hot tier
     ///
     /// This is fast (no HNSW index update), just a HashMap insert.
-    pub fn insert(&self, doc_id: u64, embedding: Vec<f32>) {
+    pub fn insert(&self, doc_id: u64, embedding: Vec<f32>, metadata: HashMap<String, String>) {
         let doc = HotDocument {
             embedding,
+            metadata,
             inserted_at: Instant::now(),
         };
 
@@ -102,6 +104,135 @@ impl HotTier {
         }
 
         result
+    }
+
+    /// Get document metadata from hot tier (if present)
+    pub fn get_metadata(&self, doc_id: u64) -> Option<HashMap<String, String>> {
+        let docs = self.documents.read();
+        docs.get(&doc_id).map(|doc| doc.metadata.clone())
+    }
+
+    /// Bulk fetch documents from hot tier (if present)
+    pub fn bulk_fetch(&self, doc_ids: &[u64]) -> Vec<Option<(Vec<f32>, HashMap<String, String>)>> {
+        let docs = self.documents.read();
+        let mut hits = 0;
+        let mut misses = 0;
+        
+        let results: Vec<_> = doc_ids.iter().map(|id| {
+            if let Some(doc) = docs.get(id) {
+                hits += 1;
+                Some((doc.embedding.clone(), doc.metadata.clone()))
+            } else {
+                misses += 1;
+                None
+            }
+        }).collect();
+        
+        let mut stats = self.stats.write();
+        stats.total_hits += hits;
+        stats.total_misses += misses;
+        
+        results
+    }
+
+    /// Check if a document exists in the hot tier without cloning its embedding
+    pub fn exists(&self, doc_id: u64) -> bool {
+        self.documents.read().contains_key(&doc_id)
+    }
+
+    /// Update document metadata without changing embedding
+    ///
+    /// # Parameters
+    /// - `doc_id`: Document ID to update
+    /// - `metadata`: New metadata
+    /// - `merge`: true = merge with existing metadata, false = replace all
+    ///
+    /// # Returns
+    /// - `true` if document existed and was updated
+    /// - `false` if document does not exist
+    pub fn update_metadata(
+        &self,
+        doc_id: u64,
+        metadata: HashMap<String, String>,
+        merge: bool,
+    ) -> bool {
+        let mut docs = self.documents.write();
+        if let Some(doc) = docs.get_mut(&doc_id) {
+            if merge {
+                doc.metadata.extend(metadata);
+            } else {
+                doc.metadata = metadata;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete document from hot tier
+    ///
+    /// # Parameters
+    /// - `doc_id`: Document ID to delete
+    ///
+    /// # Returns
+    /// - `true` if document existed and was deleted
+    /// - `false` if document did not exist
+    pub fn delete(&self, doc_id: u64) -> bool {
+        let mut docs = self.documents.write();
+        let existed = docs.remove(&doc_id).is_some();
+
+        if existed {
+            let mut stats = self.stats.write();
+            stats.current_size = docs.len();
+            // We don't decrement total_inserts, but we could track total_deletes if we added that field
+        }
+
+        existed
+    }
+
+    /// Batch delete documents from hot tier
+    ///
+    /// # Parameters
+    /// - `doc_ids`: Document IDs to delete
+    ///
+    /// # Returns
+    /// - Number of documents actually deleted
+    pub fn batch_delete(&self, doc_ids: &[u64]) -> usize {
+        let mut docs = self.documents.write();
+        let mut deleted_count = 0;
+        
+        for &doc_id in doc_ids {
+            if docs.remove(&doc_id).is_some() {
+                deleted_count += 1;
+            }
+        }
+        
+        if deleted_count > 0 {
+            let mut stats = self.stats.write();
+            stats.current_size = docs.len();
+        }
+        
+        deleted_count
+    }
+
+    /// Scan all documents and return IDs that match the predicate
+    pub fn scan<F>(&self, predicate: F) -> Vec<u64>
+    where
+        F: Fn(&HashMap<String, String>) -> bool,
+    {
+        // Take lightweight snapshot to avoid holding the read lock for the
+        // entire scan, which would otherwise block writers under heavy load.
+        let snapshot: Vec<(u64, HashMap<String, String>)> = {
+            let docs = self.documents.read();
+            docs.iter()
+                .map(|(&id, doc)| (id, doc.metadata.clone()))
+                .collect()
+        };
+
+        snapshot
+            .into_iter()
+            .filter_map(|(id, metadata)| if predicate(&metadata) { Some(id) } else { None })
+            .collect()
     }
 
     /// Check if flush is needed (based on size or age thresholds)
@@ -135,13 +266,15 @@ impl HotTier {
 
     /// Drain all documents from hot tier for flushing
     ///
-    /// Returns: Vec<(doc_id, embedding)> to be inserted into cold tier
+    /// Returns: Vec<(doc_id, embedding, metadata)> to be inserted into cold tier
     ///
     /// This clears the hot tier and updates stats.
-    pub fn drain_for_flush(&self) -> Vec<(u64, Vec<f32>)> {
+    pub fn drain_for_flush(&self) -> Vec<(u64, Vec<f32>, HashMap<String, String>)> {
         let mut docs = self.documents.write();
-        let drained: Vec<(u64, Vec<f32>)> =
-            docs.drain().map(|(id, doc)| (id, doc.embedding)).collect();
+        let drained: Vec<(u64, Vec<f32>, HashMap<String, String>)> = docs
+            .drain()
+            .map(|(id, doc)| (id, doc.embedding, doc.metadata))
+            .collect();
 
         let mut stats = self.stats.write();
         stats.current_size = 0;
@@ -183,13 +316,16 @@ impl HotTier {
     /// to avoid data loss. Preserves original insertion timestamps where possible.
     ///
     /// # Parameters
-    /// - `documents`: Documents to re-insert (doc_id, embedding pairs)
+    /// - `documents`: Documents to re-insert (doc_id, embedding, metadata)
     ///
     /// # Behavior
     /// - Re-inserted documents use current timestamp (preserves age-based flush logic)
     /// - Increments total_inserts counter (tracks all insert operations)
     /// - Does NOT increment total_flushes (flush failed, not completed)
-    pub fn reinsert_failed_documents(&self, documents: Vec<(u64, Vec<f32>)>) {
+    pub fn reinsert_failed_documents(
+        &self,
+        documents: Vec<(u64, Vec<f32>, HashMap<String, String>)>,
+    ) {
         if documents.is_empty() {
             return;
         }
@@ -197,9 +333,10 @@ impl HotTier {
         let mut docs = self.documents.write();
         let reinsert_count = documents.len();
 
-        for (doc_id, embedding) in documents {
+        for (doc_id, embedding, metadata) in documents {
             let doc = HotDocument {
                 embedding,
+                metadata,
                 inserted_at: Instant::now(), // Use current timestamp
             };
             docs.insert(doc_id, doc);
@@ -219,9 +356,11 @@ mod tests {
     #[test]
     fn test_hot_tier_insert_get() {
         let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let mut metadata = HashMap::new();
+        metadata.insert("key".to_string(), "value".to_string());
 
         // Insert document
-        hot_tier.insert(42, vec![0.1, 0.2, 0.3]);
+        hot_tier.insert(42, vec![0.1, 0.2, 0.3], metadata.clone());
 
         assert_eq!(hot_tier.len(), 1);
         assert!(!hot_tier.is_empty());
@@ -229,6 +368,10 @@ mod tests {
         // Get document
         let embedding = hot_tier.get(42).unwrap();
         assert_eq!(embedding, vec![0.1, 0.2, 0.3]);
+
+        // Get metadata
+        let meta = hot_tier.get_metadata(42).unwrap();
+        assert_eq!(meta.get("key").unwrap(), "value");
 
         // Get non-existent document
         assert!(hot_tier.get(99).is_none());
@@ -238,12 +381,12 @@ mod tests {
     fn test_hot_tier_size_threshold() {
         let hot_tier = HotTier::new(3, Duration::from_secs(3600)); // 3 docs max
 
-        hot_tier.insert(1, vec![0.1]);
-        hot_tier.insert(2, vec![0.2]);
+        hot_tier.insert(1, vec![0.1], HashMap::new());
+        hot_tier.insert(2, vec![0.2], HashMap::new());
 
         assert!(!hot_tier.needs_flush());
 
-        hot_tier.insert(3, vec![0.3]);
+        hot_tier.insert(3, vec![0.3], HashMap::new());
 
         assert!(hot_tier.needs_flush()); // Size threshold reached
     }
@@ -252,9 +395,9 @@ mod tests {
     fn test_hot_tier_drain() {
         let hot_tier = HotTier::new(1000, Duration::from_secs(60));
 
-        hot_tier.insert(1, vec![0.1]);
-        hot_tier.insert(2, vec![0.2]);
-        hot_tier.insert(3, vec![0.3]);
+        hot_tier.insert(1, vec![0.1], HashMap::new());
+        hot_tier.insert(2, vec![0.2], HashMap::new());
+        hot_tier.insert(3, vec![0.3], HashMap::new());
 
         assert_eq!(hot_tier.len(), 3);
 
@@ -274,7 +417,7 @@ mod tests {
     fn test_hot_tier_hit_rate() {
         let hot_tier = HotTier::new(1000, Duration::from_secs(60));
 
-        hot_tier.insert(1, vec![0.1]);
+        hot_tier.insert(1, vec![0.1], HashMap::new());
 
         // 1 hit
         hot_tier.get(1);
@@ -291,7 +434,7 @@ mod tests {
     fn test_hot_tier_age_threshold() {
         let hot_tier = HotTier::new(10000, Duration::from_millis(100)); // 100ms age
 
-        hot_tier.insert(1, vec![0.1]);
+        hot_tier.insert(1, vec![0.1], HashMap::new());
 
         assert!(!hot_tier.needs_flush());
 

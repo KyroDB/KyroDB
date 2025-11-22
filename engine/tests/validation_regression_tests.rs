@@ -1,4 +1,4 @@
-//! Regression tests for Phase 0 Week 9-12 validation bugs
+//! Regression tests for validation bugs
 //!
 //! These tests prevent recurrence of critical bugs discovered during validation:
 //! 1. Hybrid Semantic Cache never caching (0% hit rate) - predictor untrained

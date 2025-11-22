@@ -9,6 +9,7 @@
 use kyrodb_engine::{
     FsyncPolicy, HnswBackend, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter,
 };
+use std::collections::HashMap;
 use tempfile::TempDir;
 
 #[test]
@@ -24,6 +25,7 @@ fn test_wal_basic_operations() {
         doc_id: 42,
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         timestamp: 1000,
+        metadata: HashMap::new(),
     };
 
     let entry2 = WalEntry {
@@ -31,6 +33,7 @@ fn test_wal_basic_operations() {
         doc_id: 99,
         embedding: vec![0.5, 0.6, 0.7, 0.8],
         timestamp: 2000,
+        metadata: HashMap::new(),
     };
 
     writer.append(&entry1).unwrap();
@@ -64,7 +67,8 @@ fn test_snapshot_save_load() {
         (2, vec![0.0, 0.0, 1.0, 0.0]),
     ];
 
-    let snapshot = Snapshot::new(4, documents);
+    let metadata = documents.iter().map(|(id, _)| (*id, std::collections::HashMap::new())).collect();
+    let snapshot = Snapshot::new(4, documents, metadata).unwrap();
     snapshot.save(&snapshot_path).unwrap();
 
     // Load snapshot

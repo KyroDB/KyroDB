@@ -34,6 +34,9 @@ pub trait CacheStrategy: Send + Sync {
     /// Only called if `should_cache` returns true.
     fn insert_cached(&self, cached_vector: CachedVector);
 
+    /// Remove cached entry (if any) to maintain correctness after deletes/updates
+    fn invalidate(&self, doc_id: u64);
+
     /// Get strategy name (for metrics/logging)
     fn name(&self) -> &str;
 
@@ -80,6 +83,10 @@ impl CacheStrategy for LruCacheStrategy {
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
         let _ = self.cache.insert(cached_vector); // Ignore evictions for baseline
+    }
+
+    fn invalidate(&self, doc_id: u64) {
+        let _ = self.cache.remove(doc_id);
     }
 
     fn name(&self) -> &str {
@@ -219,6 +226,15 @@ impl CacheStrategy for LearnedCacheStrategy {
         }
     }
 
+    fn invalidate(&self, doc_id: u64) {
+        if self.cache.remove(doc_id) {
+            let predictor = self.predictor.read();
+            if predictor.is_trained() {
+                predictor.record_eviction(doc_id);
+            }
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -300,6 +316,11 @@ impl CacheStrategy for AbTestSplitter {
 
     fn get_cached(&self, doc_id: u64) -> Option<CachedVector> {
         self.get_strategy(doc_id).get_cached(doc_id)
+    }
+
+    fn invalidate(&self, doc_id: u64) {
+        self.lru_strategy.invalidate(doc_id);
+        self.learned_strategy.invalidate(doc_id);
     }
 
     fn stats(&self) -> String {

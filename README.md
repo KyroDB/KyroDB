@@ -3,15 +3,15 @@
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange)](https://www.rust-lang.org/)
 
-**Status**: Phase 0 Weeks 17-20. Two-level L1 cache architecture validated at 71.7% hit rate. Production hardening in progress.
+**Status**: Active Development. Two-level L1 cache architecture validated at 71.7% hit rate. Production hardening in progress.
 
-KyroDB is a vector database optimized for RAG workloads, featuring a **two-level L1 cache** that combines document-level frequency prediction (RMI) with query-level semantic similarity matching. Achieves 71.7% L1 hit rate on realistic workloads.
+KyroDB is a vector database optimized for RAG workloads and AI agents, featuring a **two-level L1 cache** that combines document-level frequency prediction (RMI) with query-level semantic similarity matching. Achieves 71.7% L1 hit rate on realistic workloads.
 
 > **Development Status**: Research and development project. Core architecture implemented, performance optimization in progress.
 
 ## Mission
 
-Build the highest read-speed vector database on the planet, optimized for RAG workloads with learned access pattern prediction.
+Build the highest read-speed vector database on the planet, optimized for RAG workloads and AI agents with learned access pattern prediction.
 
 ## What Makes KyroDB Different
 
@@ -49,7 +49,7 @@ KyroDB's Layer 1 is the **Hybrid Semantic Cache (HSC)**, implemented as a **two-
 
 ## Validated Performance
 
-**Layer 1 Hybrid Semantic Cache (HSC)** (Phase 0 Week 12):
+**Layer 1 Hybrid Semantic Cache (HSC)**:
 - Combined L1 (HSC) hit rate: **71.7%** (L1a: 50.2%, L1b: 21.4%)
 - Comparison: 2-3× improvement over LRU baseline (25-35%)
 - Memory stability: 0% growth over 10-minute sustained load
@@ -62,7 +62,7 @@ KyroDB's Layer 1 is the **Hybrid Semantic Cache (HSC)**, implemented as a **two-
 
 ## Development Roadmap
 
-### Phase 0 Weeks 1-16 (✅ Complete)
+### Completed Milestones
 - HNSW vector search wrapper with >95% recall validation
 - **Two-level L1 cache** achieving 71.7% hit rate (L1a: RMI frequency + L1b: semantic similarity)
 - Access pattern logging with ring buffer (32 bytes/event, 17.6ns overhead)
@@ -75,7 +75,7 @@ KyroDB's Layer 1 is the **Hybrid Semantic Cache (HSC)**, implemented as a **two-
 
 **Key Achievement**: Two-level L1 cache (L1a Document + L1b Query) achieves 71.7% hit rate on realistic RAG workloads, exceeding 70% target.
 
-### Phase 0 Weeks 17-20 (Current Focus)
+### Current Focus
 - Performance tuning of the cache layer and three-tier architecture
 - Validation and load testing under realistic RAG scenarios
 - Instrumentation and observability for long-term cache behavior
@@ -351,9 +351,7 @@ cargo clippy
 
 ## Project Status
 
-**Phase**: Phase 0 Weeks 17-20 (Production hardening and optimization)
-
-**Completed** (Phase 0 Weeks 1-16):
+**Completed Features**:
 - HNSW vector search with high recall validation
 - Hybrid Semantic Cache (RMI frequency + semantic similarity)
 - Three-tier architecture (Cache → Hot Tier → HNSW)
@@ -373,7 +371,7 @@ cargo clippy
 - Chaos engineering and crash recovery testing
 - Beta customer deployments
 - Operational runbooks and monitoring
-- Public MVP launch (Phase 1)
+- Public MVP launch
 
 ## License
 

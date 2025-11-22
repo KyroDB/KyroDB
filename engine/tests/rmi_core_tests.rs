@@ -1,6 +1,6 @@
 //! RMI Core Tests
 //!
-//! Phase 0 Week 3-8: Tests for Hybrid Semantic Cache RMI components
+//! Tests for Hybrid Semantic Cache RMI components
 
 use kyrodb_engine::rmi_core::{LocalLinearModel, RmiIndex, RmiSegment};
 

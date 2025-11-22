@@ -1,4 +1,3 @@
-//!
 //! Validates cache performance targets:
 //! - Cache lookup: < 50ns (hash table O(1))
 //! - Cache insertion: < 100ns (with LRU update)

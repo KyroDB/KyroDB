@@ -16,6 +16,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -32,12 +33,12 @@ const WAL_MAGIC: u32 = 0x57414C00; // "WAL\0"
 /// Snapshot magic number
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
 
-/// WAL operation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum WalOp {
     Insert = 1,
     Delete = 2,
+    UpdateMetadata = 3,
 }
 
 /// WAL entry: single mutation logged to disk
@@ -46,6 +47,7 @@ pub struct WalEntry {
     pub op: WalOp,
     pub doc_id: u64,
     pub embedding: Vec<f32>,
+    pub metadata: HashMap<String, String>,
     pub timestamp: u64,
 }
 
@@ -131,6 +133,11 @@ impl WalWriter {
 
     /// Internal append logic (called by append or via error handler)
     fn append_internal(&mut self, entry: &WalEntry) -> Result<()> {
+        self.write_entry(entry)?;
+        self.perform_fsync()
+    }
+
+    fn write_entry(&mut self, entry: &WalEntry) -> Result<()> {
         // Serialize entry
         let entry_bytes = bincode::serialize(entry).context("Failed to serialize WAL entry")?;
 
@@ -145,24 +152,43 @@ impl WalWriter {
 
         self.entry_count += 1;
         self.bytes_written += 4 + entry_bytes.len() as u64 + 4;
+        Ok(())
+    }
 
+    fn perform_fsync(&mut self) -> Result<()> {
         // Flush to OS buffer cache (fast, does not wait for disk)
         self.file.flush()?;
 
         // fsync policy: Only FsyncPolicy::Always does immediate sync
-        // For async contexts, caller should use sync_async() instead
         match self.fsync_policy {
             FsyncPolicy::Always => {
-                // Synchronous fsync - blocks for ~10ms
-                // For production, use FsyncPolicy::Periodic and call sync() from background task
                 self.file.get_ref().sync_data()?;
             }
             FsyncPolicy::Never | FsyncPolicy::Periodic(_) => {
-                // No immediate sync - already flushed to OS buffer
+                // No immediate sync
             }
         }
-
         Ok(())
+    }
+
+    /// Append batch of entries to WAL
+    #[instrument(level = "trace", skip(self, entries), fields(count = entries.len()))]
+    pub fn append_batch(&mut self, entries: &[WalEntry]) -> Result<()> {
+        match &self.error_handler {
+            Some(error_handler) => {
+                let handler = Arc::clone(error_handler);
+                let entries_clone = entries.to_vec();
+                handler.write_with_retry(|| self.append_batch_internal(&entries_clone))
+            }
+            None => self.append_batch_internal(entries),
+        }
+    }
+
+    fn append_batch_internal(&mut self, entries: &[WalEntry]) -> Result<()> {
+        for entry in entries {
+            self.write_entry(entry)?;
+        }
+        self.perform_fsync()
     }
 
     /// Force fsync (for periodic policy or manual sync)
@@ -522,23 +548,43 @@ pub struct Snapshot {
     pub dimension: usize,
     /// All documents: (doc_id, embedding)
     pub documents: Vec<(u64, Vec<f32>)>,
+    /// Metadata for all documents: (doc_id, metadata_map)
+    pub metadata: Vec<(u64, HashMap<String, String>)>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacySnapshotV1 {
+    pub version: u32,
+    pub timestamp: u64,
+    pub doc_count: usize,
+    pub dimension: usize,
+    pub documents: Vec<(u64, Vec<f32>)>,
 }
 
 impl Snapshot {
     /// Create snapshot from current state
-    pub fn new(dimension: usize, documents: Vec<(u64, Vec<f32>)>) -> Self {
+    pub fn new(
+        dimension: usize,
+        documents: Vec<(u64, Vec<f32>)>,
+        metadata: Vec<(u64, HashMap<String, String>)>,
+    ) -> Result<Self> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        Self {
-            version: 1,
+        let mut snapshot = Self {
+            version: 2, // Bump version for metadata support
             timestamp,
             doc_count: documents.len(),
             dimension,
             documents,
-        }
+            metadata,
+        };
+
+        snapshot.validate_and_normalize()?;
+
+        Ok(snapshot)
     }
 
     /// Save snapshot to file (atomic: write to temp, then rename)
@@ -621,8 +667,24 @@ impl Snapshot {
         }
 
         // Deserialize
-        let snapshot: Snapshot =
-            bincode::deserialize(&snapshot_bytes).context("Failed to deserialize snapshot")?;
+        let mut snapshot = match bincode::deserialize::<Snapshot>(&snapshot_bytes) {
+            Ok(snapshot) => snapshot,
+            Err(primary_err) => {
+                match bincode::deserialize::<LegacySnapshotV1>(&snapshot_bytes) {
+                    Ok(legacy) => {
+                        warn!(
+                            "Loaded legacy snapshot v1 without metadata; upgrading in-memory representation"
+                        );
+                        Snapshot::from_legacy(legacy)
+                    }
+                    Err(_) => {
+                        return Err(primary_err).context("Failed to deserialize snapshot" );
+                    }
+                }
+            }
+        };
+
+        snapshot.validate_and_normalize()?;
 
         Ok(snapshot)
     }
@@ -716,6 +778,88 @@ impl Snapshot {
     }
 }
 
+impl Snapshot {
+    fn validate_and_normalize(&mut self) -> Result<()> {
+        if self.doc_count != self.documents.len() {
+            warn!(
+                expected = self.doc_count,
+                actual = self.documents.len(),
+                "Snapshot doc_count mismatch; normalizing to actual document count"
+            );
+            self.doc_count = self.documents.len();
+        }
+
+        if self.dimension != 0 {
+            for (doc_id, embedding) in &self.documents {
+                if embedding.len() != self.dimension {
+                    bail!(
+                        "Snapshot embedding dimension mismatch for doc_id {}: expected {}, found {}",
+                        doc_id,
+                        self.dimension,
+                        embedding.len()
+                    );
+                }
+            }
+        }
+
+        Self::validate_alignment(&self.documents, &self.metadata)?;
+
+        Ok(())
+    }
+
+    fn validate_alignment(
+        documents: &[(u64, Vec<f32>)],
+        metadata: &[(u64, HashMap<String, String>)],
+    ) -> Result<()> {
+        if documents.len() != metadata.len() {
+            bail!(
+                "Snapshot metadata length ({}) does not match documents length ({})",
+                metadata.len(),
+                documents.len()
+            );
+        }
+
+        let mut remaining: HashSet<u64> = HashSet::with_capacity(documents.len());
+        for (doc_id, _) in documents {
+            if !remaining.insert(*doc_id) {
+                bail!("Duplicate doc_id {} found in snapshot documents", doc_id);
+            }
+        }
+
+        for (meta_id, _) in metadata {
+            if !remaining.remove(meta_id) {
+                bail!(
+                    "Metadata entry for doc_id {} missing corresponding document",
+                    meta_id
+                );
+            }
+        }
+
+        if !remaining.is_empty() {
+            bail!("Missing metadata entries for doc_ids: {:?}", remaining);
+        }
+
+        Ok(())
+    }
+
+    fn from_legacy(legacy: LegacySnapshotV1) -> Self {
+        let metadata = legacy
+            .documents
+            .iter()
+            .map(|(doc_id, _)| (*doc_id, HashMap::new()))
+            .collect();
+
+        Self {
+            version: 2,
+            timestamp: legacy.timestamp,
+            doc_count: legacy.documents.len(),
+            dimension: legacy.dimension,
+            documents: legacy.documents,
+            metadata,
+        }
+    }
+}
+
 /// Manifest: tracks valid snapshots and WAL segments
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -805,6 +949,7 @@ mod tests {
             doc_id: 42,
             embedding: vec![0.1, 0.2, 0.3],
             timestamp: 1000,
+            metadata: HashMap::new(),
         };
 
         let entry2 = WalEntry {
@@ -812,6 +957,7 @@ mod tests {
             doc_id: 99,
             embedding: vec![],
             timestamp: 2000,
+            metadata: HashMap::new(),
         };
 
         writer.append(&entry1).unwrap();
@@ -838,7 +984,8 @@ mod tests {
         // Create snapshot
         let documents = vec![(1, vec![0.1, 0.2]), (2, vec![0.3, 0.4])];
 
-        let snapshot = Snapshot::new(2, documents);
+        let metadata = vec![(1, HashMap::new()), (2, HashMap::new())];
+        let snapshot = Snapshot::new(2, documents, metadata).unwrap();
         snapshot.save(&snapshot_path).unwrap();
 
         // Load snapshot
@@ -1001,6 +1148,7 @@ mod tests {
             doc_id: 42,
             embedding: vec![1.0, 2.0, 3.0],
             timestamp: 1234567890,
+            metadata: HashMap::new(),
         };
 
         // Should succeed
@@ -1053,7 +1201,8 @@ mod tests {
 
         // Create valid snapshot first
         let documents = vec![(1, vec![0.1, 0.2]), (2, vec![0.3, 0.4])];
-        let snapshot = Snapshot::new(2, documents.clone());
+        let metadata = documents.iter().map(|(id, _)| (*id, HashMap::new())).collect();
+        let snapshot = Snapshot::new(2, documents.clone(), metadata).unwrap();
         snapshot.save(&snapshot_path).unwrap();
 
         // Corrupt the snapshot by modifying bytes in the data section
@@ -1083,13 +1232,15 @@ mod tests {
         // Create snapshot_100.snap (primary)
         let snapshot_100_path = dir.path().join("snapshot_100.snap");
         let documents_100 = vec![(1, vec![1.0, 2.0]), (2, vec![3.0, 4.0])];
-        let snapshot_100 = Snapshot::new(2, documents_100);
+        let metadata_100 = documents_100.iter().map(|(id, _)| (*id, HashMap::new())).collect();
+        let snapshot_100 = Snapshot::new(2, documents_100, metadata_100).unwrap();
         snapshot_100.save(&snapshot_100_path).unwrap();
 
         // Create snapshot_99.snap (fallback)
         let snapshot_99_path = dir.path().join("snapshot_99.snap");
         let documents_99 = vec![(1, vec![0.1, 0.2])];
-        let snapshot_99 = Snapshot::new(2, documents_99);
+        let metadata_99 = documents_99.iter().map(|(id, _)| (*id, HashMap::new())).collect();
+        let snapshot_99 = Snapshot::new(2, documents_99, metadata_99).unwrap();
         snapshot_99.save(&snapshot_99_path).unwrap();
 
         // Corrupt snapshot_100
