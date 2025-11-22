@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(config.rmi_capacity, 10_000);
         assert_eq!(config.recency_halflife, Duration::from_secs(1800));
         assert_eq!(config.admission_threshold, 0.15);
-        assert_eq!(config.auto_tune_enabled, true);
+        assert!(config.auto_tune_enabled);
         assert_eq!(config.target_utilization, 0.85);
     }
 

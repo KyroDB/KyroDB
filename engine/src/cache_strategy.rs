@@ -412,6 +412,7 @@ mod tests {
             }
         }
 
+        #[allow(clippy::unnecessary_cast)] // Need i32 for abs() method
         // Should be roughly 50/50 (within 10% tolerance)
         assert!(
             (lru_count as i32 - 500).abs() < 50,

@@ -270,7 +270,7 @@ mod tests {
         let available = bucket.available_tokens();
         // Allow wider range due to timing variance across systems
         assert!(
-            available >= 5.0 && available <= 20.0,
+            (5.0..=20.0).contains(&available),
             "Expected ~10 tokens, got {}",
             available
         );
@@ -372,7 +372,7 @@ mod tests {
         // Should allow ~50 requests total (50 QPS bucket)
         // Some threads will be rejected
         assert!(
-            total >= 45 && total <= 55,
+            (45..=55).contains(&total),
             "Expected ~50 requests, got {}",
             total
         );
@@ -385,7 +385,7 @@ mod tests {
         // New tenant: should have full bucket
         limiter.check_limit("tenant_a", 100);
         let available = limiter.available_tokens("tenant_a").unwrap();
-        assert!(available >= 99.0 && available <= 100.0);
+        assert!((99.0..=100.0).contains(&available));
 
         // Consume more tokens
         for _ in 0..50 {
@@ -394,7 +394,7 @@ mod tests {
 
         let available = limiter.available_tokens("tenant_a").unwrap();
         assert!(
-            available >= 48.0 && available <= 50.0,
+            (48.0..=50.0).contains(&available),
             "Expected ~49 tokens, got {}",
             available
         );
@@ -437,7 +437,7 @@ mod tests {
         let available = bucket.available_tokens();
         // Allow wider range due to timing variance (OS scheduler, CPU load, etc.)
         assert!(
-            available >= 5.0 && available <= 30.0,
+            (5.0..=30.0).contains(&available),
             "Expected ~10 tokens, got {}",
             available
         );

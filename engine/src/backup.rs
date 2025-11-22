@@ -1525,7 +1525,7 @@ mod tests {
 
         // Should keep backups within 1 hour (all of them in this test)
         let after_prune = manager.list_backups().unwrap();
-        assert!(after_prune.len() > 0);
+        assert!(!after_prune.is_empty());
         assert!(deleted.len() < before_prune.len());
     }
 

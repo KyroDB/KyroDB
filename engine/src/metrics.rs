@@ -1168,10 +1168,10 @@ mod tests {
         // Percentile calculation: P50 = value at index 50 (50th percentile of 100 samples)
         // With 100 samples, P50 is at index (0.5 * 100) = 50, which contains value 51_000
         let p50 = hist.percentile(50.0);
-        assert!(p50 >= 50_000 && p50 <= 51_000, "P50 was {}", p50);
+        assert!((50_000..=51_000).contains(&p50), "P50 was {}", p50);
 
         let p99 = hist.percentile(99.0);
-        assert!(p99 >= 99_000 && p99 <= 100_000, "P99 was {}", p99);
+        assert!((99_000..=100_000).contains(&p99), "P99 was {}", p99);
     }
 
     #[test]
@@ -1219,7 +1219,7 @@ mod tests {
         // Median should be around 10-11 (samples 6-15)
         let p50 = hist.percentile(50.0);
         assert!(
-            p50 >= 10_000 && p50 <= 12_000,
+            (10_000..=12_000).contains(&p50),
             "P50 was {}, expected ~10500",
             p50
         );

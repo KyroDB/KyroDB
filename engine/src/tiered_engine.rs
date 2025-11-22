@@ -1422,9 +1422,12 @@ mod tests {
         let cache = LruCacheStrategy::new(10);
         let embeddings = vec![vec![1.0, 0.0]];
 
-        let mut config = TieredEngineConfig::default();
-        config.data_dir = None;
-        config.hnsw_max_elements = 100;
+        let mut config = TieredEngineConfig {
+            data_dir: None,
+            hnsw_max_elements: 100,
+            ..Default::default()
+        };
+
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new()];
@@ -1784,7 +1787,7 @@ mod tests {
 
         // For this test, flush should succeed, so hot tier should be empty
         // (Testing actual failure requires disk-full simulation which is complex)
-        assert!(engine.hot_tier.len() == 0 || flushed > 0);
+        assert!(engine.hot_tier.is_empty() || flushed > 0);
 
         // Verify stats include flush operations
         let stats = engine.stats();
