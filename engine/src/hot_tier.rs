@@ -310,6 +310,102 @@ impl HotTier {
         }
     }
 
+    /// k-NN search over hot tier documents
+    ///
+    /// Performs linear scan over all documents in hot tier, computing cosine distance
+    /// to the query vector. Returns top-k results sorted by distance (ascending).
+    ///
+    /// # Performance
+    /// - Complexity: O(n × d) where n = hot_tier_size, d = embedding_dim
+    /// - Hot tier is typically small (1K-10K documents), so linear scan is acceptable
+    /// - For 10K documents × 384 dimensions: ~3.8M ops × 0.5ns ≈ 2ms worst case
+    /// - Typical case: 1K documents ≈ 200μs
+    ///
+    /// # Parameters
+    /// - `query`: Query embedding vector
+    /// - `k`: Number of nearest neighbors to return
+    ///
+    /// # Returns
+    /// Vector of (doc_id, distance) pairs, sorted by distance ascending (best match first).
+    /// If hot tier has fewer than k documents, returns all documents.
+    ///
+    /// # Note
+    /// This does NOT update hit/miss stats since it's a search operation, not a lookup.
+    pub fn knn_search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        if k == 0 {
+            return Vec::new();
+        }
+
+        let docs = self.documents.read();
+
+        if docs.is_empty() {
+            return Vec::new();
+        }
+
+        // Compute distances for all documents in hot tier
+        let mut distances: Vec<(u64, f32)> = docs
+            .iter()
+            .map(|(doc_id, doc)| {
+                let distance = Self::cosine_distance(query, &doc.embedding);
+                (*doc_id, distance)
+            })
+            .collect();
+
+        // Sort by distance ascending (smaller distance = better match)
+        distances.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Truncate to k results
+        distances.truncate(k);
+
+        distances
+    }
+
+    /// Compute cosine distance between two embeddings
+    ///
+    /// Formula: distance = 1 - cos(θ) = 1 - (A · B) / (||A|| × ||B||)
+    ///
+    /// # Properties
+    /// - distance = 0.0: Identical vectors (cos = 1.0)
+    /// - distance = 1.0: Orthogonal vectors (cos = 0.0)
+    /// - distance = 2.0: Opposite vectors (cos = -1.0)
+    ///
+    /// # Performance
+    /// O(d) where d = embedding dimension
+    /// For d=384: ~384 ops × 0.5ns = ~200ns per comparison
+    ///
+    /// # Future Optimization
+    /// - SIMD vectorization (8× speedup on AVX2)
+    /// - Pre-normalize embeddings (skip magnitude computation)
+    #[inline]
+    fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return f32::INFINITY; // Invalid comparison
+        }
+
+        let mut dot = 0.0;
+        let mut mag_a = 0.0;
+        let mut mag_b = 0.0;
+
+        for i in 0..a.len() {
+            dot += a[i] * b[i];
+            mag_a += a[i] * a[i];
+            mag_b += b[i] * b[i];
+        }
+
+        let magnitude = (mag_a * mag_b).sqrt();
+        if magnitude < f32::EPSILON {
+            return f32::INFINITY; // Degenerate case: zero vector
+        }
+
+        let cosine_similarity = (dot / magnitude).clamp(-1.0, 1.0);
+
+        // Convert similarity [-1, 1] to distance [0, 2]
+        1.0 - cosine_similarity
+    }
+
     /// Re-insert documents that failed to flush
     ///
     /// Used when flush to cold tier fails - documents are put back into hot tier
@@ -442,5 +538,120 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
 
         assert!(hot_tier.needs_flush()); // Age threshold reached
+    }
+
+    #[test]
+    fn test_hot_tier_knn_search_basic() {
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+
+        // Insert 3 documents with normalized embeddings
+        // Doc 1: [1.0, 0.0, 0.0] (normalized)
+        hot_tier.insert(1, vec![1.0, 0.0, 0.0], HashMap::new());
+
+        // Doc 2: [0.0, 1.0, 0.0] (normalized)
+        hot_tier.insert(2, vec![0.0, 1.0, 0.0], HashMap::new());
+
+        // Doc 3: [0.707, 0.707, 0.0] (normalized, similar to query)
+        hot_tier.insert(3, vec![0.707, 0.707, 0.0], HashMap::new());
+
+        // Query: [0.6, 0.8, 0.0] (closer to doc 2 and doc 3)
+        let query = vec![0.6, 0.8, 0.0];
+        let results = hot_tier.knn_search(&query, 2);
+
+        // Should return 2 results
+        assert_eq!(results.len(), 2);
+
+        // Results should be sorted by distance (ascending)
+        assert!(results[0].1 <= results[1].1);
+
+        // Doc 3 should be closest (has both x and y components)
+        assert_eq!(results[0].0, 3);
+    }
+
+    #[test]
+    fn test_hot_tier_knn_search_empty() {
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+
+        let query = vec![1.0, 0.0, 0.0];
+        let results = hot_tier.knn_search(&query, 5);
+
+        // Empty hot tier should return empty results
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_hot_tier_knn_search_fewer_than_k() {
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+
+        // Insert 2 documents
+        hot_tier.insert(1, vec![1.0, 0.0], HashMap::new());
+        hot_tier.insert(2, vec![0.0, 1.0], HashMap::new());
+
+        // Request k=5, but only 2 documents available
+        let query = vec![1.0, 0.0];
+        let results = hot_tier.knn_search(&query, 5);
+
+        // Should return 2 results (all available documents)
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_hot_tier_knn_search_identical_vector() {
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+
+        // Insert document
+        let embedding = vec![0.5, 0.5, 0.707];
+        hot_tier.insert(42, embedding.clone(), HashMap::new());
+
+        // Search with identical query
+        let results = hot_tier.knn_search(&embedding, 1);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 42);
+
+        // Distance should be ~0.0 for identical vectors
+        assert!(results[0].1 < 0.0001);
+    }
+
+    #[test]
+    fn test_hot_tier_cosine_distance() {
+        // Test cosine distance computation
+
+        // Identical vectors: distance = 0.0
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let dist = HotTier::cosine_distance(&a, &b);
+        assert!(dist < 0.001, "Identical vectors should have distance ~0.0");
+
+        // Orthogonal vectors: distance = 1.0
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let dist = HotTier::cosine_distance(&a, &b);
+        assert!((dist - 1.0).abs() < 0.001, "Orthogonal vectors should have distance ~1.0");
+
+        // Opposite vectors: distance = 2.0
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![-1.0, 0.0, 0.0];
+        let dist = HotTier::cosine_distance(&a, &b);
+        assert!((dist - 2.0).abs() < 0.001, "Opposite vectors should have distance ~2.0");
+
+        // Dimension mismatch: should return INFINITY
+        let a = vec![1.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let dist = HotTier::cosine_distance(&a, &b);
+        assert!(dist.is_infinite(), "Mismatched dimensions should return INFINITY");
+    }
+
+    #[test]
+    fn test_hot_tier_knn_search_k_zero() {
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+
+        hot_tier.insert(1, vec![1.0, 0.0], HashMap::new());
+
+        // k=0 should return empty results
+        let query = vec![1.0, 0.0];
+        let results = hot_tier.knn_search(&query, 0);
+
+        assert!(results.is_empty());
     }
 }

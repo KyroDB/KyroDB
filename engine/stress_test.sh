@@ -1,8 +1,8 @@
 #!/bin/bash
-# Phase 4 Validation - Comprehensive 1M Operation Load Test
+# Validation - Comprehensive 1M Operation Load Test
 set -e
 
-echo "=== KyroDB Phase 4 Validation: 1M Operation Load Test ==="
+echo "=== KyroDB Validation: 1M Operation Load Test ==="
 echo "Starting at: $(date)"
 echo ""
 

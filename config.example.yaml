@@ -7,9 +7,7 @@
 #   KYRODB__SERVER__PORT=50051 ./kyrodb_server
 #   KYRODB__CACHE__CAPACITY=50000 ./kyrodb_server --config config.yaml
 
-# ============================================================================
 # Server Configuration
-# ============================================================================
 server:
   # gRPC server host (IPv4 or IPv6)
   host: "127.0.0.1"
@@ -29,9 +27,7 @@ server:
   # Graceful shutdown timeout (seconds)
   shutdown_timeout_secs: 30
 
-# ============================================================================
 # Cache Configuration (Hybrid Semantic Cache)
-# ============================================================================
 cache:
   # Maximum number of vectors to cache
   # Customer A might use 1000, Customer B might use 100,000
@@ -55,9 +51,7 @@ cache:
   # A/B test traffic split (0.0-1.0, fraction for treatment group)
   ab_test_split: 0.5
 
-# ============================================================================
 # HNSW Configuration (Vector Search Backend)
-# ============================================================================
 hnsw:
   # Maximum number of vectors in index
   max_elements: 100000
@@ -81,9 +75,7 @@ hnsw:
   # Distance metric: cosine, euclidean, or innerproduct
   distance: cosine
 
-# ============================================================================
 # Persistence Configuration (WAL + Snapshots)
-# ============================================================================
 persistence:
   # Data directory for WAL and snapshots
   data_dir: "./data"
@@ -110,9 +102,7 @@ persistence:
   # Enable automatic crash recovery on startup
   enable_recovery: true
 
-# ============================================================================
 # SLO Configuration (Service Level Objectives)
-# ============================================================================
 slo:
   # P99 latency threshold (milliseconds)
   # Breach alert if P99 > this value
@@ -133,9 +123,7 @@ slo:
   # Minimum sample size before alerting (prevent false positives during startup)
   min_samples: 100
 
-# ============================================================================
 # Rate Limiting Configuration
-# ============================================================================
 rate_limit:
   # Enable rate limiting (disable for trusted internal networks)
   enabled: false
@@ -149,9 +137,7 @@ rate_limit:
   # Burst capacity (token bucket size)
   burst_capacity: 10000
 
-# ============================================================================
 # Logging Configuration
-# ============================================================================
 logging:
   # Log level: trace, debug, info, warn, error
   level: info

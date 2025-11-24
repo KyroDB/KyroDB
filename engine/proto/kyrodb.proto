@@ -96,7 +96,7 @@ message InsertRequest {
   // Phase 2: Full metadata indexing
   map<string, string> metadata = 3;
   
-  // Optional namespace for multi-tenancy (Phase 1)
+  // Optional namespace for multi-tenancy 
   string namespace = 4;
 }
 
