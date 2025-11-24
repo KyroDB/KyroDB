@@ -215,7 +215,7 @@ impl BackupManager {
         let backup_id = Uuid::new_v4();
         let backup_timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock is set before Unix epoch (1970-01-01) - this should never happen on a properly configured system")
             .as_secs();
 
         let backup_path = self.backup_dir.join(format!("backup_{}.tar", backup_id));
@@ -790,7 +790,13 @@ impl RestoreManager {
                 }
             }
 
-            if chain.last().unwrap().backup_type != BackupType::Full {
+            // Safety: chain is initialized with metadata on line 776, so it's never empty
+            if chain
+                .last()
+                .expect("BUG: chain cannot be empty (initialized with metadata on line 776)")
+                .backup_type
+                != BackupType::Full
+            {
                 return Err(anyhow!("No full backup found in chain"));
             }
 

@@ -1410,10 +1410,14 @@ async fn main() -> Result<()> {
 
     let engine_strategy = LearnedCacheStrategy::new(learned_cache_capacity, engine_predictor);
 
+    // Create empty metadata for all corpus documents
+    let corpus_metadata = vec![HashMap::new(); corpus_embeddings.len()];
+
     let mut engine = TieredEngine::new(
         Box::new(engine_strategy),
         query_cache.clone(),
-        corpus_embeddings,
+        corpus_embeddings.clone(),
+        corpus_metadata,
         tiered_config,
     )
     .context("Failed to create TieredEngine")?;
@@ -1593,10 +1597,9 @@ async fn main() -> Result<()> {
 
     let workload_gen =
         if let (Some(query_embs), Some(query_doc_map)) = (&query_embeddings, &query_to_doc) {
-            // Get corpus embeddings from HNSW backend (Layer 3)
-            let corpus_embs = engine.cold_tier().get_all_embeddings();
+            // Use corpus embeddings that were loaded earlier
             let semantic_gen = SemanticWorkloadGenerator::new(
-                corpus_embs.clone(),
+                Arc::new(corpus_embeddings.clone()),
                 query_embs.clone(),
                 query_doc_map.clone(),
                 config.zipf_exponent,

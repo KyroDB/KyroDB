@@ -519,7 +519,7 @@ impl HnswBackend {
     fn timestamp() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock is set before Unix epoch (1970-01-01) - this should never happen on a properly configured system")
             .as_secs()
     }
 

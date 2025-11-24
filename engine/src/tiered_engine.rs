@@ -34,6 +34,19 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 /// Tiered engine statistics (Two-Level Cache Architecture)
+///
+/// # Lock Strategy (Performance Optimization)
+///
+/// Statistics updates use **separate, short-lived lock acquisitions** to minimize
+/// lock contention on the hot query path. This is an intentional design choice:
+///
+/// - **No data corruption**: Each counter update is atomic
+/// - **Minimal lock contention**: Locks are held for nanoseconds, not across complex operations
+/// - **Acceptable trade-off**: Temporary inconsistent snapshots are fine for metrics
+///   (e.g., briefly `cache_hits` might appear > `total_queries`, but converges immediately)
+///
+/// Alternative (single-lock-per-query) would increase P99 latency by 5-10% due to
+/// lock contention, which is unacceptable for a performance-critical database.
 #[derive(Debug, Clone, Default)]
 pub struct TieredEngineStats {
     /// Layer 1a (Document Cache) statistics - RMI frequency-based

@@ -6,6 +6,7 @@
 // - Layer 3: Cold tier (HNSW + persistence)
 
 use kyrodb_engine::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -17,14 +18,25 @@ fn test_three_tier_query_journey() {
         initial_embeddings.push(vec![i as f32 / 10.0, 1.0 - i as f32 / 10.0]);
     }
 
+    // Create empty metadata for initial documents
+    let initial_metadata = vec![HashMap::new(); initial_embeddings.len()];
+
     let cache = LruCacheStrategy::new(5); // Small cache: 5 docs
+    let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
     let config = TieredEngineConfig {
         hot_tier_max_size: 3, // Small hot tier: 3 docs
         hnsw_max_elements: 100,
         ..Default::default()
     };
 
-    let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+    let engine = TieredEngine::new(
+        Box::new(cache),
+        query_cache,
+        initial_embeddings,
+        initial_metadata,
+        config,
+    )
+    .unwrap();
 
     // Step 1: Query existing documents (should hit cold tier)
     println!("\n=== Step 1: Cold tier queries ===");
@@ -42,8 +54,12 @@ fn test_three_tier_query_journey() {
 
     // Step 2: Insert new documents (should go to hot tier)
     println!("\n=== Step 2: Hot tier inserts ===");
-    engine.insert(100, vec![0.25, 0.75]).unwrap();
-    engine.insert(101, vec![0.30, 0.70]).unwrap();
+    engine
+        .insert(100, vec![0.25, 0.75], HashMap::new())
+        .unwrap();
+    engine
+        .insert(101, vec![0.30, 0.70], HashMap::new())
+        .unwrap();
 
     // Query documents in hot tier (before flush)
     let result = engine.query(100, None);
@@ -56,7 +72,9 @@ fn test_three_tier_query_journey() {
     // Step 3: Flush hot tier to cold tier
     println!("\n=== Step 3: Flushing to cold tier ===");
     // Insert one more to trigger flush (hot_tier_max_size=3)
-    engine.insert(102, vec![0.35, 0.65]).unwrap();
+    engine
+        .insert(102, vec![0.35, 0.65], HashMap::new())
+        .unwrap();
     let flushed = engine.flush_hot_tier().unwrap();
     println!("Flushed {} documents", flushed);
     assert!(flushed > 0, "Should have flushed at least some documents");
@@ -137,8 +155,10 @@ fn test_persistence_across_all_tiers() {
     // Step 1: Create engine with persistence
     {
         let initial_embeddings = vec![vec![1.0, 0.0], vec![0.8, 0.2], vec![0.6, 0.4]];
+        let initial_metadata = vec![HashMap::new(); initial_embeddings.len()];
 
         let cache = LruCacheStrategy::new(10);
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let config = TieredEngineConfig {
             hot_tier_max_size: 2,
             hnsw_max_elements: 100,
@@ -148,18 +168,33 @@ fn test_persistence_across_all_tiers() {
             ..Default::default()
         };
 
-        let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            initial_embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         println!("\n=== Step 1: Writing data ===");
 
         // Insert to hot tier and flush
-        engine.insert(10, vec![0.4, 0.6]).unwrap();
-        engine.insert(11, vec![0.2, 0.8]).unwrap();
+        engine
+            .insert(10, vec![0.4, 0.6], HashMap::new())
+            .unwrap();
+        engine
+            .insert(11, vec![0.2, 0.8], HashMap::new())
+            .unwrap();
         engine.flush_hot_tier().unwrap();
 
         // Insert more (should trigger snapshot at 5 inserts)
-        engine.insert(20, vec![0.1, 0.9]).unwrap();
-        engine.insert(21, vec![0.0, 1.0]).unwrap();
+        engine
+            .insert(20, vec![0.1, 0.9], HashMap::new())
+            .unwrap();
+        engine
+            .insert(21, vec![0.0, 1.0], HashMap::new())
+            .unwrap();
         engine.flush_hot_tier().unwrap();
 
         // Query to populate cache
@@ -179,13 +214,15 @@ fn test_persistence_across_all_tiers() {
         println!("\n=== Step 2: Recovery ===");
 
         let cache = LruCacheStrategy::new(10);
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
             hnsw_max_elements: 100,
             ..Default::default()
         };
 
-        let recovered = TieredEngine::recover(Box::new(cache), dir.path(), config).unwrap();
+        let recovered = TieredEngine::recover(Box::new(cache), query_cache, dir.path(), config)
+            .unwrap();
 
         // Verify initial docs
         assert!(
@@ -241,14 +278,25 @@ fn test_concurrent_tier_access() {
     use std::thread;
 
     let initial_embeddings = vec![vec![1.0, 0.0]; 20];
+    let initial_metadata = vec![HashMap::new(); initial_embeddings.len()];
     let cache = LruCacheStrategy::new(10);
+    let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
     let config = TieredEngineConfig {
         hot_tier_max_size: 10,
         hnsw_max_elements: 100,
         ..Default::default()
     };
 
-    let engine = Arc::new(TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap());
+    let engine = Arc::new(
+        TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            initial_embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap(),
+    );
 
     println!("\n=== Concurrent access test ===");
 
@@ -267,7 +315,9 @@ fn test_concurrent_tier_access() {
     let engine2 = Arc::clone(&engine);
     handles.push(thread::spawn(move || {
         for i in 100..110 {
-            engine2.insert(i, vec![0.5, 0.5]).unwrap();
+            engine2
+                .insert(i, vec![0.5, 0.5], HashMap::new())
+                .unwrap();
         }
     }));
 
@@ -298,14 +348,23 @@ fn test_query_path_layering() {
     println!("\n=== Query path layering test ===");
 
     let initial_embeddings = vec![vec![1.0, 0.0]; 5];
+    let initial_metadata = vec![HashMap::new(); initial_embeddings.len()];
     let cache = LruCacheStrategy::new(3); // Cache capacity: 3
+    let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
     let config = TieredEngineConfig {
         hot_tier_max_size: 5,
         hnsw_max_elements: 100,
         ..Default::default()
     };
 
-    let engine = TieredEngine::new(Box::new(cache), initial_embeddings, config).unwrap();
+    let engine = TieredEngine::new(
+        Box::new(cache),
+        query_cache,
+        initial_embeddings,
+        initial_metadata,
+        config,
+    )
+    .unwrap();
 
     // Step 1: Query doc 0 (cold tier hit)
     println!("Step 1: First query to doc 0");
@@ -321,7 +380,9 @@ fn test_query_path_layering() {
 
     // Step 3: Insert new doc to hot tier
     println!("Step 3: Insert doc 100 to hot tier");
-    engine.insert(100, vec![0.5, 0.5]).unwrap();
+    engine
+        .insert(100, vec![0.5, 0.5], HashMap::new())
+        .unwrap();
 
     // Step 4: Query doc 100 (hot tier hit)
     println!("Step 4: Query doc 100 from hot tier");
