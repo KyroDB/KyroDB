@@ -112,13 +112,97 @@ pub fn get_memory_stats() -> anyhow::Result<MemoryStats> {
 
 #[cfg(not(feature = "jemalloc-profiling"))]
 pub fn get_memory_stats() -> anyhow::Result<MemoryStats> {
-    // No profiling support - return zeros
+    // Fallback to platform-native memory tracking
+    platform_memory_stats()
+}
+
+/// Platform-native memory tracking (works everywhere without jemalloc)
+#[cfg(target_os = "linux")]
+fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
+    use std::fs;
+
+    // Read /proc/self/status for RSS (resident set size)
+    let status = fs::read_to_string("/proc/self/status")
+        .map_err(|e| anyhow::anyhow!("Failed to read /proc/self/status: {}", e))?;
+
+    let mut rss_kb = 0_usize;
+    let mut vm_size_kb = 0_usize;
+
+    for line in status.lines() {
+        if line.starts_with("VmRSS:") {
+            rss_kb = line.split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        } else if line.starts_with("VmSize:") {
+            vm_size_kb = line.split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+
     Ok(MemoryStats {
-        allocated: 0,
-        resident: 0,
-        mapped: 0,
-        retained: 0,
+        allocated: vm_size_kb * 1024,  // Total virtual memory
+        resident: rss_kb * 1024,        // Resident set size (physical memory)
+        mapped: vm_size_kb * 1024,      // Same as VmSize for this impl
+        retained: 0,                     // Not available without jemalloc
     })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
+    use std::mem;
+
+    // Use mach task_info to get memory stats on macOS
+    extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(
+            task: u32,
+            flavor: i32,
+            task_info: *mut u8,
+            task_info_count: *mut u32,
+        ) -> i32;
+    }
+
+    const MACH_TASK_BASIC_INFO: i32 = 20;
+    const MACH_TASK_BASIC_INFO_COUNT: u32 = 12;
+
+    #[repr(C)]
+    struct TaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        _rest: [u64; 10],
+    }
+
+    unsafe {
+        let mut info: TaskBasicInfo = mem::zeroed();
+        let mut count = MACH_TASK_BASIC_INFO_COUNT;
+
+        let kr = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as *mut u8,
+            &mut count,
+        );
+
+        if kr == 0 {
+            Ok(MemoryStats {
+                allocated: info.virtual_size as usize,
+                resident: info.resident_size as usize,
+                mapped: info.virtual_size as usize,
+                retained: 0,
+            })
+        } else {
+            anyhow::bail!("task_info failed with code: {}", kr)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
+    // Unsupported platform - return error
+    anyhow::bail!("Memory tracking not implemented for this platform (use --features jemalloc-profiling)")
 }
 
 /// Dump heap profile to file

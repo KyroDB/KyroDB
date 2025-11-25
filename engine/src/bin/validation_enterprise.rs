@@ -1692,6 +1692,9 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Capture stats before query to track cache behavior
+        let stats_before = engine.stats();
+
         // Query through TieredEngine (all tiers: L1a, L1b, L2, L3)
         let embedding_opt = engine.query(doc_id, query_embedding_for_cache);
 
@@ -1699,11 +1702,24 @@ async fn main() -> Result<()> {
             // Track document access for quality metrics
             *doc_accesses.entry(doc_id).or_insert(0) += 1;
 
-            // Log to stats persister for CSV output
-            stats_persister
-                .log_hit("tiered_engine", doc_id, 0)
-                .await
-                .ok();
+            // Capture stats after query to determine if it was a cache hit
+            let stats_after = engine.stats();
+
+            // Check if L1 cache (L1a or L1b) served this query
+            let was_l1_cache_hit = stats_after.l1_combined_hits > stats_before.l1_combined_hits;
+
+            // Log actual cache behavior to CSV (not document existence)
+            if was_l1_cache_hit {
+                stats_persister
+                    .log_hit("tiered_engine", doc_id, 0)
+                    .await
+                    .ok();
+            } else {
+                stats_persister
+                    .log_miss("tiered_engine", doc_id, 0)
+                    .await
+                    .ok();
+            }
         } else {
             // Document not found (should not happen with pre-loaded corpus)
             eprintln!("WARNING: Document {} not found in any tier", doc_id);
