@@ -156,6 +156,7 @@ async fn end_to_end_insert_query_search() -> Result<()> {
         min_score: 0.0,
         namespace: String::new(),
         include_embeddings: false,
+        filter: None,
         metadata_filters: HashMap::new(),
     };
 

@@ -11,6 +11,7 @@
 //! - L1b (query_hash_cache): Query-level cache with semantic similarity
 
 use crate::learned_cache::LearnedCachePredictor;
+use crate::semantic_adapter::SemanticAdapter;
 use crate::vector_cache::{CachedVector, VectorCache};
 use std::sync::Arc;
 use tracing::{instrument, trace};
@@ -105,16 +106,21 @@ impl CacheStrategy for LruCacheStrategy {
     }
 }
 
-/// Learned Cache strategy (RMI frequency-based)
+/// Learned Cache strategy (RMI frequency-based, optionally semantic-aware)
 ///
 /// Uses RMI predictor to decide cache admission based on predicted hotness.
 /// This is L1a (document-level cache) in the two-level architecture.
+///
+/// When created with `new_with_semantic`, combines frequency prediction with
+/// semantic similarity for hybrid cache admission decisions.
 ///
 /// L1b (query-level cache) is handled separately by QueryHashCache.
 ///
 pub struct LearnedCacheStrategy {
     pub cache: Arc<VectorCache>,
     pub predictor: Arc<parking_lot::RwLock<LearnedCachePredictor>>,
+    /// Optional semantic adapter for hybrid frequency+semantic admission
+    semantic_adapter: Option<SemanticAdapter>,
     name: String,
 }
 
@@ -130,8 +136,39 @@ impl LearnedCacheStrategy {
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
+            semantic_adapter: None,
             name: "learned_rmi".to_string(),
         }
+    }
+
+    /// Create new Learned Cache strategy with semantic adapter (hybrid frequency+semantic)
+    ///
+    /// Combines RMI frequency prediction with semantic similarity for cache admission.
+    /// When frequency score is uncertain (between low and high confidence thresholds),
+    /// semantic similarity is used as a tiebreaker.
+    ///
+    /// # Parameters
+    /// - `capacity`: Cache capacity
+    /// - `predictor`: Trained RMI frequency predictor
+    /// - `semantic_adapter`: Semantic adapter for similarity-based boosting
+    pub fn new_with_semantic(
+        capacity: usize,
+        mut predictor: LearnedCachePredictor,
+        semantic_adapter: SemanticAdapter,
+    ) -> Self {
+        Self::configure_predictor_defaults(&mut predictor, capacity);
+
+        Self {
+            cache: Arc::new(VectorCache::new(capacity)),
+            predictor: Arc::new(parking_lot::RwLock::new(predictor)),
+            semantic_adapter: Some(semantic_adapter),
+            name: "learned_semantic".to_string(),
+        }
+    }
+
+    /// Check if this strategy has a semantic adapter attached
+    pub fn has_semantic(&self) -> bool {
+        self.semantic_adapter.is_some()
     }
 
     /// Update predictor (for periodic retraining)
@@ -192,19 +229,39 @@ impl CacheStrategy for LearnedCacheStrategy {
         }
     }
 
-    #[instrument(level = "trace", skip(self, _embedding), fields(doc_id))]
-    fn should_cache(&self, doc_id: u64, _embedding: &[f32]) -> bool {
+    #[instrument(level = "trace", skip(self, embedding), fields(doc_id))]
+    fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
         let predictor = self.predictor.read();
 
         if !predictor.is_trained() {
             trace!(doc_id, strategy = %self.name, "bootstrap admit (untrained predictor)");
+            // During bootstrap, also cache embedding in semantic adapter if present
+            if let Some(ref adapter) = self.semantic_adapter {
+                adapter.cache_embedding(doc_id, embedding.to_vec());
+            }
             return true;
         }
 
-        // Pure frequency-based admission (RMI only)
+        // Get frequency-based prediction (RMI)
         let freq_score = predictor.lookup_hotness(doc_id).unwrap_or(0.0);
         let threshold = predictor.cache_threshold().max(predictor.admission_floor());
 
+        // If semantic adapter is present, use hybrid decision
+        if let Some(ref adapter) = self.semantic_adapter {
+            let should_admit = adapter.should_cache(freq_score, embedding);
+
+            if should_admit {
+                trace!(doc_id, freq_score, threshold, "admit (hybrid semantic+freq)");
+                // Cache embedding for future semantic lookups
+                adapter.cache_embedding(doc_id, embedding.to_vec());
+            } else {
+                trace!(doc_id, freq_score, threshold, "reject (hybrid semantic+freq)");
+            }
+
+            return should_admit;
+        }
+
+        // Pure frequency-based admission (RMI only)
         let should_admit = freq_score >= threshold;
 
         if should_admit {
@@ -241,14 +298,30 @@ impl CacheStrategy for LearnedCacheStrategy {
     fn stats(&self) -> String {
         let stats = self.cache.stats();
         let predictor = self.predictor.read();
-        format!(
+
+        let base_stats = format!(
             "Learned: {} hits, {} misses, {:.2}% hit rate, {} evictions, {} tracked docs",
             stats.hits,
             stats.misses,
             stats.hit_rate * 100.0,
             stats.evictions,
             predictor.tracked_count()
-        )
+        );
+
+        // Append semantic stats if adapter is present
+        if let Some(ref adapter) = self.semantic_adapter {
+            let semantic_stats = adapter.stats();
+            format!(
+                "{} | Semantic: {} fast, {} slow, {} hits, {} misses",
+                base_stats,
+                semantic_stats.fast_path_decisions,
+                semantic_stats.slow_path_decisions,
+                semantic_stats.semantic_hits,
+                semantic_stats.semantic_misses
+            )
+        } else {
+            base_stats
+        }
     }
 }
 
@@ -324,6 +397,66 @@ impl CacheStrategy for AbTestSplitter {
 
     fn stats(&self) -> String {
         self.combined_stats()
+    }
+}
+
+/// Wrapper for shared LearnedCacheStrategy
+///
+/// This wrapper allows sharing a LearnedCacheStrategy between the TieredEngine
+/// and the training task. When the training task updates the predictor via
+/// `LearnedCacheStrategy::update_predictor()`, the changes are immediately
+/// visible to the TieredEngine's query path.
+///
+/// # Usage
+/// ```ignore
+/// let shared_strategy = Arc::new(LearnedCacheStrategy::new(capacity, predictor));
+/// let wrapper = SharedLearnedCacheStrategy::new(shared_strategy.clone());
+/// 
+/// // Pass wrapper to TieredEngine
+/// let engine = TieredEngine::new(Box::new(wrapper), ...);
+/// 
+/// // Pass shared_strategy to training task
+/// spawn_training_task(access_logger, shared_strategy, ...);
+/// ```
+pub struct SharedLearnedCacheStrategy {
+    inner: Arc<LearnedCacheStrategy>,
+}
+
+impl SharedLearnedCacheStrategy {
+    /// Create wrapper around shared LearnedCacheStrategy
+    pub fn new(strategy: Arc<LearnedCacheStrategy>) -> Self {
+        Self { inner: strategy }
+    }
+
+    /// Get reference to inner strategy (for direct access to cache/predictor)
+    pub fn inner(&self) -> &Arc<LearnedCacheStrategy> {
+        &self.inner
+    }
+}
+
+impl CacheStrategy for SharedLearnedCacheStrategy {
+    fn get_cached(&self, doc_id: u64) -> Option<CachedVector> {
+        self.inner.get_cached(doc_id)
+    }
+
+    fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool {
+        self.inner.should_cache(doc_id, embedding)
+    }
+
+    fn insert_cached(&self, cached_vector: CachedVector) {
+        self.inner.insert_cached(cached_vector)
+    }
+
+    fn invalidate(&self, doc_id: u64) {
+        self.inner.invalidate(doc_id)
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn stats(&self) -> String {
+        self.inner.stats()
     }
 }
 

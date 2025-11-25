@@ -151,6 +151,20 @@ impl Default for TieredEngineConfig {
     }
 }
 
+/// Internal components built by `build_internal` helper
+///
+/// This struct holds the initialized tiers and infrastructure components
+/// that are shared between `new` and `new_with_shared_strategy` constructors.
+struct TieredEngineComponents {
+    hot_tier: Arc<HotTier>,
+    cold_tier: Arc<HnswBackend>,
+    query_semaphore: Arc<Semaphore>,
+    stats: Arc<RwLock<TieredEngineStats>>,
+    cache_circuit_breaker: Arc<CircuitBreaker>,
+    hot_tier_circuit_breaker: Arc<CircuitBreaker>,
+    cold_tier_circuit_breaker: Arc<CircuitBreaker>,
+}
+
 /// Tiered Engine - Two-level cache vector database
 pub struct TieredEngine {
     /// Layer 1a: Document Cache (RMI frequency-based, hot documents)
@@ -184,19 +198,23 @@ pub struct TieredEngine {
 }
 
 impl TieredEngine {
-    /// Create new tiered engine
+    /// Build internal components shared by all constructors
+    ///
+    /// Creates the hot tier, cold tier, semaphore, stats, and circuit breakers.
+    /// The cold tier initialization handles both persistence and non-persistence modes.
     ///
     /// # Parameters
-    /// - `cache_strategy`: Layer 1 cache strategy (LRU or Learned)
     /// - `initial_embeddings`: Initial documents to load into cold tier
+    /// - `initial_metadata`: Metadata for initial documents
     /// - `config`: Configuration for all tiers
-    pub fn new(
-        cache_strategy: Box<dyn CacheStrategy>,
-        query_cache: Arc<QueryHashCache>,
+    ///
+    /// # Returns
+    /// `TieredEngineComponents` containing all initialized infrastructure components
+    fn build_internal(
         initial_embeddings: Vec<Vec<f32>>,
         initial_metadata: Vec<std::collections::HashMap<String, String>>,
-        config: TieredEngineConfig,
-    ) -> Result<Self> {
+        config: &TieredEngineConfig,
+    ) -> Result<TieredEngineComponents> {
         // Create hot tier
         let hot_tier = Arc::new(HotTier::new(
             config.hot_tier_max_size,
@@ -225,18 +243,80 @@ impl TieredEngine {
 
         let query_semaphore = Arc::new(Semaphore::new(config.max_concurrent_queries));
 
-        Ok(Self {
-            cache_strategy: Arc::new(RwLock::new(cache_strategy)),
-            query_cache,
+        Ok(TieredEngineComponents {
             hot_tier,
             cold_tier,
-            access_logger: None,
+            query_semaphore,
             stats: Arc::new(RwLock::new(TieredEngineStats::default())),
-            config,
             cache_circuit_breaker: Arc::new(CircuitBreaker::new()),
             hot_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
             cold_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
-            query_semaphore,
+        })
+    }
+
+    /// Create new tiered engine
+    ///
+    /// # Parameters
+    /// - `cache_strategy`: Layer 1 cache strategy (LRU or Learned)
+    /// - `initial_embeddings`: Initial documents to load into cold tier
+    /// - `config`: Configuration for all tiers
+    pub fn new(
+        cache_strategy: Box<dyn CacheStrategy>,
+        query_cache: Arc<QueryHashCache>,
+        initial_embeddings: Vec<Vec<f32>>,
+        initial_metadata: Vec<std::collections::HashMap<String, String>>,
+        config: TieredEngineConfig,
+    ) -> Result<Self> {
+        let components = Self::build_internal(initial_embeddings, initial_metadata, &config)?;
+
+        Ok(Self {
+            cache_strategy: Arc::new(RwLock::new(cache_strategy)),
+            query_cache,
+            hot_tier: components.hot_tier,
+            cold_tier: components.cold_tier,
+            access_logger: None,
+            stats: components.stats,
+            config,
+            cache_circuit_breaker: components.cache_circuit_breaker,
+            hot_tier_circuit_breaker: components.hot_tier_circuit_breaker,
+            cold_tier_circuit_breaker: components.cold_tier_circuit_breaker,
+            query_semaphore: components.query_semaphore,
+        })
+    }
+
+    /// Create new tiered engine with a shared cache strategy
+    ///
+    /// This constructor allows sharing the cache strategy with external components
+    /// (e.g., training task) so that predictor updates are immediately visible
+    /// to the engine's query path.
+    ///
+    /// # Parameters
+    /// - `cache_strategy`: Shared cache strategy wrapped in Arc<RwLock<>>
+    /// - `query_cache`: Layer 1b query cache
+    /// - `initial_embeddings`: Initial documents to load into cold tier
+    /// - `initial_metadata`: Metadata for initial documents
+    /// - `config`: Configuration for all tiers
+    pub fn new_with_shared_strategy(
+        cache_strategy: Arc<RwLock<Box<dyn CacheStrategy>>>,
+        query_cache: Arc<QueryHashCache>,
+        initial_embeddings: Vec<Vec<f32>>,
+        initial_metadata: Vec<std::collections::HashMap<String, String>>,
+        config: TieredEngineConfig,
+    ) -> Result<Self> {
+        let components = Self::build_internal(initial_embeddings, initial_metadata, &config)?;
+
+        Ok(Self {
+            cache_strategy,
+            query_cache,
+            hot_tier: components.hot_tier,
+            cold_tier: components.cold_tier,
+            access_logger: None,
+            stats: components.stats,
+            config,
+            cache_circuit_breaker: components.cache_circuit_breaker,
+            hot_tier_circuit_breaker: components.hot_tier_circuit_breaker,
+            cold_tier_circuit_breaker: components.cold_tier_circuit_breaker,
+            query_semaphore: components.query_semaphore,
         })
     }
 

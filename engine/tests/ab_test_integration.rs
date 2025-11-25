@@ -6,10 +6,10 @@ use kyrodb_engine::{
     CachedVector, HnswVectorIndex, LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy,
     TrainingConfig,
 };
+use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
-use tokio::sync::RwLock;
 
 /// Test full A/B test flow: query → cache check → HNSW search → cache admission → stats
 #[tokio::test]
@@ -225,7 +225,7 @@ async fn test_background_training_updates_predictor() {
     // Create logger with access events
     let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
     {
-        let mut log = logger.write().await;
+        let mut log = logger.write();
         for i in 0..200 {
             let embedding: Vec<f32> = (0..128).map(|_| i as f32).collect();
             log.log_access(i % 10, &embedding); // 10 hot documents

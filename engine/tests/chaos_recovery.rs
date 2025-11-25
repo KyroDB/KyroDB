@@ -8,10 +8,12 @@
 //! - Retry exhaustion handling
 
 use kyrodb_engine::{
-    CircuitBreaker, CircuitBreakerConfig, FsyncPolicy, HnswBackend, MetricsCollector, Snapshot,
+    CircuitBreaker, CircuitBreakerConfig, FsyncPolicy, HnswBackend, MetricsCollector, QueryHashCache, Snapshot,
 };
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -78,10 +80,12 @@ fn test_hnsw_corruption_recovery() {
         vec![0.0, 1.0, 0.0, 0.0],
         vec![0.0, 0.0, 1.0, 0.0],
     ];
+    let metadata: Vec<HashMap<String, String>> = vec![HashMap::new(); embeddings.len()];
 
     // Create backend with persistence
     let backend = HnswBackend::with_persistence(
         embeddings.clone(),
+        metadata.clone(),
         100,
         data_dir.to_str().unwrap(),
         FsyncPolicy::Always,
@@ -94,7 +98,7 @@ fn test_hnsw_corruption_recovery() {
     backend.create_snapshot().unwrap();
 
     // Add more data
-    backend.insert(3, vec![0.0, 0.0, 0.0, 1.0]).unwrap();
+    backend.insert(3, vec![0.0, 0.0, 0.0, 1.0], HashMap::new()).unwrap();
     backend.sync_wal().unwrap();
     backend.create_snapshot().unwrap(); // snapshot_2
 
@@ -193,6 +197,7 @@ fn test_wal_normal_operation() {
     // Create backend with persistence (includes WAL)
     let backend = HnswBackend::with_persistence(
         vec![vec![1.0, 0.0, 0.0, 0.0]],
+        vec![HashMap::new()],
         100,
         temp_dir.path().to_str().unwrap(),
         FsyncPolicy::Always,
@@ -202,7 +207,7 @@ fn test_wal_normal_operation() {
 
     // Write some entries
     for i in 1..10 {
-        let result = backend.insert(i, vec![1.0, 0.0, 0.0, 0.0]);
+        let result = backend.insert(i, vec![1.0, 0.0, 0.0, 0.0], HashMap::new());
         assert!(result.is_ok(), "Normal writes should succeed");
     }
 
@@ -224,6 +229,7 @@ fn test_circuit_breaker_with_backend_operations() {
             // Create backend
             let backend = HnswBackend::with_persistence(
                 vec![vec![1.0, 0.0, 0.0, 0.0]],
+                vec![HashMap::new()],
                 100,
                 temp_dir.path().to_str().unwrap(),
                 FsyncPolicy::Always,
@@ -291,11 +297,13 @@ async fn test_tiered_query_normal_operation() {
     use kyrodb_engine::{LruCacheStrategy, TieredEngine, TieredEngineConfig};
 
     let cache = LruCacheStrategy::new(100);
+    let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
     let embeddings = vec![
         vec![1.0, 0.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0, 0.0],
         vec![0.0, 0.0, 1.0, 0.0],
     ];
+    let metadata: Vec<HashMap<String, String>> = vec![HashMap::new(); embeddings.len()];
 
     let config = TieredEngineConfig {
         hot_tier_max_size: 10,
@@ -307,7 +315,7 @@ async fn test_tiered_query_normal_operation() {
         ..Default::default()
     };
 
-    let engine = TieredEngine::new(Box::new(cache), embeddings, config).unwrap();
+    let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, metadata, config).unwrap();
 
     // Query should succeed through normal tier access
     let query = vec![0.5, 0.5, 0.0, 0.0];
