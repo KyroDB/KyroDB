@@ -404,11 +404,15 @@ impl KyroDbService for KyroDBServiceImpl {
         match engine.query(req.doc_id, None) {
             Some(embedding) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                
+                // Fetch metadata for the document
+                let metadata = engine.get_metadata(req.doc_id).unwrap_or_default();
 
                 info!(
                     doc_id = req.doc_id,
                     latency_ms = latency_ms,
                     embedding_returned = req.include_embedding,
+                    metadata_keys = metadata.len(),
                     "Document found"
                 );
 
@@ -420,7 +424,7 @@ impl KyroDbService for KyroDBServiceImpl {
                     } else {
                         vec![]
                     },
-                    metadata: HashMap::new(),
+                    metadata,
                     served_from: query_response::Tier::Unknown as i32,
                     error: String::new(),
                 }))

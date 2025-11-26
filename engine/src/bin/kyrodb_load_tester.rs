@@ -242,6 +242,7 @@ async fn warm_up_queries(config: &Config, dataset: Arc<Vec<Vec<f32>>>) -> Result
             namespace: String::new(),
             include_embeddings: false,
             metadata_filters: HashMap::new(),
+            filter: None,
         };
 
         let response = client
@@ -289,6 +290,7 @@ async fn run_worker(
                     namespace: String::new(),
                     include_embeddings: false,
                     metadata_filters: HashMap::new(),
+                    filter: None,
                 };
 
                 let start = Instant::now();

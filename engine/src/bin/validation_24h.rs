@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 
 /// Validation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,7 +531,7 @@ async fn main() -> Result<()> {
 
         // Log access for training
         {
-            let logger = access_logger.write().await;
+            let logger = access_logger.write();
             logger.log_access(doc_id, &embedding);
         }
 

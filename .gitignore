@@ -36,16 +36,16 @@ logs/
 tmp/
 temp/
 
-# # Runtime data and databases
-# /data/**
-# !/data/.gitkeep
-# /engine/data/**
-# !/engine/data/.gitkeep
-# /orchestrator/data/**
-# !/orchestrator/data/.gitkeep
-# *.db
-# *.sqlite
-# *.sqlite3
+# Runtime data and databases
+/data/*
+!/data/.gitkeep
+/engine/data/*
+!/engine/data/.gitkeep
+/orchestrator/data/*
+!/orchestrator/data/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
 
 # Node.js
 node_modules/

@@ -828,8 +828,11 @@ impl TieredEngine {
             anyhow::bail!("k must be <= 10,000 (requested: {})", k);
         }
 
+        // Check dimension consistency (only if cold tier has documents)
         let backend_dim = (*self.cold_tier).dimension();
-        if backend_dim != 0 && query.len() != backend_dim {
+        let cold_tier_has_docs = backend_dim != 0;
+        
+        if cold_tier_has_docs && query.len() != backend_dim {
             anyhow::bail!(
                 "query dimension mismatch: expected {} found {}",
                 backend_dim,
@@ -854,8 +857,12 @@ impl TieredEngine {
         );
 
         // Step 2: Search Layer 3 (Cold Tier) - HNSW index
-        // Over-fetch by 2× to ensure good coverage after deduplication
-        let cold_results = self.cold_tier.knn_search(query, k * 2)?;
+        // Only search cold tier if it has documents (dimension > 0)
+        let cold_results = if cold_tier_has_docs {
+            self.cold_tier.knn_search(query, k * 2)?
+        } else {
+            vec![]
+        };
 
         debug!(
             "Cold tier search returned {} results (requested {})",
