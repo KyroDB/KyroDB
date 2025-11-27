@@ -150,7 +150,14 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.write().await;
 
-        match engine.insert(req.doc_id, req.embedding, req.metadata) {
+        // Store namespace in metadata for filtering during search
+        // Namespace is stored as reserved key "__namespace__" to avoid conflicts with user metadata
+        let mut metadata = req.metadata;
+        if !req.namespace.is_empty() {
+            metadata.insert("__namespace__".to_string(), req.namespace.clone());
+        }
+
+        match engine.insert(req.doc_id, req.embedding, metadata) {
             Ok(_) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 self.state.metrics.record_insert(true);
@@ -495,11 +502,20 @@ impl KyroDbService for KyroDBServiceImpl {
         let engine = self.state.engine.read().await;
 
         // Adaptive oversampling based on filter complexity
+        // Namespace filtering also requires oversampling since we filter post-fetch
         let has_filter = req.filter.is_some();
-        let oversampling_factor = if let Some(ref filter) = req.filter {
+        let has_namespace = !req.namespace.is_empty();
+        let base_oversampling = if let Some(ref filter) = req.filter {
             kyrodb_engine::adaptive_oversampling::calculate_oversampling_factor(filter)
         } else {
             1
+        };
+        // Apply additional oversampling when namespace filtering is active
+        // This ensures we have enough candidates after namespace filtering
+        let oversampling_factor = if has_namespace {
+            base_oversampling.saturating_mul(4).min(10)
+        } else {
+            base_oversampling
         };
         let search_k = (req.k as usize).saturating_mul(oversampling_factor).min(10_000);
 
@@ -535,6 +551,15 @@ impl KyroDbService for KyroDBServiceImpl {
                     // Fetch metadata (needed for filtering and/or response)
                     let metadata = engine.get_metadata(candidate.doc_id).unwrap_or_default();
 
+                    // Filter by namespace if specified
+                    // Namespace is stored as "__namespace__" in metadata during insert
+                    if has_namespace {
+                        let doc_namespace = metadata.get("__namespace__").map(|s| s.as_str()).unwrap_or("");
+                        if doc_namespace != req.namespace {
+                            continue;
+                        }
+                    }
+
                     // Apply metadata filter if present
                     if let Some(filter) = &req.filter {
                         if !kyrodb_engine::metadata_filter::matches(filter, &metadata) {
@@ -566,6 +591,7 @@ impl KyroDbService for KyroDBServiceImpl {
                     latency_ns = latency_ns,
                     min_score = req.min_score,
                     has_filter = has_filter,
+                    has_namespace = has_namespace,
                     "Search completed successfully"
                 );
 

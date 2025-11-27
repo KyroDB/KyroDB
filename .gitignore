@@ -126,22 +126,16 @@ bench_server.log
 .vscode/settings.json
 .idea/workspace.xml
 .github/copilot-instructions.md
-.cursor/rules/rules.mdc
 docs/Implementation.md
-PHASE0_WEEK3-4_RESULTS.md
 /*.csv
 /*.json
 .github/AGENTS.md
 other_docs/
 docs/visiondocument.md
-docs/CONFIGURATION_IMPLEMENTATION_SUMMARY.md
 CLAUDE.md
-.venv/          
-analysis_phase1.py                  
-docs/EPISODIC_MEMORY_IMPLEMENTATION.md   
-analyze_failure.py      
-engine/src/bin/belady_simulator.rs         
-EpisodicMemory/
+.venv/     
+Vritti/     
+    
 
 
                                                                                                                                                                                                                                                                                                                                                                         
