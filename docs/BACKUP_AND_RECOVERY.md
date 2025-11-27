@@ -14,32 +14,55 @@ KyroDB provides:
 
 ```bash
 # Create full backup (default)
-kyrodb_backup create \
+./target/release/kyrodb_backup create \
+  --data-dir ./data \
+  --backup-dir ./backups \
   --description "Daily backup"
 
 # Create incremental backup
-kyrodb_backup create \
+./target/release/kyrodb_backup create \
+  --data-dir ./data \
+  --backup-dir ./backups \
   --incremental \
   --reference <PARENT_BACKUP_ID> \
   --description "Hourly incremental"
 
 # List all backups
-kyrodb_backup list
+./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups
 
 # List backups in JSON format
-kyrodb_backup list --format json
+./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --format json
 
 # Restore from backup
-kyrodb_backup restore --backup-id <BACKUP_ID>
+./target/release/kyrodb_backup restore \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --backup-id <BACKUP_ID>
 
 # Restore to specific point in time
-kyrodb_backup restore --point-in-time <UNIX_TIMESTAMP>
+./target/release/kyrodb_backup restore \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --point-in-time <UNIX_TIMESTAMP>
 
 # Verify backup integrity
-kyrodb_backup verify <BACKUP_ID>
+./target/release/kyrodb_backup verify \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  <BACKUP_ID>
 
-# Prune old backups (keep 7 daily, 4 weekly, 6 monthly)
-kyrodb_backup prune
+# Prune old backups
+./target/release/kyrodb_backup prune \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --keep-daily 7 \
+  --keep-weekly 4 \
+  --keep-monthly 6
 ```
 
 **Note**: All backup commands use default directories:
@@ -163,11 +186,10 @@ Keep backups organized and storage costs low.
 ### Automatic Pruning
 
 ```bash
-# Default policy (7 daily, 4 weekly, 6 monthly backups)
-./target/release/kyrodb_backup prune
-
-# Custom policy
+# Custom retention policy
 ./target/release/kyrodb_backup prune \
+  --data-dir ./data \
+  --backup-dir ./backups \
   --keep-daily 30 \
   --keep-weekly 12 \
   --keep-monthly 12 \
@@ -200,8 +222,13 @@ Keep backups organized and storage costs low.
 
 set -e
 
+BACKUP_DIR=/backups
+DATA_DIR=/var/lib/kyrodb/data
+
 # Apply retention policy
 /usr/local/bin/kyrodb_backup prune \
+  --data-dir $DATA_DIR \
+  --backup-dir $BACKUP_DIR \
   --keep-daily 30 \
   --keep-weekly 12 \
   --keep-monthly 12 \
@@ -225,7 +252,10 @@ Add to crontab:
 
 ```bash
 # Verify backup integrity and checksum
-./target/release/kyrodb_backup verify <BACKUP_ID>
+./target/release/kyrodb_backup verify \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  <BACKUP_ID>
 ```
 
 ### Full Verification (Test Restore)
@@ -262,83 +292,42 @@ rm -rf $TMP_DIR
 
 KyroDB protects against accidental data loss.
 
-### Restore Confirmation Required
+### Important: Stop Server Before Restore
+
+**Always stop the KyroDB server before performing a restore operation.**
 
 ```bash
-# This FAILS (refuses to clear data)
-kyrodb_backup restore --backup-id <id> --data-dir ./data
+# 1. Stop server
+systemctl stop kyrodb
 
-# Error: Data directory clear requires explicit confirmation
-```
-
-**To allow restore** (destructive operation):
-```bash
-# Option 1: Use --allow-clear flag
-kyrodb_backup restore --backup-id <id> --data-dir ./data --allow-clear
-
-# Option 2: Set environment variable
-export BACKUP_ALLOW_CLEAR=true
-kyrodb_backup restore --backup-id <id> --data-dir ./data
-```
-
-### Dry Run Mode
-
-```bash
-# Preview what will be deleted/restored
-kyrodb_backup restore \
-  --backup-id <id> \
+# 2. Perform restore
+./target/release/kyrodb_backup restore \
   --data-dir ./data \
-  --dry-run \
-  --allow-clear
+  --backup-dir ./backups \
+  --backup-id <BACKUP_ID>
 
-# Output:
-# DRY-RUN: Would delete 15 file(s) from /var/lib/kyrodb/data:
-#   - MANIFEST
-#   - snapshot_100
-#   - wal_1000.wal
-#   ...
-# DRY-RUN: Would restore 12 file(s) from backup
+# 3. Start the server
+systemctl start kyrodb
 ```
+
+Restoring while the server is running may cause data corruption or inconsistent state.
 
 ## Cloud Backup (S3)
 
-Requires `s3-backup` feature (enterprise).
-
-### Upload to S3
+**Note**: S3 backup integration is planned for a future release. For now, use standard tools like `aws s3 sync` to copy backups to cloud storage:
 
 ```bash
-# Configure AWS credentials
-export AWS_ACCESS_KEY_ID=<your_key>
-export AWS_SECRET_ACCESS_KEY=<your_secret>
-export AWS_REGION=us-west-2
+# Sync local backups to S3
+aws s3 sync ./backups s3://your-bucket/kyrodb-backups/
 
-# Upload backup
-kyrodb_backup upload-s3 \
-  --backup-id <id> \
-  --bucket kyrodb-backups \
-  --prefix production/
-```
+# Download backups from S3
+aws s3 sync s3://your-bucket/kyrodb-backups/ ./backups
 
-### Download from S3
-
-```bash
-# Download specific backup
-kyrodb_backup download-s3 \
-  --backup-id <id> \
-  --bucket kyrodb-backups \
-  --prefix production/ \
-  --output-dir /tmp/restore
-```
-
-### Automated S3 Sync
-
-```bash
-# Sync all local backups to S3
-kyrodb_backup sync-s3 \
-  --backup-dir /backups \
-  --bucket kyrodb-backups \
-  --prefix production/ \
-  --delete-after-upload
+# Then restore locally
+./target/release/kyrodb_backup restore \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --backup-id <BACKUP_ID>
 ```
 
 ## Monitoring Backups
@@ -386,25 +375,37 @@ echo "OK: Latest backup is $AGE_HOURS hours old"
 
 ```bash
 # Check disk space
-df -h /backups
+df -h ./backups
 
-# Delete old backups
-kyrodb_backup prune --backup-dir /backups --older-than-days 7
+# Prune old backups using retention policy
+./target/release/kyrodb_backup prune \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --min-age-days 1
 
 # Or move to cheaper storage
-aws s3 sync /backups s3://kyrodb-archive --storage-class GLACIER
-rm -rf /backups/*
+aws s3 sync ./backups s3://kyrodb-archive --storage-class GLACIER
+rm -rf ./backups/*
 ```
 
 ### Restore Failed: Checksum Mismatch
 
 ```bash
-# Backup may be corrupted
-kyrodb_backup verify --backup-id <id> --full-scan
+# Backup may be corrupted - verify it
+./target/release/kyrodb_backup verify \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  <BACKUP_ID>
 
 # If corrupted, use previous backup
-kyrodb_backup list --backup-dir /backups
-kyrodb_backup restore --backup-id <previous_id> --allow-clear
+./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups
+
+./target/release/kyrodb_backup restore \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --backup-id <PREVIOUS_BACKUP_ID>
 ```
 
 ### Incremental Chain Broken
@@ -413,9 +414,9 @@ kyrodb_backup restore --backup-id <previous_id> --allow-clear
 # Error: Parent backup not found
 
 # Solution: Create new full backup
-kyrodb_backup create-full \
+./target/release/kyrodb_backup create \
   --data-dir ./data \
-  --backup-dir /backups \
+  --backup-dir ./backups \
   --description "New full backup (chain reset)"
 ```
 
@@ -431,23 +432,12 @@ kyrodb_backup create-full \
 
 ## Security
 
-### Encrypt Backups
-
-```bash
-# Encrypt backup with GPG
-kyrodb_backup create-full --data-dir ./data --backup-dir /tmp/backup
-gpg --encrypt --recipient <your-key> /tmp/backup/backup_*.tar
-
-# Decrypt for restore
-gpg --decrypt backup_*.tar.gpg > backup.tar
-```
-
 ### Access Control
 
 ```bash
 # Restrict backup directory permissions
-chmod 700 /backups
-chown kyrodb:kyrodb /backups
+chmod 700 ./backups
+chown kyrodb:kyrodb ./backups
 
 # Restrict S3 bucket access (IAM policy)
 {

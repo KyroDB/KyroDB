@@ -240,11 +240,16 @@ sudo smartctl -H /dev/sdX
 # Stop server
 systemctl stop kyrodb
 
-# Restore latest backup
-kyrodb_backup restore \
-  --backup-id $(kyrodb_backup list --json | jq -r '.[0].id') \
-  --data-dir /var/lib/kyrodb/data \
-  --allow-clear
+# List available backups
+# Note: Use ./target/release/kyrodb_backup for development builds.
+# For production, use the installed binary path (e.g., /usr/local/bin/kyrodb_backup)
+./target/release/kyrodb_backup list --backup-dir ./backups --format json
+
+# Restore latest backup (note: stop server first, backup overwrites data)
+./target/release/kyrodb_backup restore \
+  --backup-id <BACKUP_ID> \
+  --data-dir ./data \
+  --backup-dir ./backups
 
 # Start server
 systemctl start kyrodb
@@ -278,7 +283,10 @@ systemctl start kyrodb
 
 ### Symptom
 ```bash
-kyrodb_backup create-full --data-dir ./data --backup-dir ./backups
+./target/release/kyrodb_backup create \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --description "My backup"
 # Error: No space left on device
 ```
 
@@ -286,16 +294,25 @@ kyrodb_backup create-full --data-dir ./data --backup-dir ./backups
 
 ```bash
 # Check backup directory size
-du -sh /backups
+du -sh ./backups
 
-# Delete old backups
-kyrodb_backup prune \
-  --backup-dir /backups \
-  --older-than-days 7
+# Delete old backups using retention policy
+./target/release/kyrodb_backup prune \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --keep-daily 7 \
+  --keep-weekly 4
 
-# Or move to cloud storage
-aws s3 sync /backups s3://kyrodb-archive --storage-class GLACIER_IR
-rm -rf /backups/*
+# Or manually archive to cloud storage
+aws s3 sync ./backups s3://kyrodb-archive --storage-class GLACIER_IR
+
+# Verify sync succeeded before deleting local backups
+if [ $? -eq 0 ]; then
+  rm -rf ./backups/*
+else
+  echo "S3 sync failed. Local backups preserved."
+  exit 1
+fi
 ```
 
 ## Slow Insert Performance
@@ -367,8 +384,9 @@ chown -R kyrodb:kyrodb /var/lib/kyrodb/data
 # 3. Disk failure
 smartctl -H /dev/sdX
 
-# Manual circuit breaker reset (force close)
-curl -X POST http://localhost:51051/admin/circuit-breaker/reset
+# Circuit breaker auto-resets after 60 seconds
+# If still stuck, restart the server
+systemctl restart kyrodb
 ```
 
 ## Training Task Crash Loop
@@ -462,7 +480,7 @@ curl http://localhost:51051/health
 journalctl -u kyrodb --since "1 hour ago" | grep -i error
 
 # 3. Backup age
-kyrodb_backup list --backup-dir /backups | head -1
+./target/release/kyrodb_backup list --backup-dir ./backups --format table | head -2
 
 # 4. Disk space
 df -h /var/lib/kyrodb
@@ -473,8 +491,8 @@ curl -s http://localhost:51051/metrics | grep -E "p99|hit_rate|error"
 
 Weekly checks:
 ```bash
-# 1. Test restore
-kyrodb_backup restore --backup-id <latest> --dry-run
+# 1. Test restore (verify backup integrity)
+./target/release/kyrodb_backup verify --backup-id <BACKUP_ID> --data-dir ./data --backup-dir ./backups
 
 # 2. Review SLO trends
 # Check if P99 latency trending up

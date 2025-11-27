@@ -31,15 +31,22 @@ Create a new full or incremental backup.
 
 ```bash
 # Full backup
-kyrodb_backup create --description "Daily backup"
+./target/release/kyrodb_backup create \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --description "Daily backup"
 
 # Incremental backup (requires reference backup ID)
-kyrodb_backup create --incremental \
+./target/release/kyrodb_backup create \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --incremental \
   --reference 550e8400-e29b-41d4-a716-446655440000 \
   --description "Hourly incremental"
 
 # With custom directories
-kyrodb_backup --data-dir /var/lib/kyrodb \
+./target/release/kyrodb_backup \
+  --data-dir /var/lib/kyrodb \
   --backup-dir /backup/kyrodb \
   create --description "Production backup"
 ```
@@ -68,10 +75,15 @@ List all available backups in table or JSON format.
 
 ```bash
 # Table format (default)
-kyrodb_backup list
+./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups
 
 # JSON format for scripting
-kyrodb_backup list --format json
+./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --format json
 ```
 
 **Options:**
@@ -111,13 +123,20 @@ Restore database from a backup or to a specific point in time.
 
 ```bash
 # Restore from specific backup
-kyrodb_backup restore --backup-id 550e8400-e29b-41d4-a716-446655440000
+./target/release/kyrodb_backup restore \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --backup-id 550e8400-e29b-41d4-a716-446655440000
 
 # Point-in-time restore (Unix timestamp)
-kyrodb_backup restore --point-in-time 1729090200
+./target/release/kyrodb_backup restore \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --point-in-time 1729090200
 
 # With custom directories
-kyrodb_backup --data-dir /var/lib/kyrodb \
+./target/release/kyrodb_backup \
+  --data-dir /var/lib/kyrodb \
   --backup-dir /backup/kyrodb \
   restore --backup-id 550e8400-e29b-41d4-a716-446655440000
 ```
@@ -143,21 +162,21 @@ Database restored from backup 550e8400-e29b-41d4-a716-446655440000
 Remove old backups based on retention policy.
 
 ```bash
-# Default policy (7 daily, 4 weekly, 6 monthly)
-kyrodb_backup prune
-
 # Custom retention policy
-kyrodb_backup prune \
+./target/release/kyrodb_backup prune \
+  --data-dir ./data \
+  --backup-dir ./backups \
   --keep-daily 14 \
   --keep-weekly 8 \
   --keep-monthly 12
 ```
 
 **Options:**
-- `--keep-daily <N>`: Keep last N daily backups (default: 7)
-- `--keep-weekly <N>`: Keep last N weekly backups (default: 4)
-- `--keep-monthly <N>`: Keep last N monthly backups (default: 6)
-- `--min-age-days <N>`: Minimum age in days before pruning (default: 0)
+- `--keep-hourly <N>`: Keep last N hourly backups
+- `--keep-daily <N>`: Keep last N daily backups
+- `--keep-weekly <N>`: Keep last N weekly backups
+- `--keep-monthly <N>`: Keep last N monthly backups
+- `--min-age-days <N>`: Minimum age in days before pruning
 
 **Output:**
 ```
@@ -178,7 +197,10 @@ Verify backup file integrity and checksum.
 
 ```bash
 # Verify specific backup
-kyrodb_backup verify 550e8400-e29b-41d4-a716-446655440000
+./target/release/kyrodb_backup verify \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  550e8400-e29b-41d4-a716-446655440000
 ```
 
 **Arguments:**
@@ -203,12 +225,16 @@ Checksum: 0xABCD1234
 ```bash
 #!/bin/bash
 # Create full backup daily at midnight
-kyrodb_backup --data-dir /var/lib/kyrodb \
+./target/release/kyrodb_backup \
+  --data-dir /var/lib/kyrodb \
   --backup-dir /backup/kyrodb \
   create --description "Daily backup $(date +%Y-%m-%d)"
 
 # Prune old backups
-kyrodb_backup --backup-dir /backup/kyrodb prune
+./target/release/kyrodb_backup \
+  --data-dir /var/lib/kyrodb \
+  --backup-dir /backup/kyrodb \
+  prune --keep-daily 7 --keep-weekly 4 --keep-monthly 6
 ```
 
 ### Hourly Incremental Backups
@@ -216,10 +242,15 @@ kyrodb_backup --backup-dir /backup/kyrodb prune
 ```bash
 #!/bin/bash
 # Get latest backup ID
-LATEST=$(kyrodb_backup list --format json | jq -r '.[0].id')
+LATEST=$(./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --format json | jq -r '.[0].id')
 
 # Create incremental backup
-kyrodb_backup create \
+./target/release/kyrodb_backup create \
+  --data-dir ./data \
+  --backup-dir ./backups \
   --incremental \
   --reference "$LATEST" \
   --description "Hourly backup $(date +%H:%M)"
@@ -230,14 +261,26 @@ kyrodb_backup create \
 ```bash
 #!/bin/bash
 # List available backups
-kyrodb_backup list
+./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups
 
 # Restore from latest backup
-LATEST=$(kyrodb_backup list --format json | jq -r '.[0].id')
-kyrodb_backup restore --backup-id "$LATEST"
+LATEST=$(./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --format json | jq -r '.[0].id')
+
+./target/release/kyrodb_backup restore \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --backup-id "$LATEST"
 
 # Verify restore success
-kyrodb_backup verify "$LATEST"
+./target/release/kyrodb_backup verify \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  "$LATEST"
 ```
 
 ### Backup Before Upgrade
@@ -245,17 +288,26 @@ kyrodb_backup verify "$LATEST"
 ```bash
 #!/bin/bash
 # Create pre-upgrade backup
-kyrodb_backup create --description "Pre-upgrade backup v2.0"
+./target/release/kyrodb_backup create \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --description "Pre-upgrade backup v2.0"
 
 # Perform upgrade
 ./upgrade.sh
 
 # If upgrade fails, restore
 if [ $? -ne 0 ]; then
-  BACKUP_ID=$(kyrodb_backup list --format json | \
+  BACKUP_ID=$(./target/release/kyrodb_backup list \
+    --data-dir ./data \
+    --backup-dir ./backups \
+    --format json | \
     jq -r '.[] | select(.description | contains("Pre-upgrade")) | .id' | \
     head -1)
-  kyrodb_backup restore --backup-id "$BACKUP_ID"
+  ./target/release/kyrodb_backup restore \
+    --data-dir ./data \
+    --backup-dir ./backups \
+    --backup-id "$BACKUP_ID"
 fi
 ```
 
@@ -310,8 +362,6 @@ kyrodb_backup restore --backup-id UUID
 
 1. **Incremental Backups**: Use incremental backups for frequent snapshots (lower overhead)
 2. **Parallel Operations**: CLI automatically uses multiple threads for large backups
-3. **Compression**: Future versions will support compression (planned for Phase 1)
-4. **S3 Remote Storage**: Configure S3 for automatic off-site backup replication
 
 ---
 
@@ -346,10 +396,10 @@ lsof /var/lib/kyrodb
 ### Prune Removes Too Many Backups
 
 ```bash
-# List backups before pruning (dry run coming in v2.0)
+# List backups before pruning to review
 kyrodb_backup list
 
-# Adjust retention policy
+# Adjust retention policy to keep more backups
 kyrodb_backup prune \
   --keep-daily 30 \
   --keep-weekly 12 \
@@ -372,7 +422,10 @@ The backup operations expose metrics:
 
 ```bash
 # Verify backups exist
-BACKUP_COUNT=$(kyrodb_backup list --format json | jq 'length')
+BACKUP_COUNT=$(./target/release/kyrodb_backup list \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  --format json | jq 'length')
 if [ "$BACKUP_COUNT" -eq 0 ]; then
   echo "CRITICAL: No backups found"
   exit 2
@@ -384,8 +437,8 @@ fi
 ## Best Practices
 
 1. **Regular Backups**: Schedule daily full backups + hourly incrementals
-2. **Off-site Storage**: Use S3 for geographic redundancy
-3. **Retention Policy**: Keep 7 daily, 4 weekly, 6 monthly backups (default), or customize as needed (e.g., 12 monthly for compliance)
+2. **Off-site Storage**: Use cloud storage (S3, GCS) for geographic redundancy
+3. **Retention Policy**: Keep daily, weekly, monthly backups as needed for compliance
 4. **Verification**: Verify backups after creation
 5. **Test Restores**: Perform quarterly restore drills
 6. **Monitoring**: Alert on backup failures
@@ -395,9 +448,9 @@ fi
 
 ## See Also
 
-- [ERROR_RECOVERY_AND_BACKUP.md](./ERROR_RECOVERY_AND_BACKUP.md) - Comprehensive design document
+- [BACKUP_AND_RECOVERY.md](./BACKUP_AND_RECOVERY.md) - Comprehensive backup guide
 
 ---
 
-**Version**: 1.0.0  
+**Version**: 0.1.0  
 **Status**: Production Ready

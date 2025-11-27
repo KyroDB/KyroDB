@@ -135,8 +135,8 @@ watch -n 2 'curl -s http://127.0.0.1:51051/metrics | grep kyrodb_'
 
 # Key metrics to watch:
 # - kyrodb_cache_hit_rate: Should be >40%
-# - kyrodb_query_latency_p99: Should be <10ms
-# - kyrodb_hnsw_vector_count: Total vectors stored
+# - kyrodb_query_latency_ns{percentile="99"}: Should be <10000000 (10ms in nanoseconds)
+# - kyrodb_hnsw_searches_total: HNSW k-NN searches performed
 ```
 
 See [Observability Guide](OBSERVABILITY.md) for monitoring setup.

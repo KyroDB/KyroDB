@@ -141,7 +141,7 @@ curl http://localhost:51051/health
 
 **Response (healthy):**
 ```json
-{"status": "healthy"}
+{"status": "healthy", "uptime_seconds": 12345}
 ```
 
 **Status Codes:**
@@ -161,8 +161,10 @@ curl http://localhost:51051/ready
 
 **Response:**
 ```json
-{"status": "ready"}
+{"ready": true, "status": "ready"}
 ```
+
+Use the `ready` boolean field for programmatic checks.
 
 **Status Codes:**
 - `200 OK`: Ready
@@ -181,25 +183,23 @@ curl http://localhost:51051/metrics
 
 **Response (text/plain):**
 ```
-# HELP kyrodb_query_latency_p99_ms Query latency P99 in milliseconds
-# TYPE kyrodb_query_latency_p99_ms gauge
-kyrodb_query_latency_p99_ms 0.9
+# HELP kyrodb_queries_total Total number of queries
+# TYPE kyrodb_queries_total counter
+kyrodb_queries_total 1234
 
-# HELP kyrodb_l1_combined_hit_rate Combined L1 cache hit rate (L1a + L1b)
-# TYPE kyrodb_l1_combined_hit_rate gauge
-kyrodb_l1_combined_hit_rate 0.717
+# HELP kyrodb_query_latency_ns Query latency percentiles in nanoseconds
+# TYPE kyrodb_query_latency_ns gauge
+kyrodb_query_latency_ns{percentile="50"} 4792
+kyrodb_query_latency_ns{percentile="95"} 68042
+kyrodb_query_latency_ns{percentile="99"} 68042
 
-# HELP kyrodb_l1a_hit_rate L1a document cache hit rate (RMI frequency)
-# TYPE kyrodb_l1a_hit_rate gauge
-kyrodb_l1a_hit_rate 0.502
+# HELP kyrodb_cache_hit_rate Cache hit rate (0.0-1.0)
+# TYPE kyrodb_cache_hit_rate gauge
+kyrodb_cache_hit_rate 0.735
 
-# HELP kyrodb_l1b_hit_rate L1b query cache hit rate (semantic similarity)
-# TYPE kyrodb_l1b_hit_rate gauge
-kyrodb_l1b_hit_rate 0.214
-
-# HELP kyrodb_hnsw_vector_count Total vectors in HNSW index
-# TYPE kyrodb_hnsw_vector_count gauge
-kyrodb_hnsw_vector_count 10000
+# HELP kyrodb_cache_size Current cache size (entries)
+# TYPE kyrodb_cache_size gauge
+kyrodb_cache_size 10000
 ```
 
 See [Observability Guide](OBSERVABILITY.md) for complete metric reference.
@@ -218,18 +218,24 @@ curl http://localhost:51051/slo
 **Response:**
 ```json
 {
-  "status": "ok",
-  "metrics": {
-    "p99_latency_ms": 0.9,
-    "l1_combined_hit_rate": 0.717,
-    "l1a_hit_rate": 0.502,
-    "l1b_hit_rate": 0.214
+  "current_metrics": {
+    "availability": 1.0,
+    "cache_hit_rate": 0.735,
+    "error_rate": 0.0,
+    "p99_latency_ns": 68042
   },
-  "thresholds": {
-    "p99_latency_ms": 1.0,
-    "l1_combined_hit_rate": 0.70
+  "slo_breaches": {
+    "availability": false,
+    "cache_hit_rate": false,
+    "error_rate": false,
+    "p99_latency": false
   },
-  "breaches": []
+  "slo_thresholds": {
+    "max_error_rate": 0.001,
+    "min_availability": 0.999,
+    "min_cache_hit_rate": 0.7,
+    "p99_latency_ns": 1000000
+  }
 }
 ```
 

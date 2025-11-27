@@ -34,8 +34,8 @@ scrape_configs:
 # Queries per second
 rate(kyrodb_queries_total[1m])
 
-# P99 latency (milliseconds)
-kyrodb_query_latency_p99
+# P99 latency (nanoseconds, divide by 1000000 for milliseconds)
+kyrodb_query_latency_ns{percentile="99"} / 1000000
 
 # Error rate (percent)
 rate(kyrodb_queries_failed[5m]) / rate(kyrodb_queries_total[5m]) * 100
@@ -49,8 +49,11 @@ kyrodb_cache_hit_rate * 100
 # Cache evictions per minute
 rate(kyrodb_cache_evictions_total[1m])
 
-# Hybrid Semantic Cache prediction accuracy
+# Learned cache prediction accuracy
 kyrodb_learned_cache_accuracy * 100
+
+# Cache size (entries)
+kyrodb_cache_size
 ```
 
 ### Resource Usage
@@ -63,6 +66,9 @@ kyrodb_disk_used_bytes / 1024 / 1024 / 1024
 
 # Active connections
 kyrodb_active_connections
+
+# Server uptime (seconds)
+kyrodb_uptime_seconds
 ```
 
 ---
@@ -138,18 +144,24 @@ curl http://localhost:51051/slo
 **Response:**
 ```json
 {
-  "status": "ok",
-  "metrics": {
-    "p99_latency_ms": 2.5,
+  "current_metrics": {
+    "availability": 1.0,
     "cache_hit_rate": 0.85,
-    "error_rate_5m": 0.0001
+    "error_rate": 0.0,
+    "p99_latency_ns": 2500000
   },
-  "thresholds": {
-    "p99_latency_ms": 10.0,
-    "min_cache_hit_rate": 0.70,
-    "max_error_rate_5m": 0.001
+  "slo_breaches": {
+    "availability": false,
+    "cache_hit_rate": false,
+    "error_rate": false,
+    "p99_latency": false
   },
-  "breaches": []
+  "slo_thresholds": {
+    "max_error_rate": 0.001,
+    "min_availability": 0.999,
+    "min_cache_hit_rate": 0.7,
+    "p99_latency_ns": 10000000
+  }
 }
 ```
 
@@ -170,14 +182,14 @@ Create alerts for SLO breaches:
 groups:
 - name: kyrodb_slo
   rules:
-  # High latency
+  # High latency (P99 > 10ms = 10000000 ns)
   - alert: KyroDBHighLatency
-    expr: kyrodb_query_latency_p99 > 10
+    expr: kyrodb_query_latency_ns{percentile="99"} > 10000000
     for: 5m
     labels:
       severity: warning
     annotations:
-      summary: "P99 latency {{ $value }}ms exceeds 10ms SLO"
+      summary: "P99 latency {{ $value | humanize }}ns exceeds 10ms SLO"
 
   # Low cache hit rate
   - alert: KyroDBLowCacheHit
@@ -233,7 +245,7 @@ receivers:
       "legendFormat": "QPS"
     },
     {
-      "expr": "kyrodb_query_latency_p99",
+      "expr": "kyrodb_query_latency_ns{percentile=\"99\"} / 1000000",
       "legendFormat": "P99 Latency (ms)"
     }
   ]
@@ -322,7 +334,7 @@ export RUST_LOG=kyrodb_engine=info
 
 ### High P99 latency
 
-**Symptom:** `kyrodb_query_latency_p99 > 10ms`
+**Symptom:** `kyrodb_query_latency_ns{percentile="99"} > 10000000` (10ms in nanoseconds)
 
 **Fix:**
 1. Check cache hit rate: `curl http://localhost:51051/metrics | grep cache_hit_rate`

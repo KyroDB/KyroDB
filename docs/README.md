@@ -14,8 +14,9 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 **Production deployment:**
 1. [**Configuration Management**](CONFIGURATION_MANAGEMENT.md) - All config options explained
 2. [**Backup & Recovery**](BACKUP_AND_RECOVERY.md) - Full and incremental backups, disaster recovery
-3. [**Observability**](OBSERVABILITY.md) - Prometheus metrics, Grafana dashboards, alerting
-4. [**Operations Guide**](OPERATIONS.md) - Troubleshooting common issues
+3. [**CLI Backup Reference**](CLI_BACKUP_REFERENCE.md) - Quick reference for backup commands
+4. [**Observability**](OBSERVABILITY.md) - Prometheus metrics, Grafana dashboards, alerting
+5. [**Operations Guide**](OPERATIONS.md) - Troubleshooting common issues
 
 ## For Developers
 

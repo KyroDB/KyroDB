@@ -17,7 +17,7 @@ KyroDB is a vector database with **two-level L1 cache** optimized for RAG worklo
 │  ┌────────────────────────────────────────────────────┐ │
 │  │   Layer 1a: Document Cache (RMI Frequency)         │ │
 │  │  • Predicts hot documents via learned index        │ │
-│  │  • 50% hit rate (validated)                        │ │
+│  │  • 63.5% hit rate (validated)                      │ │
 │  │  • <10ns prediction latency                        │ │
 │  └────────────────────────────────────────────────────┘ │
 │                         │ miss                           │
@@ -25,10 +25,10 @@ KyroDB is a vector database with **two-level L1 cache** optimized for RAG worklo
 │  ┌────────────────────────────────────────────────────┐ │
 │  │   Layer 1b: Query Cache (Semantic Similarity)      │ │
 │  │  • Caches paraphrased queries                      │ │
-│  │  • 21% additional hit rate (validated)            │ │
+│  │  • 10.1% additional hit rate (validated)           │ │
 │  │  • <1μs similarity scan                            │ │
 │  └────────────────────────────────────────────────────┘ │
-│                         │ Combined L1: 71.7% hit rate    │
+│                         │ Combined L1: 73.5% hit rate    │
 │                         │ miss                           │
 │                         ▼                                │
 │  ┌────────────────────────────────────────────────────┐ │
@@ -84,7 +84,7 @@ KyroDB is a vector database with **two-level L1 cache** optimized for RAG worklo
    ├─► RMI predicts if document is "hot" by doc_id
    ├─► If predicted hot: check cache
    │   │
-   │   ├─► Cache hit (50% of queries)
+   │   ├─► Cache hit (63.5% of queries)
    │   │   └─► Return cached vector (<10ns)
    │   │
    │   └─► Cache miss
@@ -95,7 +95,7 @@ KyroDB is a vector database with **two-level L1 cache** optimized for RAG worklo
    ├─► Hash query embedding, check for similar cached queries
    │   │
    │   ├─► Exact match or similarity >0.25
-   │   │   └─► Return cached result (21% additional hit rate, <1μs)
+   │   │   └─► Return cached result (10.1% additional hit rate, <1μs)
    │   │
    │   └─► Query cache miss
    │       └─► Continue to Layer 2
@@ -124,9 +124,9 @@ KyroDB is a vector database with **two-level L1 cache** optimized for RAG worklo
    └─► Log access for RMI training (every 15 sec)
 
 Total latency:
-• L1a hit: <10ns (50% of queries)
-• L1b hit: <1μs (21% of queries)
-• Combined L1: 71.7% hit rate
+• L1a hit: <10ns (63.5% of queries)
+• L1b hit: <1μs (10.1% of queries)
+• Combined L1: 73.5% hit rate
 • Hot tier: <200ns
 • Cold tier: <1ms (P99)
 ```
@@ -276,9 +276,9 @@ Training Task (every 15 seconds in validation, 10 min in production):
    ├─► Track L1a hit rate over next training cycle
    └─► Export metrics (L1a, L1b, combined)
 
-Validated L1a accuracy: 50.2% hit rate (Phase 0 Week 12)
-Validated L1b performance: 21.4% additional hit rate
-Combined L1 hit rate: 71.7%
+Validated L1a accuracy: 63.5% hit rate (12-hour validation)
+Validated L1b performance: 10.1% additional hit rate
+Combined L1 hit rate: 73.5%
 ```
 
 ---
@@ -440,33 +440,34 @@ persistence:
 
 ## Performance Characteristics
 
-**Latency by operation:**
+**Latency by operation (12-hour validation on MS MARCO):**
 
-| Operation | P50 | P99 | P99.9 |
+| Operation | P50 | P99 | Notes |
 |-----------|-----|-----|-------|
-| Insert | 50μs | 100μs | 200μs |
-| Query (cache hit) | 5ns | 10ns | 20ns |
-| Query (hot tier) | 50ns | 100ns | 200ns |
-| Query (cold tier) | 500μs | 1ms | 2ms |
-| Search (k=10) | 500μs | 1ms | 2ms |
-| Flush | 5s | 10s | 20s |
-| Backup (full) | 30s | 60s | 120s |
+| Query (L1 cache hit) | 4μs | 9ms | 73% of queries |
+| Query (cache miss) | 4.3ms | 9.9ms | Falls through to HNSW |
+| Query (overall) | 12μs | 9.7ms | Blended with 73% hit rate |
+| Insert | 50μs | 100μs | To hot tier |
+| Search (k=10) | 500μs | 5ms | HNSW approximate search |
+| Flush | 5s | 10s | Hot tier to cold tier |
+| Backup (full) | 30s | 60s | Depends on data size |
 
 **Throughput:**
 
 | Operation | Target QPS |
 |-----------|-----------|
 | Insert | 10,000 |
-| Query | 1,000,000 (with cache) |
+| Query | 100,000+ (with cache) |
 | Search | 10,000 |
 
 **Scalability:**
 
 | Vectors | Memory | Disk | Search P99 |
 |---------|--------|------|------------|
-| 1M | 1GB | 2GB | 500μs |
-| 10M | 10GB | 20GB | 1ms |
-| 100M | 100GB | 200GB | 5ms |
+| 10K | 100MB | 200MB | 5ms |
+| 100K | 500MB | 1GB | 5ms |
+| 1M | 2GB | 5GB | 10ms |
+| 10M | 15GB | 40GB | 20ms |
 
 ---
 
@@ -522,17 +523,17 @@ persistence:
 
 ## Future Enhancements
 
-**Phase 1 (Months 13-16):**
+**Phase 1 :**
 - Distributed architecture (multi-node)
 - Replication (primary + replicas)
 - Sharding (horizontal scaling)
 
-**Phase 2 (Months 17-20):**
+**Phase 2 :**
 - Hybrid queries (vector + metadata filters)
 - Multi-vector per document
 - Batch insert API
 
-**Phase 3 (Months 21-24):**
+**Phase 3 :**
 - Auto-scaling (cloud deployment)
 - Cost optimization (tiered storage)
 - Advanced analytics (query patterns)

@@ -50,9 +50,19 @@ cache:
   capacity: 10000                # Number of vectors to cache
   strategy: learned              # lru | learned | abtest
   training_interval_secs: 600    # Train RMI every 10 minutes
+  training_window_secs: 3600     # Training window duration
+  recency_halflife_secs: 1800    # Half-life for recency decay
   min_training_samples: 100
   enable_ab_testing: false
   ab_test_split: 0.5             # 50/50 traffic split
+  admission_threshold: 0.15      # Min score to admit to cache
+  auto_tune_threshold: true      # Auto-tune admission threshold
+  target_utilization: 0.85       # Target cache utilization
+  enable_query_clustering: true  # Group similar queries
+  clustering_similarity_threshold: 0.85  # Similarity threshold (0.0-1.0, higher = stricter)
+  enable_prefetching: true       # Prefetch related docs
+  prefetch_threshold: 0.1        # Min score threshold for prefetch decisions
+  max_prefetch_per_doc: 5        # Maximum prefetch candidates per document
 ```
 
 ### HNSW
@@ -130,8 +140,6 @@ logging:
 auth:
   enabled: false
   api_keys_file: "data/api_keys.yaml"
-  usage_stats_file: "data/usage_stats.csv"
-  usage_export_interval_secs: 300
 ```
 
 ---
@@ -317,6 +325,17 @@ Error: Configuration validation failed
 - Development: `none` (fast)
 - Production: `data_only` (balanced)
 - Critical: `full` (safest)
+
+### Query Clustering & Prefetching
+- Enable clustering for workloads with repeated similar queries
+- Adjust `clustering_similarity_threshold` based on query diversity (higher = stricter matching)
+- Prefetching works best with correlated access patterns
+- Increase `max_prefetch_per_doc` for dense datasets with strong relationships
+
+### Admission & Auto-tuning
+- `admission_threshold`: Controls cache pollution; increase if hit rate is low despite traffic
+- `auto_tune_threshold`: Enable for self-adjusting workloads with varying patterns
+- `target_utilization`: Balance between memory use and hit rate (typically 0.8-0.9)
 
 ---
 
