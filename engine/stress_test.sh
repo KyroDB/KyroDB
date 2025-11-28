@@ -46,7 +46,7 @@ DURATION=$((END_TIME - START_TIME))
 DURATION=$((DURATION < 1 ? 1 : DURATION))
 echo ""
 echo "=== RESULTS ==="
-echo "✅ All $TOTAL_OPS operations completed successfully"
+echo " All $TOTAL_OPS operations completed successfully"
 echo "⏱️  Duration: ${DURATION}s"
 THROUGHPUT=$((TOTAL_OPS / DURATION))
 echo "📊 Throughput: ${THROUGHPUT} ops/sec"

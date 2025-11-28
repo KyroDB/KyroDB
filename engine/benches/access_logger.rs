@@ -23,7 +23,7 @@ fn bench_log_access_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("log_access_overhead");
     group.throughput(Throughput::Elements(1));
 
-    let mut logger = AccessPatternLogger::new(10_000_000);
+    let logger = AccessPatternLogger::new(10_000_000);
     let embedding = generate_random_embedding(128);
 
     group.bench_function("single_log", |b| {
@@ -48,7 +48,7 @@ fn bench_batch_logging(c: &mut Criterion) {
             BenchmarkId::from_parameter(format!("{}_accesses", batch_size)),
             &batch_size,
             |b, &batch_size| {
-                let mut logger = AccessPatternLogger::new(10_000_000);
+                let logger = AccessPatternLogger::new(10_000_000);
                 let embedding = generate_random_embedding(128);
 
                 b.iter(|| {
@@ -71,7 +71,7 @@ fn bench_get_recent_window(c: &mut Criterion) {
         group.throughput(Throughput::Elements(event_count as u64));
 
         // Pre-populate logger
-        let mut logger = AccessPatternLogger::new(event_count * 2);
+        let logger = AccessPatternLogger::new(event_count * 2);
         let embedding = generate_random_embedding(128);
         for i in 0..event_count {
             logger.log_access(i as u64, &embedding);
@@ -97,7 +97,7 @@ fn bench_ring_buffer_wraparound(c: &mut Criterion) {
     let mut group = c.benchmark_group("ring_buffer_wraparound");
 
     let capacity = 10_000;
-    let mut logger = AccessPatternLogger::new(capacity);
+    let logger = AccessPatternLogger::new(capacity);
     let embedding = generate_random_embedding(128);
 
     // Fill buffer to capacity
@@ -140,7 +140,7 @@ fn bench_hash_embedding(c: &mut Criterion) {
 
 /// Benchmark: Logger stats retrieval
 fn bench_logger_stats(c: &mut Criterion) {
-    let mut logger = AccessPatternLogger::new(100_000);
+    let logger = AccessPatternLogger::new(100_000);
     let embedding = generate_random_embedding(128);
 
     // Populate with some data
@@ -157,7 +157,7 @@ fn bench_logger_stats(c: &mut Criterion) {
 fn bench_log_event_vs_log_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("log_event_comparison");
 
-    let mut logger = AccessPatternLogger::new(100_000);
+    let logger = AccessPatternLogger::new(100_000);
     let embedding = generate_random_embedding(128);
 
     // Pre-construct event
@@ -169,7 +169,7 @@ fn bench_log_event_vs_log_access(c: &mut Criterion) {
 
     group.bench_function("log_event_preconstructed", |b| {
         b.iter(|| {
-            logger.log_event(black_box(event));
+            logger.log_event(event.clone());
         });
     });
 
@@ -207,7 +207,7 @@ fn bench_high_frequency_logging(c: &mut Criterion) {
     let mut group = c.benchmark_group("high_frequency_logging");
     group.throughput(Throughput::Elements(100_000));
 
-    let mut logger = AccessPatternLogger::new(10_000_000);
+    let logger = AccessPatternLogger::new(10_000_000);
     let embedding = generate_random_embedding(128);
 
     group.bench_function("100k_rapid_fire", |b| {

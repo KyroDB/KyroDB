@@ -31,7 +31,10 @@ fn matches_range(filter: &RangeMatch, metadata: &HashMap<String, String>) -> boo
     };
 
     // Try parsing as number first
-    if let (Ok(val_num), Ok(bound_num)) = (val_str.parse::<f64>(), get_bound_value(filter).parse::<f64>()) {
+    if let (Ok(val_num), Ok(bound_num)) = (
+        val_str.parse::<f64>(),
+        get_bound_value(filter).parse::<f64>(),
+    ) {
         return match &filter.bound {
             Some(crate::proto::range_match::Bound::Gte(_)) => val_num >= bound_num,
             Some(crate::proto::range_match::Bound::Lte(_)) => val_num <= bound_num,
@@ -153,7 +156,9 @@ mod tests {
         let filter_date = MetadataFilter {
             filter_type: Some(FilterType::Range(RangeMatch {
                 key: "date".to_string(),
-                bound: Some(crate::proto::range_match::Bound::Gt("2022-12-31".to_string())),
+                bound: Some(crate::proto::range_match::Bound::Gt(
+                    "2022-12-31".to_string(),
+                )),
             })),
         };
         assert!(matches(&filter_date, &meta));
@@ -305,12 +310,30 @@ mod tests {
 
         // Test all bounds
         let cases = vec![
-            (crate::proto::range_match::Bound::Gt("100.0".to_string()), true),
-            (crate::proto::range_match::Bound::Gt("100.5".to_string()), false),
-            (crate::proto::range_match::Bound::Gte("100.5".to_string()), true),
-            (crate::proto::range_match::Bound::Lt("101.0".to_string()), true),
-            (crate::proto::range_match::Bound::Lt("100.5".to_string()), false),
-            (crate::proto::range_match::Bound::Lte("100.5".to_string()), true),
+            (
+                crate::proto::range_match::Bound::Gt("100.0".to_string()),
+                true,
+            ),
+            (
+                crate::proto::range_match::Bound::Gt("100.5".to_string()),
+                false,
+            ),
+            (
+                crate::proto::range_match::Bound::Gte("100.5".to_string()),
+                true,
+            ),
+            (
+                crate::proto::range_match::Bound::Lt("101.0".to_string()),
+                true,
+            ),
+            (
+                crate::proto::range_match::Bound::Lt("100.5".to_string()),
+                false,
+            ),
+            (
+                crate::proto::range_match::Bound::Lte("100.5".to_string()),
+                true,
+            ),
         ];
 
         for (bound, expected) in cases {
@@ -320,7 +343,12 @@ mod tests {
                     bound: Some(bound),
                 })),
             };
-            assert_eq!(matches(&filter, &meta), expected, "Failed for bound {:?}", filter);
+            assert_eq!(
+                matches(&filter, &meta),
+                expected,
+                "Failed for bound {:?}",
+                filter
+            );
         }
     }
 

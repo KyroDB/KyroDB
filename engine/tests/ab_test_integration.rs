@@ -84,7 +84,7 @@ async fn test_full_ab_test_flow() {
 
     // Verify stats were written
     let metrics = AbStatsPersister::load_metrics(&stats_path).unwrap();
-    assert!(metrics.len() > 0, "No metrics logged");
+    assert!(!metrics.is_empty(), "No metrics logged");
     assert!(metrics
         .iter()
         .any(|m| m.event_type == "hit" || m.event_type == "miss"));
@@ -111,17 +111,11 @@ async fn test_ab_split_distribution() {
         }
     }
 
-    // Should be roughly 50/50 (within 10% tolerance)
-    assert!(
-        (lru_count as i32 - 500).abs() < 50,
-        "LRU count: {}",
-        lru_count
-    );
-    assert!(
-        (learned_count as i32 - 500).abs() < 50,
-        "Learned count: {}",
-        learned_count
-    );
+    // Range contains pattern for cleaner code
+    let lru_ok = (450..=550).contains(&lru_count);
+    let learned_ok = (450..=550).contains(&learned_count);
+    assert!(lru_ok, "LRU count: {}", lru_count);
+    assert!(learned_ok, "Learned count: {}", learned_count);
 }
 
 /// Test cache improves performance over time (cache hits increase)
@@ -225,7 +219,7 @@ async fn test_background_training_updates_predictor() {
     // Create logger with access events
     let logger = Arc::new(RwLock::new(AccessPatternLogger::new(1_000)));
     {
-        let mut log = logger.write();
+        let log = logger.write();
         for i in 0..200 {
             let embedding: Vec<f32> = (0..128).map(|_| i as f32).collect();
             log.log_access(i % 10, &embedding); // 10 hot documents

@@ -200,7 +200,7 @@ impl LearnedCacheStrategy {
             .saturating_mul(8)
             .clamp(cache_capacity.max(1), predictor_cap);
         let diversity_pow2 = desired.checked_next_power_of_two().unwrap_or(desired);
-        let diversity = diversity_pow2.max(32).min(1024);
+        let diversity = diversity_pow2.clamp(32, 1024);
         predictor.set_diversity_buckets(diversity);
     }
 }
@@ -251,11 +251,21 @@ impl CacheStrategy for LearnedCacheStrategy {
             let should_admit = adapter.should_cache(freq_score, embedding);
 
             if should_admit {
-                trace!(doc_id, freq_score, threshold, "admit (hybrid semantic+freq)");
+                trace!(
+                    doc_id,
+                    freq_score,
+                    threshold,
+                    "admit (hybrid semantic+freq)"
+                );
                 // Cache embedding for future semantic lookups
                 adapter.cache_embedding(doc_id, embedding.to_vec());
             } else {
-                trace!(doc_id, freq_score, threshold, "reject (hybrid semantic+freq)");
+                trace!(
+                    doc_id,
+                    freq_score,
+                    threshold,
+                    "reject (hybrid semantic+freq)"
+                );
             }
 
             return should_admit;
@@ -411,10 +421,10 @@ impl CacheStrategy for AbTestSplitter {
 /// ```ignore
 /// let shared_strategy = Arc::new(LearnedCacheStrategy::new(capacity, predictor));
 /// let wrapper = SharedLearnedCacheStrategy::new(shared_strategy.clone());
-/// 
+///
 /// // Pass wrapper to TieredEngine
 /// let engine = TieredEngine::new(Box::new(wrapper), ...);
-/// 
+///
 /// // Pass shared_strategy to training task
 /// spawn_training_task(access_logger, shared_strategy, ...);
 /// ```
@@ -545,15 +555,16 @@ mod tests {
             }
         }
 
-        #[allow(clippy::unnecessary_cast)] // Need i32 for abs() method
         // Should be roughly 50/50 (within 10% tolerance)
+        // Using subtraction with checked operations to avoid type casting issues
+        let lru_lower = lru_count >= 450;
+        let lru_upper = lru_count <= 550;
+        let learned_lower = learned_count >= 450;
+        let learned_upper = learned_count <= 550;
+
+        assert!(lru_lower && lru_upper, "LRU count: {}", lru_count);
         assert!(
-            (lru_count as i32 - 500).abs() < 50,
-            "LRU count: {}",
-            lru_count
-        );
-        assert!(
-            (learned_count as i32 - 500).abs() < 50,
+            learned_lower && learned_upper,
             "Learned count: {}",
             learned_count
         );

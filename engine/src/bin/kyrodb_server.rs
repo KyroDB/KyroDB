@@ -299,7 +299,7 @@ impl KyroDbService for KyroDBServiceImpl {
         match engine.delete(req.doc_id) {
             Ok(existed) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
-                
+
                 if existed {
                     info!(
                         doc_id = req.doc_id,
@@ -411,7 +411,7 @@ impl KyroDbService for KyroDBServiceImpl {
         match engine.query(req.doc_id, None) {
             Some(embedding) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                
+
                 // Fetch metadata for the document
                 let metadata = engine.get_metadata(req.doc_id).unwrap_or_default();
 
@@ -517,7 +517,9 @@ impl KyroDbService for KyroDBServiceImpl {
         } else {
             base_oversampling
         };
-        let search_k = (req.k as usize).saturating_mul(oversampling_factor).min(10_000);
+        let search_k = (req.k as usize)
+            .saturating_mul(oversampling_factor)
+            .min(10_000);
 
         match engine.knn_search(&req.query_embedding, search_k) {
             Ok(results) => {
@@ -528,9 +530,8 @@ impl KyroDbService for KyroDBServiceImpl {
                 self.state.metrics.record_hnsw_search(latency_ns);
 
                 // Convert distance to similarity score
-                let convert_distance_to_score = |dist: f32| -> f32 {
-                    (1.0 - dist).clamp(-1.0, 1.0)
-                };
+                let convert_distance_to_score =
+                    |dist: f32| -> f32 { (1.0 - dist).clamp(-1.0, 1.0) };
 
                 let mut final_results = Vec::new();
                 let mut candidates = results.into_iter();
@@ -554,7 +555,10 @@ impl KyroDbService for KyroDBServiceImpl {
                     // Filter by namespace if specified
                     // Namespace is stored as "__namespace__" in metadata during insert
                     if has_namespace {
-                        let doc_namespace = metadata.get("__namespace__").map(|s| s.as_str()).unwrap_or("");
+                        let doc_namespace = metadata
+                            .get("__namespace__")
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
                         if doc_namespace != req.namespace {
                             continue;
                         }
@@ -632,18 +636,17 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<BulkQueryResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
-        
+
         let total_requested = req.doc_ids.len() as u32;
         if total_requested > MAX_BATCH_SIZE as u32 {
-             return Err(Status::invalid_argument(format!(
+            return Err(Status::invalid_argument(format!(
                 "Batch size {} exceeds maximum {}",
-                total_requested,
-                MAX_BATCH_SIZE
+                total_requested, MAX_BATCH_SIZE
             )));
         }
 
         let engine = self.state.engine.read().await;
-        
+
         // Use the new bulk_query which returns metadata too
         let results_vec = engine.bulk_query(&req.doc_ids, req.include_embeddings);
 
@@ -655,21 +658,23 @@ impl KyroDbService for KyroDBServiceImpl {
                 returned = results_vec.len(),
                 "Bulk query length mismatch"
             );
-            return Err(Status::internal("Internal error: bulk query result length mismatch"));
+            return Err(Status::internal(
+                "Internal error: bulk query result length mismatch",
+            ));
         }
-        
+
         let mut query_responses = Vec::with_capacity(results_vec.len());
         let mut total_found = 0;
-        
+
         for (i, result) in results_vec.into_iter().enumerate() {
             let doc_id = req.doc_ids[i];
             let found = result.is_some();
             if found {
                 total_found += 1;
             }
-            
+
             let (embedding, metadata) = result.unwrap_or_default();
-            
+
             query_responses.push(QueryResponse {
                 found,
                 doc_id,
@@ -679,7 +684,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 error: String::new(),
             });
         }
-        
+
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         info!(
             requested = total_requested,
@@ -703,9 +708,9 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<BatchDeleteResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
-        
+
         let engine = self.state.engine.write().await;
-        
+
         let result = match req.delete_criteria {
             Some(batch_delete_request::DeleteCriteria::Ids(id_list)) => {
                 if id_list.doc_ids.len() > MAX_BATCH_SIZE {
@@ -727,19 +732,19 @@ impl KyroDbService for KyroDBServiceImpl {
                 return Err(Status::invalid_argument("No delete criteria provided"));
             }
         };
-        
+
         match result {
             Ok(count) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 // Record metrics for observability
                 self.state.metrics.record_query_latency(latency_ns);
-                
+
                 info!(
                     deleted = count,
                     latency_ms = latency_ns as f64 / 1_000_000.0,
                     "Batch delete completed"
                 );
-                
+
                 Ok(Response::new(BatchDeleteResponse {
                     success: true,
                     deleted_count: count,

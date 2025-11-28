@@ -35,9 +35,7 @@ name = "validation_enterprise"
 path = "src/bin/validation_enterprise.rs"
 required-features = ["cli-tools"]
 
-[[bin]]
-name = "belady_simulator"
-path = "src/bin/belady_simulator.rs"
+
 
 [features]
 default = []

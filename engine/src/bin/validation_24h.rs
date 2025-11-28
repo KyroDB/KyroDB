@@ -26,6 +26,7 @@ use kyrodb_engine::{
     spawn_training_task, AbStatsPersister, AbTestSplitter, AccessPatternLogger, CacheStrategy,
     CachedVector, LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, TrainingConfig,
 };
+use parking_lot::RwLock;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Normal, Zipf};
@@ -33,7 +34,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use parking_lot::RwLock;
 
 /// Validation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -739,11 +739,7 @@ async fn main() -> Result<()> {
     );
     println!(
         "  Task crashed:    {}",
-        if training_crashed {
-            "YES"
-        } else {
-            "NO"
-        }
+        if training_crashed { "YES" } else { "NO" }
     );
     println!();
 
@@ -786,19 +782,11 @@ async fn main() -> Result<()> {
     println!("Criteria:");
     println!(
         "  ✓ Hybrid Semantic Cache hit rate 70-90%:       {}",
-        if hit_rate_pass {
-            "PASS"
-        } else {
-            "FAIL"
-        }
+        if hit_rate_pass { "PASS" } else { "FAIL" }
     );
     println!(
         "  ✓ Improvement 2.0-3.0× over LRU:       {}",
-        if improvement_pass {
-            "PASS"
-        } else {
-            "FAIL"
-        }
+        if improvement_pass { "PASS" } else { "FAIL" }
     );
     println!(
         "  ✓ Memory growth < 5%:                  {}",
@@ -806,11 +794,7 @@ async fn main() -> Result<()> {
     );
     println!(
         "  ✓ Training task stable:                {}",
-        if training_pass {
-            "PASS"
-        } else {
-            "FAIL"
-        }
+        if training_pass { "PASS" } else { "FAIL" }
     );
     println!();
     println!(

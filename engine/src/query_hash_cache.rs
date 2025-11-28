@@ -208,17 +208,14 @@ impl QueryHashCache {
         let mut lru = self.lru_queue.write();
 
         // Check if already in cache (update case)
-        if cache.contains_key(&query_hash) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = cache.entry(query_hash) {
             // Update existing entry
-            cache.insert(
+            e.insert(CachedQueryResult {
+                doc_id,
+                embedding,
                 query_hash,
-                CachedQueryResult {
-                    doc_id,
-                    embedding,
-                    query_hash,
-                    cached_at: Instant::now(),
-                },
-            );
+                cached_at: Instant::now(),
+            });
             query_embs.insert(query_hash, query_embedding);
 
             // Move to back of LRU queue
@@ -363,7 +360,7 @@ impl QueryHashCache {
 
     /// Set similarity scan limit (max queries to scan)
     pub fn set_similarity_scan_limit(&mut self, limit: usize) {
-        self.similarity_scan_limit = limit.max(10).min(10000);
+        self.similarity_scan_limit = limit.clamp(10, 10000);
     }
 
     // =========================================================================

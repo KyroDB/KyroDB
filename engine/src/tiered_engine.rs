@@ -664,10 +664,13 @@ impl TieredEngine {
         merge: bool,
     ) -> Result<bool> {
         // Try hot tier first
-        if self.hot_tier.update_metadata(doc_id, metadata.clone(), merge) {
+        if self
+            .hot_tier
+            .update_metadata(doc_id, metadata.clone(), merge)
+        {
             return Ok(true);
         }
-        
+
         // Fallback to cold tier (with WAL logging)
         self.cold_tier.update_metadata(doc_id, metadata, merge)
     }
@@ -687,29 +690,37 @@ impl TieredEngine {
     pub fn delete(&self, doc_id: u64) -> Result<bool> {
         // Delete from hot tier
         let hot_deleted = self.hot_tier.delete(doc_id);
-        
+
         // Delete from cold tier (WAL + Soft Delete)
         let cold_deleted = self.cold_tier.delete(doc_id)?;
-        
+
         // Invalidate document cache entries (L1a)
         self.cache_strategy.write().invalidate(doc_id);
 
         // Remove any cached queries referencing this document (best effort)
         let removed_queries = self.query_cache.invalidate_doc(doc_id);
         if removed_queries > 0 {
-            debug!(doc_id, removed_queries, "Removed stale query-cache entries after delete");
+            debug!(
+                doc_id,
+                removed_queries, "Removed stale query-cache entries after delete"
+            );
         }
-        
+
         Ok(hot_deleted || cold_deleted)
     }
 
     /// Bulk query documents by ID
     ///
     /// Optimized to batch lookups across tiers.
-    pub fn bulk_query(&self, doc_ids: &[u64], include_embeddings: bool) -> Vec<Option<(Vec<f32>, std::collections::HashMap<String, String>)>> {
+    #[allow(clippy::type_complexity)]
+    pub fn bulk_query(
+        &self,
+        doc_ids: &[u64],
+        include_embeddings: bool,
+    ) -> Vec<Option<(Vec<f32>, std::collections::HashMap<String, String>)>> {
         let mut results = vec![None; doc_ids.len()];
         let mut missing_indices = Vec::new();
-        
+
         // 1. Try Hot Tier (batch)
         let hot_results = self.hot_tier.bulk_fetch(doc_ids);
         for (i, res) in hot_results.into_iter().enumerate() {
@@ -719,7 +730,7 @@ impl TieredEngine {
                 missing_indices.push(i);
             }
         }
-        
+
         if missing_indices.is_empty() {
             // Filter embeddings if not requested
             if !include_embeddings {
@@ -729,24 +740,24 @@ impl TieredEngine {
             }
             return results;
         }
-        
+
         // 2. Try Cold Tier for missing
         let missing_ids: Vec<u64> = missing_indices.iter().map(|&i| doc_ids[i]).collect();
         let cold_results = self.cold_tier.bulk_fetch(&missing_ids);
-        
+
         for (i, res) in cold_results.into_iter().enumerate() {
             if let Some(doc) = res {
                 results[missing_indices[i]] = Some(doc);
             }
         }
-        
+
         // Filter embeddings if not requested
         if !include_embeddings {
             for res in results.iter_mut().flatten() {
                 res.0.clear();
             }
         }
-        
+
         results
     }
 
@@ -754,10 +765,10 @@ impl TieredEngine {
     pub fn batch_delete(&self, doc_ids: &[u64]) -> Result<u64> {
         // Delete from hot tier (efficient batch)
         let hot_deleted = self.hot_tier.batch_delete(doc_ids);
-        
+
         // Delete from cold tier (efficient batch with WAL logging)
         let cold_deleted = self.cold_tier.batch_delete(doc_ids)?;
-        
+
         // Invalidate caches
         {
             let cache = self.cache_strategy.write();
@@ -765,12 +776,12 @@ impl TieredEngine {
                 cache.invalidate(id);
             }
         }
-        
+
         // Query cache invalidation
         for &id in doc_ids {
-             self.query_cache.invalidate_doc(id);
+            self.query_cache.invalidate_doc(id);
         }
-        
+
         // Return total deleted (assuming disjoint tiers mostly)
         Ok((hot_deleted as u64) + cold_deleted)
     }
@@ -782,16 +793,16 @@ impl TieredEngine {
     {
         // Scan hot tier
         let hot_ids = self.hot_tier.scan(&predicate);
-        
+
         // Scan cold tier
         let cold_ids = self.cold_tier.scan(&predicate);
-        
+
         // Combine IDs (deduplicate)
         let mut all_ids = hot_ids;
         all_ids.extend(cold_ids);
         all_ids.sort_unstable();
         all_ids.dedup();
-        
+
         // Delete
         self.batch_delete(&all_ids)
     }
@@ -831,7 +842,7 @@ impl TieredEngine {
         // Check dimension consistency (only if cold tier has documents)
         let backend_dim = (*self.cold_tier).dimension();
         let cold_tier_has_docs = backend_dim != 0;
-        
+
         if cold_tier_has_docs && query.len() != backend_dim {
             anyhow::bail!(
                 "query dimension mismatch: expected {} found {}",
@@ -949,7 +960,6 @@ impl TieredEngine {
 
         final_results
     }
-
 
     /// k-NN search with per-layer timeouts and graceful degradation
     ///
@@ -1170,7 +1180,10 @@ impl TieredEngine {
 
         // Insert into cold tier (HNSW + WAL) with per-document error handling
         for (doc_id, embedding, metadata) in documents {
-            match self.cold_tier.insert(doc_id, embedding.clone(), metadata.clone()) {
+            match self
+                .cold_tier
+                .insert(doc_id, embedding.clone(), metadata.clone())
+            {
                 Ok(()) => {
                     success_count += 1;
                 }
@@ -1238,7 +1251,10 @@ impl TieredEngine {
 
         // Insert into cold tier (HNSW + WAL) with per-document error handling
         for (doc_id, embedding, metadata) in documents {
-            match self.cold_tier.insert(doc_id, embedding.clone(), metadata.clone()) {
+            match self
+                .cold_tier
+                .insert(doc_id, embedding.clone(), metadata.clone())
+            {
                 Ok(()) => {
                     success_count += 1;
                 }
@@ -1409,10 +1425,19 @@ mod tests {
             ..Default::default()
         };
 
-        let initial_metadata = vec![std::collections::HashMap::new(), std::collections::HashMap::new()];
+        let initial_metadata = vec![
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        ];
 
-        let engine =
-            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            initial_embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Query doc 0 (in cold tier)
         let result = engine.query(0, None);
@@ -1438,11 +1463,19 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new()];
-        let engine =
-            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            initial_embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Insert into hot tier
-        engine.insert(10, vec![0.5, 0.5], std::collections::HashMap::new()).unwrap();
+        engine
+            .insert(10, vec![0.5, 0.5], std::collections::HashMap::new())
+            .unwrap();
 
         // Query should hit hot tier
         let result = engine.query(10, None);
@@ -1468,12 +1501,22 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new()];
-        let engine =
-            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            initial_embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Insert 2 documents (trigger flush threshold)
-        engine.insert(10, vec![0.1, 0.1], std::collections::HashMap::new()).unwrap();
-        engine.insert(11, vec![0.2, 0.2], std::collections::HashMap::new()).unwrap();
+        engine
+            .insert(10, vec![0.1, 0.1], std::collections::HashMap::new())
+            .unwrap();
+        engine
+            .insert(11, vec![0.2, 0.2], std::collections::HashMap::new())
+            .unwrap();
 
         assert!(engine.hot_tier().needs_flush());
 
@@ -1508,12 +1551,19 @@ mod tests {
 
             let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
             let initial_metadata = vec![std::collections::HashMap::new()];
-            let engine =
-                TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, initial_metadata, config)
-                    .unwrap();
+            let engine = TieredEngine::new(
+                Box::new(cache),
+                query_cache,
+                initial_embeddings,
+                initial_metadata,
+                config,
+            )
+            .unwrap();
 
             // Insert and flush (should trigger because hot_tier_max_size=1)
-            engine.insert(10, vec![0.5, 0.5], std::collections::HashMap::new()).unwrap();
+            engine
+                .insert(10, vec![0.5, 0.5], std::collections::HashMap::new())
+                .unwrap();
             let flushed = engine.flush_hot_tier().unwrap();
             assert_eq!(flushed, 1, "Expected 1 document to be flushed");
 
@@ -1574,7 +1624,14 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 100];
-        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Search for nearest neighbors
         let query = vec![5.0, 0.0, 0.0, 0.0];
@@ -1608,7 +1665,14 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 3];
-        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         let query = vec![2.5, 0.0, 0.0, 0.0];
         let results = engine.knn_search_with_timeouts(&query, 2).await.unwrap();
@@ -1626,16 +1690,22 @@ mod tests {
         let cache = LruCacheStrategy::new(10);
         let embeddings = vec![vec![1.0, 0.0]];
 
-        let mut config = TieredEngineConfig {
+        let config = TieredEngineConfig {
             data_dir: None,
             hnsw_max_elements: 100,
             ..Default::default()
         };
 
-
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new()];
-        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Initial stats should be zero
         let stats = engine.stats();
@@ -1667,7 +1737,14 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 1000];
-        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         let query = vec![500.0; 128];
         let _result = engine.knn_search_with_timeouts(&query, 10).await;
@@ -1694,7 +1771,14 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new()];
-        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // All circuit breakers should start closed
         assert!(engine.cache_circuit_breaker.is_closed());
@@ -1718,12 +1802,19 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new()];
-        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Trigger multiple searches - some may timeout, some may succeed
         for _ in 0..10 {
             let _ = engine
-                .knn_search_with_timeouts(&vec![1.0, 0.0, 0.0, 0.0], 5)
+                .knn_search_with_timeouts(&[1.0, 0.0, 0.0, 0.0], 5)
                 .await;
         }
 
@@ -1757,8 +1848,16 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 10];
-        let engine =
-            Arc::new(TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap());
+        let engine = Arc::new(
+            TieredEngine::new(
+                Box::new(cache),
+                query_cache,
+                embeddings,
+                initial_metadata,
+                config,
+            )
+            .unwrap(),
+        );
 
         // Barrier to coordinate: 2 background tasks will wait AFTER acquiring permit
         // but BEFORE releasing it, so main thread can attempt 3rd query
@@ -1832,8 +1931,16 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 5];
-        let engine =
-            Arc::new(TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap());
+        let engine = Arc::new(
+            TieredEngine::new(
+                Box::new(cache),
+                query_cache,
+                embeddings,
+                initial_metadata,
+                config,
+            )
+            .unwrap(),
+        );
 
         // Execute first query - should succeed
         let query1 = vec![1.0, 2.0];
@@ -1864,7 +1971,14 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 5];
-        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Manually open circuit breakers to test rejection path
         engine.cache_circuit_breaker.open();
@@ -1898,8 +2012,16 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 10];
-        let engine =
-            Arc::new(TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap());
+        let engine = Arc::new(
+            TieredEngine::new(
+                Box::new(cache),
+                query_cache,
+                embeddings,
+                initial_metadata,
+                config,
+            )
+            .unwrap(),
+        );
 
         // Initial queue depth should be 0
         let initial_stats = engine.stats();
@@ -1940,7 +2062,14 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 5];
-        let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Open cold tier circuit breaker
         engine.cold_tier_circuit_breaker.open();
@@ -1976,13 +2105,25 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 5];
-        let engine =
-            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            initial_embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Insert documents into hot tier
-        engine.insert(10, vec![2.0, 0.0], std::collections::HashMap::new()).unwrap();
-        engine.insert(11, vec![3.0, 0.0], std::collections::HashMap::new()).unwrap();
-        engine.insert(12, vec![4.0, 0.0], std::collections::HashMap::new()).unwrap();
+        engine
+            .insert(10, vec![2.0, 0.0], std::collections::HashMap::new())
+            .unwrap();
+        engine
+            .insert(11, vec![3.0, 0.0], std::collections::HashMap::new())
+            .unwrap();
+        engine
+            .insert(12, vec![4.0, 0.0], std::collections::HashMap::new())
+            .unwrap();
 
         assert_eq!(engine.hot_tier.len(), 3);
 
@@ -2018,8 +2159,14 @@ mod tests {
 
         let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
         let initial_metadata = vec![std::collections::HashMap::new(); 2];
-        let engine =
-            TieredEngine::new(Box::new(cache), query_cache, initial_embeddings, initial_metadata, config).unwrap();
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            initial_embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
 
         // Insert documents up to hard limit
         // Hard limit is 6, so insert 6 documents
@@ -2068,7 +2215,7 @@ mod tests {
         // Simulate failed flush scenario: documents that couldn't be flushed
         let failed_docs = vec![
             (10, vec![10.0, 0.0], std::collections::HashMap::new()),
-            (11, vec![11.0, 0.0], std::collections::HashMap::new())
+            (11, vec![11.0, 0.0], std::collections::HashMap::new()),
         ];
 
         hot_tier.reinsert_failed_documents(failed_docs);

@@ -148,7 +148,7 @@ fn default_learned_cache_multiplier() -> f64 {
 }
 
 fn default_working_set_multiplier() -> f64 {
-    1.0  // Use Zipf calculation only (don't inflate based on cache size)
+    1.0 // Use Zipf calculation only (don't inflate based on cache size)
 }
 
 fn default_query_reuse_probability() -> f64 {
@@ -1390,7 +1390,8 @@ async fn main() -> Result<()> {
 
     // Create SharedLearnedCacheStrategy wrapper that delegates to the SAME strategy
     // used by the training task. This ensures predictor updates are immediately visible.
-    let shared_strategy_wrapper = SharedLearnedCacheStrategy::new(learned_strategy_for_training.clone());
+    let shared_strategy_wrapper =
+        SharedLearnedCacheStrategy::new(learned_strategy_for_training.clone());
 
     // Create empty metadata for all corpus documents
     let corpus_metadata = vec![HashMap::new(); corpus_embeddings.len()];
@@ -1578,48 +1579,51 @@ async fn main() -> Result<()> {
         }
     }
 
-    let workload_gen =
-        if let (Some(query_embs), Some(query_doc_map)) = (&query_embeddings, &query_to_doc) {
-            // Use corpus embeddings that were loaded earlier
-            let semantic_gen = SemanticWorkloadGenerator::new(
-                Arc::new(corpus_embeddings.clone()),
-                query_embs.clone(),
-                query_doc_map.clone(),
-                config.zipf_exponent,
-                config.top_k_queries_per_doc,
-                config.cold_traffic_ratio,
-                config.min_paraphrases_per_doc,
-                config.query_reuse_probability,
-                config.min_reuse_pool_size,
-            )
-            .await?;
-            
-            // NOTE: SemanticWorkloadGenerator does NOT support temporal patterns (topic rotations, spikes)
-            // It focuses on realistic semantic query distribution instead.
-            // To test temporal patterns, disable query_embeddings_path in config.
-            if config.enable_temporal_patterns {
-                println!("NOTE: Temporal patterns (topic rotations, spikes) are DISABLED when using SemanticWorkloadGenerator.");
-                println!("      To enable temporal patterns, set query_embeddings_path to null in config.");
-            }
-            
-            WorkloadGenerator::Semantic(semantic_gen)
-        } else {
-            println!("Using TemporalWorkloadGenerator (ID-based sampling)");
-            let temporal_gen = TemporalWorkloadGenerator::new(
-                config.corpus_size,
-                config.zipf_exponent,
-                Duration::from_secs(config.topic_rotation_interval_secs),
-                config.spike_probability,
-                Duration::from_secs(config.spike_duration_secs),
-                config.enable_temporal_patterns,
-                config.cache_capacity,
-                config.working_set_multiplier,
-                config.working_set_churn,
-                config.cold_traffic_ratio,
-                config.working_set_bias,
-            )?;
-            WorkloadGenerator::Temporal(temporal_gen)
-        };
+    let workload_gen = if let (Some(query_embs), Some(query_doc_map)) =
+        (&query_embeddings, &query_to_doc)
+    {
+        // Use corpus embeddings that were loaded earlier
+        let semantic_gen = SemanticWorkloadGenerator::new(
+            Arc::new(corpus_embeddings.clone()),
+            query_embs.clone(),
+            query_doc_map.clone(),
+            config.zipf_exponent,
+            config.top_k_queries_per_doc,
+            config.cold_traffic_ratio,
+            config.min_paraphrases_per_doc,
+            config.query_reuse_probability,
+            config.min_reuse_pool_size,
+        )
+        .await?;
+
+        // NOTE: SemanticWorkloadGenerator does NOT support temporal patterns (topic rotations, spikes)
+        // It focuses on realistic semantic query distribution instead.
+        // To test temporal patterns, disable query_embeddings_path in config.
+        if config.enable_temporal_patterns {
+            println!("NOTE: Temporal patterns (topic rotations, spikes) are DISABLED when using SemanticWorkloadGenerator.");
+            println!(
+                "      To enable temporal patterns, set query_embeddings_path to null in config."
+            );
+        }
+
+        WorkloadGenerator::Semantic(semantic_gen)
+    } else {
+        println!("Using TemporalWorkloadGenerator (ID-based sampling)");
+        let temporal_gen = TemporalWorkloadGenerator::new(
+            config.corpus_size,
+            config.zipf_exponent,
+            Duration::from_secs(config.topic_rotation_interval_secs),
+            config.spike_probability,
+            Duration::from_secs(config.spike_duration_secs),
+            config.enable_temporal_patterns,
+            config.cache_capacity,
+            config.working_set_multiplier,
+            config.working_set_churn,
+            config.cold_traffic_ratio,
+            config.working_set_bias,
+        )?;
+        WorkloadGenerator::Temporal(temporal_gen)
+    };
 
     // Test parameters
     let test_duration = Duration::from_secs_f64(config.duration_hours * 3600.0);

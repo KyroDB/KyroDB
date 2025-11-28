@@ -12,4 +12,4 @@ license = "BSL"
 repository = "https://github.com/vatskishan03/KyroDB"
 keywords = ["vector-database", "hnsw", "hybrid-semantic-cache", "rag", "embeddings"]
 categories = ["database-implementations", "machine-learning"]
-description = "KyroDB: High-performance vector database for RAG workloads with Hybrid Semantic Cache"
+description = "KyroDB: High-performance vector database for RAG workloads and AI agents"

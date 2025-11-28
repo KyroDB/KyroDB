@@ -130,12 +130,14 @@ fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
 
     for line in status.lines() {
         if line.starts_with("VmRSS:") {
-            rss_kb = line.split_whitespace()
+            rss_kb = line
+                .split_whitespace()
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
         } else if line.starts_with("VmSize:") {
-            vm_size_kb = line.split_whitespace()
+            vm_size_kb = line
+                .split_whitespace()
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
@@ -143,10 +145,10 @@ fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
     }
 
     Ok(MemoryStats {
-        allocated: vm_size_kb * 1024,  // Total virtual memory
-        resident: rss_kb * 1024,        // Resident set size (physical memory)
-        mapped: vm_size_kb * 1024,      // Same as VmSize for this impl
-        retained: 0,                     // Not available without jemalloc
+        allocated: vm_size_kb * 1024, // Total virtual memory
+        resident: rss_kb * 1024,      // Resident set size (physical memory)
+        mapped: vm_size_kb * 1024,    // Same as VmSize for this impl
+        retained: 0,                  // Not available without jemalloc
     })
 }
 
@@ -157,12 +159,7 @@ fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
     // Use mach task_info to get memory stats on macOS
     extern "C" {
         fn mach_task_self() -> u32;
-        fn task_info(
-            task: u32,
-            flavor: i32,
-            task_info: *mut u8,
-            task_info_count: *mut u32,
-        ) -> i32;
+        fn task_info(task: u32, flavor: i32, task_info: *mut u8, task_info_count: *mut u32) -> i32;
     }
 
     const MACH_TASK_BASIC_INFO: i32 = 20;
@@ -202,7 +199,9 @@ fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
     // Unsupported platform - return error
-    anyhow::bail!("Memory tracking not implemented for this platform (use --features jemalloc-profiling)")
+    anyhow::bail!(
+        "Memory tracking not implemented for this platform (use --features jemalloc-profiling)"
+    )
 }
 
 /// Dump heap profile to file

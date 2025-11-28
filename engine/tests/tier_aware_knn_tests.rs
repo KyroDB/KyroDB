@@ -60,17 +60,33 @@ fn test_knn_searches_hot_tier() {
     // Insert 3 documents into hot tier (NOT flushed)
     println!("Inserting 3 documents to hot tier");
     engine
-        .insert(100, create_normalized_embedding(vec![0.25, 0.75]), HashMap::new())
+        .insert(
+            100,
+            create_normalized_embedding(vec![0.25, 0.75]),
+            HashMap::new(),
+        )
         .unwrap();
     engine
-        .insert(101, create_normalized_embedding(vec![0.30, 0.70]), HashMap::new())
+        .insert(
+            101,
+            create_normalized_embedding(vec![0.30, 0.70]),
+            HashMap::new(),
+        )
         .unwrap();
     engine
-        .insert(102, create_normalized_embedding(vec![0.35, 0.65]), HashMap::new())
+        .insert(
+            102,
+            create_normalized_embedding(vec![0.35, 0.65]),
+            HashMap::new(),
+        )
         .unwrap();
 
     // Verify they're in hot tier
-    assert_eq!(engine.hot_tier().len(), 3, "Hot tier should have 3 documents");
+    assert_eq!(
+        engine.hot_tier().len(),
+        3,
+        "Hot tier should have 3 documents"
+    );
 
     // k-NN search with query close to hot tier documents
     let query = create_normalized_embedding(vec![0.3, 0.7]);
@@ -146,7 +162,11 @@ fn test_knn_deduplication() {
     // Insert doc 2 again with DIFFERENT embedding (update scenario)
     println!("Inserting updated doc 2 to hot tier");
     engine
-        .insert(2, create_normalized_embedding(vec![0.9, 0.1]), HashMap::new())
+        .insert(
+            2,
+            create_normalized_embedding(vec![0.9, 0.1]),
+            HashMap::new(),
+        )
         .unwrap();
 
     // k-NN search should return doc 2 only ONCE (hot tier version)
@@ -161,7 +181,10 @@ fn test_knn_deduplication() {
         "Doc 2 should appear only once (deduplicated)"
     );
 
-    println!("✓ Deduplication works correctly (doc 2 appeared {} time)", doc_2_count);
+    println!(
+        "✓ Deduplication works correctly (doc 2 appeared {} time)",
+        doc_2_count
+    );
 }
 
 #[test]
@@ -173,10 +196,7 @@ fn test_knn_result_merging_correctness() {
     let mut initial_metadata = Vec::new();
     for i in 0..20 {
         let angle = (i as f32 / 20.0) * std::f32::consts::PI * 2.0;
-        initial_embeddings.push(create_normalized_embedding(vec![
-            angle.cos(),
-            angle.sin(),
-        ]));
+        initial_embeddings.push(create_normalized_embedding(vec![angle.cos(), angle.sin()]));
         initial_metadata.push(HashMap::new());
     }
 
@@ -234,7 +254,10 @@ fn test_knn_result_merging_correctness() {
         );
     }
 
-    println!("✓ Merging produced {} unique, sorted results", results.len());
+    println!(
+        "✓ Merging produced {} unique, sorted results",
+        results.len()
+    );
 }
 
 #[test]
@@ -419,10 +442,7 @@ fn test_knn_latency_with_hot_tier() {
     let mut initial_metadata = Vec::new();
     for i in 0..1000 {
         let angle = (i as f32 / 1000.0) * std::f32::consts::PI * 2.0;
-        initial_embeddings.push(create_normalized_embedding(vec![
-            angle.cos(),
-            angle.sin(),
-        ]));
+        initial_embeddings.push(create_normalized_embedding(vec![angle.cos(), angle.sin()]));
         initial_metadata.push(HashMap::new());
     }
 

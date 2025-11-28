@@ -1,4 +1,4 @@
-use kyrodb_engine::backup::{BackupManager, ClearDirectoryOptions, RestoreManager};
+use kyrodb_engine::backup::{ClearDirectoryOptions, RestoreManager};
 use std::fs;
 use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;

@@ -6,7 +6,6 @@ use kyrodb_engine::backup::{
     RetentionPolicy,
 };
 use std::fs;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -106,7 +105,7 @@ fn test_pitr_incremental_chain_traversal() {
     }
 
     // Create RestoreManager and test PITR to a point after Inc2
-    let restore_manager = RestoreManager::new(&backup_dir, &data_dir).unwrap();
+    let _restore_manager = RestoreManager::new(&backup_dir, &data_dir).unwrap();
 
     // PITR to timestamp after Inc2 should include: Full + Inc1 + Inc2 (NOT Inc3)
     // The old buggy code would only find Inc1, missing Inc2
@@ -245,7 +244,7 @@ fn test_backup_manager_and_restore_manager_list_consistency() {
 
     // Both BackupManager and RestoreManager should return same results
     let backup_manager = BackupManager::new(&backup_dir, &data_dir).unwrap();
-    let restore_manager = RestoreManager::new(&backup_dir, &data_dir).unwrap();
+    let _restore_manager = RestoreManager::new(&backup_dir, &data_dir).unwrap();
 
     let backups_from_backup_mgr = backup_manager.list_backups().unwrap();
     // Can't directly call list_backups on RestoreManager (it's private),

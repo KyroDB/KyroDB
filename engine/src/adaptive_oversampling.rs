@@ -2,7 +2,7 @@
 //!
 //! Estimates filter selectivity to dynamically adjust oversampling factor
 
-use crate::proto::{MetadataFilter, metadata_filter::FilterType};
+use crate::proto::{metadata_filter::FilterType, MetadataFilter};
 
 /// Calculate oversampling factor based on filter complexity
 ///
@@ -18,10 +18,10 @@ fn estimate_selectivity(filter_type: &FilterType) -> usize {
     match filter_type {
         // Exact match: high selectivity (few matches expected)
         FilterType::Exact(_) => 2,
-        
+
         // Range match: medium selectivity
         FilterType::Range(_) => 5,
-        
+
         // IN match: depends on cardinality, but assume medium
         FilterType::InMatch(in_match) => {
             // More values = lower selectivity
@@ -34,7 +34,7 @@ fn estimate_selectivity(filter_type: &FilterType) -> usize {
                 8
             }
         }
-        
+
         // AND: takes minimum selectivity (most restrictive sub-filter dominates)
         FilterType::AndFilter(and_filter) => {
             if and_filter.filters.is_empty() {
@@ -48,7 +48,7 @@ fn estimate_selectivity(filter_type: &FilterType) -> usize {
                 .min()
                 .unwrap_or(2) // Take minimum (most selective)
         }
-        
+
         // OR: reduce selectivity (less restrictive)
         FilterType::OrFilter(or_filter) => {
             if or_filter.filters.is_empty() {
@@ -61,11 +61,11 @@ fn estimate_selectivity(filter_type: &FilterType) -> usize {
                 .map(estimate_selectivity)
                 .sum::<usize>()
                 / or_filter.filters.len().max(1);
-            
+
             // OR filters are typically less selective
             (avg_selectivity * 2).clamp(2, 20)
         }
-        
+
         // NOT: very low selectivity (inverts the filter)
         FilterType::NotFilter(not_filter) => {
             if let Some(ref inner_filter) = not_filter.filter {
@@ -123,7 +123,14 @@ mod tests {
         let filter_large = MetadataFilter {
             filter_type: Some(FilterType::InMatch(InMatch {
                 key: "status".to_string(),
-                values: vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(), "e".to_string(), "f".to_string()],
+                values: vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                    "c".to_string(),
+                    "d".to_string(),
+                    "e".to_string(),
+                    "f".to_string(),
+                ],
             })),
         };
         assert_eq!(calculate_oversampling_factor(&filter_large), 8);
@@ -167,7 +174,7 @@ mod tests {
         };
         // NOT of exact match should have high oversampling
         let factor = calculate_oversampling_factor(&filter);
-        assert!(factor >= 10 && factor <= 50);
+        assert!((10..=50).contains(&factor));
     }
 
     #[test]
@@ -198,15 +205,13 @@ mod tests {
         };
         // Average of 2 and 5 is 3, doubled is 6
         let factor = calculate_oversampling_factor(&filter);
-        assert!(factor >= 2 && factor <= 20);
+        assert!((2..=20).contains(&factor));
     }
 
     #[test]
     fn test_empty_and_filter() {
         let filter = MetadataFilter {
-            filter_type: Some(FilterType::AndFilter(AndFilter {
-                filters: vec![],
-            })),
+            filter_type: Some(FilterType::AndFilter(AndFilter { filters: vec![] })),
         };
         let factor = calculate_oversampling_factor(&filter);
         assert!(factor >= 1); // Should not be 0
@@ -215,9 +220,7 @@ mod tests {
     #[test]
     fn test_empty_or_filter() {
         let filter = MetadataFilter {
-            filter_type: Some(FilterType::OrFilter(OrFilter {
-                filters: vec![],
-            })),
+            filter_type: Some(FilterType::OrFilter(OrFilter { filters: vec![] })),
         };
         let factor = calculate_oversampling_factor(&filter);
         assert!(factor >= 1); // Should not be 0

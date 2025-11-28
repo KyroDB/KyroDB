@@ -669,19 +669,17 @@ impl Snapshot {
         // Deserialize
         let mut snapshot = match bincode::deserialize::<Snapshot>(&snapshot_bytes) {
             Ok(snapshot) => snapshot,
-            Err(primary_err) => {
-                match bincode::deserialize::<LegacySnapshotV1>(&snapshot_bytes) {
-                    Ok(legacy) => {
-                        warn!(
+            Err(primary_err) => match bincode::deserialize::<LegacySnapshotV1>(&snapshot_bytes) {
+                Ok(legacy) => {
+                    warn!(
                             "Loaded legacy snapshot v1 without metadata; upgrading in-memory representation"
                         );
-                        Snapshot::from_legacy(legacy)
-                    }
-                    Err(_) => {
-                        return Err(primary_err).context("Failed to deserialize snapshot" );
-                    }
+                    Snapshot::from_legacy(legacy)
                 }
-            }
+                Err(_) => {
+                    return Err(primary_err).context("Failed to deserialize snapshot");
+                }
+            },
         };
 
         snapshot.validate_and_normalize()?;
@@ -1201,7 +1199,10 @@ mod tests {
 
         // Create valid snapshot first
         let documents = vec![(1, vec![0.1, 0.2]), (2, vec![0.3, 0.4])];
-        let metadata = documents.iter().map(|(id, _)| (*id, HashMap::new())).collect();
+        let metadata = documents
+            .iter()
+            .map(|(id, _)| (*id, HashMap::new()))
+            .collect();
         let snapshot = Snapshot::new(2, documents.clone(), metadata).unwrap();
         snapshot.save(&snapshot_path).unwrap();
 
@@ -1232,14 +1233,20 @@ mod tests {
         // Create snapshot_100.snap (primary)
         let snapshot_100_path = dir.path().join("snapshot_100.snap");
         let documents_100 = vec![(1, vec![1.0, 2.0]), (2, vec![3.0, 4.0])];
-        let metadata_100 = documents_100.iter().map(|(id, _)| (*id, HashMap::new())).collect();
+        let metadata_100 = documents_100
+            .iter()
+            .map(|(id, _)| (*id, HashMap::new()))
+            .collect();
         let snapshot_100 = Snapshot::new(2, documents_100, metadata_100).unwrap();
         snapshot_100.save(&snapshot_100_path).unwrap();
 
         // Create snapshot_99.snap (fallback)
         let snapshot_99_path = dir.path().join("snapshot_99.snap");
         let documents_99 = vec![(1, vec![0.1, 0.2])];
-        let metadata_99 = documents_99.iter().map(|(id, _)| (*id, HashMap::new())).collect();
+        let metadata_99 = documents_99
+            .iter()
+            .map(|(id, _)| (*id, HashMap::new()))
+            .collect();
         let snapshot_99 = Snapshot::new(2, documents_99, metadata_99).unwrap();
         snapshot_99.save(&snapshot_99_path).unwrap();
 

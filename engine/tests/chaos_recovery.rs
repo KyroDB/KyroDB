@@ -8,7 +8,7 @@
 //! - Retry exhaustion handling
 
 use kyrodb_engine::{
-    CircuitBreaker, CircuitBreakerConfig, FsyncPolicy, HnswBackend, MetricsCollector, QueryHashCache, Snapshot,
+    CircuitBreaker, FsyncPolicy, HnswBackend, MetricsCollector, QueryHashCache, Snapshot,
 };
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -98,14 +98,16 @@ fn test_hnsw_corruption_recovery() {
     backend.create_snapshot().unwrap();
 
     // Add more data
-    backend.insert(3, vec![0.0, 0.0, 0.0, 1.0], HashMap::new()).unwrap();
+    backend
+        .insert(3, vec![0.0, 0.0, 0.0, 1.0], HashMap::new())
+        .unwrap();
     backend.sync_wal().unwrap();
     backend.create_snapshot().unwrap(); // snapshot_2
 
     drop(backend);
 
     // Find and corrupt the latest snapshot file
-    let mut snapshot_files: Vec<_> = std::fs::read_dir(&data_dir)
+    let mut snapshot_files: Vec<_> = std::fs::read_dir(data_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -315,7 +317,8 @@ async fn test_tiered_query_normal_operation() {
         ..Default::default()
     };
 
-    let engine = TieredEngine::new(Box::new(cache), query_cache, embeddings, metadata, config).unwrap();
+    let engine =
+        TieredEngine::new(Box::new(cache), query_cache, embeddings, metadata, config).unwrap();
 
     // Query should succeed through normal tier access
     let query = vec![0.5, 0.5, 0.0, 0.0];

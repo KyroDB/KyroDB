@@ -180,21 +180,13 @@ fn test_persistence_across_all_tiers() {
         println!("\n=== Step 1: Writing data ===");
 
         // Insert to hot tier and flush
-        engine
-            .insert(10, vec![0.4, 0.6], HashMap::new())
-            .unwrap();
-        engine
-            .insert(11, vec![0.2, 0.8], HashMap::new())
-            .unwrap();
+        engine.insert(10, vec![0.4, 0.6], HashMap::new()).unwrap();
+        engine.insert(11, vec![0.2, 0.8], HashMap::new()).unwrap();
         engine.flush_hot_tier().unwrap();
 
         // Insert more (should trigger snapshot at 5 inserts)
-        engine
-            .insert(20, vec![0.1, 0.9], HashMap::new())
-            .unwrap();
-        engine
-            .insert(21, vec![0.0, 1.0], HashMap::new())
-            .unwrap();
+        engine.insert(20, vec![0.1, 0.9], HashMap::new()).unwrap();
+        engine.insert(21, vec![0.0, 1.0], HashMap::new()).unwrap();
         engine.flush_hot_tier().unwrap();
 
         // Query to populate cache
@@ -221,8 +213,8 @@ fn test_persistence_across_all_tiers() {
             ..Default::default()
         };
 
-        let recovered = TieredEngine::recover(Box::new(cache), query_cache, dir.path(), config)
-            .unwrap();
+        let recovered =
+            TieredEngine::recover(Box::new(cache), query_cache, dir.path(), config).unwrap();
 
         // Verify initial docs
         assert!(
@@ -315,9 +307,7 @@ fn test_concurrent_tier_access() {
     let engine2 = Arc::clone(&engine);
     handles.push(thread::spawn(move || {
         for i in 100..110 {
-            engine2
-                .insert(i, vec![0.5, 0.5], HashMap::new())
-                .unwrap();
+            engine2.insert(i, vec![0.5, 0.5], HashMap::new()).unwrap();
         }
     }));
 
@@ -380,9 +370,7 @@ fn test_query_path_layering() {
 
     // Step 3: Insert new doc to hot tier
     println!("Step 3: Insert doc 100 to hot tier");
-    engine
-        .insert(100, vec![0.5, 0.5], HashMap::new())
-        .unwrap();
+    engine.insert(100, vec![0.5, 0.5], HashMap::new()).unwrap();
 
     // Step 4: Query doc 100 (hot tier hit)
     println!("Step 4: Query doc 100 from hot tier");

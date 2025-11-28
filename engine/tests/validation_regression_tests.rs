@@ -408,12 +408,10 @@ fn test_full_ab_validation_simulation() {
             } else {
                 lru_misses += 1;
             }
+        } else if cache_hit {
+            learned_hits += 1;
         } else {
-            if cache_hit {
-                learned_hits += 1;
-            } else {
-                learned_misses += 1;
-            }
+            learned_misses += 1;
         }
 
         // Train Hybrid Semantic Cache every 10K queries

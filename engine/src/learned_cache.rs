@@ -661,7 +661,7 @@ impl LearnedCachePredictor {
 
         let bucket_count = self.diversity_bucket_count;
         let mut bucket_usage = vec![0usize; bucket_count];
-        let max_per_bucket = ((limit + bucket_count - 1) / bucket_count).max(1);
+        let max_per_bucket = limit.div_ceil(bucket_count).max(1);
 
         let mut selected = Vec::with_capacity(limit);
         let mut overflow = Vec::new();
@@ -717,7 +717,7 @@ impl LearnedCachePredictor {
         }
 
         let mut misses = self.miss_counters.write();
-        let entry = misses.entry(doc_id).or_insert_with(MissStats::default);
+        let entry = misses.entry(doc_id).or_default();
         entry.consecutive = entry.consecutive.saturating_add(1);
         entry.total = entry.total.saturating_add(1);
     }
@@ -969,9 +969,9 @@ mod tests {
         let h3 = predictor.predict_hotness(3);
 
         // Hotness should be normalized to [0, 1]
-        assert!(h1 >= 0.0 && h1 <= 1.0);
-        assert!(h2 >= 0.0 && h2 <= 1.0);
-        assert!(h3 >= 0.0 && h3 <= 1.0);
+        assert!((0.0..=1.0).contains(&h1));
+        assert!((0.0..=1.0).contains(&h2));
+        assert!((0.0..=1.0).contains(&h3));
 
         // Ordering should be: h1 > h2 > h3
         assert!(h1 > h2);

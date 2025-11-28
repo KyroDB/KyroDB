@@ -1,7 +1,9 @@
 //! Integration tests for metadata filtering
 
 use kyrodb_engine::metadata_filter::matches;
-use kyrodb_engine::proto::{AndFilter, ExactMatch, InMatch, MetadataFilter, NotFilter, OrFilter, RangeMatch};
+use kyrodb_engine::proto::{
+    AndFilter, ExactMatch, InMatch, MetadataFilter, NotFilter, OrFilter, RangeMatch,
+};
 use kyrodb_engine::{TieredEngine, TieredEngineConfig};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -139,8 +141,8 @@ async fn test_and_filtering() {
     engine.insert(2, vec![0.9; 128], meta2).unwrap();
 
     let filter = MetadataFilter {
-        filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::AndFilter(
-            AndFilter {
+        filter_type: Some(
+            kyrodb_engine::proto::metadata_filter::FilterType::AndFilter(AndFilter {
                 filters: vec![
                     MetadataFilter {
                         filter_type: Some(
@@ -159,8 +161,8 @@ async fn test_and_filtering() {
                         ),
                     },
                 ],
-            },
-        )),
+            }),
+        ),
     };
 
     let metadata1 = engine.get_metadata(1).unwrap();
@@ -234,8 +236,8 @@ async fn test_not_filter() {
     engine.insert(2, vec![0.9; 128], meta2).unwrap();
 
     let filter = MetadataFilter {
-        filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::NotFilter(
-            Box::new(NotFilter {
+        filter_type: Some(
+            kyrodb_engine::proto::metadata_filter::FilterType::NotFilter(Box::new(NotFilter {
                 filter: Some(Box::new(MetadataFilter {
                     filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::Exact(
                         ExactMatch {
@@ -244,8 +246,8 @@ async fn test_not_filter() {
                         },
                     )),
                 })),
-            }),
-        )),
+            })),
+        ),
     };
 
     let metadata1 = engine.get_metadata(1).unwrap();

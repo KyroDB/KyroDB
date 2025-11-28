@@ -161,7 +161,7 @@ fn test_time_windowed_training() {
     // Verify get_recent_window still returns events with 1-second window
     // (all logged within last second in this test)
     let recent = logger.get_recent_window(Duration::from_secs(1));
-    assert!(recent.len() > 0, "Should have recent events");
+    assert!(!recent.is_empty(), "Should have recent events");
     assert!(
         recent.len() <= all_events.len(),
         "Recent should be subset of all"
@@ -294,7 +294,7 @@ fn test_empty_logger_training() {
 
     // Predictor should still work (return default predictions)
     let score = predictor.predict_hotness(1);
-    assert!(score >= 0.0 && score <= 1.0, "Score should be in [0, 1]");
+    assert!((0.0..=1.0).contains(&score), "Score should be in [0, 1]");
 }
 
 #[test]

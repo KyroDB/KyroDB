@@ -113,22 +113,28 @@ impl HotTier {
     }
 
     /// Bulk fetch documents from hot tier (if present)
+    #[allow(clippy::type_complexity)]
     pub fn bulk_fetch(&self, doc_ids: &[u64]) -> Vec<Option<(Vec<f32>, HashMap<String, String>)>> {
         // Take snapshot to avoid holding read lock during cloning
+        #[allow(clippy::type_complexity)]
         let snapshot: Vec<Option<(Vec<f32>, HashMap<String, String>)>> = {
             let docs = self.documents.read();
-            doc_ids.iter().map(|id| {
-                docs.get(id).map(|doc| (doc.embedding.clone(), doc.metadata.clone()))
-            }).collect()
+            doc_ids
+                .iter()
+                .map(|id| {
+                    docs.get(id)
+                        .map(|doc| (doc.embedding.clone(), doc.metadata.clone()))
+                })
+                .collect()
         };
-        
+
         let hits = snapshot.iter().filter(|opt| opt.is_some()).count() as u64;
         let misses = snapshot.len() as u64 - hits;
-        
+
         let mut stats = self.stats.write();
         stats.total_hits += hits;
         stats.total_misses += misses;
-        
+
         snapshot
     }
 
@@ -200,18 +206,18 @@ impl HotTier {
     pub fn batch_delete(&self, doc_ids: &[u64]) -> usize {
         let mut docs = self.documents.write();
         let mut deleted_count = 0;
-        
+
         for &doc_id in doc_ids {
             if docs.remove(&doc_id).is_some() {
                 deleted_count += 1;
             }
         }
-        
+
         if deleted_count > 0 {
             let mut stats = self.stats.write();
             stats.current_size = docs.len();
         }
-        
+
         deleted_count
     }
 
@@ -358,10 +364,7 @@ impl HotTier {
             .collect();
 
         // Sort by distance ascending (smaller distance = better match)
-        distances.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Truncate to k results
         distances.truncate(k);
@@ -633,19 +636,28 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
         let dist = HotTier::cosine_distance(&a, &b);
-        assert!((dist - 1.0).abs() < 0.001, "Orthogonal vectors should have distance ~1.0");
+        assert!(
+            (dist - 1.0).abs() < 0.001,
+            "Orthogonal vectors should have distance ~1.0"
+        );
 
         // Opposite vectors: distance = 2.0
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![-1.0, 0.0, 0.0];
         let dist = HotTier::cosine_distance(&a, &b);
-        assert!((dist - 2.0).abs() < 0.001, "Opposite vectors should have distance ~2.0");
+        assert!(
+            (dist - 2.0).abs() < 0.001,
+            "Opposite vectors should have distance ~2.0"
+        );
 
         // Dimension mismatch: should return INFINITY
         let a = vec![1.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
         let dist = HotTier::cosine_distance(&a, &b);
-        assert!(dist.is_infinite(), "Mismatched dimensions should return INFINITY");
+        assert!(
+            dist.is_infinite(),
+            "Mismatched dimensions should return INFINITY"
+        );
     }
 
     #[test]

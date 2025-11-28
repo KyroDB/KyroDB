@@ -281,6 +281,6 @@ proptest! {
         // HNSW may return fewer than k results (especially with small datasets)
         let result_vec = results.unwrap();
         prop_assert!(result_vec.len() <= search_k);
-        prop_assert!(result_vec.len() > 0);
+        prop_assert!(!result_vec.is_empty());
     }
 }

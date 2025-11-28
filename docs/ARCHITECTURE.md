@@ -408,12 +408,10 @@ Lookup: < 100ns (O(log n))
 **Key config parameters:**
 
 ```yaml
-```yaml
 # config.yaml
 server:
   grpc_port: 50051
   http_port: 51051
-```
   
 cache:
   strategy: "learned"  # or "lru"

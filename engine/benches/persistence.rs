@@ -21,22 +21,20 @@ fn bench_insert_with_persistence(c: &mut Criterion) {
             policy,
             |b, policy| {
                 let dir = TempDir::new().unwrap();
+                let data_dir = dir.path();
 
-                let initial_embeddings = vec![vec![0.1; 128]; 100];
-                let backend = HnswBackend::with_persistence(
-                    initial_embeddings,
-                    10000,
-                    dir.path(),
-                    *policy,
-                    1000, // High threshold
-                )
-                .unwrap();
+                let backend =
+                    HnswBackend::with_persistence(vec![], vec![], 100, data_dir, *policy, 16)
+                        .unwrap();
 
                 let mut doc_id = 100;
 
                 b.iter(|| {
                     let embedding = vec![0.1; 128];
-                    backend.insert(black_box(doc_id), embedding).unwrap();
+                    let metadata = std::collections::HashMap::new();
+                    backend
+                        .insert(black_box(doc_id), embedding, metadata)
+                        .unwrap();
                     doc_id += 1;
                 });
             },
@@ -54,17 +52,20 @@ fn bench_snapshot_creation(c: &mut Criterion) {
 
     for size in &[100, 1000, 10000] {
         group.bench_with_input(BenchmarkId::new("docs", size), size, |b, size| {
-            let size = *size;
-            let embeddings: Vec<Vec<f32>> = (0..size)
-                .map(|i| vec![(i as f32) / size as f32; 128])
+            let embeddings: Vec<Vec<f32>> = (0..*size)
+                .map(|i| vec![(i as f32) / *size as f32; 128])
+                .collect();
+            let metadata_vec: Vec<std::collections::HashMap<String, String>> = (0..*size)
+                .map(|_| std::collections::HashMap::new())
                 .collect();
 
             let backend = HnswBackend::with_persistence(
-                embeddings,
-                size * 2,
+                embeddings.clone(),
+                metadata_vec,
+                *size * 2,
                 dir.path(),
                 FsyncPolicy::Never,
-                100000,
+                100,
             )
             .unwrap();
 
@@ -89,13 +90,17 @@ fn bench_recovery(c: &mut Criterion) {
             let embeddings: Vec<Vec<f32>> = (0..size_val)
                 .map(|i| vec![(i as f32) / size_val as f32; 128])
                 .collect();
+            let metadata_vec: Vec<std::collections::HashMap<String, String>> = (0..size_val)
+                .map(|_| std::collections::HashMap::new())
+                .collect();
 
             let backend = HnswBackend::with_persistence(
-                embeddings,
+                embeddings.clone(),
+                metadata_vec,
                 size_val * 2,
                 dir.path(),
                 FsyncPolicy::Never,
-                100000,
+                100,
             )
             .unwrap();
 
@@ -107,9 +112,14 @@ fn bench_recovery(c: &mut Criterion) {
             &(dir, size_val),
             |b, (dir, size_val)| {
                 b.iter(|| {
-                    let _recovered =
-                        HnswBackend::recover(dir.path(), *size_val * 2, FsyncPolicy::Never, 100000)
-                            .unwrap();
+                    let _recovered = HnswBackend::recover(
+                        dir.path(),
+                        *size_val * 2,
+                        FsyncPolicy::Never,
+                        100,
+                        kyrodb_engine::MetricsCollector::new(),
+                    )
+                    .unwrap();
                 });
             },
         );

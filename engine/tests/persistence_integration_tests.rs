@@ -67,7 +67,10 @@ fn test_snapshot_save_load() {
         (2, vec![0.0, 0.0, 1.0, 0.0]),
     ];
 
-    let metadata = documents.iter().map(|(id, _)| (*id, HashMap::new())).collect();
+    let metadata = documents
+        .iter()
+        .map(|(id, _)| (*id, HashMap::new()))
+        .collect();
     let snapshot = Snapshot::new(4, documents, metadata).unwrap();
     snapshot.save(&snapshot_path).unwrap();
 
@@ -102,8 +105,12 @@ fn test_hnsw_backend_persistence() {
     .unwrap();
 
     // Insert new documents
-    backend.insert(2, vec![0.0, 0.0, 1.0, 0.0], HashMap::new()).unwrap();
-    backend.insert(3, vec![0.0, 0.0, 0.0, 1.0], HashMap::new()).unwrap();
+    backend
+        .insert(2, vec![0.0, 0.0, 1.0, 0.0], HashMap::new())
+        .unwrap();
+    backend
+        .insert(3, vec![0.0, 0.0, 0.0, 1.0], HashMap::new())
+        .unwrap();
 
     // Verify documents exist
     let doc2 = backend.fetch_document(2).unwrap();
@@ -252,9 +259,15 @@ fn test_fsync_policy_never() {
     // Should work even without fsync (but no durability guarantee)
     let initial_embeddings = vec![vec![1.0, 0.0]];
 
-    let backend =
-        HnswBackend::with_persistence(initial_embeddings, vec![HashMap::new(); 1], 100, dir.path(), FsyncPolicy::Never, 5)
-            .unwrap();
+    let backend = HnswBackend::with_persistence(
+        initial_embeddings,
+        vec![HashMap::new(); 1],
+        100,
+        dir.path(),
+        FsyncPolicy::Never,
+        5,
+    )
+    .unwrap();
 
     backend.insert(1, vec![0.9, 0.1], HashMap::new()).unwrap();
     backend.create_snapshot().unwrap();

@@ -5,7 +5,7 @@
 //
 // Run with: cargo test --test loom_concurrency_tests --release
 
-#![cfg(loom)]
+#![cfg(feature = "loom")]
 
 use loom::sync::Arc;
 use loom::sync::Mutex;
