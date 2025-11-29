@@ -1,0 +1,32 @@
+# KyroDB Configuration - Image Instance (Port 50052)
+# Separate instance for image embeddings (512-dim CLIP)
+
+[server]
+port = 50052
+http_port = 51052
+
+[hnsw]
+max_elements = 100000
+dimension = 512  # CLIP embeddings
+m = 16
+ef_construction = 200
+ef_search = 50
+
+[cache]
+capacity = 10000
+strategy = "learned"
+
+training_interval_secs = 600
+
+[persistence]
+data_dir = "./data/kyrodb_images"
+enable_wal = true
+fsync_policy = "data_only"
+snapshot_interval_secs = 300
+
+[slo]
+p99_latency_ms = 50.0
+cache_hit_rate = 0.70
+
+[log]
+level = "info"
