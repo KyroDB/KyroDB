@@ -126,16 +126,14 @@ bench_server.log
 .vscode/settings.json
 .idea/workspace.xml
 .github/copilot-instructions.md
-docs/Implementation.md
 /*.csv
 /*.json
 .github/AGENTS.md
 other_docs/
-docs/visiondocument.md
-CLAUDE.md
-.venv/     
-Vritti/     
-    
+docs/ENGINEERING_STATUS.md
+docs/VISION.md
+.venv/       
+simulation.html
 
 
                                                                                                                                                                                                                                                                                                                                                                         
