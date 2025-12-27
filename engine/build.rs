@@ -4,6 +4,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================================
     // STEP 1: Compile protobuf definitions for gRPC server
     // ============================================================================
+    let protoc_path =
+        protoc_bin_vendored::protoc_bin_path().expect("Failed to fetch vendored protoc");
+    std::env::set_var("PROTOC", protoc_path);
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
