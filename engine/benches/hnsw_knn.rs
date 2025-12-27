@@ -129,38 +129,39 @@ fn bench_hnsw_recall(c: &mut Criterion) {
 
 /// Cosine distance with SIMD optimization (1 - cosine similarity)
 /// 
-/// Uses auto-vectorization techniques for ~4-8× speedup on modern CPUs
+/// Uses auto-vectorization techniques with single-pass computation
+/// for ~4-8× speedup on modern CPUs
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     const CHUNK_SIZE: usize = 8;
     
-    let len = a.len();
-    let chunks = len / CHUNK_SIZE;
-    let remainder = len % CHUNK_SIZE;
-
     let mut dot = 0.0_f32;
     let mut mag_a = 0.0_f32;
     let mut mag_b = 0.0_f32;
 
-    // Main vectorized loop
-    for i in 0..chunks {
-        let offset = i * CHUNK_SIZE;
-        let a_chunk = &a[offset..offset + CHUNK_SIZE];
-        let b_chunk = &b[offset..offset + CHUNK_SIZE];
-        
-        dot += a_chunk.iter().zip(b_chunk.iter()).map(|(x, y)| x * y).sum::<f32>();
-        mag_a += a_chunk.iter().map(|x| x * x).sum::<f32>();
-        mag_b += b_chunk.iter().map(|x| x * x).sum::<f32>();
+    // Main vectorized loop using chunks_exact
+    let mut a_chunks = a.chunks_exact(CHUNK_SIZE);
+    let mut b_chunks = b.chunks_exact(CHUNK_SIZE);
+    
+    for (a_chunk, b_chunk) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        // Single pass for better cache efficiency
+        for i in 0..CHUNK_SIZE {
+            let av = a_chunk[i];
+            let bv = b_chunk[i];
+            dot += av * bv;
+            mag_a += av * av;
+            mag_b += bv * bv;
+        }
     }
 
     // Scalar fallback for remaining elements
-    if remainder > 0 {
-        let offset = chunks * CHUNK_SIZE;
-        for i in 0..remainder {
-            let idx = offset + i;
-            dot += a[idx] * b[idx];
-            mag_a += a[idx] * a[idx];
-            mag_b += b[idx] * b[idx];
-        }
+    let a_remainder = a_chunks.remainder();
+    let b_remainder = b_chunks.remainder();
+    for i in 0..a_remainder.len() {
+        let av = a_remainder[i];
+        let bv = b_remainder[i];
+        dot += av * bv;
+        mag_a += av * av;
+        mag_b += bv * bv;
     }
 
     let magnitude = (mag_a * mag_b).sqrt();

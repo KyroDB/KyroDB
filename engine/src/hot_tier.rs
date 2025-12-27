@@ -385,6 +385,7 @@ impl HotTier {
     /// SIMD-optimized using auto-vectorization:
     /// - Uses chunks_exact(8) for aligned processing (AVX2/NEON friendly)
     /// - LLVM auto-vectorizes the iterator patterns
+    /// - Single-pass computation for better cache efficiency
     /// - ~4-8× speedup on modern CPUs with AVX2/AVX512
     /// - For d=384: ~50-100ns per comparison (vs ~200ns scalar)
     ///
@@ -399,40 +400,40 @@ impl HotTier {
             return f32::INFINITY; // Invalid comparison
         }
 
-        // SIMD-friendly implementation using chunks for auto-vectorization
+        // SIMD-friendly implementation using chunks_exact for auto-vectorization
         // Process 8 elements at a time (optimal for AVX2: 256-bit / 32-bit float = 8)
         const CHUNK_SIZE: usize = 8;
         
-        let len = a.len();
-        let chunks = len / CHUNK_SIZE;
-        let remainder = len % CHUNK_SIZE;
-
-        // Process main chunks (auto-vectorized by LLVM)
         let mut dot = 0.0_f32;
         let mut mag_a = 0.0_f32;
         let mut mag_b = 0.0_f32;
 
-        // Main vectorized loop - LLVM will generate SIMD instructions
-        for i in 0..chunks {
-            let offset = i * CHUNK_SIZE;
-            let a_chunk = &a[offset..offset + CHUNK_SIZE];
-            let b_chunk = &b[offset..offset + CHUNK_SIZE];
-            
-            // These iterator patterns are auto-vectorized by LLVM
-            dot += a_chunk.iter().zip(b_chunk.iter()).map(|(x, y)| x * y).sum::<f32>();
-            mag_a += a_chunk.iter().map(|x| x * x).sum::<f32>();
-            mag_b += b_chunk.iter().map(|x| x * x).sum::<f32>();
+        // Main vectorized loop using chunks_exact - LLVM will generate SIMD instructions
+        // Single pass over chunks for better cache efficiency
+        let mut a_chunks = a.chunks_exact(CHUNK_SIZE);
+        let mut b_chunks = b.chunks_exact(CHUNK_SIZE);
+        
+        for (a_chunk, b_chunk) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+            // Single pass: compute dot, mag_a, mag_b together
+            // These operations are auto-vectorized by LLVM
+            for i in 0..CHUNK_SIZE {
+                let av = a_chunk[i];
+                let bv = b_chunk[i];
+                dot += av * bv;
+                mag_a += av * av;
+                mag_b += bv * bv;
+            }
         }
 
         // Scalar fallback for remaining elements
-        if remainder > 0 {
-            let offset = chunks * CHUNK_SIZE;
-            for i in 0..remainder {
-                let idx = offset + i;
-                dot += a[idx] * b[idx];
-                mag_a += a[idx] * a[idx];
-                mag_b += b[idx] * b[idx];
-            }
+        let a_remainder = a_chunks.remainder();
+        let b_remainder = b_chunks.remainder();
+        for i in 0..a_remainder.len() {
+            let av = a_remainder[i];
+            let bv = b_remainder[i];
+            dot += av * bv;
+            mag_a += av * av;
+            mag_b += bv * bv;
         }
 
         let magnitude = (mag_a * mag_b).sqrt();
