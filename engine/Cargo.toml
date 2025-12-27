@@ -167,6 +167,7 @@ features = ["html_reports"]
 [build-dependencies]
 # gRPC: Protobuf compilation
 tonic-build = "0.10"
+protoc-bin-vendored = "3.2.0"
 
 [package.metadata.docs.rs]
 features = ["learned-index"]
