@@ -1,0 +1,33 @@
+# KyroDB Benchmark Configuration
+# Optimized settings for ANN-benchmarks performance testing
+
+[server]
+host = "0.0.0.0"
+port = 50051
+http_port = 51051
+
+[server.tls]
+enabled = false
+
+[hnsw]
+# HNSW parameters for benchmarking - tune these for recall/speed tradeoff
+max_elements = 2000000       # Support up to 2M vectors (SIFT-1M + headroom)
+m = 16                       # Connections per node (default: 16, higher = better recall, more memory)
+ef_construction = 200        # Build-time ef (default: 200, higher = better index quality)
+ef_search = 100              # Search-time ef (override via query if supported)
+
+[cache]
+max_entries = 100000        # Cache size (smaller for benchmarking - we want to test HNSW)
+ttl_seconds = 60
+
+[hot_tier]
+max_size = 50000            # Flush quickly to cold tier for benchmark
+max_age_seconds = 10
+
+[persistence]
+data_dir = "./benchmark_data"
+fsync_policy = "Never"      # Disable fsync for maximum benchmark speed (not production!)
+snapshot_interval_seconds = 0  # Disable snapshots during benchmark
+
+[logging]
+level = "warn"              # Minimal logging for benchmarks

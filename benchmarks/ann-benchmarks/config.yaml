@@ -1,0 +1,73 @@
+# KyroDB ANN-Benchmarks Configuration
+#
+# This file defines parameter configurations for benchmarking KyroDB
+# across different HNSW parameter combinations.
+#
+# Metrics:
+#   - angular: Cosine similarity (common for text embeddings)
+#   - euclidean: L2 distance
+
+float:
+  # Angular distance (cosine similarity)
+  angular:
+    - base_args: {}
+      constructor: KyroDB
+      disabled: false
+      docker_tag: ann-benchmarks-kyrodb
+      module: ann_benchmarks.algorithms.kyrodb
+      name: kyrodb
+      run_groups:
+        # Low accuracy, high throughput
+        fast:
+          args:
+            M: 12
+            ef_construction: 100
+          query_args: [[10], [20], [40]]
+
+        # Balanced accuracy/throughput
+        balanced:
+          args:
+            M: 16
+            ef_construction: 200
+          query_args: [[20], [50], [100], [200]]
+
+        # High accuracy
+        accurate:
+          args:
+            M: 24
+            ef_construction: 400
+          query_args: [[100], [200], [400], [800]]
+
+        # Maximum accuracy
+        max_recall:
+          args:
+            M: 32
+            ef_construction: 500
+          query_args: [[200], [400], [800], [1200]]
+
+  # Euclidean distance (L2)
+  euclidean:
+    - base_args: {}
+      constructor: KyroDB
+      disabled: false
+      docker_tag: ann-benchmarks-kyrodb
+      module: ann_benchmarks.algorithms.kyrodb
+      name: kyrodb
+      run_groups:
+        fast:
+          args:
+            M: 12
+            ef_construction: 100
+          query_args: [[10], [20], [40]]
+
+        balanced:
+          args:
+            M: 16
+            ef_construction: 200
+          query_args: [[20], [50], [100], [200]]
+
+        accurate:
+          args:
+            M: 24
+            ef_construction: 400
+          query_args: [[100], [200], [400], [800]]
