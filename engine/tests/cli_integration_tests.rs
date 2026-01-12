@@ -1,11 +1,16 @@
 #![cfg(feature = "cli-tools")]
 
 use anyhow::Result;
-use kyrodb_engine::backup::{BackupManager, BackupType, RestoreManager, RetentionPolicy};
+use kyrodb_engine::backup::{BackupManager, BackupType};
 use kyrodb_engine::hnsw_backend::HnswBackend;
 use kyrodb_engine::persistence::FsyncPolicy;
+use std::collections::HashMap;
 use std::process::Command;
 use tempfile::TempDir;
+
+fn empty_metadata(n: usize) -> Vec<HashMap<String, String>> {
+    vec![HashMap::new(); n]
+}
 
 #[test]
 fn test_cli_backup_create_full() -> Result<()> {
@@ -23,8 +28,15 @@ fn test_cli_backup_create_full() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend =
-        HnswBackend::with_persistence(embeddings.clone(), 100, data_path, FsyncPolicy::Always, 10)?;
+    let metadata = empty_metadata(embeddings.len());
+    let backend = HnswBackend::with_persistence(
+        embeddings.clone(),
+        metadata,
+        100,
+        data_path,
+        FsyncPolicy::Always,
+        10,
+    )?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -71,8 +83,15 @@ fn test_cli_backup_list() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend =
-        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
+    let metadata = empty_metadata(embeddings.len());
+    let backend = HnswBackend::with_persistence(
+        embeddings,
+        metadata,
+        100,
+        data_path,
+        FsyncPolicy::Always,
+        10,
+    )?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -111,8 +130,15 @@ fn test_cli_backup_list_json() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend =
-        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
+    let metadata = empty_metadata(embeddings.len());
+    let backend = HnswBackend::with_persistence(
+        embeddings,
+        metadata,
+        100,
+        data_path,
+        FsyncPolicy::Always,
+        10,
+    )?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -153,8 +179,15 @@ fn test_cli_restore_from_backup() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend =
-        HnswBackend::with_persistence(embeddings.clone(), 100, data_path, FsyncPolicy::Always, 10)?;
+    let metadata = empty_metadata(embeddings.len());
+    let backend = HnswBackend::with_persistence(
+        embeddings.clone(),
+        metadata,
+        100,
+        data_path,
+        FsyncPolicy::Always,
+        10,
+    )?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -214,8 +247,15 @@ fn test_cli_prune_backups() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend =
-        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
+    let metadata = empty_metadata(embeddings.len());
+    let backend = HnswBackend::with_persistence(
+        embeddings,
+        metadata,
+        100,
+        data_path,
+        FsyncPolicy::Always,
+        10,
+    )?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -308,8 +348,15 @@ fn test_cli_verify_backup() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend =
-        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
+    let metadata = empty_metadata(embeddings.len());
+    let backend = HnswBackend::with_persistence(
+        embeddings,
+        metadata,
+        100,
+        data_path,
+        FsyncPolicy::Always,
+        10,
+    )?;
     backend.create_snapshot()?;
     drop(backend);
 
@@ -353,8 +400,15 @@ fn test_cli_incremental_backup() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend =
-        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
+    let metadata = empty_metadata(embeddings.len());
+    let backend = HnswBackend::with_persistence(
+        embeddings,
+        metadata,
+        100,
+        data_path,
+        FsyncPolicy::Always,
+        10,
+    )?;
     backend.sync_wal()?;
 
     let output_full = Command::new(env!("CARGO_BIN_EXE_kyrodb_backup"))
@@ -376,7 +430,7 @@ fn test_cli_incremental_backup() -> Result<()> {
     let backups = backup_manager.list_backups()?;
     let reference_id = backups[0].id;
 
-    backend.insert(1, vec![5.0, 6.0, 7.0, 8.0])?;
+    backend.insert(1, vec![5.0, 6.0, 7.0, 8.0], HashMap::new())?;
     backend.sync_wal()?;
 
     let output_inc = Command::new(env!("CARGO_BIN_EXE_kyrodb_backup"))
@@ -421,8 +475,15 @@ fn test_cli_point_in_time_restore() -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
 
-    let backend =
-        HnswBackend::with_persistence(embeddings, 100, data_path, FsyncPolicy::Always, 10)?;
+    let metadata = empty_metadata(embeddings.len());
+    let backend = HnswBackend::with_persistence(
+        embeddings,
+        metadata,
+        100,
+        data_path,
+        FsyncPolicy::Always,
+        10,
+    )?;
     backend.sync_wal()?;
 
     let backup_manager = BackupManager::new(backup_dir.path(), data_dir.path())?;
@@ -431,7 +492,7 @@ fn test_cli_point_in_time_restore() -> Result<()> {
 
     std::thread::sleep(std::time::Duration::from_secs(1));
 
-    backend.insert(1, vec![5.0, 6.0, 7.0, 8.0])?;
+    backend.insert(1, vec![5.0, 6.0, 7.0, 8.0], HashMap::new())?;
     backend.sync_wal()?;
     drop(backend);
 

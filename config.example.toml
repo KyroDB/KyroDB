@@ -27,6 +27,14 @@ connection_timeout_secs = 300
 # Graceful shutdown timeout (seconds)
 shutdown_timeout_secs = 30
 
+# TLS Configuration
+[server.tls]
+enabled = false
+# cert_path = "/etc/kyrodb/certs/server.crt"
+# key_path = "/etc/kyrodb/certs/server.key"
+# ca_cert_path = "/etc/kyrodb/certs/ca.crt"
+require_client_cert = false
+
 # Cache Configuration (Hybrid Semantic Cache)
 [cache]
 # Maximum number of vectors to cache

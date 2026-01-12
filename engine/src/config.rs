@@ -80,6 +80,9 @@ pub struct ServerConfig {
 
     /// Graceful shutdown timeout (seconds)
     pub shutdown_timeout_secs: u64,
+
+    /// TLS configuration for secure connections
+    pub tls: TlsConfig,
 }
 
 impl Default for ServerConfig {
@@ -87,12 +90,32 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 50051,
-            http_port: None, // Auto-calculated as port + 1000
+            http_port: None,
             max_connections: 10_000,
-            connection_timeout_secs: 300, // 5 minutes
+            connection_timeout_secs: 300,
             shutdown_timeout_secs: 30,
+            tls: TlsConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Enable TLS for gRPC server
+    pub enabled: bool,
+
+    /// Path to PEM-encoded server certificate
+    pub cert_path: Option<PathBuf>,
+
+    /// Path to PEM-encoded server private key
+    pub key_path: Option<PathBuf>,
+
+    /// Path to CA certificate for client verification (mTLS)
+    pub ca_cert_path: Option<PathBuf>,
+
+    /// Require client certificate (mTLS)
+    pub require_client_cert: bool,
 }
 
 // ============================================================================
@@ -703,6 +726,24 @@ impl KyroDbConfig {
             "usage_export_interval_secs must be > 0, got {}",
             self.auth.usage_export_interval_secs
         );
+
+        // TLS validation
+        if self.server.tls.enabled {
+            anyhow::ensure!(
+                self.server.tls.cert_path.is_some(),
+                "TLS enabled but cert_path not provided"
+            );
+            anyhow::ensure!(
+                self.server.tls.key_path.is_some(),
+                "TLS enabled but key_path not provided"
+            );
+            if self.server.tls.require_client_cert {
+                anyhow::ensure!(
+                    self.server.tls.ca_cert_path.is_some(),
+                    "mTLS enabled but ca_cert_path not provided"
+                );
+            }
+        }
 
         Ok(())
     }
