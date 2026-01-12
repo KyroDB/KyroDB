@@ -26,7 +26,7 @@ max_age_seconds = 10
 
 [persistence]
 data_dir = "./benchmark_data"
-fsync_policy = "Never"      # Disable fsync for maximum benchmark speed (not production!)
+fsync_policy = "none"         # Disable fsync for maximum benchmark speed (not production!)
 snapshot_interval_seconds = 0  # Disable snapshots during benchmark
 
 [logging]
