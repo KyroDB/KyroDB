@@ -54,8 +54,10 @@ fn check_disk_space(path: impl AsRef<Path>) -> Result<DiskSpaceInfo> {
             anyhow::bail!("statvfs failed for path: {}", path.display());
         }
 
-        // Cast to u64 for arithmetic (f_blocks and f_bavail are platform-dependent types)
+        // Cast to u64 for arithmetic - these are platform-dependent types (u64 on Linux x64, c_ulong elsewhere)
+        #[allow(clippy::unnecessary_cast)]
         let total_bytes = stat.f_blocks as u64 * stat.f_frsize;
+        #[allow(clippy::unnecessary_cast)]
         let available_bytes = stat.f_bavail as u64 * stat.f_frsize;
         let available_percent = if total_bytes > 0 {
             available_bytes as f64 / total_bytes as f64

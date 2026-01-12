@@ -316,7 +316,7 @@ unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut norm_b = _mm256_setzero_ps();
 
     let chunks = len / 8;
-    let remainder = len % 8;
+    let _remainder = len % 8;
 
     for i in 0..chunks {
         let offset = i * 8;
@@ -359,6 +359,7 @@ unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
     similarity.clamp(0.0, 1.0)
 }
 
+#[allow(dead_code)] // Intentionally kept as fallback for non-AVX2 systems
 #[inline(always)]
 fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());

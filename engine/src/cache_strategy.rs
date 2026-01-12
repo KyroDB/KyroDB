@@ -358,7 +358,7 @@ impl AbTestSplitter {
 
     /// Get strategy for doc_id based on deterministic 50/50 split
     pub fn get_strategy(&self, doc_id: u64) -> Arc<dyn CacheStrategy> {
-        if doc_id % 2 == 0 {
+        if doc_id.is_multiple_of(2) {
             Arc::clone(&self.lru_strategy)
         } else {
             Arc::clone(&self.learned_strategy)
