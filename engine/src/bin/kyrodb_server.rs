@@ -1349,7 +1349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = flush_shutdown_rx.recv() => {
                     info!("Background flush task shutting down gracefully");
                     let engine = engine_for_flush.write().await;
-                    if let Ok(count) = engine.flush_hot_tier() {
+                    if let Ok(count) = engine.flush_hot_tier(true) { // Pass true for shutdown flush
                         if count > 0 {
                             info!(docs_flushed = count, "Final flush completed on shutdown");
                         }
