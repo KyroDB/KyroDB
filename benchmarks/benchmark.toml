@@ -20,7 +20,7 @@ ttl_seconds = 3600           # 1 hour TTL
 [hnsw]
 # HNSW parameters for large-scale benchmarking
 # With 730GB RAM we can test up to 1B+ vectors
-max_elements = 1000000000    # 1 billion vectors capacity
+max_elements = 2000000       # 2M vectors (2x SIFT dataset size)
 m = 16                       # Connections per node
 ef_construction = 200        # Build-time ef
 ef_search = 100              # Search-time ef
