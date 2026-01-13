@@ -21,10 +21,11 @@ ttl_seconds = 3600           # 1 hour TTL
 # HNSW parameters for large-scale benchmarking
 # With 730GB RAM we can test up to 1B+ vectors
 max_elements = 1000000000    # 1 billion vectors capacity
-m = 16                       # Connections per node (16 is good balance)
-ef_construction = 200        # Build-time ef (200 for quality index)
-ef_search = 100              # Default search-time ef
-dimension = 128              # SIFT-128 dimension
+m = 16                       # Connections per node
+ef_construction = 200        # Build-time ef
+ef_search = 100              # Search-time ef
+dimension = 128              # SIFT-128 dimension (CRITICAL: must match dataset!)
+distance = "euclidean"       # SIFT uses L2 distance
 
 [persistence]
 data_dir = "./benchmark_data"
