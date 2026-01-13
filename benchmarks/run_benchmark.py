@@ -178,6 +178,27 @@ class KyroDBBenchmark:
         elapsed = time.time() - start
         print(f"✓ Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
         
+    def flush_to_hnsw(self):
+        """Flush hot tier to HNSW cold tier for fast search.
+        
+        Data in hot tier is searched linearly (slow). Flushing moves it to
+        HNSW index for O(log n) search performance.
+        """
+        self.connect()
+        print("Flushing hot tier to HNSW...")
+        start = time.time()
+        
+        try:
+            response = self._stub.FlushHotTier(kyrodb_pb2.FlushRequest(force=True))
+            elapsed = time.time() - start
+            if response.success:
+                print(f"✓ Flushed {response.documents_flushed:,} documents to HNSW in {elapsed:.1f}s")
+            else:
+                print(f"✗ Flush failed: {response.error}")
+        except grpc.RpcError as e:
+            elapsed = time.time() - start
+            print(f"✗ Flush RPC failed after {elapsed:.1f}s: {e.code()} - {e.details()}")
+        
     def query(self, vector: np.ndarray, k: int) -> List[Tuple[int, float]]:
         """Query for k nearest neighbors."""
         request = kyrodb_pb2.SearchRequest(
@@ -270,6 +291,7 @@ def main():
     
     if not args.skip_index:
         benchmark.index(train)
+        benchmark.flush_to_hnsw()  # Move data to HNSW for fast search
         
     results = benchmark.benchmark_queries(test, neighbors, args.k)
     
