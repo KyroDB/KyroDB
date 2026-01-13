@@ -10,27 +10,27 @@ http_port = 51051
 [server.tls]
 enabled = false
 
+[cache]
+# CRITICAL: hot_tier_hard_limit = capacity * 2
+# For 1M vectors: capacity = 1000000, hard_limit = 2000000
+capacity = 10000000          # 10M cache capacity -> 20M hot tier hard limit
+strategy = "lru"             # Use simple LRU for benchmark consistency
+ttl_seconds = 3600           # 1 hour TTL
+
 [hnsw]
 # HNSW parameters for large-scale benchmarking
 # With 730GB RAM we can test up to 1B+ vectors
 max_elements = 1000000000    # 1 billion vectors capacity
 m = 16                       # Connections per node (16 is good balance)
 ef_construction = 200        # Build-time ef (200 for quality index)
-ef_search = 100              # Default search-time ef (override per query)
-
-[cache]
-# Large cache for benchmark - utilize available RAM
-max_entries = 10000000       # 10M cache entries
-ttl_seconds = 3600           # 1 hour TTL
-
-[hot_tier]
-max_size = 1000000           # 1M vectors before flush
-max_age_seconds = 60         # Flush every minute
+ef_search = 100              # Default search-time ef
+dimension = 128              # SIFT-128 dimension
 
 [persistence]
 data_dir = "./benchmark_data"
-fsync_policy = "none"         # Disable fsync for maximum benchmark speed
-snapshot_interval_seconds = 0  # Disable snapshots during benchmark
+enable_wal = false            # Disable WAL for pure benchmark speed
+fsync_policy = "none"         # No fsync for benchmarks
+snapshot_interval_secs = 0    # Disable snapshots during benchmark
 
 [logging]
 level = "warn"               # Minimal logging for benchmarks
