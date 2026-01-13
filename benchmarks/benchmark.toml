@@ -1,5 +1,6 @@
 # KyroDB Benchmark Configuration
-# Optimized settings for ANN-benchmarks performance testing
+# Optimized for Azure FX32ms v2 (32 vCPUs, 730 GB RAM)
+# Maximum performance settings for comprehensive benchmarking
 
 [server]
 host = "0.0.0.0"
@@ -10,24 +11,26 @@ http_port = 51051
 enabled = false
 
 [hnsw]
-# HNSW parameters for benchmarking - tune these for recall/speed tradeoff
-max_elements = 2000000       # Support up to 2M vectors (SIFT-1M + headroom)
-m = 16                       # Connections per node (default: 16, higher = better recall, more memory)
-ef_construction = 200        # Build-time ef (default: 200, higher = better index quality)
-ef_search = 100              # Search-time ef (override via query if supported)
+# HNSW parameters for large-scale benchmarking
+# With 730GB RAM we can test up to 1B+ vectors
+max_elements = 1000000000    # 1 billion vectors capacity
+m = 16                       # Connections per node (16 is good balance)
+ef_construction = 200        # Build-time ef (200 for quality index)
+ef_search = 100              # Default search-time ef (override per query)
 
 [cache]
-max_entries = 100000        # Cache size (smaller for benchmarking - we want to test HNSW)
-ttl_seconds = 60
+# Large cache for benchmark - utilize available RAM
+max_entries = 10000000       # 10M cache entries
+ttl_seconds = 3600           # 1 hour TTL
 
 [hot_tier]
-max_size = 50000            # Flush quickly to cold tier for benchmark
-max_age_seconds = 10
+max_size = 1000000           # 1M vectors before flush
+max_age_seconds = 60         # Flush every minute
 
 [persistence]
 data_dir = "./benchmark_data"
-fsync_policy = "none"         # Disable fsync for maximum benchmark speed (not production!)
+fsync_policy = "none"         # Disable fsync for maximum benchmark speed
 snapshot_interval_seconds = 0  # Disable snapshots during benchmark
 
 [logging]
-level = "warn"              # Minimal logging for benchmarks
+level = "warn"               # Minimal logging for benchmarks

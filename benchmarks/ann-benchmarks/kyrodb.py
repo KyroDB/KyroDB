@@ -83,7 +83,7 @@ class KyroDB:
         """Generator for streaming bulk insert."""
         for i, vec in enumerate(X):
             yield kyrodb_pb2.InsertRequest(
-                doc_id=i,
+                doc_id=i + 1,  # doc_id must be >= 1
                 embedding=list(map(float, vec))
             )
             
@@ -117,7 +117,7 @@ class KyroDB:
         # Fallback: individual inserts with progress tracking
         for i, vec in enumerate(X):
             req = kyrodb_pb2.InsertRequest(
-                doc_id=i,
+                doc_id=i + 1,  # doc_id must be >= 1
                 embedding=list(map(float, vec))
             )
             try:

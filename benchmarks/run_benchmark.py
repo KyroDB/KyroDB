@@ -133,7 +133,7 @@ class KyroDBBenchmark:
         """Generator for streaming bulk insert."""
         for i, vec in enumerate(vectors):
             yield kyrodb_pb2.InsertRequest(
-                doc_id=i,
+                doc_id=i + 1,  # doc_id must be >= 1
                 embedding=list(map(float, vec))
             )
             if (i + 1) % 10000 == 0:
@@ -160,7 +160,7 @@ class KyroDBBenchmark:
         # Fallback to individual inserts
         for i, vec in enumerate(vectors):
             req = kyrodb_pb2.InsertRequest(
-                doc_id=i,
+                doc_id=i + 1,  # doc_id must be >= 1
                 embedding=list(map(float, vec))
             )
             self._stub.Insert(req)
