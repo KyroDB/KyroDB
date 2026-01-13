@@ -1336,7 +1336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! {
                 _ = interval.tick() => {
                     let engine = engine_for_flush.write().await;
-                    match engine.flush_hot_tier() {
+                    match engine.flush_hot_tier(false) {
                         Ok(count) if count > 0 => {
                             info!(docs_flushed = count, "Background flush completed");
                         }
