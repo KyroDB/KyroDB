@@ -1233,8 +1233,8 @@ impl TieredEngine {
     /// - On partial failure: re-inserts failed documents back into hot tier
     /// - On complete failure: all documents re-inserted, flush marked as failed
     /// - Tracks flush_failures metric for observability
-    pub fn flush_hot_tier(&self) -> Result<usize> {
-        if !self.hot_tier.needs_flush() {
+    pub fn flush_hot_tier(&self, force: bool) -> Result<usize> {
+        if !force && !self.hot_tier.needs_flush() {
             return Ok(0);
         }
 
@@ -1317,7 +1317,7 @@ impl TieredEngine {
                 tokio::select! {
                     _ = ticker.tick() => {
                         if self.hot_tier.needs_flush() {
-                            match self.flush_hot_tier() {
+                            match self.flush_hot_tier(false) {
                                 Ok(count) => {
                                     if count > 0 {
                                         info!(
@@ -1337,7 +1337,7 @@ impl TieredEngine {
 
                         // Final flush before shutdown
                         if self.hot_tier.needs_flush() {
-                            match self.flush_hot_tier() {
+                            match self.flush_hot_tier(true) {
                                 Ok(count) => {
                                     info!(
                                         count,

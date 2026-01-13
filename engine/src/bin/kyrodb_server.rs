@@ -895,7 +895,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.write().await;
 
-        match engine.flush_hot_tier() {
+        match engine.flush_hot_tier(req.force) {
             Ok(docs_flushed) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
