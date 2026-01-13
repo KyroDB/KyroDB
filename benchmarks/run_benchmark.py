@@ -89,11 +89,16 @@ def load_dataset(filepath: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def compute_recall(results: List[Tuple[int, float]], ground_truth: np.ndarray, k: int) -> float:
-    """Compute recall@k."""
+    """Compute recall@k.
+    
+    Note: ground_truth is 0-indexed but our doc_ids are 1-indexed,
+    so we subtract 1 from result doc_ids to compare.
+    """
     if len(results) == 0:
         return 0.0
     gt_set = set(int(x) for x in ground_truth[:k])
-    result_set = set(int(r[0]) for r in results[:k])
+    # Convert 1-indexed doc_ids back to 0-indexed for comparison with ground truth
+    result_set = set(int(r[0]) - 1 for r in results[:k])
     return len(gt_set & result_set) / k
 
 
