@@ -137,15 +137,13 @@ impl RateLimiter {
     /// Returns false if rate limit exceeded (should reject with 429).
     ///
     /// Token bucket is created on first request for tenant with the provided max_qps.
-    /// Subsequent calls must use the same max_qps value (validated via assertion).
+    /// Subsequent calls should use the same max_qps value.
     ///
     /// # Performance
     /// - O(1) HashMap lookup: ~50ns
     /// - Token bucket update: ~50ns
     /// - Total: ~100ns per request
     ///
-    /// # Panics
-    /// Panics if max_qps differs from the bucket's existing capacity.
     pub fn check_limit(&self, tenant_id: &str, max_qps: u32) -> bool {
         // Fast path: read lock for existing bucket
         {
@@ -153,11 +151,15 @@ impl RateLimiter {
             if let Some(bucket) = buckets.get(tenant_id) {
                 // Validate that max_qps matches existing bucket capacity
                 let bucket_capacity = bucket.lock().capacity();
-                assert_eq!(
-                    bucket_capacity, max_qps,
-                    "Rate limit mismatch for tenant {}: existing capacity {}, requested {}",
-                    tenant_id, bucket_capacity, max_qps
-                );
+                if bucket_capacity != max_qps {
+                    // Defensive: never panic on a misconfiguration; continue using the existing bucket.
+                    // This mismatch should be impossible in normal operation.
+                    debug_assert_eq!(
+                        bucket_capacity, max_qps,
+                        "Rate limit mismatch for tenant {}: existing capacity {}, requested {}",
+                        tenant_id, bucket_capacity, max_qps
+                    );
+                }
 
                 let bucket = Arc::clone(bucket);
                 drop(buckets); // Release read lock before acquiring mutex

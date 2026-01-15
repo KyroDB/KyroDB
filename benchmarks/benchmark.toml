@@ -14,6 +14,7 @@ enabled = false
 # CRITICAL: hot_tier_hard_limit = capacity * 2
 # For 1M vectors: capacity = 1000000, hard_limit = 2000000
 capacity = 10000000          # 10M cache capacity -> 20M hot tier hard limit
+hot_tier_hard_limit = 20000000
 strategy = "lru"             # Use simple LRU for benchmark consistency
 ttl_seconds = 3600           # 1 hour TTL
 

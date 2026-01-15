@@ -100,7 +100,9 @@ async fn end_to_end_insert_query_search() -> Result<()> {
     let mut child = Command::new(binary)
         .env("KYRODB_DATA_DIR", &data_dir)
         .env("KYRODB_PORT", port.to_string())
-        .env("KYRODB_HTTP_PORT", http_port.to_string())
+        // KyroDbConfig reads environment variables via the `config` crate using the
+        // `KYRODB__...` prefix with `__` as a separator.
+        .env("KYRODB__SERVER__HTTP_PORT", http_port.to_string())
         .kill_on_drop(true)
         .spawn()
         .context("failed to spawn kyrodb_server")?;

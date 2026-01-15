@@ -28,7 +28,7 @@ In production RAG systems:
 
 ## Key Features
 
-### 🚀 Hybrid Semantic Cache (73.5% Hit Rate)
+### Hybrid Semantic Cache (73.5% Hit Rate)
 
 KyroDB's two-level Layer 1 cache combines complementary caching strategies:
 

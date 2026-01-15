@@ -45,6 +45,7 @@ fn test_knn_searches_hot_tier() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 1000, // Large to prevent auto-flush
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -147,6 +148,7 @@ fn test_knn_deduplication() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 1000,
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -205,6 +207,7 @@ fn test_knn_result_merging_correctness() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 1000,
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -280,6 +283,7 @@ fn test_knn_consistency() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 1000,
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -344,6 +348,7 @@ fn test_knn_empty_hot_tier() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 1000,
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -389,6 +394,7 @@ fn test_knn_only_hot_tier() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 1000,
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -451,6 +457,7 @@ fn test_knn_latency_with_hot_tier() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 1000,
         hnsw_max_elements: 10_000,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -541,6 +548,7 @@ fn test_knn_correctness_vs_brute_force() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 1000,
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 

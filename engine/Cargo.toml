@@ -52,6 +52,9 @@ s3-backup = ["aws-config", "aws-sdk-s3"]
 # Loom testing: Enable loom model checker for concurrency correctness
 loom = ["dep:loom"]
 
+# Legacy (deprecated) KV/event-log layer tests. Not built by default.
+legacy-event-log = []
+
 [dependencies]
 # HNSW vector search
 hnsw_rs = "0.3"
@@ -73,7 +76,7 @@ rayon = "1.10"  # Parallel doc-to-queries map building
 
 # gRPC server for production deployment
 # tonic 0.10 requires prost 0.12 (must match versions)
-tonic = "0.10"
+tonic = { version = "0.10", features = ["tls"] }
 prost = "0.12"
 tokio-stream = "0.1"
 tracing = "0.1"

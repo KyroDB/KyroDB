@@ -38,6 +38,12 @@ float:
             ef_construction: 400
           query_args: [[100], [200], [400], [800]]
 
+        max_recall:
+          args:
+            M: 32
+            ef_construction: 500
+          query_args: [[200], [400], [800], [1200]]
+
         # Maximum accuracy
         max_recall:
           args:

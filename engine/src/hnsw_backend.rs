@@ -197,12 +197,13 @@ impl HnswBackend {
     /// For production with persistence, use `with_persistence` or `recover`.
     #[instrument(level = "debug", skip(embeddings, metadata), fields(num_docs = embeddings.len(), max_elements))]
     pub fn new(
+        dimension: usize,
         embeddings: Vec<Vec<f32>>,
         metadata: Vec<HashMap<String, String>>,
         max_elements: usize,
     ) -> Result<Self> {
-        if embeddings.is_empty() {
-            anyhow::bail!("Cannot create HnswBackend with empty embeddings");
+        if dimension == 0 {
+            anyhow::bail!("embedding dimension must be > 0");
         }
         if embeddings.len() != metadata.len() {
             anyhow::bail!(
@@ -211,8 +212,6 @@ impl HnswBackend {
                 metadata.len()
             );
         }
-
-        let dimension = embeddings[0].len();
         let mut index = HnswVectorIndex::new(dimension, max_elements)?;
 
         // Build HNSW index from embeddings
@@ -221,6 +220,14 @@ impl HnswBackend {
             dimension, "building HNSW index"
         );
         for (doc_id, embedding) in embeddings.iter().enumerate() {
+            if embedding.len() != dimension {
+                anyhow::bail!(
+                    "embedding dimension mismatch for doc_id {}: expected {}, got {}",
+                    doc_id,
+                    dimension,
+                    embedding.len()
+                );
+            }
             index.add_vector(doc_id as u64, embedding)?;
         }
         info!("HNSW index built");
@@ -244,6 +251,7 @@ impl HnswBackend {
     /// - `snapshot_interval`: Create snapshot every N inserts
     #[instrument(level = "debug", skip(embeddings, metadata, data_dir), fields(num_docs = embeddings.len(), max_elements, snapshot_interval))]
     pub fn with_persistence(
+        dimension: usize,
         embeddings: Vec<Vec<f32>>,
         metadata: Vec<HashMap<String, String>>,
         max_elements: usize,
@@ -251,8 +259,8 @@ impl HnswBackend {
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
     ) -> Result<Self> {
-        if embeddings.is_empty() {
-            anyhow::bail!("Cannot create HnswBackend with empty embeddings");
+        if dimension == 0 {
+            anyhow::bail!("embedding dimension must be > 0");
         }
         if embeddings.len() != metadata.len() {
             anyhow::bail!(
@@ -265,7 +273,6 @@ impl HnswBackend {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
 
-        let dimension = embeddings[0].len();
         let mut index = HnswVectorIndex::new(dimension, max_elements)?;
 
         // Build HNSW index
@@ -274,6 +281,14 @@ impl HnswBackend {
             dimension, "building HNSW index (persistence)"
         );
         for (doc_id, embedding) in embeddings.iter().enumerate() {
+            if embedding.len() != dimension {
+                anyhow::bail!(
+                    "embedding dimension mismatch for doc_id {}: expected {}, got {}",
+                    doc_id,
+                    dimension,
+                    embedding.len()
+                );
+            }
             index.add_vector(doc_id as u64, embedding)?;
         }
         info!("HNSW index built (persistence)");
@@ -323,12 +338,16 @@ impl HnswBackend {
     /// 5. Create new active WAL
     #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval))]
     pub fn recover(
+        embedding_dimension: usize,
         data_dir: impl AsRef<Path>,
         max_elements: usize,
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
         metrics: MetricsCollector,
     ) -> Result<Self> {
+        if embedding_dimension == 0 {
+            anyhow::bail!("embedding dimension must be > 0");
+        }
         let data_dir = data_dir.as_ref().to_path_buf();
         info!("recovering HnswBackend");
 
@@ -343,7 +362,7 @@ impl HnswBackend {
         // Load snapshot with fallback recovery (if exists)
         let mut embeddings: Vec<Vec<f32>> = Vec::new();
         let mut metadata: Vec<HashMap<String, String>> = Vec::new();
-        let mut dimension = 0;
+        let mut dimension = embedding_dimension;
         let mut snapshot_timestamp = 0u64;
 
         if let Some(snapshot_name) = &manifest.latest_snapshot {
@@ -353,6 +372,16 @@ impl HnswBackend {
             // Use load_with_validation for automatic fallback recovery
             match Snapshot::load_with_validation(&snapshot_path, &metrics) {
                 Ok((snapshot, recovered_from_fallback)) => {
+                    if snapshot.dimension == 0 {
+                        anyhow::bail!("snapshot dimension is 0 (corrupt snapshot)");
+                    }
+                    if snapshot.dimension != embedding_dimension {
+                        anyhow::bail!(
+                            "configured embedding dimension {} does not match snapshot dimension {}",
+                            embedding_dimension,
+                            snapshot.dimension
+                        );
+                    }
                     dimension = snapshot.dimension;
                     snapshot_timestamp = snapshot.timestamp;
 
@@ -431,8 +460,13 @@ impl HnswBackend {
 
                 match entry.op {
                     WalOp::Insert => {
-                        if dimension == 0 && !entry.embedding.is_empty() {
-                            dimension = entry.embedding.len();
+                        if entry.embedding.len() != dimension {
+                            anyhow::bail!(
+                                "WAL embedding dimension mismatch for doc_id {}: expected {}, got {}",
+                                entry.doc_id,
+                                dimension,
+                                entry.embedding.len()
+                            );
                         }
 
                         let doc_id = entry.doc_id as usize;
@@ -1218,7 +1252,7 @@ mod tests {
             HashMap::from([("id".to_string(), "2".to_string())]),
         ];
 
-        let backend = HnswBackend::new(embeddings, metadata, 100).unwrap();
+        let backend = HnswBackend::new(4, embeddings, metadata, 100).unwrap();
 
         // Test fetch_document
         let doc0 = backend.fetch_document(0).unwrap();
@@ -1245,7 +1279,7 @@ mod tests {
 
         let metadata = vec![HashMap::new(); 3];
 
-        let backend = HnswBackend::new(embeddings, metadata, 100).unwrap();
+        let backend = HnswBackend::new(4, embeddings, metadata, 100).unwrap();
 
         // Query closest to doc 0
         let query = vec![1.0, 0.0, 0.0, 0.0];
@@ -1260,7 +1294,7 @@ mod tests {
     fn test_hnsw_backend_empty_check() {
         let embeddings = vec![vec![1.0, 0.0]];
         let metadata = vec![HashMap::new()];
-        let backend = HnswBackend::new(embeddings, metadata, 100).unwrap();
+        let backend = HnswBackend::new(2, embeddings, metadata, 100).unwrap();
         assert!(!backend.is_empty());
         assert_eq!(backend.len(), 1);
         assert_eq!(backend.dimension(), 2);
@@ -1278,6 +1312,7 @@ mod tests {
         let initial_metadata = vec![HashMap::new(), HashMap::new()];
 
         let backend = HnswBackend::with_persistence(
+            2,
             initial_embeddings,
             initial_metadata,
             100,
@@ -1362,6 +1397,7 @@ mod tests {
         let metadata = vec![HashMap::from([("key".to_string(), "val1".to_string())])];
 
         let backend = HnswBackend::with_persistence(
+            2,
             embeddings,
             metadata,
             100,

@@ -148,7 +148,7 @@ fn test_hnsw_results_ordered() {
     // Results should be ordered by distance (closest first)
     let mut index = HnswVectorIndex::new(4, 100).unwrap();
 
-    let vectors = vec![
+    let vectors = [
         vec![1.0, 0.0, 0.0, 0.0],
         vec![0.5, 0.5, 0.0, 0.0],
         vec![0.0, 1.0, 0.0, 0.0],

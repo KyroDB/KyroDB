@@ -30,6 +30,7 @@ fn test_cli_backup_create_full() -> Result<()> {
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings.clone(),
         metadata,
         100,
@@ -85,6 +86,7 @@ fn test_cli_backup_list() -> Result<()> {
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings,
         metadata,
         100,
@@ -132,6 +134,7 @@ fn test_cli_backup_list_json() -> Result<()> {
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings,
         metadata,
         100,
@@ -181,6 +184,7 @@ fn test_cli_restore_from_backup() -> Result<()> {
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings.clone(),
         metadata,
         100,
@@ -249,6 +253,7 @@ fn test_cli_prune_backups() -> Result<()> {
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings,
         metadata,
         100,
@@ -350,6 +355,7 @@ fn test_cli_verify_backup() -> Result<()> {
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings,
         metadata,
         100,
@@ -402,6 +408,7 @@ fn test_cli_incremental_backup() -> Result<()> {
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings,
         metadata,
         100,
@@ -477,6 +484,7 @@ fn test_cli_point_in_time_restore() -> Result<()> {
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings,
         metadata,
         100,

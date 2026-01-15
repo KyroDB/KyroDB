@@ -111,6 +111,11 @@ pub struct TieredEngineConfig {
     /// HNSW max elements capacity
     pub hnsw_max_elements: usize,
 
+    /// Embedding dimension for the database.
+    ///
+    /// Required to initialize an empty cold tier without inserting dummy vectors.
+    pub embedding_dimension: usize,
+
     /// Persistence data directory
     pub data_dir: Option<String>,
 
@@ -139,6 +144,7 @@ impl Default for TieredEngineConfig {
             hot_tier_hard_limit: 20_000, // 2x soft limit for emergency eviction
             hot_tier_max_age: Duration::from_secs(60),
             hnsw_max_elements: 1_000_000,
+            embedding_dimension: 768,
             data_dir: None,
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 10_000,
@@ -225,6 +231,7 @@ impl TieredEngine {
         let cold_tier = if let Some(ref data_dir) = config.data_dir {
             // With persistence
             Arc::new(HnswBackend::with_persistence(
+                config.embedding_dimension,
                 initial_embeddings,
                 initial_metadata,
                 config.hnsw_max_elements,
@@ -235,6 +242,7 @@ impl TieredEngine {
         } else {
             // Without persistence (testing only)
             Arc::new(HnswBackend::new(
+                config.embedding_dimension,
                 initial_embeddings,
                 initial_metadata,
                 config.hnsw_max_elements,
@@ -332,6 +340,7 @@ impl TieredEngine {
         // Recover cold tier from WAL + snapshot
         let metrics = crate::metrics::MetricsCollector::new();
         let cold_tier = Arc::new(HnswBackend::recover(
+            config.embedding_dimension,
             &data_dir_str,
             config.hnsw_max_elements,
             config.fsync_policy,
@@ -1421,6 +1430,7 @@ mod tests {
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
             hnsw_max_elements: 100,
+            embedding_dimension: 4,
             data_dir: None,
             ..Default::default()
         };
@@ -1457,6 +1467,7 @@ mod tests {
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             data_dir: None,
             ..Default::default()
         };
@@ -1495,6 +1506,7 @@ mod tests {
         let config = TieredEngineConfig {
             hot_tier_max_size: 2, // Small threshold
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             data_dir: None,
             ..Default::default()
         };
@@ -1521,7 +1533,7 @@ mod tests {
         assert!(engine.hot_tier().needs_flush());
 
         // Manual flush
-        let flushed = engine.flush_hot_tier().unwrap();
+        let flushed = engine.flush_hot_tier(false).unwrap();
         assert_eq!(flushed, 2);
 
         // Hot tier should be empty
@@ -1544,6 +1556,7 @@ mod tests {
             let config = TieredEngineConfig {
                 hot_tier_max_size: 1,
                 hnsw_max_elements: 100,
+                embedding_dimension: 2,
                 data_dir: Some(dir.path().to_string_lossy().to_string()),
                 fsync_policy: FsyncPolicy::Always,
                 ..Default::default()
@@ -1564,7 +1577,7 @@ mod tests {
             engine
                 .insert(10, vec![0.5, 0.5], std::collections::HashMap::new())
                 .unwrap();
-            let flushed = engine.flush_hot_tier().unwrap();
+            let flushed = engine.flush_hot_tier(false).unwrap();
             assert_eq!(flushed, 1, "Expected 1 document to be flushed");
 
             // Verify doc 10 is in cold tier before snapshot
@@ -1586,6 +1599,7 @@ mod tests {
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             ..Default::default()
         };
 
@@ -1615,6 +1629,7 @@ mod tests {
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
             hnsw_max_elements: 200,
+            embedding_dimension: 4,
             data_dir: None,
             cache_timeout_ms: 10,
             hot_tier_timeout_ms: 50,
@@ -1659,6 +1674,7 @@ mod tests {
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
             hnsw_max_elements: 100,
+            embedding_dimension: 4,
             data_dir: None,
             ..Default::default()
         };
@@ -1693,6 +1709,7 @@ mod tests {
         let config = TieredEngineConfig {
             data_dir: None,
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             ..Default::default()
         };
 
@@ -1731,6 +1748,7 @@ mod tests {
         let config = TieredEngineConfig {
             cold_tier_timeout_ms: 1, // Very short timeout to force timeout
             hnsw_max_elements: 2000,
+            embedding_dimension: 128,
             data_dir: None,
             ..Default::default()
         };
@@ -1766,6 +1784,7 @@ mod tests {
         let config = TieredEngineConfig {
             data_dir: None,
             hnsw_max_elements: 100,
+            embedding_dimension: 4,
             ..Default::default()
         };
 
@@ -1796,6 +1815,7 @@ mod tests {
         let config = TieredEngineConfig {
             cold_tier_timeout_ms: 1, // Very short timeout to trigger failures
             hnsw_max_elements: 100,
+            embedding_dimension: 4,
             data_dir: None,
             ..Default::default()
         };
@@ -1842,6 +1862,7 @@ mod tests {
         let config = TieredEngineConfig {
             max_concurrent_queries: 2, // Very low limit to trigger rejection
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             data_dir: None,
             ..Default::default()
         };
@@ -1925,6 +1946,7 @@ mod tests {
         let config = TieredEngineConfig {
             max_concurrent_queries: 1, // Only 1 concurrent query allowed
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             data_dir: None,
             ..Default::default()
         };
@@ -1966,6 +1988,7 @@ mod tests {
         let config = TieredEngineConfig {
             hnsw_max_elements: 100,
             data_dir: None,
+            embedding_dimension: 1,
             ..Default::default()
         };
 
@@ -2007,6 +2030,7 @@ mod tests {
             hnsw_max_elements: 100,
             data_dir: None,
             cold_tier_timeout_ms: 200, // Short timeout for quick test
+            embedding_dimension: 2,
             ..Default::default()
         };
 
@@ -2057,6 +2081,7 @@ mod tests {
         let config = TieredEngineConfig {
             hnsw_max_elements: 100,
             data_dir: None,
+            embedding_dimension: 2,
             ..Default::default()
         };
 
@@ -2098,6 +2123,7 @@ mod tests {
         let config = TieredEngineConfig {
             hot_tier_max_size: 3, // Small threshold to trigger flush
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             data_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             snapshot_interval: 1000, // Don't snapshot during test
             ..Default::default()
@@ -2128,7 +2154,7 @@ mod tests {
         assert_eq!(engine.hot_tier.len(), 3);
 
         // Attempt flush (should succeed normally)
-        let flushed = engine.flush_hot_tier().unwrap();
+        let flushed = engine.flush_hot_tier(false).unwrap();
 
         // For this test, flush should succeed, so hot tier should be empty
         // (Testing actual failure requires disk-full simulation which is complex)
@@ -2152,6 +2178,7 @@ mod tests {
             hot_tier_max_size: 3,   // Soft limit (very small for testing)
             hot_tier_hard_limit: 6, // Hard limit (2x soft limit)
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             data_dir: Some(temp_dir.path().to_string_lossy().to_string()),
             snapshot_interval: 1000, // Don't snapshot during test
             ..Default::default()

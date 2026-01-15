@@ -285,6 +285,12 @@ pub struct PersistenceConfig {
 
     /// Enable automatic crash recovery on startup
     pub enable_recovery: bool,
+
+    /// If true, allow the server to start with a fresh empty database when recovery fails.
+    ///
+    /// This is dangerous in production because it can silently discard access to existing data
+    /// if the on-disk state is corrupted or misconfigured.
+    pub allow_fresh_start_on_recovery_failure: bool,
 }
 
 impl Default for PersistenceConfig {
@@ -297,6 +303,7 @@ impl Default for PersistenceConfig {
             snapshot_interval_secs: 3600,          // 1 hour
             max_wal_size_bytes: 100 * 1024 * 1024, // 100 MB
             enable_recovery: true,
+            allow_fresh_start_on_recovery_failure: false,
         }
     }
 }

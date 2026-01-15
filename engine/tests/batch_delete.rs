@@ -38,6 +38,7 @@ fn test_hnsw_backend_batch_delete() {
     let metadata = vec![HashMap::new(); 4];
 
     let backend = HnswBackend::with_persistence(
+        1,
         embeddings,
         metadata,
         100,
@@ -72,6 +73,7 @@ fn test_tiered_engine_batch_delete() {
     let config = TieredEngineConfig {
         data_dir: Some(temp_dir.path().to_string_lossy().to_string()),
         fsync_policy: FsyncPolicy::Never,
+        embedding_dimension: 1,
         ..Default::default()
     };
 
@@ -113,6 +115,7 @@ fn test_tiered_engine_batch_delete_by_filter() {
     let config = TieredEngineConfig {
         data_dir: Some(temp_dir.path().to_string_lossy().to_string()),
         fsync_policy: FsyncPolicy::Never,
+        embedding_dimension: 1,
         ..Default::default()
     };
 

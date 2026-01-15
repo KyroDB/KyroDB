@@ -84,6 +84,7 @@ fn test_hnsw_corruption_recovery() {
 
     // Create backend with persistence
     let backend = HnswBackend::with_persistence(
+        4,
         embeddings.clone(),
         metadata.clone(),
         100,
@@ -136,6 +137,7 @@ fn test_hnsw_corruption_recovery() {
     // Try to recover - should fallback to previous snapshot
     let metrics = MetricsCollector::new();
     let recovered = HnswBackend::recover(
+        4,
         data_dir.to_str().unwrap(),
         100,
         FsyncPolicy::Always,
@@ -198,6 +200,7 @@ fn test_wal_normal_operation() {
 
     // Create backend with persistence (includes WAL)
     let backend = HnswBackend::with_persistence(
+        4,
         vec![vec![1.0, 0.0, 0.0, 0.0]],
         vec![HashMap::new()],
         100,
@@ -230,6 +233,7 @@ fn test_circuit_breaker_with_backend_operations() {
         if breaker.is_closed() {
             // Create backend
             let backend = HnswBackend::with_persistence(
+                4,
                 vec![vec![1.0, 0.0, 0.0, 0.0]],
                 vec![HashMap::new()],
                 100,
@@ -310,6 +314,7 @@ async fn test_tiered_query_normal_operation() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 10,
         hnsw_max_elements: 100,
+        embedding_dimension: 4,
         data_dir: None,
         cache_timeout_ms: 10,
         hot_tier_timeout_ms: 50,

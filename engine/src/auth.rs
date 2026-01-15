@@ -182,7 +182,12 @@ impl AuthManager {
         );
 
         // Find the last underscore (separates tenant_id from secret)
-        let last_underscore_pos = key.rfind('_').unwrap(); // Safe: we know there's at least one '_' after "kyro"
+        let last_underscore_pos = key.rfind('_').ok_or_else(|| {
+            anyhow::anyhow!(
+                "API key must have format kyro_<tenant_id>_<secret>: {}",
+                key
+            )
+        })?;
 
         anyhow::ensure!(
             last_underscore_pos > 5, // Must be after "kyro_"
@@ -219,6 +224,16 @@ impl AuthManager {
         );
 
         Ok(())
+    }
+
+    /// Return all enabled tenants (deduplicated by tenant_id at caller if needed).
+    pub fn enabled_tenants(&self) -> Vec<TenantInfo> {
+        self.api_keys
+            .read()
+            .values()
+            .filter(|tenant_info| tenant_info.enabled)
+            .cloned()
+            .collect()
     }
 
     /// Validate API key and return tenant info

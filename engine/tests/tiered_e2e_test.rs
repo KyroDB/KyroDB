@@ -26,6 +26,7 @@ fn test_three_tier_query_journey() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 3, // Small hot tier: 3 docs
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -75,7 +76,7 @@ fn test_three_tier_query_journey() {
     engine
         .insert(102, vec![0.35, 0.65], HashMap::new())
         .unwrap();
-    let flushed = engine.flush_hot_tier().unwrap();
+    let flushed = engine.flush_hot_tier(false).unwrap();
     println!("Flushed {} documents", flushed);
     assert!(flushed > 0, "Should have flushed at least some documents");
 
@@ -162,6 +163,7 @@ fn test_persistence_across_all_tiers() {
         let config = TieredEngineConfig {
             hot_tier_max_size: 2,
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             data_dir: Some(dir.path().to_string_lossy().to_string()),
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 5, // Snapshot every 5 inserts
@@ -182,12 +184,12 @@ fn test_persistence_across_all_tiers() {
         // Insert to hot tier and flush
         engine.insert(10, vec![0.4, 0.6], HashMap::new()).unwrap();
         engine.insert(11, vec![0.2, 0.8], HashMap::new()).unwrap();
-        engine.flush_hot_tier().unwrap();
+        engine.flush_hot_tier(false).unwrap();
 
         // Insert more (should trigger snapshot at 5 inserts)
         engine.insert(20, vec![0.1, 0.9], HashMap::new()).unwrap();
         engine.insert(21, vec![0.0, 1.0], HashMap::new()).unwrap();
-        engine.flush_hot_tier().unwrap();
+        engine.flush_hot_tier(false).unwrap();
 
         // Query to populate cache
         engine.query(10, Some(&[0.4, 0.6]));
@@ -210,6 +212,7 @@ fn test_persistence_across_all_tiers() {
         let config = TieredEngineConfig {
             hot_tier_max_size: 10,
             hnsw_max_elements: 100,
+            embedding_dimension: 2,
             ..Default::default()
         };
 
@@ -276,6 +279,7 @@ fn test_concurrent_tier_access() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 10,
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 
@@ -344,6 +348,7 @@ fn test_query_path_layering() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 5,
         hnsw_max_elements: 100,
+        embedding_dimension: 2,
         ..Default::default()
     };
 

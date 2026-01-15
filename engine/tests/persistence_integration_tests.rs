@@ -95,6 +95,7 @@ fn test_hnsw_backend_persistence() {
     let initial_embeddings = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
 
     let backend = HnswBackend::with_persistence(
+        4,
         initial_embeddings.clone(),
         vec![HashMap::new(); 2],
         100,
@@ -124,7 +125,7 @@ fn test_hnsw_backend_persistence() {
     // Recover from persistence with metrics
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
     let recovered =
-        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 10, metrics.clone()).unwrap();
+        HnswBackend::recover(4, dir.path(), 100, FsyncPolicy::Always, 10, metrics.clone()).unwrap();
 
     // Verify all documents recovered
     assert_eq!(recovered.len(), 4);
@@ -156,6 +157,7 @@ fn test_crash_recovery_wal_only() {
 
     {
         let backend = HnswBackend::with_persistence(
+            2,
             initial_embeddings.clone(),
             vec![HashMap::new(); 2],
             100,
@@ -174,7 +176,7 @@ fn test_crash_recovery_wal_only() {
     // Recover from WAL
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
     let recovered =
-        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 1000, metrics).unwrap();
+        HnswBackend::recover(2, dir.path(), 100, FsyncPolicy::Always, 1000, metrics).unwrap();
 
     // Verify data recovered from WAL
     assert_eq!(recovered.len(), 3);
@@ -189,6 +191,7 @@ fn test_automatic_snapshot_creation() {
     let initial_embeddings = vec![vec![1.0, 0.0]];
 
     let backend = HnswBackend::with_persistence(
+        2,
         initial_embeddings,
         vec![HashMap::new(); 1],
         100,
@@ -226,6 +229,7 @@ fn test_knn_search_after_recovery() {
         ];
 
         let backend = HnswBackend::with_persistence(
+            4,
             initial_embeddings,
             vec![HashMap::new(); 3],
             100,
@@ -241,7 +245,7 @@ fn test_knn_search_after_recovery() {
     // Recover and test k-NN search
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
     let recovered =
-        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 10, metrics).unwrap();
+        HnswBackend::recover(4, dir.path(), 100, FsyncPolicy::Always, 10, metrics).unwrap();
 
     // Query closest to doc 0
     let query = vec![1.0, 0.0, 0.0, 0.0];
@@ -260,6 +264,7 @@ fn test_fsync_policy_never() {
     let initial_embeddings = vec![vec![1.0, 0.0]];
 
     let backend = HnswBackend::with_persistence(
+        2,
         initial_embeddings,
         vec![HashMap::new(); 1],
         100,
@@ -276,7 +281,8 @@ fn test_fsync_policy_never() {
     drop(backend);
 
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
-    let recovered = HnswBackend::recover(dir.path(), 100, FsyncPolicy::Never, 5, metrics).unwrap();
+    let recovered =
+        HnswBackend::recover(2, dir.path(), 100, FsyncPolicy::Never, 5, metrics).unwrap();
 
     assert_eq!(recovered.len(), 2);
 }

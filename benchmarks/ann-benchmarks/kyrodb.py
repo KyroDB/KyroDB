@@ -12,6 +12,7 @@ Usage:
 import os
 import time
 import numpy as np
+import logging
 
 try:
     import grpc
@@ -61,6 +62,8 @@ class KyroDB:
         self._channel = None
         self._stub = None
         self._n_items = 0
+
+        self._logger = logging.getLogger(__name__)
         
     def _connect(self):
         """Establish gRPC connection to KyroDB server."""
@@ -110,11 +113,16 @@ class KyroDB:
                       f"({len(X)/elapsed:,.0f} vectors/sec)")
                 return
             else:
-                print(f"[KyroDB] Bulk insert returned error: {response.error}")
+                self._logger.error("[KyroDB] Bulk insert returned error: %s", response.error)
         except grpc.RpcError as e:
-            print(f"[KyroDB] Bulk insert failed ({e.code()}), falling back to single inserts...")
+            self._logger.exception(
+                "[KyroDB] Bulk insert failed (%s), falling back to single inserts...",
+                e.code(),
+            )
         
         # Fallback: individual inserts with progress tracking
+        failures = []
+        max_failures = 10
         for i, vec in enumerate(X):
             req = kyrodb_pb2.InsertRequest(
                 doc_id=i + 1,  # doc_id must be >= 1
@@ -123,9 +131,17 @@ class KyroDB:
             try:
                 self._stub.Insert(req)
             except grpc.RpcError as e:
-                if i == 0:
-                    print(f"[KyroDB] Insert failed: {e}")
-                    raise
+                self._logger.error(
+                    "[KyroDB] Insert failed at index=%d doc_id=%d: %s",
+                    i,
+                    req.doc_id,
+                    e,
+                )
+                failures.append((i, req.doc_id, str(e)))
+                if len(failures) >= max_failures:
+                    raise RuntimeError(
+                        f"[KyroDB] Insert failed {len(failures)} times; aborting"
+                    )
                     
             if (i + 1) % 10000 == 0:
                 elapsed = time.time() - start
@@ -133,6 +149,11 @@ class KyroDB:
                 print(f"[KyroDB] Indexed {i+1}/{len(X)} vectors ({rate:,.0f} vec/s)")
                 
         elapsed = time.time() - start
+        if failures:
+            raise RuntimeError(
+                f"[KyroDB] Insert failures: {len(failures)} of {len(X)}. "
+                f"First failure: index={failures[0][0]}, doc_id={failures[0][1]} error={failures[0][2]}"
+            )
         print(f"[KyroDB] Indexing complete: {len(X)} vectors in {elapsed:.2f}s "
               f"({len(X)/elapsed:,.0f} vectors/sec)")
         
@@ -171,13 +192,25 @@ class KyroDB:
         
         try:
             response = self._stub.Search(request)
-            # Return list of (doc_id, score) - score is similarity, higher is better
-            # For ann-benchmarks, we return doc_id, distance where lower is better
-            # Cosine similarity: distance = 1 - similarity
-            return [(r.doc_id, 1.0 - r.score) for r in response.results]
+            # Server score is similarity; ann-benchmarks expects distance (lower is better)
+            return [(r.doc_id, self._score_to_distance(r.score)) for r in response.results]
         except grpc.RpcError as e:
             print(f"[KyroDB] Query failed: {e}")
             return []
+
+    def _score_to_distance(self, score: float) -> float:
+        """
+        Convert server score to ann-benchmarks distance.
+
+        KyroDB currently encodes score as (1 - distance) for all metrics. If server
+        behavior becomes metric-specific, update this conversion accordingly.
+        """
+        metric = self.metric.lower()
+        if metric in ("angular", "cosine"):
+            return 1.0 - score
+        if metric in ("euclidean", "l2"):
+            return 1.0 - score
+        return 1.0 - score
             
     def batch_query(self, X: np.ndarray, k: int) -> list:
         """
@@ -204,10 +237,15 @@ class KyroDB:
             results = []
             for response in self._stub.BulkSearch(generate_search_requests()):
                 results.append([
-                    (r.doc_id, 1.0 - r.score) for r in response.results
+                    (r.doc_id, self._score_to_distance(r.score)) for r in response.results
                 ])
             return results
         except grpc.RpcError:
+            self._logger.exception(
+                "[KyroDB] BulkSearch failed (metric=%s, k=%d). Falling back to per-query calls.",
+                self.metric,
+                k,
+            )
             # Fallback to individual queries
             return [self.query(q, k) for q in X]
             

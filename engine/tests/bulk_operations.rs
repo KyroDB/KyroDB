@@ -49,7 +49,7 @@ fn test_hnsw_backend_bulk_fetch() {
         HashMap::from([("id".to_string(), "2".to_string())]),
     ];
 
-    let backend = HnswBackend::new(embeddings, metadata, 100).unwrap();
+    let backend = HnswBackend::new(1, embeddings, metadata, 100).unwrap();
 
     // Bulk fetch
     let ids = vec![0, 2, 5]; // 5 is missing
@@ -75,6 +75,7 @@ fn test_tiered_engine_bulk_query() {
     let config = TieredEngineConfig {
         data_dir: Some(temp_dir.path().to_string_lossy().to_string()),
         fsync_policy: FsyncPolicy::Never,
+        embedding_dimension: 1,
         ..Default::default()
     };
 

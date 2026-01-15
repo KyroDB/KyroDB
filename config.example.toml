@@ -110,6 +110,10 @@ max_wal_size_bytes = 104857600  # 100 MB
 # Enable automatic crash recovery on startup
 enable_recovery = true
 
+# If true, allows starting with a fresh empty DB when recovery fails.
+# WARNING: This can discard access to existing data if the on-disk state is corrupted.
+allow_fresh_start_on_recovery_failure = false
+
 # SLO Configuration (Service Level Objectives)
 [slo]
 # P99 latency threshold (milliseconds)

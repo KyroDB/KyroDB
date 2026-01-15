@@ -24,7 +24,7 @@ fn bench_insert_with_persistence(c: &mut Criterion) {
                 let data_dir = dir.path();
 
                 let backend =
-                    HnswBackend::with_persistence(vec![], vec![], 100, data_dir, *policy, 16)
+                    HnswBackend::with_persistence(128, vec![], vec![], 100, data_dir, *policy, 16)
                         .unwrap();
 
                 let mut doc_id = 100;
@@ -60,6 +60,7 @@ fn bench_snapshot_creation(c: &mut Criterion) {
                 .collect();
 
             let backend = HnswBackend::with_persistence(
+                128,
                 embeddings.clone(),
                 metadata_vec,
                 *size * 2,
@@ -95,6 +96,7 @@ fn bench_recovery(c: &mut Criterion) {
                 .collect();
 
             let backend = HnswBackend::with_persistence(
+                128,
                 embeddings.clone(),
                 metadata_vec,
                 size_val * 2,
@@ -113,6 +115,7 @@ fn bench_recovery(c: &mut Criterion) {
             |b, (dir, size_val)| {
                 b.iter(|| {
                     let _recovered = HnswBackend::recover(
+                        128,
                         dir.path(),
                         *size_val * 2,
                         FsyncPolicy::Never,
