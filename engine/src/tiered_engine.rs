@@ -836,6 +836,15 @@ impl TieredEngine {
     /// - Result merging: <100μs (deduplication + sorting)
     /// - Total P99: <2ms typical
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.knn_search_with_ef(query, k, None)
+    }
+
+    pub fn knn_search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
         if query.is_empty() {
             anyhow::bail!("query embedding cannot be empty");
         }
@@ -879,7 +888,8 @@ impl TieredEngine {
         // Step 2: Search Layer 3 (Cold Tier) - HNSW index
         // Only search cold tier if it has documents (dimension > 0)
         let cold_results = if cold_tier_has_docs {
-            self.cold_tier.knn_search(query, k * 2)?
+            self.cold_tier
+                .knn_search_with_ef(query, k * 2, ef_search_override)?
         } else {
             vec![]
         };

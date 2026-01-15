@@ -60,8 +60,8 @@ cd KyroDB
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-# Build optimized binary
-RUSTFLAGS="-C target-cpu=native" cargo build --release --bin kyrodb_server
+# Build release binary (reproducible)
+cargo build --release --locked --bin kyrodb_server
 ```
 
 ### 2. Run Server with Performance Tuning

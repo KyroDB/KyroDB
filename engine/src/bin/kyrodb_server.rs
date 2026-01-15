@@ -361,6 +361,13 @@ impl KyroDBServiceImpl {
             )));
         }
 
+        if req.ef_search > 10_000 {
+            self.state.metrics.record_error(ErrorCategory::Validation);
+            return Err(Status::invalid_argument(
+                "ef_search must be <= 10000 (0 = server default)",
+            ));
+        }
+
         // Adaptive oversampling based on filter complexity
         // Namespace filtering also requires oversampling since we filter post-fetch
         let _has_filter = req.filter.is_some();
@@ -381,8 +388,14 @@ impl KyroDBServiceImpl {
 
         let engine = self.state.engine.read().await;
 
+        let ef_search_override = if req.ef_search == 0 {
+            None
+        } else {
+            Some(req.ef_search as usize)
+        };
+
         let results = engine
-            .knn_search(&req.query_embedding, search_k)
+            .knn_search_with_ef(&req.query_embedding, search_k, ef_search_override)
             .map_err(|e| {
                 self.state.metrics.record_query_failure();
                 self.state.metrics.record_error(ErrorCategory::Internal);
@@ -393,8 +406,18 @@ impl KyroDBServiceImpl {
         self.state.metrics.record_query_latency(latency_ns);
         self.state.metrics.record_hnsw_search(latency_ns);
 
-        // Convert distance to similarity score
-        let convert_distance_to_score = |dist: f32| -> f32 { (1.0 - dist).clamp(-1.0, 1.0) };
+        // Convert engine distance to API score (higher is better).
+        // - Cosine: distance in [0, 2], score = 1 - distance (in [-1, 1])
+        // - Euclidean/L2: score = -distance (avoids clamping, preserves ordering and magnitude)
+        // - Inner product: engine returns a distance-like value; use -distance for monotonicity
+        let convert_distance_to_score = |dist: f32| -> f32 {
+            use kyrodb_engine::config::DistanceMetric;
+
+            match self.state.app_config.hnsw.distance {
+                DistanceMetric::Cosine => 1.0 - dist,
+                DistanceMetric::Euclidean | DistanceMetric::InnerProduct => -dist,
+            }
+        };
 
         let mut final_results = Vec::new();
         let mut candidates = results.into_iter();

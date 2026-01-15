@@ -94,8 +94,21 @@ impl HnswVectorIndex {
         Ok(())
     }
 
-    /// k-NN search with cosine similarity (ef_search=200, auto-tuned for small indexes)
+    /// k-NN search (adaptive ef_search by default)
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.knn_search_with_ef(query, k, None)
+    }
+
+    /// k-NN search with optional ef_search override.
+    ///
+    /// If `ef_search_override` is `None`, uses the existing adaptive behavior.
+    /// If set, it is clamped to be >= k and <= 10_000.
+    pub fn knn_search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
         if query.len() != self.dimension {
             anyhow::bail!(
                 "Query dimension mismatch: expected {}, got {}",
@@ -109,14 +122,19 @@ impl HnswVectorIndex {
         }
 
         // ef_search controls search quality (higher = better recall, slower)
-        // Adaptive: for very small indexes, crank this up to ensure near-perfect recall
-        let mut ef_search = 200; // RAG-optimized default for large corpora
-        if self.current_count <= 1024 {
-            // Explore more of the graph when the index is small to guarantee recall in tests
-            // Use max of current_count and k scaled, with an upper safety bound
-            let target = (self.current_count.max(k) * 4).max(32);
-            ef_search = ef_search.max(target.min(2048));
-        }
+        let ef_search = if let Some(override_val) = ef_search_override {
+            override_val.clamp(k.max(1), 10_000)
+        } else {
+            // Adaptive: for very small indexes, crank this up to ensure near-perfect recall
+            let mut ef = 200; // RAG-optimized default for large corpora
+            if self.current_count <= 1024 {
+                // Explore more of the graph when the index is small to guarantee recall in tests
+                // Use max of current_count and k scaled, with an upper safety bound
+                let target = (self.current_count.max(k) * 4).max(32);
+                ef = ef.max(target.min(2048));
+            }
+            ef
+        };
         let neighbours = self.index.search(query, k, ef_search);
 
         let results = neighbours

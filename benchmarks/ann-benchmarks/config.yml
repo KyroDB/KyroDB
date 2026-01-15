@@ -1,0 +1,42 @@
+# KyroDB ANN-Benchmarks Configuration
+#
+# This file is meant to be copied into the upstream ann-benchmarks repository at:
+#   ann_benchmarks/algorithms/kyrodb/config.yml
+#
+# Notes:
+# - `base_args: ['@metric']` passes the dataset metric (angular/euclidean) into the constructor.
+# - `args` are passed to the KyroDB constructor as a dict (HNSW build params).
+# - `query_args` values are passed to `set_query_arguments(*query_args)` and map to ef_search.
+
+float:
+  any:
+    - name: kyrodb
+      docker_tag: ann-benchmarks-kyrodb
+      module: ann_benchmarks.algorithms.kyrodb
+      constructor: KyroDB
+      disabled: false
+      base_args: ['@metric']
+      run_groups:
+        fast:
+          args:
+            M: 12
+            ef_construction: 100
+          query_args: [[10], [20], [40]]
+
+        balanced:
+          args:
+            M: 16
+            ef_construction: 200
+          query_args: [[20], [50], [100], [200]]
+
+        accurate:
+          args:
+            M: 24
+            ef_construction: 400
+          query_args: [[100], [200], [400], [800]]
+
+        max_recall:
+          args:
+            M: 32
+            ef_construction: 500
+          query_args: [[200], [400], [800], [1200]]

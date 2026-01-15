@@ -234,6 +234,10 @@ message SearchRequest {
   // Whether to include embeddings in results (default: false)
   // Set to false to save bandwidth
   bool include_embeddings = 5;
+
+  // Optional HNSW ef_search override (0 = use server default)
+  // Higher values typically improve recall at the cost of latency.
+  uint32 ef_search = 7;
   
   // Optional metadata filters (Phase 1)
   MetadataFilter filter = 6;

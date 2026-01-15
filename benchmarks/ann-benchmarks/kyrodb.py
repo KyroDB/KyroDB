@@ -202,14 +202,16 @@ class KyroDB:
         """
         Convert server score to ann-benchmarks distance.
 
-        KyroDB currently encodes score as (1 - distance) for all metrics. If server
-        behavior becomes metric-specific, update this conversion accordingly.
+        KyroDB encodes score as:
+        - angular/cosine: score = 1 - cosine_distance
+        - euclidean/L2:   score = -l2_distance
+        - inner product:  score = -distance_like_value
         """
         metric = self.metric.lower()
         if metric in ("angular", "cosine"):
             return 1.0 - score
         if metric in ("euclidean", "l2"):
-            return 1.0 - score
+            return -score
         return 1.0 - score
             
     def batch_query(self, X: np.ndarray, k: int) -> list:

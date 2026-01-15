@@ -1053,6 +1053,16 @@ impl HnswBackend {
     /// If the deletion rate is very high (>50%), it may return fewer than `k` results.
     #[instrument(level = "trace", skip(self, query), fields(k, dim = query.len()))]
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.knn_search_with_ef(query, k, None)
+    }
+
+    #[instrument(level = "trace", skip(self, query), fields(k, dim = query.len(), ef_search_override))]
+    pub fn knn_search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
         if query.is_empty() {
             anyhow::bail!("query embedding cannot be empty");
         }
@@ -1081,7 +1091,7 @@ impl HnswBackend {
         // We ask for more results, then filter out deleted ones
         // Heuristic: fetch 2x, capped at max allowed to avoid index errors
         let search_k = std::cmp::min(k * 2, 10_000);
-        let mut results = index.knn_search(query, search_k)?;
+        let mut results = index.knn_search_with_ef(query, search_k, ef_search_override)?;
 
         // Filter out tombstones (all-zero embeddings)
         results.retain(|r| {

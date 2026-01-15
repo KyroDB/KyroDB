@@ -1,4 +1,3 @@
-# Init file for ann-benchmarks integration
-from .kyrodb import KyroDB
+from .module import KyroDB
 
-__all__ = ['KyroDB']
+__all__ = ["KyroDB"]

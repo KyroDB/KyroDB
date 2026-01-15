@@ -105,11 +105,20 @@ def compute_recall(results: List[Tuple[int, float]], ground_truth: np.ndarray, k
 class KyroDBBenchmark:
     """KyroDB benchmark runner."""
     
-    def __init__(self, host: str = "localhost", port: int = 50051):
+    def __init__(self, host: str = "localhost", port: int = 50051, metric: str = "euclidean"):
         self.host = host
         self.port = port
+        self.metric = metric
         self._channel = None
         self._stub = None
+
+    def _score_to_distance(self, score: float) -> float:
+        metric = self.metric.lower()
+        if metric in ("angular", "cosine"):
+            return 1.0 - score
+        if metric in ("euclidean", "l2"):
+            return -score
+        return 1.0 - score
         
     def connect(self):
         """Connect to KyroDB server."""
@@ -208,7 +217,7 @@ class KyroDBBenchmark:
         
         response = self._stub.Search(request)
         # Convert similarity score to distance (lower is better)
-        return [(r.doc_id, 1.0 - r.score) for r in response.results]
+        return [(r.doc_id, self._score_to_distance(r.score)) for r in response.results]
         
     def benchmark_queries(
         self,
