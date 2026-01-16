@@ -30,17 +30,16 @@ except Exception:  # pragma: no cover - allows standalone import tests
 try:
     from . import kyrodb_pb2
     from . import kyrodb_pb2_grpc
-except ModuleNotFoundError as e:  # pragma: no cover - allows standalone import tests
-    # In ann-benchmarks Docker, the most common failure is missing protobuf runtime
-    # which manifests as `No module named 'google'` while importing kyrodb_pb2.
-    if getattr(e, "name", "") and str(e.name).startswith("google"):
-        raise ModuleNotFoundError(
-            "Missing Python protobuf runtime (google.protobuf). Install the 'protobuf' package in the algorithm image."
-        ) from e
-
-    # Standalone import tests may not be within a package; fall back to top-level imports.
-    import kyrodb_pb2  # type: ignore
-    import kyrodb_pb2_grpc  # type: ignore
+except ImportError as e:
+    # The generated protobuf stubs MUST be present in this package directory.
+    # The Dockerfile generates them and copies them here. If this fails:
+    # 1. Rebuild the Docker image completely: docker builder prune -f && python install.py --algorithm kyrodb
+    # 2. Ensure the Dockerfile generates stubs from engine/proto/kyrodb.proto
+    raise ImportError(
+        "kyrodb_pb2 / kyrodb_pb2_grpc not found. "
+        "Ensure the Docker image was built correctly with protobuf stub generation. "
+        f"Original error: {e}"
+    ) from e
 
 import grpc
 
