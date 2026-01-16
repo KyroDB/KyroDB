@@ -21,12 +21,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     pkg-config \
     libssl-dev \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install grpcio-tools for protobuf generation
+RUN pip3 install --no-cache-dir --break-system-packages grpcio-tools==1.60.0
 
 WORKDIR /src
 
-# NOTE: ann-benchmarks builds algorithm images with context set to the ann-benchmarks repo.
-# We therefore clone KyroDB explicitly.
+# Clone KyroDB repo
 RUN test -n "$KYRODB_GIT" || (echo "KYRODB_GIT build-arg is required" && exit 2)
 RUN git clone --depth 1 "$KYRODB_GIT" /src/kyrodb \
     && if [ -n "$KYRODB_REF" ]; then \
@@ -36,16 +40,21 @@ RUN git clone --depth 1 "$KYRODB_GIT" /src/kyrodb \
         fi
 
 WORKDIR /src/kyrodb
+
+# Build the server
 RUN cargo build --release --locked --bin kyrodb_server
+
+# Generate Python protobuf stubs
+RUN python3 -m grpc_tools.protoc \
+    -Iengine/proto \
+    --python_out=/src/stubs \
+    --grpc_python_out=/src/stubs \
+    engine/proto/kyrodb.proto
 
 # ============================================================================
 # Stage 2: Runtime (inherits ann-benchmarks entrypoint)
 # ============================================================================
 FROM ann-benchmarks
-
-# Copy algorithm wrapper + generated stubs into the image.
-# (ann-benchmarks builds algorithm images with build context set to this folder.)
-COPY . /home/app/ann_benchmarks/algorithms/kyrodb
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
@@ -57,9 +66,18 @@ RUN pip install --no-cache-dir \
     grpcio==1.60.0 \
     protobuf==4.25.3
 
+# Copy algorithm wrapper from build context (ann-benchmarks/algorithms/kyrodb/)
+COPY . /home/app/ann_benchmarks/algorithms/kyrodb
+
+# Copy generated protobuf stubs
+COPY --from=builder /src/stubs/kyrodb_pb2.py /home/app/ann_benchmarks/algorithms/kyrodb/
+COPY --from=builder /src/stubs/kyrodb_pb2_grpc.py /home/app/ann_benchmarks/algorithms/kyrodb/
+
+# Copy KyroDB server binary
 COPY --from=builder /src/kyrodb/target/release/kyrodb_server /usr/local/bin/kyrodb_server
 
 ENV KYRODB_HOST=127.0.0.1
 ENV KYRODB_PORT=50051
 
 EXPOSE 50051 51051
+
