@@ -45,7 +45,8 @@ WORKDIR /src/kyrodb
 RUN cargo build --release --locked --bin kyrodb_server
 
 # Generate Python protobuf stubs
-RUN python3 -m grpc_tools.protoc \
+RUN mkdir -p /src/stubs \
+    && python3 -m grpc_tools.protoc \
     -Iengine/proto \
     --python_out=/src/stubs \
     --grpc_python_out=/src/stubs \
