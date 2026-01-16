@@ -13,8 +13,10 @@
 # ============================================================================
 FROM rust:1.86-bookworm AS builder
 
-ARG KYRODB_GIT
-ARG KYRODB_REF
+# Default to the public KyroDB repo so ann-benchmarks runs do not depend on
+# caller environment variables being set correctly.
+ARG KYRODB_GIT=https://github.com/KyroDB/KyroDB.git
+ARG KYRODB_REF=benchmark
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -31,7 +33,6 @@ RUN pip3 install --no-cache-dir --break-system-packages grpcio-tools==1.60.0
 WORKDIR /src
 
 # Clone KyroDB repo
-RUN test -n "$KYRODB_GIT" || (echo "KYRODB_GIT build-arg is required" && exit 2)
 RUN git clone --depth 1 "$KYRODB_GIT" /src/kyrodb \
     && if [ -n "$KYRODB_REF" ]; then \
             cd /src/kyrodb \
@@ -67,8 +68,10 @@ RUN pip install --no-cache-dir \
     grpcio==1.60.0 \
     protobuf==4.25.3
 
-# Copy algorithm wrapper from build context (ann-benchmarks/algorithms/kyrodb/)
-COPY . /home/app/ann_benchmarks/algorithms/kyrodb
+# Copy only the kyrodb algorithm folder from the ann-benchmarks repo context.
+# Do NOT `COPY .` here: the ann-benchmarks repo often contains large `data/` and
+# `results/` directories which bloat builds and cause avoidable failures.
+COPY ann_benchmarks/algorithms/kyrodb/ /home/app/ann_benchmarks/algorithms/kyrodb/
 
 # Copy generated protobuf stubs
 COPY --from=builder /src/stubs/kyrodb_pb2.py /home/app/ann_benchmarks/algorithms/kyrodb/
