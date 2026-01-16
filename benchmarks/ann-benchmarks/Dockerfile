@@ -53,6 +53,11 @@ RUN mkdir -p /src/stubs \
     --grpc_python_out=/src/stubs \
     engine/proto/kyrodb.proto
 
+# grpc_tools.protoc generates absolute imports like `import kyrodb_pb2 as ...`.
+# Inside ann-benchmarks, our stubs live within a package, so we must use
+# package-relative imports.
+RUN sed -i 's/^import kyrodb_pb2 as /from . import kyrodb_pb2 as /' /src/stubs/kyrodb_pb2_grpc.py
+
 # ============================================================================
 # Stage 2: Runtime (inherits ann-benchmarks entrypoint)
 # ============================================================================
@@ -79,6 +84,10 @@ COPY --from=builder /src/stubs/kyrodb_pb2_grpc.py /home/app/ann_benchmarks/algor
 
 # Copy KyroDB server binary
 COPY --from=builder /src/kyrodb/target/release/kyrodb_server /usr/local/bin/kyrodb_server
+
+# Safety net: ensure the algorithm folder itself is importable as a top-level
+# module so any remaining absolute imports resolve.
+ENV PYTHONPATH=/home/app/ann_benchmarks/algorithms/kyrodb:${PYTHONPATH}
 
 ENV KYRODB_HOST=127.0.0.1
 ENV KYRODB_PORT=50051

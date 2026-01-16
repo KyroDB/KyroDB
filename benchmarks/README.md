@@ -116,8 +116,8 @@ cp /path/to/KyroDB/benchmarks/ann-benchmarks/Dockerfile ann_benchmarks/algorithm
 cp /path/to/KyroDB/benchmarks/ann-benchmarks/module.py ann_benchmarks/algorithms/kyrodb/module.py
 cp /path/to/KyroDB/benchmarks/ann-benchmarks/__init__.py ann_benchmarks/algorithms/kyrodb/__init__.py
 cp /path/to/KyroDB/benchmarks/ann-benchmarks/config.yml ann_benchmarks/algorithms/kyrodb/config.yml
-cp /path/to/KyroDB/benchmarks/ann-benchmarks/kyrodb_pb2.py ann_benchmarks/algorithms/kyrodb/kyrodb_pb2.py
-cp /path/to/KyroDB/benchmarks/ann-benchmarks/kyrodb_pb2_grpc.py ann_benchmarks/algorithms/kyrodb/kyrodb_pb2_grpc.py
+
+# Note: protobuf stubs are generated during the Docker build from KyroDB's proto.
 
 # Build image (NOTE: ann-benchmarks install.py accepts --build-arg only once)
 python install.py --algorithm kyrodb \
