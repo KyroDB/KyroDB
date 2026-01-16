@@ -11,7 +11,7 @@
 # ============================================================================
 # Stage 1: Build KyroDB Server (from KyroDB git repo)
 # ============================================================================
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.80-bookworm AS builder
 
 ARG KYRODB_GIT
 ARG KYRODB_REF

@@ -123,6 +123,10 @@ export KYRODB_GIT="https://github.com/KyroDB/KyroDB.git"
 export KYRODB_REF="benchmark"
 python install.py --algorithm kyrodb \
     --build-arg KYRODB_GIT=$KYRODB_GIT KYRODB_REF=$KYRODB_REF
+
+# If Docker build fails with: "lock file version `4` was found"
+# you are using an older Rust/Cargo builder image. Use the updated
+# `benchmarks/ann-benchmarks/Dockerfile` which pins a newer Rust version.
 ```
 
 ### 4. Run Benchmarks
