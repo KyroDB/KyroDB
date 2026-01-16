@@ -105,10 +105,17 @@ def compute_recall(results: List[Tuple[int, float]], ground_truth: np.ndarray, k
 class KyroDBBenchmark:
     """KyroDB benchmark runner."""
     
-    def __init__(self, host: str = "localhost", port: int = 50051, metric: str = "euclidean"):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 50051,
+        metric: str = "euclidean",
+        ef_search: int = 0,
+    ):
         self.host = host
         self.port = port
         self.metric = metric
+        self.ef_search = int(ef_search)
         self._channel = None
         self._stub = None
 
@@ -135,9 +142,9 @@ class KyroDBBenchmark:
             # Check connection
             try:
                 self._stub.Health(kyrodb_pb2.HealthRequest())
-                print(f"✓ Connected to KyroDB at {self.host}:{self.port}")
+                print(f"Connected to KyroDB at {self.host}:{self.port}")
             except grpc.RpcError as e:
-                print(f"✗ Failed to connect to KyroDB at {self.host}:{self.port}")
+                print(f"Failed to connect to KyroDB at {self.host}:{self.port}")
                 print(f"  Error: {e.code()} - {e.details()}")
                 print(f"\nMake sure KyroDB server is running:")
                 print(f"  cargo run --release --bin kyrodb_server")
@@ -166,7 +173,7 @@ class KyroDBBenchmark:
             response = self._stub.BulkInsert(self._generate_insert_requests(vectors))
             if response.success:
                 elapsed = time.time() - start
-                print(f"✓ Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
+                print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
                 return
         except grpc.RpcError as e:
             print(f"  Bulk insert not available ({e.code()}), using individual inserts...")
@@ -185,7 +192,7 @@ class KyroDBBenchmark:
                 print(f"  {i+1:,}/{n_vectors:,} ({rate:,.0f} vec/s)")
                 
         elapsed = time.time() - start
-        print(f"✓ Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
+        print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
         
     def flush_to_hnsw(self):
         """Flush hot tier to HNSW cold tier for fast search.
@@ -201,18 +208,19 @@ class KyroDBBenchmark:
             response = self._stub.FlushHotTier(kyrodb_pb2.FlushRequest(force=True))
             elapsed = time.time() - start
             if response.success:
-                print(f"✓ Flushed {response.documents_flushed:,} documents to HNSW in {elapsed:.1f}s")
+                print(f"Flushed {response.documents_flushed:,} documents to HNSW in {elapsed:.1f}s")
             else:
-                print(f"✗ Flush failed: {response.error}")
+                print(f"Flush failed: {response.error}")
         except grpc.RpcError as e:
             elapsed = time.time() - start
-            print(f"✗ Flush RPC failed after {elapsed:.1f}s: {e.code()} - {e.details()}")
+            print(f"Flush RPC failed after {elapsed:.1f}s: {e.code()} - {e.details()}")
         
     def query(self, vector: np.ndarray, k: int) -> List[Tuple[int, float]]:
         """Query for k nearest neighbors."""
         request = kyrodb_pb2.SearchRequest(
             query_embedding=list(map(float, vector)),
             k=k,
+            ef_search=int(self.ef_search),
         )
         
         response = self._stub.Search(request)
@@ -272,6 +280,12 @@ def main():
     parser.add_argument("--k", type=int, default=10, help="Number of neighbors")
     parser.add_argument("--host", type=str, default="localhost", help="KyroDB host")
     parser.add_argument("--port", type=int, default=50051, help="KyroDB port")
+    parser.add_argument(
+        "--ef-search",
+        type=int,
+        default=0,
+        help="HNSW ef_search override (0 uses server default)",
+    )
     parser.add_argument("--max-queries", type=int, default=1000,
                         help="Maximum number of queries to run")
     parser.add_argument("--skip-index", action="store_true",
@@ -296,7 +310,7 @@ def main():
         neighbors = neighbors[:args.max_queries]
     
     # Run benchmark
-    benchmark = KyroDBBenchmark(host=args.host, port=args.port)
+    benchmark = KyroDBBenchmark(host=args.host, port=args.port, ef_search=args.ef_search)
     
     if not args.skip_index:
         benchmark.index(train)
@@ -324,7 +338,7 @@ def main():
     with open(output_file, 'w') as f:
         json.dump(output_data, f, indent=2)
         
-    print(f"\n✓ Results saved to {output_file}")
+    print(f"\nResults saved to {output_file}")
     
     # Print summary
     print("\n" + "="*60)

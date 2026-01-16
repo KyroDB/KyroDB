@@ -1,6 +1,7 @@
 ## Deprecated
 #
-# Upstream ann-benchmarks expects algorithm definitions in `config.yml`.
-# Keep this file only as a guardrail to prevent accidental use.
+# ann-benchmarks expects algorithm definitions in `config.yml`.
+# This file exists only to avoid silent confusion from older references.
 
-raise RuntimeError("Deprecated: use config.yml for ann-benchmarks")
+deprecated: true
+message: "Use config.yml (not config.yaml) for ann-benchmarks algorithm definitions."

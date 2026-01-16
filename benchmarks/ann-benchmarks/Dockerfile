@@ -11,7 +11,7 @@
 # ============================================================================
 # Stage 1: Build KyroDB Server (from KyroDB git repo)
 # ============================================================================
-FROM rust:1.80-bookworm AS builder
+FROM rust:1.86-bookworm AS builder
 
 ARG KYRODB_GIT
 ARG KYRODB_REF
@@ -19,6 +19,8 @@ ARG KYRODB_REF
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
+    pkg-config \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -26,10 +28,11 @@ WORKDIR /src
 # NOTE: ann-benchmarks builds algorithm images with context set to the ann-benchmarks repo.
 # We therefore clone KyroDB explicitly.
 RUN test -n "$KYRODB_GIT" || (echo "KYRODB_GIT build-arg is required" && exit 2)
-RUN if [ -n "$KYRODB_REF" ]; then \
-            git clone --depth 1 --branch "$KYRODB_REF" "$KYRODB_GIT" /src/kyrodb; \
-        else \
-            git clone --depth 1 "$KYRODB_GIT" /src/kyrodb; \
+RUN git clone --depth 1 "$KYRODB_GIT" /src/kyrodb \
+    && if [ -n "$KYRODB_REF" ]; then \
+            cd /src/kyrodb \
+            && git fetch --depth 1 origin "$KYRODB_REF" \
+            && git checkout --detach FETCH_HEAD; \
         fi
 
 WORKDIR /src/kyrodb

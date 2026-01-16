@@ -53,6 +53,10 @@ class KyroDB(BaseANN):
         self._stub: Optional[kyrodb_pb2_grpc.KyroDBServiceStub] = None
         self._server_proc: Optional[subprocess.Popen] = None
         self._data_dir: Optional[str] = None
+        self._server_stdout = None
+        self._server_stderr = None
+        self._server_stdout_path: Optional[str] = None
+        self._server_stderr_path: Optional[str] = None
 
         self._logger = logging.getLogger(__name__)
 
@@ -117,11 +121,16 @@ class KyroDB(BaseANN):
             env["KYRODB__HNSW__DISTANCE"],
         )
 
+        self._server_stdout_path = os.path.join(self._data_dir, "kyrodb_server.stdout.log")
+        self._server_stderr_path = os.path.join(self._data_dir, "kyrodb_server.stderr.log")
+        self._server_stdout = open(self._server_stdout_path, "wb")
+        self._server_stderr = open(self._server_stderr_path, "wb")
+
         self._server_proc = subprocess.Popen(
             ["kyrodb_server"],
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._server_stdout,
+            stderr=self._server_stderr,
         )
 
         # Wait for server readiness (best-effort) by probing gRPC channel connectivity.
@@ -137,6 +146,19 @@ class KyroDB(BaseANN):
                 last_err = e
                 time.sleep(0.2)
 
+        stderr_tail = None
+        if self._server_stderr_path is not None:
+            try:
+                with open(self._server_stderr_path, "rb") as f:
+                    data = f.read()
+                stderr_tail = data[-8192:].decode("utf-8", errors="replace")
+            except Exception:
+                stderr_tail = None
+
+        if stderr_tail:
+            raise RuntimeError(
+                f"kyrodb_server failed to become ready: {last_err}; stderr tail:\n{stderr_tail}"
+            )
         raise RuntimeError(f"kyrodb_server failed to become ready: {last_err}")
 
     def _generate_insert_requests(self, X: np.ndarray):
@@ -236,3 +258,15 @@ class KyroDB(BaseANN):
                     pass
             finally:
                 self._server_proc = None
+
+        try:
+            if self._server_stdout is not None:
+                self._server_stdout.close()
+        finally:
+            self._server_stdout = None
+
+        try:
+            if self._server_stderr is not None:
+                self._server_stderr.close()
+        finally:
+            self._server_stderr = None

@@ -82,7 +82,9 @@ pip install grpcio grpcio-tools numpy h5py matplotlib
 
 # Run all datasets
 for dataset in sift-128-euclidean glove-100-angular gist-960-euclidean; do
-    python benchmarks/run_benchmark.py --dataset $dataset --k 10 --ef-search 10,20,50,100,200,400,800
+    for ef in 10 20 50 100 200 400 800; do
+        python benchmarks/run_benchmark.py --dataset $dataset --k 10 --ef-search $ef
+    done
 done
 ```
 
@@ -103,7 +105,6 @@ cd ann-benchmarks
 
 ```bash
 mkdir -p ann_benchmarks/algorithms/kyrodb
-cp /path/to/KyroDB/benchmarks/ann-benchmarks/* ann_benchmarks/algorithms/kyrodb/
 ```
 
 ### 3. Build Docker Image
@@ -127,6 +128,11 @@ python install.py --algorithm kyrodb \
 # If Docker build fails with: "lock file version `4` was found"
 # you are using an older Rust/Cargo builder image. Use the updated
 # `benchmarks/ann-benchmarks/Dockerfile` which pins a newer Rust version.
+
+# If Docker build fails with:
+#   feature `edition2024` is required
+# your builder image is too old. `benchmarks/ann-benchmarks/Dockerfile` pins
+# a Rust toolchain new enough to build dependencies that have moved to Rust 2024.
 ```
 
 ### 4. Run Benchmarks
@@ -146,9 +152,9 @@ Submit a pull request to `erikbern/ann-benchmarks` with your algorithm.
 
 | Dataset   | Recall@10 | Target QPS | Current Status |
 | --------- | --------- | ---------- | -------------- |
-| SIFT-1M   | 0.95      | >15,000    | 🔄 Testing     |
-| GloVe-100 | 0.95      | >20,000    | 🔄 Testing     |
-| GIST-960  | 0.95      | >5,000     | 🔄 Testing     |
+| SIFT-1M   | 0.95      | >15,000    | Testing        |
+| GloVe-100 | 0.95      | >20,000    | Testing        |
+| GIST-960  | 0.95      | >5,000     | Testing        |
 
 ---
 
