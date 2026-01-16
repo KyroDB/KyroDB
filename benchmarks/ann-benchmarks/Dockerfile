@@ -43,13 +43,19 @@ RUN cargo build --release --locked --bin kyrodb_server
 # ============================================================================
 FROM ann-benchmarks
 
+# Copy algorithm wrapper + generated stubs into the image.
+# (ann-benchmarks builds algorithm images with build context set to this folder.)
+COPY . /home/app/ann_benchmarks/algorithms/kyrodb
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# KyroDB wrapper uses gRPC.
-RUN pip install --no-cache-dir grpcio==1.60.0
+# KyroDB wrapper uses gRPC and generated protobuf stubs.
+RUN pip install --no-cache-dir \
+    grpcio==1.60.0 \
+    protobuf==4.25.3
 
 COPY --from=builder /src/kyrodb/target/release/kyrodb_server /usr/local/bin/kyrodb_server
 
