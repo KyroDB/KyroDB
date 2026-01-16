@@ -98,6 +98,11 @@ class KyroDB(BaseANN):
         env.setdefault("KYRODB__PERSISTENCE__SNAPSHOT_INTERVAL_SECS", "0")
         env.setdefault("KYRODB__PERSISTENCE__FSYNC_POLICY", "none")
 
+        # ann-benchmarks expects single-CPU saturation; keep thread counts bounded.
+        env.setdefault("TOKIO_WORKER_THREADS", "1")
+        env.setdefault("RAYON_NUM_THREADS", "1")
+        env.setdefault("OMP_NUM_THREADS", "1")
+
         # Default HTTP port is grpc+1000. Keep it explicit to make health waits deterministic.
         env["KYRODB__SERVER__HTTP_PORT"] = str(self.port + 1000)
 

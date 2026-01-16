@@ -32,9 +32,9 @@ Results are saved to `benchmarks/results/` as JSON files.
 ```
 benchmarks/
 ├── ann-benchmarks/          # Files for ann-benchmarks integration
-│   ├── kyrodb.py           # BaseANN wrapper
-│   ├── config.yaml         # Parameter configurations
-│   ├── Dockerfile          # Docker build
+│   ├── module.py          # BaseANN wrapper (upstream-compatible)
+│   ├── config.yml         # ann-benchmarks algorithm definition
+│   ├── Dockerfile         # Docker build (upstream ann-benchmarks repo context)
 │   ├── kyrodb_pb2.py       # Generated gRPC stub
 │   └── kyrodb_pb2_grpc.py  # Generated gRPC stub
 ├── run_benchmark.py        # Local benchmark runner
@@ -109,11 +109,20 @@ cp /path/to/KyroDB/benchmarks/ann-benchmarks/* ann_benchmarks/algorithms/kyrodb/
 ### 3. Build Docker Image
 
 ```bash
-# Create Dockerfile entry
-cp ann_benchmarks/algorithms/kyrodb/Dockerfile install/Dockerfile.kyrodb
+# Copy KyroDB algorithm folder into ann-benchmarks
+mkdir -p ann_benchmarks/algorithms/kyrodb
+cp /path/to/KyroDB/benchmarks/ann-benchmarks/Dockerfile ann_benchmarks/algorithms/kyrodb/Dockerfile
+cp /path/to/KyroDB/benchmarks/ann-benchmarks/module.py ann_benchmarks/algorithms/kyrodb/module.py
+cp /path/to/KyroDB/benchmarks/ann-benchmarks/__init__.py ann_benchmarks/algorithms/kyrodb/__init__.py
+cp /path/to/KyroDB/benchmarks/ann-benchmarks/config.yml ann_benchmarks/algorithms/kyrodb/config.yml
+cp /path/to/KyroDB/benchmarks/ann-benchmarks/kyrodb_pb2.py ann_benchmarks/algorithms/kyrodb/kyrodb_pb2.py
+cp /path/to/KyroDB/benchmarks/ann-benchmarks/kyrodb_pb2_grpc.py ann_benchmarks/algorithms/kyrodb/kyrodb_pb2_grpc.py
 
-# Build
-python install.py --algorithm kyrodb
+# Build image (NOTE: ann-benchmarks install.py accepts --build-arg only once)
+export KYRODB_GIT="https://github.com/KyroDB/KyroDB.git"
+export KYRODB_REF="benchmark"
+python install.py --algorithm kyrodb \
+    --build-arg KYRODB_GIT=$KYRODB_GIT KYRODB_REF=$KYRODB_REF
 ```
 
 ### 4. Run Benchmarks
