@@ -73,10 +73,13 @@ RUN pip install --no-cache-dir \
     grpcio==1.60.0 \
     protobuf==4.25.3
 
-# Copy only the kyrodb algorithm folder from the ann-benchmarks repo context.
-# Do NOT `COPY .` here: the ann-benchmarks repo often contains large `data/` and
-# `results/` directories which bloat builds and cause avoidable failures.
-COPY ann_benchmarks/algorithms/kyrodb/ /home/app/ann_benchmarks/algorithms/kyrodb/
+# Copy algorithm files from the Docker build context.
+#
+# Important: ann-benchmarks' `install.py` may set the Docker build context to
+# `ann_benchmarks/algorithms/kyrodb/` (the algorithm folder itself). In that
+# case, paths like `ann_benchmarks/algorithms/kyrodb/...` do not exist within
+# the build context and the build fails.
+COPY . /home/app/ann_benchmarks/algorithms/kyrodb
 
 # Copy generated protobuf stubs
 COPY --from=builder /src/stubs/kyrodb_pb2.py /home/app/ann_benchmarks/algorithms/kyrodb/

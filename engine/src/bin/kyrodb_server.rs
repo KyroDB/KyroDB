@@ -718,6 +718,143 @@ impl KyroDbService for KyroDBServiceImpl {
         }))
     }
 
+    /// Bulk load directly to HNSW index (bypasses hot tier)
+    ///
+    /// This provides maximum indexing speed for benchmarks and data migrations.
+    /// Warning: Data is NOT persisted to WAL during load.
+    #[instrument(skip(self, request))]
+    async fn bulk_load_hnsw(
+        &self,
+        request: Request<tonic::Streaming<InsertRequest>>,
+    ) -> Result<Response<BulkLoadResponse>, Status> {
+        let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        let mut stream = request.into_inner();
+
+        // Collect all documents first (can't hold lock across stream)
+        let mut documents: Vec<(u64, Vec<f32>, std::collections::HashMap<String, String>)> =
+            Vec::new();
+        let mut validation_errors = 0u64;
+        let mut last_error = String::new();
+
+        info!("BulkLoadHnsw: starting to collect documents");
+
+        while let Some(req) = stream.message().await? {
+            // Validate doc_id
+            if req.doc_id < MIN_DOC_ID {
+                validation_errors += 1;
+                last_error = format!("Invalid doc_id: {} (must be >= {})", req.doc_id, MIN_DOC_ID);
+                continue;
+            }
+
+            // Validate embedding
+            if req.embedding.is_empty() {
+                validation_errors += 1;
+                last_error = format!("Empty embedding for doc_id {}", req.doc_id);
+                continue;
+            }
+
+            if req.embedding.len() > MAX_EMBEDDING_DIM {
+                validation_errors += 1;
+                last_error = format!(
+                    "Embedding dimension {} exceeds maximum {}",
+                    req.embedding.len(),
+                    MAX_EMBEDDING_DIM
+                );
+                continue;
+            }
+
+            // Map doc_id for multi-tenancy
+            let global_doc_id = match self.map_doc_id(tenant.as_ref(), req.doc_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    validation_errors += 1;
+                    last_error = e.message().to_string();
+                    continue;
+                }
+            };
+
+            // Build metadata with tenant info
+            let mut metadata = req.metadata;
+            if let Some(tenant) = &tenant {
+                metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
+                metadata.insert(
+                    "__tenant_idx__".to_string(),
+                    tenant.tenant_index.to_string(),
+                );
+            }
+            if !req.namespace.is_empty() {
+                metadata.insert("__namespace__".to_string(), req.namespace.clone());
+            }
+
+            documents.push((global_doc_id, req.embedding, metadata));
+        }
+
+        let collection_time = start.elapsed();
+        info!(
+            doc_count = documents.len(),
+            validation_errors,
+            collection_ms = collection_time.as_millis() as u64,
+            "BulkLoadHnsw: collected all documents, starting HNSW load"
+        );
+
+        if documents.is_empty() {
+            return Ok(Response::new(BulkLoadResponse {
+                success: validation_errors == 0,
+                error: if validation_errors > 0 {
+                    last_error
+                } else {
+                    String::new()
+                },
+                total_loaded: 0,
+                total_failed: validation_errors,
+                load_duration_ms: 0.0,
+                avg_insert_rate: 0.0,
+                peak_memory_bytes: 0,
+            }));
+        }
+
+        // Now bulk load to HNSW (single lock acquisition)
+        let engine = self.state.engine.write().await;
+        let result = engine.bulk_load_cold_tier(documents);
+
+        match result {
+            Ok((loaded, failed, duration_ms, rate)) => {
+                let total_time = start.elapsed();
+                info!(
+                    loaded,
+                    failed,
+                    validation_errors,
+                    duration_ms,
+                    rate_per_sec = rate,
+                    total_ms = total_time.as_millis() as u64,
+                    "BulkLoadHnsw: complete"
+                );
+
+                Ok(Response::new(BulkLoadResponse {
+                    success: failed == 0 && validation_errors == 0,
+                    error: if failed > 0 || validation_errors > 0 {
+                        format!(
+                            "Loaded {} docs; {} failed validation, {} failed insertion",
+                            loaded, validation_errors, failed
+                        )
+                    } else {
+                        String::new()
+                    },
+                    total_loaded: loaded,
+                    total_failed: failed + validation_errors,
+                    load_duration_ms: duration_ms,
+                    avg_insert_rate: rate,
+                    peak_memory_bytes: 0, // Could integrate sysinfo crate if needed
+                }))
+            }
+            Err(e) => {
+                error!(error = %e, "BulkLoadHnsw: failed");
+                Err(Status::internal(format!("Bulk load failed: {}", e)))
+            }
+        }
+    }
+
     #[instrument(skip(self, request))]
     async fn delete(
         &self,

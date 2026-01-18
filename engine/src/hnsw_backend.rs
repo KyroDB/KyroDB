@@ -662,6 +662,135 @@ impl HnswBackend {
         Ok(())
     }
 
+    /// Bulk insert documents directly into HNSW index.
+    ///
+    /// This method is optimized for loading large batches of vectors quickly:
+    /// - Acquires write locks once (not per-vector)
+    /// - Pre-allocates capacity for embeddings/metadata arrays
+    /// - Validates all dimensions upfront before inserting
+    /// - Logs progress for long-running operations
+    ///
+    /// # Parameters
+    /// - `documents`: Vector of (doc_id, embedding, metadata) tuples
+    ///
+    /// # Returns
+    /// - `Ok((loaded, failed))`: Tuple of successfully loaded and failed counts
+    ///
+    /// # Note
+    /// This bypasses the hot tier and WAL for maximum speed. Use for:
+    /// - Benchmarks
+    /// - Data migrations
+    /// - Initial data loading
+    ///
+    /// For production streaming inserts, use `insert()` instead.
+    #[instrument(level = "info", skip(self, documents), fields(batch_size = documents.len()))]
+    pub fn bulk_insert(
+        &self,
+        documents: Vec<(u64, Vec<f32>, HashMap<String, String>)>,
+    ) -> Result<(u64, u64)> {
+        use std::time::Instant;
+        use tracing::info;
+
+        if documents.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let start = Instant::now();
+        let total = documents.len();
+        
+        // Get expected dimension from first vector or from index
+        let expected_dim = if let Some((_, ref emb, _)) = documents.first() {
+            emb.len()
+        } else {
+            self.dimension()
+        };
+
+        // Validate all dimensions upfront (fail fast)
+        for (doc_id, embedding, _) in &documents {
+            if embedding.len() != expected_dim {
+                anyhow::bail!(
+                    "bulk_insert: embedding dimension mismatch for doc_id={}: expected {} found {}",
+                    doc_id,
+                    expected_dim,
+                    embedding.len()
+                );
+            }
+        }
+
+        // Find max doc_id for pre-allocation
+        let max_doc_id = documents.iter().map(|(id, _, _)| *id).max().unwrap_or(0) as usize;
+
+        // Acquire all write locks once
+        let mut index = self.index.write();
+        let mut embeddings = self.embeddings.write();
+        let mut metas = self.metadata.write();
+
+        // Pre-allocate capacity
+        if max_doc_id >= embeddings.len() {
+            embeddings.resize(max_doc_id + 1, vec![0.0; expected_dim]);
+            metas.resize(max_doc_id + 1, HashMap::new());
+        }
+
+        let mut loaded = 0u64;
+        let mut failed = 0u64;
+        let log_interval = std::cmp::max(total / 20, 10000); // Log every 5% or 10K
+
+        for (i, (doc_id, embedding, metadata)) in documents.into_iter().enumerate() {
+            let doc_id_usize = doc_id as usize;
+
+            // Ensure capacity for this specific doc_id
+            if doc_id_usize >= embeddings.len() {
+                embeddings.resize(doc_id_usize + 1, vec![0.0; expected_dim]);
+                metas.resize(doc_id_usize + 1, HashMap::new());
+            }
+
+            // Store embedding and metadata
+            embeddings[doc_id_usize] = embedding.clone();
+            metas[doc_id_usize] = metadata;
+
+            // Add to HNSW index
+            match index.add_vector(doc_id, &embedding) {
+                Ok(_) => loaded += 1,
+                Err(e) => {
+                    // Log first few failures, then throttle
+                    if failed < 10 {
+                        tracing::warn!(doc_id, error = %e, "bulk_insert: failed to add vector");
+                    }
+                    failed += 1;
+                }
+            }
+
+            // Progress logging
+            if (i + 1) % log_interval == 0 {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = (i + 1) as f64 / elapsed;
+                info!(
+                    progress = i + 1,
+                    total,
+                    rate_per_sec = rate as u64,
+                    "bulk_insert progress"
+                );
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let rate = if elapsed.as_secs_f64() > 0.0 {
+            loaded as f64 / elapsed.as_secs_f64()
+        } else {
+            loaded as f64
+        };
+
+        info!(
+            loaded,
+            failed,
+            elapsed_ms = elapsed.as_millis() as u64,
+            rate_per_sec = rate as u64,
+            "bulk_insert complete"
+        );
+
+        Ok((loaded, failed))
+    }
+
     /// Create snapshot (atomic file operation)
     ///
     /// This is called automatically when `snapshot_interval` is reached,

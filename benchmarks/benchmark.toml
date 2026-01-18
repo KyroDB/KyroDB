@@ -13,8 +13,8 @@ enabled = false
 [cache]
 # CRITICAL: hot_tier_hard_limit = capacity * 2
 # For 1M vectors: capacity = 1000000, hard_limit = 2000000
-capacity = 10000000          # 10M cache capacity -> 20M hot tier hard limit
-hot_tier_hard_limit = 20000000
+capacity = 2000000            # 2M cache capacity -> 4M hot tier hard limit
+hot_tier_hard_limit = 4000000
 strategy = "lru"             # Use simple LRU for benchmark consistency
 ttl_seconds = 3600           # 1 hour TTL
 
@@ -23,9 +23,9 @@ ttl_seconds = 3600           # 1 hour TTL
 # With 730GB RAM we can test up to 1B+ vectors
 max_elements = 2000000       # 2M vectors (2x SIFT dataset size)
 m = 16                       # Connections per node
-ef_construction = 200        # Build-time ef
+ef_construction = 64         # Lower for faster builds (still good recall)
 ef_search = 100              # Search-time ef
-dimension = 128              # SIFT-128 dimension (CRITICAL: must match dataset!)
+dimension = 128              # SIFT-128 dimension
 distance = "euclidean"       # SIFT uses L2 distance
 
 [persistence]

@@ -116,6 +116,13 @@ bench/*.svg
 bench/*.csv
 bench_server.log
 
+# Benchmark data (large files - DO NOT COMMIT)
+benchmarks/data/
+benchmark_data/
+*.hdf5
+*.wal
+*.npy
+
 # Docker
 .dockerignore
 

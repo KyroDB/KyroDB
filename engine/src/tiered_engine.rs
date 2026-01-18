@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Tiered engine statistics (Two-Level Cache Architecture)
 ///
@@ -1241,6 +1241,63 @@ impl TieredEngine {
         }
 
         Ok(success_count)
+    }
+
+    /// Bulk load documents directly into cold tier (HNSW index).
+    ///
+    /// This bypasses the hot tier entirely for maximum indexing speed.
+    /// Use for benchmarks, data migrations, and initial data loading.
+    ///
+    /// # Parameters
+    /// - `documents`: Vector of (doc_id, embedding, metadata) tuples
+    ///
+    /// # Returns
+    /// - `Ok((loaded, failed, duration_ms, rate))`: Load statistics
+    ///
+    /// # Warning
+    /// - Data is NOT written to WAL (not durable against crashes during load)
+    /// - Hot tier is NOT populated (no write caching)
+    /// - Best for benchmark scenarios where durability is not required
+    #[instrument(level = "info", skip(self, documents), fields(count = documents.len()))]
+    pub fn bulk_load_cold_tier(
+        &self,
+        documents: Vec<(u64, Vec<f32>, std::collections::HashMap<String, String>)>,
+    ) -> Result<(u64, u64, f32, f32)> {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let total = documents.len() as u64;
+
+        // Collect doc_ids for cache invalidation
+        let doc_ids: Vec<u64> = documents.iter().map(|(id, _, _)| *id).collect();
+
+        // Bulk insert into cold tier (HNSW)
+        let (loaded, failed) = self.cold_tier.bulk_insert(documents)?;
+
+        // Invalidate query cache for these doc_ids (if any were previously cached)
+        // This ensures queries see the new data
+        for doc_id in &doc_ids {
+            self.query_cache.invalidate_doc(*doc_id);
+        }
+
+        let elapsed = start.elapsed();
+        let duration_ms = elapsed.as_secs_f32() * 1000.0;
+        let rate = if elapsed.as_secs_f64() > 0.0 {
+            loaded as f32 / elapsed.as_secs_f32()
+        } else {
+            loaded as f32
+        };
+
+        info!(
+            total,
+            loaded,
+            failed,
+            duration_ms,
+            rate_per_sec = rate,
+            "bulk_load_cold_tier complete"
+        );
+
+        Ok((loaded, failed, duration_ms, rate))
     }
 
     /// Flush hot tier to cold tier (manual trigger)

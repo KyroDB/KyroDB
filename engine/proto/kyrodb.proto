@@ -21,6 +21,12 @@ service KyroDBService {
   // Throughput: 50K-100K docs/sec
   rpc BulkInsert(stream InsertRequest) returns (InsertResponse);
   
+  // Bulk load directly to HNSW index (bypasses hot tier)
+  // Use for benchmarks and data migrations - NOT for production traffic!
+  // This provides maximum indexing speed at the cost of no hot-tier caching.
+  // Warning: Data is only searchable after this call completes.
+  rpc BulkLoadHnsw(stream InsertRequest) returns (BulkLoadResponse);
+  
   // Delete a document by ID
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   
@@ -118,6 +124,27 @@ message InsertResponse {
   // Stats (for bulk insert)
   uint64 total_inserted = 5;
   uint64 total_failed = 6;
+}
+
+// Response for BulkLoadHnsw - detailed stats for bulk loading
+message BulkLoadResponse {
+  bool success = 1;
+  string error = 2;
+  
+  // Number of documents successfully loaded
+  uint64 total_loaded = 3;
+  
+  // Number of documents that failed to load
+  uint64 total_failed = 4;
+  
+  // Total duration of the load operation in milliseconds
+  float load_duration_ms = 5;
+  
+  // Average insertion rate (vectors per second)
+  float avg_insert_rate = 6;
+  
+  // Peak memory usage during load (bytes)
+  uint64 peak_memory_bytes = 7;
 }
 
 message DeleteRequest {

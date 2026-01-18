@@ -41,9 +41,9 @@ except ImportError:
     os.system("pip install grpcio")
     import grpc
 
-# Import generated stubs
-ann_bench_dir = Path(__file__).parent / "ann-benchmarks"
-sys.path.insert(0, str(ann_bench_dir))
+# Import generated stubs (from benchmarks/ directory, not ann-benchmarks/)
+bench_dir = Path(__file__).parent
+sys.path.insert(0, str(bench_dir))
 import kyrodb_pb2
 import kyrodb_pb2_grpc
 
@@ -161,24 +161,49 @@ class KyroDBBenchmark:
                 print(f"  Streaming {i+1}/{len(vectors)} vectors...")
                 
     def index(self, vectors: np.ndarray):
-        """Index vectors into KyroDB."""
+        """Index vectors into KyroDB.
+        
+        Uses BulkLoadHnsw API for direct HNSW indexing (fastest).
+        Falls back to BulkInsert + FlushHotTier if not available.
+        """
         self.connect()
         n_vectors = len(vectors)
         
         print(f"Indexing {n_vectors:,} vectors (dim={vectors.shape[1]})...")
         start = time.time()
         
-        # Try streaming bulk insert first
+        # Try BulkLoadHnsw first (bypasses hot tier, fastest)
+        try:
+            print("  Using BulkLoadHnsw (direct HNSW indexing)...")
+            response = self._stub.BulkLoadHnsw(self._generate_insert_requests(vectors))
+            elapsed = time.time() - start
+            
+            if response.success:
+                rate = response.avg_insert_rate if response.avg_insert_rate > 0 else n_vectors / elapsed
+                print(f"  Loaded {response.total_loaded:,} vectors in {response.load_duration_ms/1000:.1f}s ({rate:,.0f} vec/s)")
+                print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s (total including gRPC)")
+                return
+            else:
+                print(f"  BulkLoadHnsw failed: {response.error}")
+                # Fall through to legacy path
+        except grpc.RpcError as e:
+            print(f"  BulkLoadHnsw not available ({e.code()}), using legacy path...")
+        
+        # Legacy path: BulkInsert + FlushHotTier
         try:
             response = self._stub.BulkInsert(self._generate_insert_requests(vectors))
             if response.success:
+                elapsed_insert = time.time() - start
+                print(f"  Bulk inserted {n_vectors:,} vectors in {elapsed_insert:.1f}s")
+                # Now flush to HNSW
+                self.flush_to_hnsw()
                 elapsed = time.time() - start
                 print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
                 return
         except grpc.RpcError as e:
             print(f"  Bulk insert not available ({e.code()}), using individual inserts...")
         
-        # Fallback to individual inserts
+        # Fallback to individual inserts (slowest)
         for i, vec in enumerate(vectors):
             req = kyrodb_pb2.InsertRequest(
                 doc_id=i + 1,  # doc_id must be >= 1
@@ -193,6 +218,8 @@ class KyroDBBenchmark:
                 
         elapsed = time.time() - start
         print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
+        # Flush after individual inserts too
+        self.flush_to_hnsw()
         
     def flush_to_hnsw(self):
         """Flush hot tier to HNSW cold tier for fast search.
@@ -314,7 +341,8 @@ def main():
     
     if not args.skip_index:
         benchmark.index(train)
-        benchmark.flush_to_hnsw()  # Move data to HNSW for fast search
+        # Note: index() now uses BulkLoadHnsw which bypasses hot tier entirely
+        # No flush needed - data goes directly to HNSW
         
     results = benchmark.benchmark_queries(test, neighbors, args.k)
     

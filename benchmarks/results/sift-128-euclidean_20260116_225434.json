@@ -1,0 +1,16 @@
+{
+  "dataset": "sift-128-euclidean",
+  "k": 10,
+  "n_train": 1000000,
+  "n_queries": 1000,
+  "dimension": 128,
+  "timestamp": "20260116_225434",
+  "results": {
+    "recall": 0.9674,
+    "qps": 830.4942349779848,
+    "avg_latency_ms": 1.2041022777557373,
+    "p50_latency_ms": 1.2145042419433594,
+    "p99_latency_ms": 2.259318828582763,
+    "total_queries": 1000
+  }
+}
