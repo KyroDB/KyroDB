@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import urllib.request
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple
@@ -329,33 +330,47 @@ class KyroDBBenchmark:
 
             wall_start = time.time()
 
-            def do_one(idx: int):
+            # IMPORTANT: reuse one gRPC channel per worker thread.
+            # Creating a channel per query adds massive overhead and will dominate latency.
+            def run_batch(worker_indices: List[int]):
                 channel, stub = self._new_stub()
                 try:
-                    start = time.time()
-                    res = self.query_preconverted(stub, query_lists[idx], k)
-                    latency = time.time() - start
-                    return idx, res, latency
+                    out: List[Tuple[int, List[Tuple[int, float]], float]] = []
+                    for idx in worker_indices:
+                        start = time.time()
+                        res = self.query_preconverted(stub, query_lists[idx], k)
+                        latency = time.time() - start
+                        out.append((idx, res, latency))
+                    return out
                 finally:
                     channel.close()
 
+            # Split queries into roughly equal chunks; each worker issues requests sequentially,
+            # giving us ~concurrency in-flight requests overall.
+            n = len(query_lists)
+            chunk_size = int(math.ceil(n / concurrency))
+            chunks: List[List[int]] = [
+                list(range(i, min(i + chunk_size, n))) for i in range(0, n, chunk_size)
+            ]
+
             completed = 0
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = [executor.submit(do_one, i) for i in range(len(query_lists))]
+                futures = [executor.submit(run_batch, chunk) for chunk in chunks]
                 for fut in as_completed(futures):
-                    idx, result, latency = fut.result()
-                    recall = compute_recall(result, ground_truth[idx], k)
-                    recalls.append(recall)
-                    latencies_s.append(latency)
+                    batch = fut.result()
+                    for idx, result, latency in batch:
+                        recall = compute_recall(result, ground_truth[idx], k)
+                        recalls.append(recall)
+                        latencies_s.append(latency)
 
-                    completed += 1
-                    if completed % 500 == 0:
+                    completed += len(batch)
+                    if completed % 500 == 0 or completed == n:
                         avg_recall = float(np.mean(recalls))
                         avg_latency = float(np.mean(latencies_s)) * 1000
                         elapsed = time.time() - wall_start
                         wall_qps = completed / elapsed if elapsed > 0 else 0.0
                         print(
-                            f"  Completed {completed}/{len(query_lists)}: recall={avg_recall:.3f}, "
+                            f"  Completed {completed}/{n}: recall={avg_recall:.3f}, "
                             f"avg_latency={avg_latency:.2f}ms, wall_QPS={wall_qps:,.0f}"
                         )
 
