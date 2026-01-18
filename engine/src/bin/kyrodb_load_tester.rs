@@ -32,7 +32,7 @@ struct WorkerStats {
     latencies_ns: Vec<u64>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let config = parse_args()?;
 

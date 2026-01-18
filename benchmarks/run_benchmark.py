@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple
 
@@ -149,6 +150,20 @@ class KyroDBBenchmark:
                 print(f"\nMake sure KyroDB server is running:")
                 print(f"  cargo run --release --bin kyrodb_server")
                 sys.exit(1)
+
+    def _new_stub(self):
+        """Create a new gRPC stub.
+
+        For concurrent benchmarks, using a stub per worker thread avoids
+        contention and makes latency accounting clearer.
+        """
+        options = [
+            ('grpc.max_send_message_length', 100 * 1024 * 1024),
+            ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+        ]
+        channel = grpc.insecure_channel(f'{self.host}:{self.port}', options=options)
+        stub = kyrodb_pb2_grpc.KyroDBServiceStub(channel)
+        return channel, stub
     
     def _generate_insert_requests(self, vectors: np.ndarray):
         """Generator for streaming bulk insert."""
@@ -253,42 +268,105 @@ class KyroDBBenchmark:
         response = self._stub.Search(request)
         # Convert similarity score to distance (lower is better)
         return [(r.doc_id, self._score_to_distance(r.score)) for r in response.results]
+
+    def query_preconverted(self, stub, vector_list: List[float], k: int) -> List[Tuple[int, float]]:
+        """Query using a pre-converted python list of floats.
+
+        This removes numpy->python conversion cost from the per-request critical path
+        when running concurrent benchmarks.
+        """
+        request = kyrodb_pb2.SearchRequest(
+            query_embedding=vector_list,
+            k=k,
+            ef_search=int(self.ef_search),
+        )
+        response = stub.Search(request)
+        return [(r.doc_id, self._score_to_distance(r.score)) for r in response.results]
         
     def benchmark_queries(
         self,
         queries: np.ndarray,
         ground_truth: np.ndarray,
         k: int,
+        concurrency: int = 1,
     ) -> dict:
         """Run query benchmarks."""
         self.connect()
+
+        concurrency = int(concurrency)
+        if concurrency <= 0:
+            raise ValueError("concurrency must be >= 1")
         
-        print(f"\nRunning {len(queries)} queries (k={k})...")
+        print(f"\nRunning {len(queries)} queries (k={k}, concurrency={concurrency})...")
         
-        recalls = []
-        latencies = []
-        
-        for i, (query, gt) in enumerate(zip(queries, ground_truth)):
-            start = time.time()
-            result = self.query(query, k)
-            latency = time.time() - start
-            
-            recall = compute_recall(result, gt, k)
-            recalls.append(recall)
-            latencies.append(latency)
-            
-            if (i + 1) % 500 == 0:
-                avg_recall = np.mean(recalls)
-                avg_latency = np.mean(latencies) * 1000
-                qps = (i + 1) / sum(latencies)
-                print(f"  Query {i+1}/{len(queries)}: recall={avg_recall:.3f}, "
-                      f"latency={avg_latency:.2f}ms, QPS={qps:,.0f}")
-        
-        avg_recall = np.mean(recalls)
-        avg_latency = np.mean(latencies) * 1000
-        p50_latency = np.percentile(latencies, 50) * 1000
-        p99_latency = np.percentile(latencies, 99) * 1000
-        qps = 1.0 / np.mean(latencies)
+        recalls: List[float] = []
+        latencies_s: List[float] = []
+
+        # Concurrency=1 keeps the previous behavior for apples-to-apples comparisons.
+        if concurrency == 1:
+            for i, (query, gt) in enumerate(zip(queries, ground_truth)):
+                start = time.time()
+                result = self.query(query, k)
+                latency = time.time() - start
+
+                recall = compute_recall(result, gt, k)
+                recalls.append(recall)
+                latencies_s.append(latency)
+
+                if (i + 1) % 500 == 0:
+                    avg_recall = float(np.mean(recalls))
+                    avg_latency = float(np.mean(latencies_s)) * 1000
+                    qps = (i + 1) / sum(latencies_s)
+                    print(
+                        f"  Query {i+1}/{len(queries)}: recall={avg_recall:.3f}, "
+                        f"latency={avg_latency:.2f}ms, QPS={qps:,.0f}"
+                    )
+
+            wall_qps = 1.0 / float(np.mean(latencies_s))
+        else:
+            # Pre-convert queries to python lists once to reduce per-request overhead.
+            query_lists: List[List[float]] = [q.astype(np.float32).tolist() for q in queries]
+
+            wall_start = time.time()
+
+            def do_one(idx: int):
+                channel, stub = self._new_stub()
+                try:
+                    start = time.time()
+                    res = self.query_preconverted(stub, query_lists[idx], k)
+                    latency = time.time() - start
+                    return idx, res, latency
+                finally:
+                    channel.close()
+
+            completed = 0
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = [executor.submit(do_one, i) for i in range(len(query_lists))]
+                for fut in as_completed(futures):
+                    idx, result, latency = fut.result()
+                    recall = compute_recall(result, ground_truth[idx], k)
+                    recalls.append(recall)
+                    latencies_s.append(latency)
+
+                    completed += 1
+                    if completed % 500 == 0:
+                        avg_recall = float(np.mean(recalls))
+                        avg_latency = float(np.mean(latencies_s)) * 1000
+                        elapsed = time.time() - wall_start
+                        wall_qps = completed / elapsed if elapsed > 0 else 0.0
+                        print(
+                            f"  Completed {completed}/{len(query_lists)}: recall={avg_recall:.3f}, "
+                            f"avg_latency={avg_latency:.2f}ms, wall_QPS={wall_qps:,.0f}"
+                        )
+
+            wall_elapsed = time.time() - wall_start
+            wall_qps = len(query_lists) / wall_elapsed if wall_elapsed > 0 else 0.0
+
+        avg_recall = float(np.mean(recalls)) if recalls else 0.0
+        avg_latency = float(np.mean(latencies_s)) * 1000 if latencies_s else 0.0
+        p50_latency = float(np.percentile(latencies_s, 50)) * 1000 if latencies_s else 0.0
+        p99_latency = float(np.percentile(latencies_s, 99)) * 1000 if latencies_s else 0.0
+        qps = float(wall_qps)
         
         return {
             "recall": avg_recall,
@@ -315,6 +393,12 @@ def main():
     )
     parser.add_argument("--max-queries", type=int, default=1000,
                         help="Maximum number of queries to run")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of concurrent in-flight queries (threaded client).",
+    )
     parser.add_argument("--skip-index", action="store_true",
                         help="Skip indexing (assume data already loaded)")
     parser.add_argument("--output-dir", type=str, default="benchmarks/results",
@@ -344,7 +428,7 @@ def main():
         # Note: index() now uses BulkLoadHnsw which bypasses hot tier entirely
         # No flush needed - data goes directly to HNSW
         
-    results = benchmark.benchmark_queries(test, neighbors, args.k)
+    results = benchmark.benchmark_queries(test, neighbors, args.k, concurrency=args.concurrency)
     
     # Save results
     output_dir = Path(args.output_dir)
