@@ -302,6 +302,7 @@ class KyroDBBenchmark:
         
         recalls: List[float] = []
         latencies_s: List[float] = []
+        empty_results = 0
 
         # Concurrency=1 keeps the previous behavior for apples-to-apples comparisons.
         if concurrency == 1:
@@ -309,6 +310,9 @@ class KyroDBBenchmark:
                 start = time.time()
                 result = self.query(query, k)
                 latency = time.time() - start
+
+                if len(result) == 0:
+                    empty_results += 1
 
                 recall = compute_recall(result, gt, k)
                 recalls.append(recall)
@@ -359,6 +363,8 @@ class KyroDBBenchmark:
                 for fut in as_completed(futures):
                     batch = fut.result()
                     for idx, result, latency in batch:
+                        if len(result) == 0:
+                            empty_results += 1
                         recall = compute_recall(result, ground_truth[idx], k)
                         recalls.append(recall)
                         latencies_s.append(latency)
@@ -376,6 +382,14 @@ class KyroDBBenchmark:
 
             wall_elapsed = time.time() - wall_start
             wall_qps = len(query_lists) / wall_elapsed if wall_elapsed > 0 else 0.0
+
+        # Guardrail: If we're getting empty results, the server likely has no data loaded.
+        if empty_results == len(queries):
+            raise RuntimeError(
+                "All Search responses were empty. This usually means the server has no indexed data "
+                "(common when using --skip-index against a fresh data dir). Re-run without --skip-index "
+                "or start the server with the data_dir that contains your SIFT index/snapshot."
+            )
 
         avg_recall = float(np.mean(recalls)) if recalls else 0.0
         avg_latency = float(np.mean(latencies_s)) * 1000 if latencies_s else 0.0
