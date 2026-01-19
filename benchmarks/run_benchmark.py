@@ -290,6 +290,7 @@ class KyroDBBenchmark:
         ground_truth: np.ndarray,
         k: int,
         concurrency: int = 1,
+        bulk_search: bool = False,
     ) -> dict:
         """Run query benchmarks."""
         self.connect()
@@ -298,14 +299,55 @@ class KyroDBBenchmark:
         if concurrency <= 0:
             raise ValueError("concurrency must be >= 1")
         
-        print(f"\nRunning {len(queries)} queries (k={k}, concurrency={concurrency})...")
+        mode = "BulkSearch" if bulk_search else "Search"
+        print(f"\nRunning {len(queries)} queries (k={k}, concurrency={concurrency}, mode={mode})...")
         
         recalls: List[float] = []
         latencies_s: List[float] = []
         empty_results = 0
 
+        # BulkSearch mode: single streaming call, responses in request order.
+        if bulk_search:
+            query_lists: List[List[float]] = [q.astype(np.float32).tolist() for q in queries]
+
+            def request_iter():
+                for vec in query_lists:
+                    yield kyrodb_pb2.SearchRequest(
+                        query_embedding=vec,
+                        k=k,
+                        ef_search=int(self.ef_search),
+                    )
+
+            wall_start = time.time()
+            responses = self._stub.BulkSearch(request_iter())
+
+            for i, response in enumerate(responses):
+                start = time.time()
+                result = [(r.doc_id, self._score_to_distance(r.score)) for r in response.results]
+                latency = time.time() - start
+
+                if len(result) == 0:
+                    empty_results += 1
+
+                recall = compute_recall(result, ground_truth[i], k)
+                recalls.append(recall)
+                latencies_s.append(latency)
+
+                if (i + 1) % 500 == 0:
+                    avg_recall = float(np.mean(recalls))
+                    avg_latency = float(np.mean(latencies_s)) * 1000
+                    elapsed = time.time() - wall_start
+                    wall_qps = (i + 1) / elapsed if elapsed > 0 else 0.0
+                    print(
+                        f"  Completed {i+1}/{len(query_lists)}: recall={avg_recall:.3f}, "
+                        f"avg_latency={avg_latency:.2f}ms, wall_QPS={wall_qps:,.0f}"
+                    )
+
+            wall_elapsed = time.time() - wall_start
+            wall_qps = len(query_lists) / wall_elapsed if wall_elapsed > 0 else 0.0
+
         # Concurrency=1 keeps the previous behavior for apples-to-apples comparisons.
-        if concurrency == 1:
+        elif concurrency == 1:
             for i, (query, gt) in enumerate(zip(queries, ground_truth)):
                 start = time.time()
                 result = self.query(query, k)
@@ -428,6 +470,11 @@ def main():
         default=1,
         help="Number of concurrent in-flight queries (threaded client).",
     )
+    parser.add_argument(
+        "--bulk-search",
+        action="store_true",
+        help="Use gRPC BulkSearch streaming API to reduce per-query overhead.",
+    )
     parser.add_argument("--skip-index", action="store_true",
                         help="Skip indexing (assume data already loaded)")
     parser.add_argument("--output-dir", type=str, default="benchmarks/results",
@@ -457,7 +504,13 @@ def main():
         # Note: index() now uses BulkLoadHnsw which bypasses hot tier entirely
         # No flush needed - data goes directly to HNSW
         
-    results = benchmark.benchmark_queries(test, neighbors, args.k, concurrency=args.concurrency)
+    results = benchmark.benchmark_queries(
+        test,
+        neighbors,
+        args.k,
+        concurrency=args.concurrency,
+        bulk_search=args.bulk_search,
+    )
     
     # Save results
     output_dir = Path(args.output_dir)
