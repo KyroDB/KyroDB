@@ -319,12 +319,15 @@ class KyroDBBenchmark:
                     )
 
             wall_start = time.time()
+            last_response_time = wall_start
             responses = self._stub.BulkSearch(request_iter())
 
             for i, response in enumerate(responses):
-                start = time.time()
+                now = time.time()
+                response_gap = now - last_response_time
+                last_response_time = now
                 result = [(r.doc_id, self._score_to_distance(r.score)) for r in response.results]
-                latency = time.time() - start
+                latency = response_gap
 
                 if len(result) == 0:
                     empty_results += 1
