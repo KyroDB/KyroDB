@@ -420,7 +420,12 @@ impl KyroDBServiceImpl {
         };
 
         let mut final_results = Vec::new();
+        final_results.reserve(req.k as usize);
         let mut candidates = results.into_iter();
+
+        // Metadata fetch is only required when we need it for correctness (tenancy/namespace/filtering).
+        // For pure ANN benchmarking workloads, skipping metadata avoids significant overhead.
+        let needs_metadata = tenant.is_some() || has_namespace || req.filter.is_some();
 
         // Iterate candidates until we fill k results or run out
         while final_results.len() < req.k as usize {
@@ -441,33 +446,39 @@ impl KyroDBServiceImpl {
                 continue;
             }
 
-            // Fetch metadata (needed for filtering and/or response)
-            let metadata = engine.get_metadata(candidate.doc_id).unwrap_or_default();
+            let metadata = if needs_metadata {
+                // Fetch metadata only when required for correctness.
+                let metadata = engine.get_metadata(candidate.doc_id).unwrap_or_default();
 
-            if let Some(tenant) = tenant {
-                let expected = tenant.tenant_index.to_string();
-                if metadata.get("__tenant_idx__") != Some(&expected) {
-                    continue;
+                if let Some(tenant) = tenant {
+                    let expected = tenant.tenant_index.to_string();
+                    if metadata.get("__tenant_idx__") != Some(&expected) {
+                        continue;
+                    }
                 }
-            }
 
-            // Filter by namespace if specified
-            if has_namespace {
-                let doc_namespace = metadata
-                    .get("__namespace__")
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if doc_namespace != req.namespace {
-                    continue;
+                // Filter by namespace if specified
+                if has_namespace {
+                    let doc_namespace = metadata
+                        .get("__namespace__")
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    if doc_namespace != req.namespace {
+                        continue;
+                    }
                 }
-            }
 
-            // Apply metadata filter if present
-            if let Some(filter) = &req.filter {
-                if !kyrodb_engine::metadata_filter::matches(filter, &metadata) {
-                    continue;
+                // Apply metadata filter if present
+                if let Some(filter) = &req.filter {
+                    if !kyrodb_engine::metadata_filter::matches(filter, &metadata) {
+                        continue;
+                    }
                 }
-            }
+
+                metadata
+            } else {
+                std::collections::HashMap::new()
+            };
 
             // Fetch embedding if requested (expensive)
             let embedding = if req.include_embeddings {
@@ -491,9 +502,10 @@ impl KyroDBServiceImpl {
 
         let latency_ms = latency_ns as f64 / 1_000_000.0;
 
+        let total_found = final_results.len() as u32;
         Ok(SearchResponse {
-            results: final_results.clone(),
-            total_found: final_results.len() as u32,
+            results: final_results,
+            total_found,
             search_latency_ms: latency_ms as f32,
             search_path: search_response::SearchPath::Unknown as i32,
             error: String::new(),
