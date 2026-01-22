@@ -162,7 +162,11 @@ impl TenantIdMapper {
         let map_snapshot = map.clone();
         let path = self.path.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(move || Self::persist_map_atomic(&path, &map_snapshot));
+            handle.spawn_blocking(move || {
+                if let Err(e) = Self::persist_map_atomic(&path, &map_snapshot) {
+                    tracing::error!(error = %e, "Failed to persist tenant map asynchronously");
+                }
+            });
         } else {
             Self::persist_map_atomic(&path, &map_snapshot)?;
         }
@@ -752,6 +756,11 @@ impl KyroDbService for KyroDBServiceImpl {
         info!("BulkLoadHnsw: starting to collect documents");
 
         while let Some(req) = stream.message().await? {
+            if documents.len() >= MAX_BATCH_SIZE {
+                validation_errors += 1;
+                last_error = format!("Batch size exceeds maximum {}", MAX_BATCH_SIZE);
+                break;
+            }
             // Validate doc_id
             if req.doc_id < MIN_DOC_ID {
                 validation_errors += 1;

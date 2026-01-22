@@ -154,10 +154,18 @@ impl RateLimiter {
                 if bucket_capacity != max_qps {
                     // Defensive: never panic on a misconfiguration; continue using the existing bucket.
                     // This mismatch should be impossible in normal operation.
+                    #[cfg(debug_assertions)]
                     debug_assert_eq!(
                         bucket_capacity, max_qps,
                         "Rate limit mismatch for tenant {}: existing capacity {}, requested {}",
                         tenant_id, bucket_capacity, max_qps
+                    );
+                    #[cfg(not(debug_assertions))]
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        existing_capacity = bucket_capacity,
+                        requested_qps = max_qps,
+                        "Rate limit mismatch: using existing bucket capacity"
                     );
                 }
 

@@ -14,12 +14,17 @@ cargo run --release --bin kyrodb_server
 ### 2. Run Local Benchmarks
 
 ```bash
-# Install dependencies
-pip install grpcio grpcio-tools numpy h5py
+# Install dependencies (pinned for reproducibility)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r benchmarks/requirements.txt
 
 # Run on SIFT-128 dataset
 python benchmarks/run_benchmark.py --dataset sift-128-euclidean --k 10
 ```
+
+Notes:
+- The running `kyrodb_server` must be configured with the correct embedding dimension and distance metric for the dataset.
+- The benchmark runner records dataset SHA-256 and basic environment metadata into the result JSON.
 
 ### 3. View Results
 
@@ -31,12 +36,11 @@ Results are saved to `benchmarks/results/` as JSON files.
 
 ```
 benchmarks/
+├── _generated/             # Generated Python gRPC stubs (auto; ignored by git)
 ├── ann-benchmarks/          # Files for ann-benchmarks integration
 │   ├── module.py          # BaseANN wrapper (upstream-compatible)
 │   ├── config.yml         # ann-benchmarks algorithm definition
 │   ├── Dockerfile         # Docker build (upstream ann-benchmarks repo context)
-│   ├── kyrodb_pb2.py       # Generated gRPC stub
-│   └── kyrodb_pb2_grpc.py  # Generated gRPC stub
 ├── run_benchmark.py        # Local benchmark runner
 ├── data/                   # Downloaded datasets (auto-created)
 └── results/                # Benchmark results (auto-created)
@@ -46,6 +50,14 @@ benchmarks/
 
 ## Running on Azure VM
 
+For a repeatable, VM-ready end-to-end suite (dataset × ef_search × concurrency), use:
+
+```bash
+bash benchmarks/scripts/vm_ann_suite.sh
+```
+
+Protocol details and reporting expectations are in `benchmarks/VM_BENCHMARK_PROTOCOL.md`.
+
 ### 1. Setup VM (Standard FX32ms v2)
 
 ```bash
@@ -53,7 +65,7 @@ benchmarks/
 ssh azureuser@<vm-ip>
 
 # Clone repository
-git clone https://github.com/<your-org>/KyroDB.git -b benchmark
+git clone https://github.com/vatskishan03/KyroDB.git -b benchmark
 cd KyroDB
 
 # Install Rust
@@ -77,15 +89,12 @@ taskset -c 0-15 ./target/release/kyrodb_server --config benchmarks/benchmark.tom
 ### 3. Run Benchmarks
 
 ```bash
-# Install Python deps
-pip install grpcio grpcio-tools numpy h5py matplotlib
+# Install Python deps (pinned for reproducibility)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r benchmarks/requirements.txt
 
-# Run all datasets
-for dataset in sift-128-euclidean glove-100-angular gist-960-euclidean; do
-    for ef in 10 20 50 100 200 400 800; do
-        python benchmarks/run_benchmark.py --dataset $dataset --k 10 --ef-search $ef
-    done
-done
+# Run the canonical suite (dataset × ef_search × concurrency)
+bash benchmarks/scripts/vm_ann_suite.sh
 ```
 
 ---
@@ -119,7 +128,8 @@ cp /path/to/KyroDB/benchmarks/ann-benchmarks/config.yml ann_benchmarks/algorithm
 
 # Note: protobuf stubs are generated during the Docker build from KyroDB's proto.
 
-# Build image (NOTE: ann-benchmarks install.py accepts --build-arg only once)
+# Build image (NOTE: ann-benchmarks install.py accepts --build-arg only once
+# and expects multiple KEY=VALUE pairs after that single flag)
 python install.py --algorithm kyrodb \
     --build-arg KYRODB_GIT=https://github.com/KyroDB/KyroDB.git KYRODB_REF=benchmark
 

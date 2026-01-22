@@ -109,10 +109,12 @@ class KyroDB(BaseANN):
         env.setdefault("KYRODB__PERSISTENCE__SNAPSHOT_INTERVAL_SECS", "0")
         env.setdefault("KYRODB__PERSISTENCE__FSYNC_POLICY", "none")
 
-        # ann-benchmarks expects single-CPU saturation; keep thread counts bounded.
-        env.setdefault("TOKIO_WORKER_THREADS", "1")
-        env.setdefault("RAYON_NUM_THREADS", "1")
-        env.setdefault("OMP_NUM_THREADS", "1")
+        # Keep thread counts bounded and explicit for reproducibility.
+        # Allow overrides via KYRODB_BENCH_THREADS.
+        threads = env.get("KYRODB_BENCH_THREADS", "1")
+        env.setdefault("TOKIO_WORKER_THREADS", threads)
+        env.setdefault("RAYON_NUM_THREADS", threads)
+        env.setdefault("OMP_NUM_THREADS", threads)
 
         # Default HTTP port is grpc+1000. Keep it explicit to make health waits deterministic.
         env["KYRODB__SERVER__HTTP_PORT"] = str(self.port + 1000)
@@ -131,14 +133,19 @@ class KyroDB(BaseANN):
         self._server_stdout_path = os.path.join(self._data_dir, "kyrodb_server.stdout.log")
         self._server_stderr_path = os.path.join(self._data_dir, "kyrodb_server.stderr.log")
         self._server_stdout = open(self._server_stdout_path, "wb")
-        self._server_stderr = open(self._server_stderr_path, "wb")
-
-        self._server_proc = subprocess.Popen(
-            ["kyrodb_server"],
-            env=env,
-            stdout=self._server_stdout,
-            stderr=self._server_stderr,
-        )
+        try:
+            self._server_stderr = open(self._server_stderr_path, "wb")
+            self._server_proc = subprocess.Popen(
+                ["kyrodb_server"],
+                env=env,
+                stdout=self._server_stdout,
+                stderr=self._server_stderr,
+            )
+        except Exception:
+            self._server_stdout.close()
+            if self._server_stderr is not None:
+                self._server_stderr.close()
+            raise
 
         # Wait for server readiness (best-effort) by probing gRPC channel connectivity.
         deadline = time.time() + 30.0
@@ -180,7 +187,26 @@ class KyroDB(BaseANN):
         self._connect()
         assert self._stub is not None
 
+        # Prefer BulkLoadHnsw for benchmark ingestion (bypasses hot tier, avoids flush).
         start = time.time()
+        try:
+            resp = self._stub.BulkLoadHnsw(self._generate_insert_requests(X))
+            if not resp.success:
+                raise RuntimeError(resp.error)
+            elapsed = time.time() - start
+            self._logger.info(
+                "BulkLoadHnsw complete: n=%d dim=%d seconds=%.2f rate=%.0f vec/s",
+                len(X),
+                X.shape[1],
+                elapsed,
+                float(getattr(resp, "avg_insert_rate", 0.0) or 0.0),
+            )
+            return
+        except grpc.RpcError as e:
+            self._logger.info("BulkLoadHnsw unavailable (%s); falling back to BulkInsert+Flush", e.code())
+        except Exception as e:
+            self._logger.info("BulkLoadHnsw failed (%s); falling back to BulkInsert+Flush", e)
+
         response = self._stub.BulkInsert(self._generate_insert_requests(X))
         if not response.success:
             raise RuntimeError(f"BulkInsert failed: {response.error}")
@@ -188,7 +214,6 @@ class KyroDB(BaseANN):
         elapsed = time.time() - start
         self._logger.info("BulkInsert complete: n=%d dim=%d seconds=%.2f", len(X), X.shape[1], elapsed)
 
-        # Ensure data is searchable via HNSW (cold tier) before benchmark queries.
         flush = self._stub.FlushHotTier(kyrodb_pb2.FlushRequest(force=True))
         if not flush.success:
             raise RuntimeError(f"FlushHotTier failed: {flush.error}")

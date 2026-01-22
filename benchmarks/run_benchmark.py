@@ -20,9 +20,12 @@ import sys
 import time
 import urllib.request
 import math
+import hashlib
+import platform
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -32,32 +35,112 @@ sys.path.insert(0, str(Path(__file__).parent / "ann-benchmarks"))
 try:
     import h5py
 except ImportError:
-    print("Installing h5py...")
-    os.system("pip install h5py")
-    import h5py
+    raise SystemExit(
+        "Missing dependency 'h5py'. Install benchmark dependencies with: "
+        "pip install -r benchmarks/requirements.txt"
+    )
 
 try:
     import grpc
 except ImportError:
-    print("Installing grpcio...")
-    os.system("pip install grpcio")
-    import grpc
+    raise SystemExit(
+        "Missing dependency 'grpcio'. Install benchmark dependencies with: "
+        "pip install -r benchmarks/requirements.txt"
+    )
 
 # Import generated stubs (from benchmarks/ directory, not ann-benchmarks/)
 bench_dir = Path(__file__).parent
+generated_dir = bench_dir / "_generated"
+if not (generated_dir / "kyrodb_pb2.py").exists() or not (generated_dir / "kyrodb_pb2_grpc.py").exists():
+    # Generate stubs deterministically from the repo proto.
+    gen_script = bench_dir / "scripts" / "gen_grpc_stubs.py"
+    if not gen_script.exists():
+        raise SystemExit(f"Missing stub generator: {gen_script}")
+    proc = subprocess.run(
+        [sys.executable, str(gen_script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(f"Failed to generate gRPC stubs:\n{proc.stdout}")
+
 sys.path.insert(0, str(bench_dir))
-import kyrodb_pb2
-import kyrodb_pb2_grpc
+
+# Import generated stubs as a package so relative imports inside the generated
+# files work correctly (kyrodb_pb2_grpc.py imports kyrodb_pb2).
+from _generated import kyrodb_pb2  # type: ignore
+from _generated import kyrodb_pb2_grpc  # type: ignore
 
 
 # Dataset URLs (from ann-benchmarks)
 DATASETS = {
-    "sift-128-euclidean": "http://ann-benchmarks.com/sift-128-euclidean.hdf5",
-    "glove-100-angular": "http://ann-benchmarks.com/glove-100-angular.hdf5",
-    "gist-960-euclidean": "http://ann-benchmarks.com/gist-960-euclidean.hdf5",
-    "mnist-784-euclidean": "http://ann-benchmarks.com/mnist-784-euclidean.hdf5",
-    "fashion-mnist-784-euclidean": "http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5",
+    # Prefer https; keep http fallback for environments where TLS is blocked.
+    "sift-128-euclidean": "https://ann-benchmarks.com/sift-128-euclidean.hdf5",
+    "glove-100-angular": "https://ann-benchmarks.com/glove-100-angular.hdf5",
+    "gist-960-euclidean": "https://ann-benchmarks.com/gist-960-euclidean.hdf5",
+    "mnist-784-euclidean": "https://ann-benchmarks.com/mnist-784-euclidean.hdf5",
+    "fashion-mnist-784-euclidean": "https://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5",
 }
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _run_capture(cmd: List[str], timeout_s: float = 5.0) -> Optional[str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_s,
+            check=False,
+            text=True,
+        )
+        out = (proc.stdout or "").strip()
+        return out if out else None
+    except Exception:
+        return None
+
+
+def _collect_metadata(
+    *,
+    dataset_name: str,
+    dataset_url: str,
+    dataset_path: Path,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    return {
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "dataset": {
+            "name": dataset_name,
+            "url": dataset_url,
+            "path": str(dataset_path),
+            "size_bytes": dataset_path.stat().st_size if dataset_path.exists() else None,
+            "sha256": _sha256_file(dataset_path) if dataset_path.exists() else None,
+        },
+        "client": {
+            "python": sys.version,
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+            },
+            "git_commit": _run_capture(["git", "rev-parse", "HEAD"]),
+            "grpc_target": f"{args.host}:{args.port}",
+            "concurrency": int(args.concurrency),
+            "bulk_search": bool(args.bulk_search),
+            "warmup_queries": int(args.warmup_queries),
+            "repetitions": int(args.repetitions),
+            "max_queries": int(args.max_queries),
+        },
+    }
 
 
 def download_dataset(name: str, data_dir: Path) -> Path:
@@ -74,7 +157,13 @@ def download_dataset(name: str, data_dir: Path) -> Path:
         raise ValueError(f"Unknown dataset: {name}. Available: {list(DATASETS.keys())}")
     
     print(f"Downloading {name} from {url}...")
-    urllib.request.urlretrieve(url, filepath)
+    try:
+        urllib.request.urlretrieve(url, filepath)
+    except Exception:
+        # Fallback to http for older environments.
+        http_url = url.replace("https://", "http://", 1)
+        print(f"  HTTPS download failed; retrying via HTTP: {http_url}")
+        urllib.request.urlretrieve(http_url, filepath)
     print(f"Downloaded to {filepath}")
     return filepath
 
@@ -291,8 +380,17 @@ class KyroDBBenchmark:
         k: int,
         concurrency: int = 1,
         bulk_search: bool = False,
+        warmup_queries: int = 0,
+        repetitions: int = 1,
     ) -> dict:
-        """Run query benchmarks."""
+        """Run query benchmarks.
+
+        Notes on measurement:
+        - Uses perf_counter for timing (monotonic, high resolution).
+        - Reports wall-clock QPS for all modes for consistency.
+        - In BulkSearch mode, per-query latencies are not directly observable
+          (responses are streamed); we report response gaps as an approximation.
+        """
         self.connect()
 
         concurrency = int(concurrency)
@@ -300,156 +398,187 @@ class KyroDBBenchmark:
             raise ValueError("concurrency must be >= 1")
         
         mode = "BulkSearch" if bulk_search else "Search"
-        print(f"\nRunning {len(queries)} queries (k={k}, concurrency={concurrency}, mode={mode})...")
-        
-        recalls: List[float] = []
-        latencies_s: List[float] = []
-        empty_results = 0
 
-        # BulkSearch mode: single streaming call, responses in request order.
-        if bulk_search:
-            query_lists: List[List[float]] = [q.astype(np.float32).tolist() for q in queries]
+        warmup_queries = max(0, int(warmup_queries))
+        repetitions = max(1, int(repetitions))
 
-            def request_iter():
-                for vec in query_lists:
-                    yield kyrodb_pb2.SearchRequest(
-                        query_embedding=vec,
-                        k=k,
-                        ef_search=int(self.ef_search),
-                    )
+        print(
+            f"\nRunning {len(queries)} queries (k={k}, concurrency={concurrency}, mode={mode}, "
+            f"warmup={warmup_queries}, repetitions={repetitions})..."
+        )
 
-            wall_start = time.time()
-            last_response_time = wall_start
-            responses = self._stub.BulkSearch(request_iter())
+        def run_once() -> Dict[str, Any]:
+            recalls: List[float] = []
+            latencies_s: List[float] = []
+            empty_results = 0
 
-            for i, response in enumerate(responses):
-                now = time.time()
-                response_gap = now - last_response_time
-                last_response_time = now
-                result = [(r.doc_id, self._score_to_distance(r.score)) for r in response.results]
-                latency = response_gap
+            # Warmup: run a small prefix of queries without recording.
+            if warmup_queries > 0:
+                warm_n = min(warmup_queries, len(queries))
+                for i in range(warm_n):
+                    _ = self.query(queries[i], k)
 
-                if len(result) == 0:
-                    empty_results += 1
+            # BulkSearch mode: single streaming call, responses in request order.
+            if bulk_search:
+                query_lists: List[List[float]] = [q.astype(np.float32).tolist() for q in queries]
 
-                recall = compute_recall(result, ground_truth[i], k)
-                recalls.append(recall)
-                latencies_s.append(latency)
+                def request_iter():
+                    for vec in query_lists:
+                        yield kyrodb_pb2.SearchRequest(
+                            query_embedding=vec,
+                            k=k,
+                            ef_search=int(self.ef_search),
+                        )
 
-                if (i + 1) % 500 == 0:
-                    avg_recall = float(np.mean(recalls))
-                    avg_latency = float(np.mean(latencies_s)) * 1000
-                    elapsed = time.time() - wall_start
-                    wall_qps = (i + 1) / elapsed if elapsed > 0 else 0.0
-                    print(
-                        f"  Completed {i+1}/{len(query_lists)}: recall={avg_recall:.3f}, "
-                        f"avg_latency={avg_latency:.2f}ms, wall_QPS={wall_qps:,.0f}"
-                    )
+                wall_start = time.perf_counter()
+                last_response_time = wall_start
+                responses = self._stub.BulkSearch(request_iter())
 
-            wall_elapsed = time.time() - wall_start
-            wall_qps = len(query_lists) / wall_elapsed if wall_elapsed > 0 else 0.0
+                for i, response in enumerate(responses):
+                    now = time.perf_counter()
+                    response_gap = now - last_response_time
+                    last_response_time = now
+                    result = [(r.doc_id, self._score_to_distance(r.score)) for r in response.results]
 
-        # Concurrency=1 keeps the previous behavior for apples-to-apples comparisons.
-        elif concurrency == 1:
-            for i, (query, gt) in enumerate(zip(queries, ground_truth)):
-                start = time.time()
-                result = self.query(query, k)
-                latency = time.time() - start
+                    if len(result) == 0:
+                        empty_results += 1
 
-                if len(result) == 0:
-                    empty_results += 1
+                    recall = compute_recall(result, ground_truth[i], k)
+                    recalls.append(recall)
+                    latencies_s.append(response_gap)
 
-                recall = compute_recall(result, gt, k)
-                recalls.append(recall)
-                latencies_s.append(latency)
+                    if (i + 1) % 500 == 0:
+                        avg_recall = float(np.mean(recalls))
+                        avg_gap_ms = float(np.mean(latencies_s)) * 1000
+                        elapsed = time.perf_counter() - wall_start
+                        wall_qps = (i + 1) / elapsed if elapsed > 0 else 0.0
+                        print(
+                            f"  Completed {i+1}/{len(query_lists)}: recall={avg_recall:.3f}, "
+                            f"avg_resp_gap={avg_gap_ms:.2f}ms, wall_QPS={wall_qps:,.0f}"
+                        )
 
-                if (i + 1) % 500 == 0:
-                    avg_recall = float(np.mean(recalls))
-                    avg_latency = float(np.mean(latencies_s)) * 1000
-                    qps = (i + 1) / sum(latencies_s)
-                    print(
-                        f"  Query {i+1}/{len(queries)}: recall={avg_recall:.3f}, "
-                        f"latency={avg_latency:.2f}ms, QPS={qps:,.0f}"
-                    )
+                wall_elapsed = time.perf_counter() - wall_start
+                wall_qps = len(query_lists) / wall_elapsed if wall_elapsed > 0 else 0.0
 
-            wall_qps = 1.0 / float(np.mean(latencies_s))
-        else:
-            # Pre-convert queries to python lists once to reduce per-request overhead.
-            query_lists: List[List[float]] = [q.astype(np.float32).tolist() for q in queries]
+            # Concurrency=1 (sequential): direct per-query latency.
+            elif concurrency == 1:
+                wall_start = time.perf_counter()
+                for i, (query, gt) in enumerate(zip(queries, ground_truth)):
+                    start = time.perf_counter()
+                    result = self.query(query, k)
+                    latency = time.perf_counter() - start
 
-            wall_start = time.time()
+                    if len(result) == 0:
+                        empty_results += 1
 
-            # IMPORTANT: reuse one gRPC channel per worker thread.
-            # Creating a channel per query adds massive overhead and will dominate latency.
-            def run_batch(worker_indices: List[int]):
-                channel, stub = self._new_stub()
-                try:
-                    out: List[Tuple[int, List[Tuple[int, float]], float]] = []
-                    for idx in worker_indices:
-                        start = time.time()
-                        res = self.query_preconverted(stub, query_lists[idx], k)
-                        latency = time.time() - start
-                        out.append((idx, res, latency))
-                    return out
-                finally:
-                    channel.close()
+                    recall = compute_recall(result, gt, k)
+                    recalls.append(recall)
+                    latencies_s.append(latency)
 
-            # Split queries into roughly equal chunks; each worker issues requests sequentially,
-            # giving us ~concurrency in-flight requests overall.
-            n = len(query_lists)
-            chunk_size = int(math.ceil(n / concurrency))
-            chunks: List[List[int]] = [
-                list(range(i, min(i + chunk_size, n))) for i in range(0, n, chunk_size)
-            ]
-
-            completed = 0
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = [executor.submit(run_batch, chunk) for chunk in chunks]
-                for fut in as_completed(futures):
-                    batch = fut.result()
-                    for idx, result, latency in batch:
-                        if len(result) == 0:
-                            empty_results += 1
-                        recall = compute_recall(result, ground_truth[idx], k)
-                        recalls.append(recall)
-                        latencies_s.append(latency)
-
-                    completed += len(batch)
-                    if completed % 500 == 0 or completed == n:
+                    if (i + 1) % 500 == 0:
                         avg_recall = float(np.mean(recalls))
                         avg_latency = float(np.mean(latencies_s)) * 1000
-                        elapsed = time.time() - wall_start
-                        wall_qps = completed / elapsed if elapsed > 0 else 0.0
+                        elapsed = time.perf_counter() - wall_start
+                        wall_qps = (i + 1) / elapsed if elapsed > 0 else 0.0
                         print(
-                            f"  Completed {completed}/{n}: recall={avg_recall:.3f}, "
+                            f"  Query {i+1}/{len(queries)}: recall={avg_recall:.3f}, "
                             f"avg_latency={avg_latency:.2f}ms, wall_QPS={wall_qps:,.0f}"
                         )
 
-            wall_elapsed = time.time() - wall_start
-            wall_qps = len(query_lists) / wall_elapsed if wall_elapsed > 0 else 0.0
+                wall_elapsed = time.perf_counter() - wall_start
+                wall_qps = len(queries) / wall_elapsed if wall_elapsed > 0 else 0.0
+            else:
+                # Pre-convert queries to python lists once to reduce per-request overhead.
+                query_lists = [q.astype(np.float32).tolist() for q in queries]
 
-        # Guardrail: If we're getting empty results, the server likely has no data loaded.
-        if empty_results == len(queries):
-            raise RuntimeError(
-                "All Search responses were empty. This usually means the server has no indexed data "
-                "(common when using --skip-index against a fresh data dir). Re-run without --skip-index "
-                "or start the server with the data_dir that contains your SIFT index/snapshot."
-            )
+                wall_start = time.perf_counter()
 
-        avg_recall = float(np.mean(recalls)) if recalls else 0.0
-        avg_latency = float(np.mean(latencies_s)) * 1000 if latencies_s else 0.0
-        p50_latency = float(np.percentile(latencies_s, 50)) * 1000 if latencies_s else 0.0
-        p99_latency = float(np.percentile(latencies_s, 99)) * 1000 if latencies_s else 0.0
-        qps = float(wall_qps)
-        
-        return {
-            "recall": avg_recall,
-            "qps": qps,
-            "avg_latency_ms": avg_latency,
-            "p50_latency_ms": p50_latency,
-            "p99_latency_ms": p99_latency,
+                # IMPORTANT: reuse one gRPC channel per worker thread.
+                def run_batch(worker_indices: List[int]):
+                    channel, stub = self._new_stub()
+                    try:
+                        out: List[Tuple[int, List[Tuple[int, float]], float]] = []
+                        for idx in worker_indices:
+                            start = time.perf_counter()
+                            res = self.query_preconverted(stub, query_lists[idx], k)
+                            latency = time.perf_counter() - start
+                            out.append((idx, res, latency))
+                        return out
+                    finally:
+                        channel.close()
+
+                n = len(query_lists)
+                chunk_size = int(math.ceil(n / concurrency))
+                chunks: List[List[int]] = [
+                    list(range(i, min(i + chunk_size, n))) for i in range(0, n, chunk_size)
+                ]
+
+                completed = 0
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    futures = [executor.submit(run_batch, chunk) for chunk in chunks]
+                    for fut in as_completed(futures):
+                        batch = fut.result()
+                        for idx, result, latency in batch:
+                            if len(result) == 0:
+                                empty_results += 1
+                            recall = compute_recall(result, ground_truth[idx], k)
+                            recalls.append(recall)
+                            latencies_s.append(latency)
+
+                        completed += len(batch)
+                        if completed % 500 == 0 or completed == n:
+                            avg_recall = float(np.mean(recalls))
+                            avg_latency = float(np.mean(latencies_s)) * 1000
+                            elapsed = time.perf_counter() - wall_start
+                            wall_qps = completed / elapsed if elapsed > 0 else 0.0
+                            print(
+                                f"  Completed {completed}/{n}: recall={avg_recall:.3f}, "
+                                f"avg_latency={avg_latency:.2f}ms, wall_QPS={wall_qps:,.0f}"
+                            )
+
+                wall_elapsed = time.perf_counter() - wall_start
+                wall_qps = n / wall_elapsed if wall_elapsed > 0 else 0.0
+
+            if empty_results == len(queries):
+                raise RuntimeError(
+                    "All Search responses were empty. This usually means the server has no indexed data "
+                    "(common when using --skip-index against a fresh data dir). Re-run without --skip-index "
+                    "or start the server with the data_dir that contains your index/snapshot."
+                )
+
+            avg_recall = float(np.mean(recalls)) if recalls else 0.0
+            avg_latency = float(np.mean(latencies_s)) * 1000 if latencies_s else 0.0
+            p50_latency = float(np.percentile(latencies_s, 50)) * 1000 if latencies_s else 0.0
+            p99_latency = float(np.percentile(latencies_s, 99)) * 1000 if latencies_s else 0.0
+            out: Dict[str, Any] = {
+                "recall": avg_recall,
+                "qps": float(wall_qps),
+                "avg_latency_ms": avg_latency,
+                "p50_latency_ms": p50_latency,
+                "p99_latency_ms": p99_latency,
+                "total_queries": len(queries),
+            }
+            if bulk_search:
+                out["latency_note"] = "BulkSearch latency is response-gap approximation (streaming)."
+            return out
+
+        per_run: List[Dict[str, Any]] = []
+        for r in range(repetitions):
+            if repetitions > 1:
+                print(f"\n--- Repetition {r+1}/{repetitions} ---")
+            per_run.append(run_once())
+
+        # Aggregate across runs (mean of per-run metrics).
+        agg = {
+            "recall": float(np.mean([x["recall"] for x in per_run])),
+            "qps": float(np.mean([x["qps"] for x in per_run])),
+            "avg_latency_ms": float(np.mean([x["avg_latency_ms"] for x in per_run])),
+            "p50_latency_ms": float(np.mean([x["p50_latency_ms"] for x in per_run])),
+            "p99_latency_ms": float(np.mean([x["p99_latency_ms"] for x in per_run])),
             "total_queries": len(queries),
+            "per_run": per_run,
         }
+        return agg
 
 
 def main():
@@ -457,7 +586,8 @@ def main():
     parser.add_argument("--dataset", type=str, default="sift-128-euclidean",
                         choices=list(DATASETS.keys()), help="Dataset to benchmark")
     parser.add_argument("--k", type=int, default=10, help="Number of neighbors")
-    parser.add_argument("--host", type=str, default="localhost", help="KyroDB host")
+    # Use an explicit IPv4 loopback default to avoid localhost->IPv6 issues on some VMs.
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="KyroDB host")
     parser.add_argument("--port", type=int, default=50051, help="KyroDB port")
     parser.add_argument(
         "--ef-search",
@@ -467,6 +597,18 @@ def main():
     )
     parser.add_argument("--max-queries", type=int, default=1000,
                         help="Maximum number of queries to run")
+    parser.add_argument(
+        "--warmup-queries",
+        type=int,
+        default=100,
+        help="Warmup queries to run (not measured).",
+    )
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=3,
+        help="Number of repeated query runs to reduce noise.",
+    )
     parser.add_argument(
         "--concurrency",
         type=int,
@@ -500,7 +642,32 @@ def main():
         neighbors = neighbors[:args.max_queries]
     
     # Run benchmark
-    benchmark = KyroDBBenchmark(host=args.host, port=args.port, ef_search=args.ef_search)
+    dataset_metric = "angular" if args.dataset.endswith("-angular") else "euclidean"
+    benchmark = KyroDBBenchmark(
+        host=args.host,
+        port=args.port,
+        metric=dataset_metric,
+        ef_search=args.ef_search,
+    )
+
+    # Best-effort: capture server-side config for traceability.
+    server_config: Optional[Dict[str, Any]] = None
+    try:
+        benchmark.connect()
+        resp = benchmark._stub.GetConfig(kyrodb_pb2.ConfigRequest())  # type: ignore[attr-defined]
+        server_config = {
+            "hot_tier_max_size": int(getattr(resp, "hot_tier_max_size", 0)),
+            "hot_tier_max_age_seconds": int(getattr(resp, "hot_tier_max_age_seconds", 0)),
+            "hnsw_max_elements": int(getattr(resp, "hnsw_max_elements", 0)),
+            "data_dir": getattr(resp, "data_dir", None),
+            "fsync_policy": getattr(resp, "fsync_policy", None),
+            "snapshot_interval": int(getattr(resp, "snapshot_interval", 0)),
+            "flush_interval_seconds": int(getattr(resp, "flush_interval_seconds", 0)),
+            "embedding_dimension": int(getattr(resp, "embedding_dimension", 0)),
+            "version": getattr(resp, "version", None),
+        }
+    except Exception:
+        server_config = None
     
     if not args.skip_index:
         benchmark.index(train)
@@ -513,22 +680,31 @@ def main():
         args.k,
         concurrency=args.concurrency,
         bulk_search=args.bulk_search,
+        warmup_queries=args.warmup_queries,
+        repetitions=args.repetitions,
     )
     
     # Save results
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     output_file = output_dir / f"{args.dataset}_{timestamp}.json"
-    
-    output_data = {
+
+    output_data: Dict[str, Any] = {
         "dataset": args.dataset,
         "k": args.k,
-        "n_train": len(train),
-        "n_queries": len(test),
-        "dimension": train.shape[1],
+        "n_train": int(len(train)),
+        "n_queries": int(len(test)),
+        "dimension": int(train.shape[1]),
         "timestamp": timestamp,
+        "metadata": _collect_metadata(
+            dataset_name=args.dataset,
+            dataset_url=DATASETS[args.dataset],
+            dataset_path=filepath,
+            args=args,
+        ),
+        "server_config": server_config,
         "results": results,
     }
     

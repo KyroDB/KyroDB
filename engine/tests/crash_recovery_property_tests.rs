@@ -77,7 +77,7 @@ mod crash_recovery_tests {
                 }
 
                 Ok(())
-            });
+            })?;
         }
 
         #[test]
@@ -148,7 +148,7 @@ mod crash_recovery_tests {
                     "Final offset mismatch after snapshot recovery");
 
                 Ok(())
-            });
+            })?;
         }
 
         #[test]
@@ -240,7 +240,7 @@ mod crash_recovery_tests {
                     compact_stats.before_bytes, compact_stats.after_bytes);
 
                 Ok(())
-            });
+            })?;
         }
     }
 

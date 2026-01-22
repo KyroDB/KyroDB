@@ -1274,8 +1274,13 @@ impl TieredEngine {
         // Bulk insert into cold tier (HNSW)
         let (loaded, failed) = self.cold_tier.bulk_insert(documents)?;
 
-        // Invalidate query cache for these doc_ids (if any were previously cached)
-        // This ensures queries see the new data
+        // Invalidate document cache (L1a) and query cache (L1b) for consistency
+        {
+            let cache = self.cache_strategy.write();
+            for doc_id in &doc_ids {
+                cache.invalidate(*doc_id);
+            }
+        }
         for doc_id in &doc_ids {
             self.query_cache.invalidate_doc(*doc_id);
         }

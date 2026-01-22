@@ -14,16 +14,13 @@ git pull origin benchmark
 
 # Install dependencies
 sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev python3-pip
-pip3 install grpcio grpcio-tools protobuf numpy h5py matplotlib
+pip3 install -r benchmarks/requirements.txt
 
 # Build release binary
 cargo build --release --bin kyrodb_server
 
 # Regenerate Python stubs
-python3 -m grpc_tools.protoc -Iengine/proto \
-    --python_out=benchmarks \
-    --grpc_python_out=benchmarks \
-    engine/proto/kyrodb.proto
+python3 benchmarks/scripts/gen_grpc_stubs.py
 ```
 
 ---
@@ -42,7 +39,7 @@ Based on analysis, here are the recommended HNSW parameters:
 
 ## Benchmark Commands for Each Scale
 
-### 1️⃣ 1M Vectors (SIFT-128) - ~15 min
+### 1M Vectors (SIFT-128) - ~15 min
 
 ```bash
 # Create optimized config for 1M
@@ -54,7 +51,11 @@ http_port = 51051
 
 [cache]
 capacity = 2000000
-hot_tier_hard_limit = 4000000
+strategy = "lru"
+enable_ab_testing = false
+enable_query_clustering = false
+enable_prefetching = false
+auto_tune_threshold = false
 
 [hnsw]
 m = 32                       # Optimized (was 16)
@@ -65,13 +66,15 @@ max_elements = 1500000
 distance = "euclidean"
 
 [persistence]
-enabled = true
 data_dir = "./data_1m"
-wal_fsync = "never"
-snapshot_interval = 1000000
+enable_wal = false
+fsync_policy = "none"
+snapshot_interval_secs = 0
+enable_recovery = true
+allow_fresh_start_on_recovery_failure = true
 
-[background]
-flush_interval_ms = 5000
+[logging]
+level = "warn"
 EOF
 
 # Clean and run
@@ -84,7 +87,9 @@ sleep 5
 python3 benchmarks/run_benchmark.py \
     --dataset sift-128-euclidean \
     --k 10 \
-    --ef-search 200
+    --ef-search 200 \
+    --warmup-queries 200 \
+    --repetitions 3
 
 # Stop server
 pkill -9 kyrodb_server
@@ -92,7 +97,7 @@ pkill -9 kyrodb_server
 
 ---
 
-### 2️⃣ 10M Vectors - ~2-3 hours
+### 10M Vectors - ~2-3 hours
 
 For 10M vectors, you need the **SIFT-10M** dataset or can use random vectors:
 
@@ -106,7 +111,11 @@ http_port = 51051
 
 [cache]
 capacity = 5000000
-hot_tier_hard_limit = 15000000
+strategy = "lru"
+enable_ab_testing = false
+enable_query_clustering = false
+enable_prefetching = false
+auto_tune_threshold = false
 
 [hnsw]
 m = 32
@@ -117,13 +126,15 @@ max_elements = 12000000
 distance = "euclidean"
 
 [persistence]
-enabled = true
 data_dir = "./data_10m"
-wal_fsync = "never"
-snapshot_interval = 5000000
+enable_wal = false
+fsync_policy = "none"
+snapshot_interval_secs = 0
+enable_recovery = true
+allow_fresh_start_on_recovery_failure = true
 
-[background]
-flush_interval_ms = 10000
+[logging]
+level = "warn"
 EOF
 
 # Clean and run
@@ -132,8 +143,8 @@ pkill -9 kyrodb_server 2>/dev/null || true
 RUST_LOG=warn ./target/release/kyrodb_server --config benchmark_10m.toml &
 sleep 5
 
-# For 10M, use deep-image dataset or random vectors
-# Option A: Use deep-image-96 (10M vectors, 96-dim)
+# Note: `benchmarks/run_benchmark.py` only downloads datasets listed in
+# `benchmarks/run_benchmark.py:DATASETS`.
 python3 benchmarks/run_benchmark.py \
     --dataset deep-image-96-angular \
     --k 10 \
@@ -145,7 +156,7 @@ pkill -9 kyrodb_server
 
 ---
 
-### 3️⃣ 100M Vectors - ~1 day
+### 100M Vectors - ~1 day
 
 ```bash
 # Create config for 100M (requires ~64GB+ RAM)
@@ -157,7 +168,11 @@ http_port = 51051
 
 [cache]
 capacity = 10000000
-hot_tier_hard_limit = 50000000
+strategy = "lru"
+enable_ab_testing = false
+enable_query_clustering = false
+enable_prefetching = false
+auto_tune_threshold = false
 
 [hnsw]
 m = 24                       # Lower M for memory efficiency
@@ -168,13 +183,15 @@ max_elements = 110000000
 distance = "euclidean"
 
 [persistence]
-enabled = true
 data_dir = "./data_100m"
-wal_fsync = "never"
-snapshot_interval = 10000000
+enable_wal = false
+fsync_policy = "none"
+snapshot_interval_secs = 0
+enable_recovery = true
+allow_fresh_start_on_recovery_failure = true
 
-[background]
-flush_interval_ms = 30000
+[logging]
+level = "warn"
 EOF
 
 # Clean and run
@@ -184,18 +201,41 @@ RUST_LOG=warn ./target/release/kyrodb_server --config benchmark_100m.toml &
 sleep 5
 
 # For 100M: Use SIFT-1B (subset) or generate random
-# Note: You'll need to generate/download this dataset separately
-python3 benchmarks/run_benchmark.py \
-    --dataset sift-128-euclidean \
-    --k 10 \
-    --ef-search 150
+# Dataset preparation (SIFT1B / BIGANN)
+# Download base/query/ground-truth files from IRISA TEXMEX:
+#   ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz
+#   ftp://ftp.irisa.fr/local/texmex/corpus/bigann_query.bvecs.gz
+#   ftp://ftp.irisa.fr/local/texmex/corpus/bigann_gnd.zip
+mkdir -p data_sift1b
+cd data_sift1b
+wget -c ftp://ftp.irisa.fr/local/texmex/corpus/bigann_base.bvecs.gz
+wget -c ftp://ftp.irisa.fr/local/texmex/corpus/bigann_query.bvecs.gz
+wget -c ftp://ftp.irisa.fr/local/texmex/corpus/bigann_gnd.zip
+gunzip -k bigann_base.bvecs.gz
+gunzip -k bigann_query.bvecs.gz
+unzip -o bigann_gnd.zip
+cd ..
+
+# NOTE: KyroDB's end-to-end benchmark runner expects an HDF5 dataset with
+# train/test/neighbors. For 100M+ runs, generating ground-truth neighbors is
+# expensive. If you need recall numbers, compute ground truth with FAISS and
+# convert to HDF5 before running the Python benchmark.
+
+# Throughput-only (synthetic) benchmark for 100M scale:
+./target/release/kyrodb_load_tester \
+    --server http://127.0.0.1:50051 \
+    --dataset 100000000 \
+    --dimension 128 \
+    --qps 2000 \
+    --duration 600 \
+    --concurrency 32
 
 pkill -9 kyrodb_server
 ```
 
 ---
 
-### 4️⃣ 500M Vectors - ~3-5 days
+### 500M Vectors - ~3-5 days
 
 ```bash
 # Create config for 500M (requires ~256GB+ RAM)
@@ -207,7 +247,11 @@ http_port = 51051
 
 [cache]
 capacity = 20000000
-hot_tier_hard_limit = 100000000
+strategy = "lru"
+enable_ab_testing = false
+enable_query_clustering = false
+enable_prefetching = false
+auto_tune_threshold = false
 
 [hnsw]
 m = 16                       # Lower M for memory
@@ -218,13 +262,15 @@ max_elements = 550000000
 distance = "euclidean"
 
 [persistence]
-enabled = true
 data_dir = "./data_500m"
-wal_fsync = "never"
-snapshot_interval = 50000000
+enable_wal = false
+fsync_policy = "none"
+snapshot_interval_secs = 0
+enable_recovery = true
+allow_fresh_start_on_recovery_failure = true
 
-[background]
-flush_interval_ms = 60000
+[logging]
+level = "warn"
 EOF
 
 rm -rf data_500m && mkdir -p data_500m
@@ -233,6 +279,18 @@ RUST_LOG=warn ./target/release/kyrodb_server --config benchmark_500m.toml &
 sleep 5
 
 # 500M requires SIFT-1B dataset subset
+# Download steps are identical to the 100M section above. Use the same TEXMEX files
+# and subset the first 500M vectors for base. Ground truth is required if you want
+# recall metrics and should be computed with FAISS.
+
+# Throughput-only (synthetic) benchmark for 500M scale:
+./target/release/kyrodb_load_tester \
+    --server http://127.0.0.1:50051 \
+    --dataset 500000000 \
+    --dimension 128 \
+    --qps 2000 \
+    --duration 600 \
+    --concurrency 32
 # Download from: http://corpus-texmex.irisa.fr/
 
 pkill -9 kyrodb_server
@@ -282,8 +340,8 @@ watch -n 1 'free -h'
 htop
 
 # Check health endpoint
-curl http://localhost:51051/health | jq
+curl http://localhost:51051/health
 
 # Check metrics
-curl http://localhost:51051/metrics | jq
+curl http://localhost:51051/metrics
 ```

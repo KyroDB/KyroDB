@@ -591,7 +591,7 @@ impl HnswBackend {
     /// - `metadata`: Document metadata
     ///
     /// # Durability
-    /// - If persistence enabled: Append to WAL → Update in-memory → fsync (if Always)
+    /// - If persistence enabled: Update in-memory → HNSW insert → Append to WAL → fsync (if Always)
     /// - Triggers snapshot creation if `inserts_since_snapshot >= snapshot_interval`
     #[instrument(level = "trace", skip(self, embedding, metadata), fields(doc_id, dim = embedding.len()))]
     pub fn insert(
@@ -607,30 +607,6 @@ impl HnswBackend {
                     "Insert rejected: disk space critically low (< {}%)",
                     DISK_SPACE_CRITICAL_THRESHOLD * 100.0
                 );
-            }
-
-            let entry = WalEntry {
-                op: WalOp::Insert,
-                doc_id,
-                embedding: embedding.clone(),
-                metadata: metadata.clone(),
-                timestamp: Self::timestamp(),
-            };
-
-            persistence.wal.write().append(&entry)?;
-
-            // Track inserts for snapshot trigger
-            let mut inserts = persistence.inserts_since_snapshot.write();
-            *inserts += 1;
-
-            if *inserts >= persistence.snapshot_interval {
-                debug!(
-                    inserts = *inserts,
-                    interval = persistence.snapshot_interval,
-                    "snapshot interval reached; creating snapshot"
-                );
-                drop(inserts); // Release lock before snapshot
-                self.create_snapshot()?;
             }
         }
 
@@ -655,9 +631,45 @@ impl HnswBackend {
             metas.resize(doc_id_usize + 1, HashMap::new());
         }
 
-        embeddings[doc_id_usize] = embedding.clone();
+        let old_embedding = embeddings[doc_id_usize].clone();
+        let old_metadata = metas[doc_id_usize].clone();
+
+        let embedding_for_wal = embedding.clone();
+        let metadata_for_wal = metadata.clone();
+
+        embeddings[doc_id_usize] = embedding;
         metas[doc_id_usize] = metadata;
-        index.add_vector(doc_id, &embedding)?;
+        if let Err(e) = index.add_vector(doc_id, &embedding_for_wal) {
+            embeddings[doc_id_usize] = old_embedding;
+            metas[doc_id_usize] = old_metadata;
+            return Err(e);
+        }
+
+        if let Some(ref persistence) = self.persistence {
+            let entry = WalEntry {
+                op: WalOp::Insert,
+                doc_id,
+                embedding: embedding_for_wal,
+                metadata: metadata_for_wal,
+                timestamp: Self::timestamp(),
+            };
+
+            persistence.wal.write().append(&entry)?;
+
+            // Track inserts for snapshot trigger
+            let mut inserts = persistence.inserts_since_snapshot.write();
+            *inserts += 1;
+
+            if *inserts >= persistence.snapshot_interval {
+                debug!(
+                    inserts = *inserts,
+                    interval = persistence.snapshot_interval,
+                    "snapshot interval reached; creating snapshot"
+                );
+                drop(inserts); // Release lock before snapshot
+                self.create_snapshot()?;
+            }
+        }
 
         Ok(())
     }
@@ -705,6 +717,15 @@ impl HnswBackend {
             self.dimension()
         };
 
+        let backend_dim = self.dimension();
+        if backend_dim != 0 && expected_dim != backend_dim {
+            anyhow::bail!(
+                "bulk_insert: batch dimension {} does not match backend dimension {}",
+                expected_dim,
+                backend_dim
+            );
+        }
+
         // Validate all dimensions upfront (fail fast)
         for (doc_id, embedding, _) in &documents {
             if embedding.len() != expected_dim {
@@ -744,6 +765,9 @@ impl HnswBackend {
                 metas.resize(doc_id_usize + 1, HashMap::new());
             }
 
+            let old_embedding = embeddings[doc_id_usize].clone();
+            let old_metadata = metas[doc_id_usize].clone();
+
             // Store embedding and metadata
             embeddings[doc_id_usize] = embedding.clone();
             metas[doc_id_usize] = metadata;
@@ -752,6 +776,8 @@ impl HnswBackend {
             match index.add_vector(doc_id, &embedding) {
                 Ok(_) => loaded += 1,
                 Err(e) => {
+                    embeddings[doc_id_usize] = old_embedding;
+                    metas[doc_id_usize] = old_metadata;
                     // Log first few failures, then throttle
                     if failed < 10 {
                         tracing::warn!(doc_id, error = %e, "bulk_insert: failed to add vector");

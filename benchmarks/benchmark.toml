@@ -11,16 +11,17 @@ http_port = 51051
 enabled = false
 
 [cache]
-# CRITICAL: hot_tier_hard_limit = capacity * 2
-# For 1M vectors: capacity = 1000000, hard_limit = 2000000
-capacity = 2000000            # 2M cache capacity -> 4M hot tier hard limit
-hot_tier_hard_limit = 4000000
+# Hot tier hard limit is derived by the server (currently: hard_limit = capacity * 2).
+capacity = 2000000            # 2M cache capacity -> 4M derived hot tier hard limit
 strategy = "lru"             # Use simple LRU for benchmark consistency
-ttl_seconds = 3600           # 1 hour TTL
+enable_ab_testing = false
+enable_query_clustering = false
+enable_prefetching = false
+auto_tune_threshold = false
 
 [hnsw]
 # HNSW parameters for large-scale benchmarking
-# With 730GB RAM we can test up to 1B+ vectors
+# Configured for SIFT1M benchmark (730GB RAM supports much larger datasets if needed)
 max_elements = 2000000       # 2M vectors (2x SIFT dataset size)
 m = 16                       # Connections per node
 ef_construction = 64         # Lower for faster builds (still good recall)

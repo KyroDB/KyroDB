@@ -52,8 +52,6 @@ s3-backup = ["aws-config", "aws-sdk-s3"]
 # Loom testing: Enable loom model checker for concurrency correctness
 loom = ["dep:loom"]
 
-# Legacy (deprecated) KV/event-log layer tests. Not built by default.
-legacy-event-log = []
 
 [dependencies]
 # HNSW vector search
