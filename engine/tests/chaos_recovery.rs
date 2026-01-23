@@ -85,10 +85,11 @@ fn test_hnsw_corruption_recovery() {
     // Create backend with persistence
     let backend = HnswBackend::with_persistence(
         4,
+        kyrodb_engine::config::DistanceMetric::Cosine,
         embeddings.clone(),
         metadata.clone(),
         100,
-        data_dir.to_str().unwrap(),
+        data_dir,
         FsyncPolicy::Always,
         10,
     )
@@ -138,7 +139,8 @@ fn test_hnsw_corruption_recovery() {
     let metrics = MetricsCollector::new();
     let recovered = HnswBackend::recover(
         4,
-        data_dir.to_str().unwrap(),
+        kyrodb_engine::config::DistanceMetric::Cosine,
+        data_dir,
         100,
         FsyncPolicy::Always,
         10,
@@ -201,10 +203,11 @@ fn test_wal_normal_operation() {
     // Create backend with persistence (includes WAL)
     let backend = HnswBackend::with_persistence(
         4,
+        kyrodb_engine::config::DistanceMetric::Cosine,
         vec![vec![1.0, 0.0, 0.0, 0.0]],
         vec![HashMap::new()],
         100,
-        temp_dir.path().to_str().unwrap(),
+        temp_dir.path(),
         FsyncPolicy::Always,
         10,
     )
@@ -234,10 +237,11 @@ fn test_circuit_breaker_with_backend_operations() {
             // Create backend
             let backend = HnswBackend::with_persistence(
                 4,
+                kyrodb_engine::config::DistanceMetric::Cosine,
                 vec![vec![1.0, 0.0, 0.0, 0.0]],
                 vec![HashMap::new()],
                 100,
-                temp_dir.path().to_str().unwrap(),
+                temp_dir.path(),
                 FsyncPolicy::Always,
                 10,
             );
@@ -269,11 +273,17 @@ fn test_snapshot_corruption_metrics() {
     // Create a valid snapshot
     let documents = vec![(0, vec![1.0, 0.0, 0.0, 0.0]), (1, vec![0.0, 1.0, 0.0, 0.0])];
 
-    let metadata = documents
+    let metadata: Vec<(u64, std::collections::HashMap<String, String>)> = documents
         .iter()
         .map(|(id, _)| (*id, std::collections::HashMap::new()))
         .collect();
-    let snapshot = Snapshot::new(4, documents.clone(), metadata).unwrap();
+    let snapshot = Snapshot::new(
+        4,
+        kyrodb_engine::config::DistanceMetric::Cosine,
+        documents.clone(),
+        metadata,
+    )
+    .unwrap();
 
     snapshot.save(&snapshot_path).unwrap();
 

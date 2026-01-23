@@ -1,5 +1,5 @@
 # Build stage
-ARG RUST_IMAGE_TAG=1.75-bookworm
+ARG RUST_IMAGE_TAG=1.86-bookworm
 FROM rust:${RUST_IMAGE_TAG} AS builder
 
 WORKDIR /usr/src/kyrodb

@@ -7,6 +7,8 @@ use anyhow::Result;
 use hnsw_rs::prelude::*;
 use std::sync::Arc;
 
+use crate::config::DistanceMetric;
+
 /// Vector search result with document ID and distance
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
@@ -29,10 +31,18 @@ pub struct SearchResult {
 /// assert_eq!(results[0].doc_id, 42);
 /// ```
 pub struct HnswVectorIndex {
-    index: Arc<Hnsw<'static, f32, DistCosine>>,
+    index: HnswIndexImpl,
     dimension: usize,
     max_elements: usize,
     current_count: usize,
+    distance: DistanceMetric,
+}
+
+#[derive(Clone)]
+enum HnswIndexImpl {
+    Cosine(Arc<Hnsw<'static, f32, DistCosine>>),
+    Euclidean(Arc<Hnsw<'static, f32, DistL2>>),
+    InnerProduct(Arc<Hnsw<'static, f32, DistDot>>),
 }
 
 impl HnswVectorIndex {
@@ -44,6 +54,23 @@ impl HnswVectorIndex {
     ///
     /// Uses M=16, ef_construction=200 (RAG-optimized)
     pub fn new(dimension: usize, max_elements: usize) -> Result<Self> {
+        Self::new_with_distance(dimension, max_elements, DistanceMetric::Cosine)
+    }
+
+    /// Create a new HNSW index with the requested distance metric.
+    ///
+    /// This is critical for correctness: using Cosine for an L2 benchmark (or vice versa)
+    /// will destroy recall and makes results incomparable.
+    ///
+    /// Warning: `DistanceMetric::InnerProduct` uses `DistDot`, which assumes **L2-normalized**
+    /// input vectors. If embeddings are not normalized, results will be incorrect. Normalize
+    /// each vector to unit length before inserting/querying. In debug builds, KyroDB validates
+    /// this invariant and rejects non-normalized vectors.
+    pub fn new_with_distance(
+        dimension: usize,
+        max_elements: usize,
+        distance: DistanceMetric,
+    ) -> Result<Self> {
         // RAG-optimized parameters
         let max_nb_connection = 16; // Graph connectivity (M parameter)
         let ef_construction = 200; // Build quality
@@ -51,19 +78,40 @@ impl HnswVectorIndex {
         // Calculate max_layer based on max_elements (hnsw_rs convention)
         let max_layer = 16.min((max_elements as f32).ln().ceil() as usize);
 
-        let index = Hnsw::<f32, DistCosine>::new(
-            max_nb_connection,
-            max_elements,
-            max_layer,
-            ef_construction,
-            DistCosine {},
-        );
+        let index = match distance {
+            DistanceMetric::Cosine => HnswIndexImpl::Cosine(Arc::new(Hnsw::<f32, DistCosine>::new(
+                max_nb_connection,
+                max_elements,
+                max_layer,
+                ef_construction,
+                DistCosine {},
+            ))),
+            DistanceMetric::Euclidean => HnswIndexImpl::Euclidean(Arc::new(Hnsw::<f32, DistL2>::new(
+                max_nb_connection,
+                max_elements,
+                max_layer,
+                ef_construction,
+                DistL2 {},
+            ))),
+            DistanceMetric::InnerProduct => {
+                // DistDot assumes vectors are L2-normalized by the caller.
+                // We enforce no normalization here to keep the hot path allocation-free.
+                HnswIndexImpl::InnerProduct(Arc::new(Hnsw::<f32, DistDot>::new(
+                    max_nb_connection,
+                    max_elements,
+                    max_layer,
+                    ef_construction,
+                    DistDot {},
+                )))
+            }
+        };
 
         Ok(Self {
-            index: Arc::new(index),
+            index,
             dimension,
             max_elements,
             current_count: 0,
+            distance,
         })
     }
 
@@ -85,10 +133,26 @@ impl HnswVectorIndex {
             );
         }
 
-        // hnsw_rs uses usize for DataId internally
-        // Convert embedding slice to owned Vec for insertion
-        let embedding_vec = embedding.to_vec();
-        self.index.insert((&embedding_vec, doc_id as usize));
+        #[cfg(debug_assertions)]
+        if matches!(self.distance, DistanceMetric::InnerProduct) {
+            let norm_sq: f32 = embedding.iter().map(|v| v * v).sum();
+            if !(0.98..=1.02).contains(&norm_sq) {
+                anyhow::bail!(
+                    "InnerProduct requires L2-normalized vectors; norm_sq={}",
+                    norm_sq
+                );
+            }
+        }
+
+        // hnsw_rs copies the slice internally (Point::new(data.to_vec(), ...)), so we can pass
+        // the provided slice directly without an extra allocation here.
+        let origin_id = usize::try_from(doc_id)
+            .map_err(|_| anyhow::anyhow!("doc_id {} exceeds usize capacity", doc_id))?;
+        match &self.index {
+            HnswIndexImpl::Cosine(h) => h.insert((embedding, origin_id)),
+            HnswIndexImpl::Euclidean(h) => h.insert((embedding, origin_id)),
+            HnswIndexImpl::InnerProduct(h) => h.insert((embedding, origin_id)),
+        }
 
         self.current_count += 1;
         Ok(())
@@ -135,7 +199,11 @@ impl HnswVectorIndex {
             }
             ef
         };
-        let neighbours = self.index.search(query, k, ef_search);
+        let neighbours = match &self.index {
+            HnswIndexImpl::Cosine(h) => h.search(query, k, ef_search),
+            HnswIndexImpl::Euclidean(h) => h.search(query, k, ef_search),
+            HnswIndexImpl::InnerProduct(h) => h.search(query, k, ef_search),
+        };
 
         let results = neighbours
             .into_iter()
@@ -165,6 +233,10 @@ impl HnswVectorIndex {
 
     pub fn capacity(&self) -> usize {
         self.max_elements
+    }
+
+    pub fn distance_metric(&self) -> DistanceMetric {
+        self.distance
     }
 
     /// Estimate memory usage assuming M=16, avg 2 layers/node, +10% overhead

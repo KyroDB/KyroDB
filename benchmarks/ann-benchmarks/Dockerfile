@@ -61,7 +61,7 @@ RUN sed -i 's/^import kyrodb_pb2 as /from . import kyrodb_pb2 as /' /src/stubs/k
 # ============================================================================
 # Stage 2: Runtime (inherits ann-benchmarks entrypoint)
 # ============================================================================
-FROM ann-benchmarks
+FROM ann-benchmarks:2024.12
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
@@ -69,7 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # KyroDB wrapper uses gRPC and generated protobuf stubs.
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --break-system-packages \
     grpcio==1.60.0 \
     protobuf==4.25.3
 

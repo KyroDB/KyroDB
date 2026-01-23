@@ -16,8 +16,9 @@ git pull origin benchmark
 sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev python3-pip
 pip3 install -r benchmarks/requirements.txt
 
-# Build release binary
+# Build release binaries
 cargo build --release --bin kyrodb_server
+cargo build --release --bin kyrodb_load_tester
 
 # Regenerate Python stubs
 python3 benchmarks/scripts/gen_grpc_stubs.py
@@ -38,6 +39,61 @@ Based on analysis, here are the recommended HNSW parameters:
 ---
 
 ## Benchmark Commands for Each Scale
+
+### Server Control Helpers (reused below)
+
+```bash
+stop_server() {
+    pkill -TERM kyrodb_server 2>/dev/null || true
+    local timeout=20
+    while pgrep -x kyrodb_server >/dev/null && [ $timeout -gt 0 ]; do
+        sleep 1
+        timeout=$((timeout - 1))
+    done
+    if pgrep -x kyrodb_server >/dev/null; then
+        pkill -KILL kyrodb_server 2>/dev/null || true
+    fi
+}
+
+start_server() {
+    local config="$1"
+    local log_file="${2:-/tmp/kyrodb_server.log}"
+    RUST_LOG=warn ./target/release/kyrodb_server --config "$config" >"$log_file" 2>&1 &
+    echo $!
+}
+
+wait_for_server() {
+    local pid="$1"
+    local timeout="${2:-30}"
+    local health_url="${3:-http://127.0.0.1:51051/health}"
+    local elapsed=0
+    while [ $elapsed -lt $timeout ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "kyrodb_server exited before becoming ready"
+            return 1
+        fi
+        if curl -sf "$health_url" >/dev/null; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    echo "kyrodb_server failed to become ready within ${timeout}s"
+    return 1
+}
+
+start_and_wait_server() {
+    local config="$1"
+    local log_file="${2:-/tmp/kyrodb_server.log}"
+    local pid
+    pid=$(start_server "$config" "$log_file")
+    if ! wait_for_server "$pid" 30; then
+        echo "Startup failed; check ${log_file}"
+        return 1
+    fi
+    echo "$pid"
+}
+```
 
 ### 1M Vectors (SIFT-128) - ~15 min
 
@@ -79,9 +135,8 @@ EOF
 
 # Clean and run
 rm -rf data_1m && mkdir -p data_1m
-pkill -9 kyrodb_server 2>/dev/null || true
-RUST_LOG=warn ./target/release/kyrodb_server --config benchmark_1m.toml &
-sleep 5
+stop_server
+server_pid=$(start_and_wait_server benchmark_1m.toml /tmp/kyrodb_1m.log) || exit 1
 
 # Run benchmark (SIFT-128: 1M vectors)
 python3 benchmarks/run_benchmark.py \
@@ -92,7 +147,7 @@ python3 benchmarks/run_benchmark.py \
     --repetitions 3
 
 # Stop server
-pkill -9 kyrodb_server
+stop_server
 ```
 
 ---
@@ -139,9 +194,8 @@ EOF
 
 # Clean and run
 rm -rf data_10m && mkdir -p data_10m
-pkill -9 kyrodb_server 2>/dev/null || true
-RUST_LOG=warn ./target/release/kyrodb_server --config benchmark_10m.toml &
-sleep 5
+stop_server
+server_pid=$(start_and_wait_server benchmark_10m.toml /tmp/kyrodb_10m.log) || exit 1
 
 # Note: `benchmarks/run_benchmark.py` only downloads datasets listed in
 # `benchmarks/run_benchmark.py:DATASETS`.
@@ -151,7 +205,7 @@ python3 benchmarks/run_benchmark.py \
     --ef-search 200
 
 # Stop server
-pkill -9 kyrodb_server
+stop_server
 ```
 
 ---
@@ -196,9 +250,8 @@ EOF
 
 # Clean and run
 rm -rf data_100m && mkdir -p data_100m
-pkill -9 kyrodb_server 2>/dev/null || true
-RUST_LOG=warn ./target/release/kyrodb_server --config benchmark_100m.toml &
-sleep 5
+stop_server
+server_pid=$(start_and_wait_server benchmark_100m.toml /tmp/kyrodb_100m.log) || exit 1
 
 # For 100M: Use SIFT-1B (subset) or generate random
 # Dataset preparation (SIFT1B / BIGANN)
@@ -230,7 +283,7 @@ cd ..
     --duration 600 \
     --concurrency 32
 
-pkill -9 kyrodb_server
+stop_server
 ```
 
 ---
@@ -274,9 +327,8 @@ level = "warn"
 EOF
 
 rm -rf data_500m && mkdir -p data_500m
-pkill -9 kyrodb_server 2>/dev/null || true
-RUST_LOG=warn ./target/release/kyrodb_server --config benchmark_500m.toml &
-sleep 5
+stop_server
+server_pid=$(start_and_wait_server benchmark_500m.toml /tmp/kyrodb_500m.log) || exit 1
 
 # 500M requires SIFT-1B dataset subset
 # Download steps are identical to the 100M section above. Use the same TEXMEX files
@@ -293,7 +345,7 @@ sleep 5
     --concurrency 32
 # Download from: http://corpus-texmex.irisa.fr/
 
-pkill -9 kyrodb_server
+stop_server
 ```
 
 ---
@@ -315,13 +367,54 @@ pkill -9 kyrodb_server
 #!/bin/bash
 # Run all benchmarks sequentially
 
-for scale in 1m; do  # Add 10m 100m 500m as needed
-    echo "Running $scale benchmark..."
-    ./target/release/kyrodb_server --config benchmark_${scale}.toml &
-    sleep 10
-    python3 benchmarks/run_benchmark.py --dataset sift-128-euclidean --k 10
-    pkill -9 kyrodb_server
-    echo "Completed $scale"
+scales=(1m 10m 100m 500m)
+for scale in "${scales[@]}"; do
+    echo "Running ${scale} benchmark..."
+    stop_server
+    server_pid=$(start_and_wait_server "benchmark_${scale}.toml" "/tmp/kyrodb_${scale}.log") || exit 1
+
+    case "$scale" in
+        1m)
+            python3 benchmarks/run_benchmark.py \
+                --dataset sift-128-euclidean \
+                --k 10 \
+                --ef-search 200 \
+                --warmup-queries 200 \
+                --repetitions 3
+            ;;
+        10m)
+            python3 benchmarks/run_benchmark.py \
+                --dataset deep-image-96-angular \
+                --k 10 \
+                --ef-search 200
+            ;;
+        100m)
+            ./target/release/kyrodb_load_tester \
+                --server http://127.0.0.1:50051 \
+                --dataset 100000000 \
+                --dimension 128 \
+                --qps 2000 \
+                --duration 600 \
+                --concurrency 32
+            ;;
+        500m)
+            ./target/release/kyrodb_load_tester \
+                --server http://127.0.0.1:50051 \
+                --dataset 500000000 \
+                --dimension 128 \
+                --qps 2000 \
+                --duration 600 \
+                --concurrency 32
+            ;;
+        *)
+            echo "Unknown scale: ${scale}"
+            stop_server
+            exit 1
+            ;;
+    esac
+
+    stop_server
+    echo "Completed ${scale}"
 done
 ```
 

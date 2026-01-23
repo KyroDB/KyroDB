@@ -39,6 +39,7 @@ fn create_test_engine() -> TestEngineGuard {
         hot_tier_hard_limit: 150,
         hnsw_max_elements: 1000,
         embedding_dimension: 128,
+        hnsw_distance: kyrodb_engine::config::DistanceMetric::Cosine,
         data_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
         fsync_policy: kyrodb_engine::FsyncPolicy::Never,
         snapshot_interval: 1000,

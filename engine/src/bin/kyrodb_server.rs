@@ -161,15 +161,7 @@ impl TenantIdMapper {
 
         let map_snapshot = map.clone();
         let path = self.path.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(move || {
-                if let Err(e) = Self::persist_map_atomic(&path, &map_snapshot) {
-                    tracing::error!(error = %e, "Failed to persist tenant map asynchronously");
-                }
-            });
-        } else {
-            Self::persist_map_atomic(&path, &map_snapshot)?;
-        }
+        Self::persist_map_atomic(&path, &map_snapshot)?;
         Ok(next_idx)
     }
 
@@ -1970,6 +1962,7 @@ async fn main() -> anyhow::Result<()> {
         hot_tier_max_age: Duration::from_secs(config.cache.training_interval_secs),
         hnsw_max_elements: config.hnsw.max_elements,
         embedding_dimension: config.hnsw.dimension,
+        hnsw_distance: config.hnsw.distance,
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
         fsync_policy,
         snapshot_interval: config.persistence.snapshot_interval_secs as usize,

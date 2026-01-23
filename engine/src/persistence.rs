@@ -550,6 +550,13 @@ pub struct Snapshot {
     pub documents: Vec<(u64, Vec<f32>)>,
     /// Metadata for all documents: (doc_id, metadata_map)
     pub metadata: Vec<(u64, HashMap<String, String>)>,
+    /// Distance metric used by the HNSW index that produced this snapshot.
+    ///
+    /// This is critical for correctness: building/searching with the wrong metric can destroy recall.
+    ///
+    /// `#[serde(default)]` keeps backward compatibility with older snapshots.
+    #[serde(default)]
+    pub distance: crate::config::DistanceMetric,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -561,10 +568,21 @@ struct LegacySnapshotV1 {
     pub documents: Vec<(u64, Vec<f32>)>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LegacySnapshotV2 {
+    pub version: u32,
+    pub timestamp: u64,
+    pub doc_count: usize,
+    pub dimension: usize,
+    pub documents: Vec<(u64, Vec<f32>)>,
+    pub metadata: Vec<(u64, HashMap<String, String>)>,
+}
+
 impl Snapshot {
     /// Create snapshot from current state
     pub fn new(
         dimension: usize,
+        distance: crate::config::DistanceMetric,
         documents: Vec<(u64, Vec<f32>)>,
         metadata: Vec<(u64, HashMap<String, String>)>,
     ) -> Result<Self> {
@@ -578,6 +596,7 @@ impl Snapshot {
             timestamp,
             doc_count: documents.len(),
             dimension,
+            distance,
             documents,
             metadata,
         };
@@ -669,16 +688,24 @@ impl Snapshot {
         // Deserialize
         let mut snapshot = match bincode::deserialize::<Snapshot>(&snapshot_bytes) {
             Ok(snapshot) => snapshot,
-            Err(primary_err) => match bincode::deserialize::<LegacySnapshotV1>(&snapshot_bytes) {
+            Err(primary_err) => match bincode::deserialize::<LegacySnapshotV2>(&snapshot_bytes) {
                 Ok(legacy) => {
                     warn!(
+                        "Loaded legacy snapshot v2 without distance; upgrading in-memory representation"
+                    );
+                    Snapshot::from_legacy_v2(legacy)
+                }
+                Err(_) => match bincode::deserialize::<LegacySnapshotV1>(&snapshot_bytes) {
+                    Ok(legacy) => {
+                        warn!(
                             "Loaded legacy snapshot v1 without metadata; upgrading in-memory representation"
                         );
-                    Snapshot::from_legacy(legacy)
-                }
-                Err(_) => {
-                    return Err(primary_err).context("Failed to deserialize snapshot");
-                }
+                        Snapshot::from_legacy(legacy)
+                    }
+                    Err(_) => {
+                        return Err(primary_err).context("Failed to deserialize snapshot");
+                    }
+                },
             },
         };
 
@@ -854,6 +881,19 @@ impl Snapshot {
             dimension: legacy.dimension,
             documents: legacy.documents,
             metadata,
+            distance: crate::config::DistanceMetric::default(),
+        }
+    }
+
+    fn from_legacy_v2(legacy: LegacySnapshotV2) -> Self {
+        Self {
+            version: 2,
+            timestamp: legacy.timestamp,
+            doc_count: legacy.documents.len(),
+            dimension: legacy.dimension,
+            documents: legacy.documents,
+            metadata: legacy.metadata,
+            distance: crate::config::DistanceMetric::default(),
         }
     }
 }
@@ -983,7 +1023,8 @@ mod tests {
         let documents = vec![(1, vec![0.1, 0.2]), (2, vec![0.3, 0.4])];
 
         let metadata = vec![(1, HashMap::new()), (2, HashMap::new())];
-        let snapshot = Snapshot::new(2, documents, metadata).unwrap();
+        let snapshot = Snapshot::new(2, crate::config::DistanceMetric::Cosine, documents, metadata)
+            .unwrap();
         snapshot.save(&snapshot_path).unwrap();
 
         // Load snapshot
@@ -1203,7 +1244,13 @@ mod tests {
             .iter()
             .map(|(id, _)| (*id, HashMap::new()))
             .collect();
-        let snapshot = Snapshot::new(2, documents.clone(), metadata).unwrap();
+        let snapshot = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            documents.clone(),
+            metadata,
+        )
+        .unwrap();
         snapshot.save(&snapshot_path).unwrap();
 
         // Corrupt the snapshot by modifying bytes in the data section
@@ -1237,7 +1284,13 @@ mod tests {
             .iter()
             .map(|(id, _)| (*id, HashMap::new()))
             .collect();
-        let snapshot_100 = Snapshot::new(2, documents_100, metadata_100).unwrap();
+        let snapshot_100 = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            documents_100,
+            metadata_100,
+        )
+        .unwrap();
         snapshot_100.save(&snapshot_100_path).unwrap();
 
         // Create snapshot_99.snap (fallback)
@@ -1247,7 +1300,13 @@ mod tests {
             .iter()
             .map(|(id, _)| (*id, HashMap::new()))
             .collect();
-        let snapshot_99 = Snapshot::new(2, documents_99, metadata_99).unwrap();
+        let snapshot_99 = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            documents_99,
+            metadata_99,
+        )
+        .unwrap();
         snapshot_99.save(&snapshot_99_path).unwrap();
 
         // Corrupt snapshot_100

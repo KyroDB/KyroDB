@@ -41,8 +41,12 @@ benchmarks/
 │   ├── module.py          # BaseANN wrapper (upstream-compatible)
 │   ├── config.yml         # ann-benchmarks algorithm definition
 │   ├── Dockerfile         # Docker build (upstream ann-benchmarks repo context)
+├── benchmark.toml           # Default VM benchmark config
 ├── run_benchmark.py        # Local benchmark runner
+├── scripts/                # VM benchmark helpers
+│   └── vm_ann_suite.sh      # VM ANN suite runner
 ├── data/                   # Downloaded datasets (auto-created)
+├── VM_BENCHMARK_PROTOCOL.md # VM benchmark protocol and reporting
 └── results/                # Benchmark results (auto-created)
 ```
 
@@ -131,7 +135,7 @@ cp /path/to/KyroDB/benchmarks/ann-benchmarks/config.yml ann_benchmarks/algorithm
 # Build image (NOTE: ann-benchmarks install.py accepts --build-arg only once
 # and expects multiple KEY=VALUE pairs after that single flag)
 python install.py --algorithm kyrodb \
-    --build-arg KYRODB_GIT=https://github.com/KyroDB/KyroDB.git KYRODB_REF=benchmark
+    --build-arg KYRODB_GIT=https://github.com/vatskishan03/KyroDB.git KYRODB_REF=benchmark
 
 # If Docker build fails with: "lock file version `4` was found"
 # you are using an older Rust/Cargo builder image. Use the updated

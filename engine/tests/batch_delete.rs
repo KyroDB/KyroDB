@@ -1,6 +1,6 @@
 use kyrodb_engine::{
     cache_strategy::LruCacheStrategy, persistence::FsyncPolicy, HnswBackend, HotTier,
-    QueryHashCache, TieredEngine, TieredEngineConfig,
+    QueryHashCache, TieredEngine, TieredEngineConfig, DistanceMetric,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,6 +39,7 @@ fn test_hnsw_backend_batch_delete() {
 
     let backend = HnswBackend::with_persistence(
         1,
+        DistanceMetric::Cosine,
         embeddings,
         metadata,
         100,

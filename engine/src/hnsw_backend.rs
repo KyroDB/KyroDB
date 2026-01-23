@@ -8,6 +8,7 @@
 use crate::hnsw_index::{HnswVectorIndex, SearchResult};
 use crate::metrics::MetricsCollector;
 use crate::persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
+use crate::config::DistanceMetric;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -198,6 +199,7 @@ impl HnswBackend {
     #[instrument(level = "debug", skip(embeddings, metadata), fields(num_docs = embeddings.len(), max_elements))]
     pub fn new(
         dimension: usize,
+        distance: DistanceMetric,
         embeddings: Vec<Vec<f32>>,
         metadata: Vec<HashMap<String, String>>,
         max_elements: usize,
@@ -212,7 +214,7 @@ impl HnswBackend {
                 metadata.len()
             );
         }
-        let mut index = HnswVectorIndex::new(dimension, max_elements)?;
+        let mut index = HnswVectorIndex::new_with_distance(dimension, max_elements, distance)?;
 
         // Build HNSW index from embeddings
         info!(
@@ -252,6 +254,7 @@ impl HnswBackend {
     #[instrument(level = "debug", skip(embeddings, metadata, data_dir), fields(num_docs = embeddings.len(), max_elements, snapshot_interval))]
     pub fn with_persistence(
         dimension: usize,
+        distance: DistanceMetric,
         embeddings: Vec<Vec<f32>>,
         metadata: Vec<HashMap<String, String>>,
         max_elements: usize,
@@ -273,7 +276,7 @@ impl HnswBackend {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
 
-        let mut index = HnswVectorIndex::new(dimension, max_elements)?;
+        let mut index = HnswVectorIndex::new_with_distance(dimension, max_elements, distance)?;
 
         // Build HNSW index
         info!(
@@ -339,6 +342,7 @@ impl HnswBackend {
     #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval))]
     pub fn recover(
         embedding_dimension: usize,
+        distance: DistanceMetric,
         data_dir: impl AsRef<Path>,
         max_elements: usize,
         fsync_policy: FsyncPolicy,
@@ -380,6 +384,14 @@ impl HnswBackend {
                             "configured embedding dimension {} does not match snapshot dimension {}",
                             embedding_dimension,
                             snapshot.dimension
+                        );
+                    }
+
+                    if snapshot.distance != distance {
+                        anyhow::bail!(
+                            "configured distance metric {:?} does not match snapshot distance metric {:?}",
+                            distance,
+                            snapshot.distance
                         );
                     }
                     dimension = snapshot.dimension;
@@ -508,7 +520,7 @@ impl HnswBackend {
         }
 
         // Rebuild HNSW index
-        let mut index = HnswVectorIndex::new(dimension, max_elements)?;
+        let mut index = HnswVectorIndex::new_with_distance(dimension, max_elements, distance)?;
         info!(
             documents = embeddings.len(),
             dimension, "rebuilding HNSW index after recovery"
@@ -880,7 +892,8 @@ impl HnswBackend {
         };
 
         let doc_count = documents.len();
-        let snapshot = Snapshot::new(dimension, documents, metadata_vec)?;
+        let distance = self.index.read().distance_metric();
+        let snapshot = Snapshot::new(dimension, distance, documents, metadata_vec)?;
 
         // Save snapshot with timestamp
         let snapshot_timestamp = Self::timestamp();
@@ -1428,7 +1441,8 @@ mod tests {
             HashMap::from([("id".to_string(), "2".to_string())]),
         ];
 
-        let backend = HnswBackend::new(4, embeddings, metadata, 100).unwrap();
+        let backend =
+            HnswBackend::new(4, DistanceMetric::Cosine, embeddings, metadata, 100).unwrap();
 
         // Test fetch_document
         let doc0 = backend.fetch_document(0).unwrap();
@@ -1455,7 +1469,8 @@ mod tests {
 
         let metadata = vec![HashMap::new(); 3];
 
-        let backend = HnswBackend::new(4, embeddings, metadata, 100).unwrap();
+        let backend =
+            HnswBackend::new(4, DistanceMetric::Cosine, embeddings, metadata, 100).unwrap();
 
         // Query closest to doc 0
         let query = vec![1.0, 0.0, 0.0, 0.0];
@@ -1470,7 +1485,8 @@ mod tests {
     fn test_hnsw_backend_empty_check() {
         let embeddings = vec![vec![1.0, 0.0]];
         let metadata = vec![HashMap::new()];
-        let backend = HnswBackend::new(2, embeddings, metadata, 100).unwrap();
+        let backend =
+            HnswBackend::new(2, DistanceMetric::Cosine, embeddings, metadata, 100).unwrap();
         assert!(!backend.is_empty());
         assert_eq!(backend.len(), 1);
         assert_eq!(backend.dimension(), 2);
@@ -1489,6 +1505,7 @@ mod tests {
 
         let backend = HnswBackend::with_persistence(
             2,
+            DistanceMetric::Cosine,
             initial_embeddings,
             initial_metadata,
             100,
@@ -1574,6 +1591,7 @@ mod tests {
 
         let backend = HnswBackend::with_persistence(
             2,
+            DistanceMetric::Cosine,
             embeddings,
             metadata,
             100,

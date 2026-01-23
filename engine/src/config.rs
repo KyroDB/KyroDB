@@ -258,6 +258,12 @@ pub enum DistanceMetric {
     InnerProduct,
 }
 
+impl Default for DistanceMetric {
+    fn default() -> Self {
+        DistanceMetric::Cosine
+    }
+}
+
 // ============================================================================
 // Persistence Configuration
 // ============================================================================

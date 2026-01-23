@@ -24,6 +24,7 @@ use crate::{
     AccessPatternLogger, CacheStrategy, CachedVector, CircuitBreaker, FsyncPolicy, HnswBackend,
     HotTier, QueryHashCache, SearchResult,
 };
+use crate::config::DistanceMetric;
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use std::path::Path;
@@ -116,6 +117,9 @@ pub struct TieredEngineConfig {
     /// Required to initialize an empty cold tier without inserting dummy vectors.
     pub embedding_dimension: usize,
 
+    /// Distance metric for the cold-tier HNSW index.
+    pub hnsw_distance: DistanceMetric,
+
     /// Persistence data directory
     pub data_dir: Option<String>,
 
@@ -145,6 +149,7 @@ impl Default for TieredEngineConfig {
             hot_tier_max_age: Duration::from_secs(60),
             hnsw_max_elements: 1_000_000,
             embedding_dimension: 768,
+            hnsw_distance: DistanceMetric::Cosine,
             data_dir: None,
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 10_000,
@@ -232,6 +237,7 @@ impl TieredEngine {
             // With persistence
             Arc::new(HnswBackend::with_persistence(
                 config.embedding_dimension,
+                config.hnsw_distance,
                 initial_embeddings,
                 initial_metadata,
                 config.hnsw_max_elements,
@@ -243,6 +249,7 @@ impl TieredEngine {
             // Without persistence (testing only)
             Arc::new(HnswBackend::new(
                 config.embedding_dimension,
+                config.hnsw_distance,
                 initial_embeddings,
                 initial_metadata,
                 config.hnsw_max_elements,
@@ -341,6 +348,7 @@ impl TieredEngine {
         let metrics = crate::metrics::MetricsCollector::new();
         let cold_tier = Arc::new(HnswBackend::recover(
             config.embedding_dimension,
+            config.hnsw_distance,
             &data_dir_str,
             config.hnsw_max_elements,
             config.fsync_policy,
