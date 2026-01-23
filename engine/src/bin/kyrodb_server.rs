@@ -747,20 +747,20 @@ impl KyroDbService for KyroDBServiceImpl {
         let tenant = self.tenant_context(&request)?;
         let mut stream = request.into_inner();
 
-        // Collect all documents first (can't hold lock across stream)
+        // Stream ingestion in bounded chunks.
+        // We cannot hold the engine write lock across `.await` on the request stream.
+        // Instead, we batch up to MAX_BATCH_SIZE docs, ingest synchronously, then continue.
         let mut documents: Vec<(u64, Vec<f32>, std::collections::HashMap<String, String>)> =
-            Vec::new();
+            Vec::with_capacity(MAX_BATCH_SIZE);
         let mut validation_errors = 0u64;
         let mut last_error = String::new();
 
-        info!("BulkLoadHnsw: starting to collect documents");
+        let mut total_loaded = 0u64;
+        let mut total_failed_insertion = 0u64;
+
+        info!("BulkLoadHnsw: starting streaming load");
 
         while let Some(req) = stream.message().await? {
-            if documents.len() >= MAX_BATCH_SIZE {
-                validation_errors += 1;
-                last_error = format!("Batch size exceeds maximum {}", MAX_BATCH_SIZE);
-                break;
-            }
             // Validate doc_id
             if req.doc_id < MIN_DOC_ID {
                 validation_errors += 1;
@@ -809,71 +809,75 @@ impl KyroDbService for KyroDBServiceImpl {
             }
 
             documents.push((global_doc_id, req.embedding, metadata));
+
+            if documents.len() >= MAX_BATCH_SIZE {
+                let batch = std::mem::take(&mut documents);
+                let engine = self.state.engine.write().await;
+                match engine.bulk_load_cold_tier(batch) {
+                    Ok((loaded, failed, _duration_ms, _rate)) => {
+                        total_loaded += loaded;
+                        total_failed_insertion += failed;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "BulkLoadHnsw: batch load failed");
+                        return Err(Status::internal(format!("Bulk load failed: {}", e)));
+                    }
+                }
+            }
         }
 
-        let collection_time = start.elapsed();
+        if !documents.is_empty() {
+            let batch = std::mem::take(&mut documents);
+            let engine = self.state.engine.write().await;
+            match engine.bulk_load_cold_tier(batch) {
+                Ok((loaded, failed, _duration_ms, _rate)) => {
+                    total_loaded += loaded;
+                    total_failed_insertion += failed;
+                }
+                Err(e) => {
+                    error!(error = %e, "BulkLoadHnsw: final batch load failed");
+                    return Err(Status::internal(format!("Bulk load failed: {}", e)));
+                }
+            }
+        }
+
+        let total_time = start.elapsed();
+        let total_seconds = total_time.as_secs_f64().max(1e-9);
+        let rate = (total_loaded as f64) / total_seconds;
+        let total_failed = total_failed_insertion + validation_errors;
+
         info!(
-            doc_count = documents.len(),
+            loaded = total_loaded,
+            failed_insertion = total_failed_insertion,
             validation_errors,
-            collection_ms = collection_time.as_millis() as u64,
-            "BulkLoadHnsw: collected all documents, starting HNSW load"
+            rate_per_sec = rate,
+            total_ms = total_time.as_millis() as u64,
+            "BulkLoadHnsw: complete"
         );
 
-        if documents.is_empty() {
-            return Ok(Response::new(BulkLoadResponse {
-                success: validation_errors == 0,
-                error: if validation_errors > 0 {
-                    last_error
-                } else {
-                    String::new()
-                },
-                total_loaded: 0,
-                total_failed: validation_errors,
-                load_duration_ms: 0.0,
-                avg_insert_rate: 0.0,
-                peak_memory_bytes: 0,
-            }));
-        }
-
-        // Now bulk load to HNSW (single lock acquisition)
-        let engine = self.state.engine.write().await;
-        let result = engine.bulk_load_cold_tier(documents);
-
-        match result {
-            Ok((loaded, failed, duration_ms, rate)) => {
-                let total_time = start.elapsed();
-                info!(
-                    loaded,
-                    failed,
+        Ok(Response::new(BulkLoadResponse {
+            success: total_failed == 0,
+            error: if total_failed > 0 {
+                format!(
+                    "Loaded {} docs; {} failed validation, {} failed insertion{}",
+                    total_loaded,
                     validation_errors,
-                    duration_ms,
-                    rate_per_sec = rate,
-                    total_ms = total_time.as_millis() as u64,
-                    "BulkLoadHnsw: complete"
-                );
-
-                Ok(Response::new(BulkLoadResponse {
-                    success: failed == 0 && validation_errors == 0,
-                    error: if failed > 0 || validation_errors > 0 {
-                        format!(
-                            "Loaded {} docs; {} failed validation, {} failed insertion",
-                            loaded, validation_errors, failed
-                        )
-                    } else {
+                    total_failed_insertion,
+                    if last_error.is_empty() {
                         String::new()
-                    },
-                    total_loaded: loaded,
-                    total_failed: failed + validation_errors,
-                    load_duration_ms: duration_ms,
-                    avg_insert_rate: rate,
-                    peak_memory_bytes: 0, // Could integrate sysinfo crate if needed
-                }))
-            }
-            Err(e) => {
-                error!(error = %e, "BulkLoadHnsw: failed");
-                Err(Status::internal(format!("Bulk load failed: {}", e)))
-            }
-        }
+                    } else {
+                        format!("; last_error={}", last_error)
+                    }
+                )
+            } else {
+                String::new()
+            },
+            total_loaded,
+            total_failed,
+            load_duration_ms: (total_seconds * 1000.0) as f32,
+            avg_insert_rate: rate as f32,
+            peak_memory_bytes: 0,
+        }))
     }
 
     #[instrument(skip(self, request))]

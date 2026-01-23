@@ -645,6 +645,7 @@ impl HnswBackend {
             return Err(e);
         }
 
+        let mut should_create_snapshot = false;
         if let Some(ref persistence) = self.persistence {
             let entry = WalEntry {
                 op: WalOp::Insert,
@@ -666,9 +667,19 @@ impl HnswBackend {
                     interval = persistence.snapshot_interval,
                     "snapshot interval reached; creating snapshot"
                 );
-                drop(inserts); // Release lock before snapshot
-                self.create_snapshot()?;
+                should_create_snapshot = true;
             }
+        }
+
+        // Important: release the in-memory write locks before snapshot creation.
+        // Snapshot creation needs to acquire read locks on embeddings/metadata, and
+        // performing disk I/O while holding write locks would block writers.
+        drop(index);
+        drop(embeddings);
+        drop(metas);
+
+        if should_create_snapshot {
+            self.create_snapshot()?;
         }
 
         Ok(())
