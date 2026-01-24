@@ -36,6 +36,7 @@ pub struct HnswVectorIndex {
     max_elements: usize,
     current_count: usize,
     distance: DistanceMetric,
+    disable_normalization_check: bool,
 }
 
 #[derive(Clone)]
@@ -46,6 +47,9 @@ enum HnswIndexImpl {
 }
 
 impl HnswVectorIndex {
+    pub const DEFAULT_M: usize = 16;
+    pub const DEFAULT_EF_CONSTRUCTION: usize = 200;
+
     /// Create new HNSW index
     ///
     /// # Parameters
@@ -64,30 +68,61 @@ impl HnswVectorIndex {
     ///
     /// Warning: `DistanceMetric::InnerProduct` uses `DistDot`, which assumes **L2-normalized**
     /// input vectors. If embeddings are not normalized, results will be incorrect. Normalize
-    /// each vector to unit length before inserting/querying. In debug builds, KyroDB validates
-    /// this invariant and rejects non-normalized vectors.
+    /// each vector to unit length before inserting/querying. KyroDB validates and rejects
+    /// non-normalized vectors at runtime unless `disable_normalization_check` is enabled.
     pub fn new_with_distance(
         dimension: usize,
         max_elements: usize,
         distance: DistanceMetric,
     ) -> Result<Self> {
-        // RAG-optimized parameters
-        let max_nb_connection = 16; // Graph connectivity (M parameter)
-        let ef_construction = 200; // Build quality
+        Self::new_with_params(
+            dimension,
+            max_elements,
+            distance,
+            Self::DEFAULT_M,
+            Self::DEFAULT_EF_CONSTRUCTION,
+            false,
+        )
+    }
+
+    /// Create a new HNSW index with explicit construction parameters.
+    ///
+    /// `m` controls graph connectivity (higher = better recall, more memory).
+    /// `ef_construction` controls build quality (higher = better recall, slower build).
+    pub fn new_with_params(
+        dimension: usize,
+        max_elements: usize,
+        distance: DistanceMetric,
+        m: usize,
+        ef_construction: usize,
+        disable_normalization_check: bool,
+    ) -> Result<Self> {
+        if dimension == 0 {
+            anyhow::bail!("dimension must be > 0");
+        }
+        if max_elements == 0 {
+            anyhow::bail!("max_elements must be > 0");
+        }
+        if m == 0 {
+            anyhow::bail!("HNSW m must be > 0");
+        }
+        if ef_construction == 0 {
+            anyhow::bail!("HNSW ef_construction must be > 0");
+        }
 
         // Calculate max_layer based on max_elements (hnsw_rs convention)
         let max_layer = 16.min((max_elements as f32).ln().ceil() as usize);
 
         let index = match distance {
             DistanceMetric::Cosine => HnswIndexImpl::Cosine(Arc::new(Hnsw::<f32, DistCosine>::new(
-                max_nb_connection,
+                m,
                 max_elements,
                 max_layer,
                 ef_construction,
                 DistCosine {},
             ))),
             DistanceMetric::Euclidean => HnswIndexImpl::Euclidean(Arc::new(Hnsw::<f32, DistL2>::new(
-                max_nb_connection,
+                m,
                 max_elements,
                 max_layer,
                 ef_construction,
@@ -97,7 +132,7 @@ impl HnswVectorIndex {
                 // DistDot assumes vectors are L2-normalized by the caller.
                 // We enforce no normalization here to keep the hot path allocation-free.
                 HnswIndexImpl::InnerProduct(Arc::new(Hnsw::<f32, DistDot>::new(
-                    max_nb_connection,
+                    m,
                     max_elements,
                     max_layer,
                     ef_construction,
@@ -112,6 +147,7 @@ impl HnswVectorIndex {
             max_elements,
             current_count: 0,
             distance,
+            disable_normalization_check,
         })
     }
 
@@ -133,8 +169,7 @@ impl HnswVectorIndex {
             );
         }
 
-        #[cfg(debug_assertions)]
-        if matches!(self.distance, DistanceMetric::InnerProduct) {
+        if matches!(self.distance, DistanceMetric::InnerProduct) && !self.disable_normalization_check {
             let norm_sq: f32 = embedding.iter().map(|v| v * v).sum();
             if !(0.98..=1.02).contains(&norm_sq) {
                 anyhow::bail!(

@@ -25,6 +25,7 @@ use crate::{
     HotTier, QueryHashCache, SearchResult,
 };
 use crate::config::DistanceMetric;
+use crate::proto::MetadataFilter;
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use std::path::Path;
@@ -120,6 +121,18 @@ pub struct TieredEngineConfig {
     /// Distance metric for the cold-tier HNSW index.
     pub hnsw_distance: DistanceMetric,
 
+    /// HNSW construction parameter M (graph connectivity).
+    pub hnsw_m: usize,
+
+    /// HNSW construction parameter ef_construction (build quality).
+    pub hnsw_ef_construction: usize,
+
+    /// HNSW search parameter ef_search (query-time candidate list size).
+    pub hnsw_ef_search: usize,
+
+    /// Disable L2-normalization checks for inner-product vectors (performance opt-out).
+    pub hnsw_disable_normalization_check: bool,
+
     /// Persistence data directory
     pub data_dir: Option<String>,
 
@@ -150,6 +163,10 @@ impl Default for TieredEngineConfig {
             hnsw_max_elements: 1_000_000,
             embedding_dimension: 768,
             hnsw_distance: DistanceMetric::Cosine,
+            hnsw_m: crate::hnsw_index::HnswVectorIndex::DEFAULT_M,
+            hnsw_ef_construction: crate::hnsw_index::HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
+            hnsw_ef_search: 50,
+            hnsw_disable_normalization_check: false,
             data_dir: None,
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 10_000,
@@ -230,12 +247,13 @@ impl TieredEngine {
         let hot_tier = Arc::new(HotTier::new(
             config.hot_tier_max_size,
             config.hot_tier_max_age,
+            config.hnsw_distance,
         ));
 
         // Create cold tier (HNSW backend)
         let cold_tier = if let Some(ref data_dir) = config.data_dir {
             // With persistence
-            Arc::new(HnswBackend::with_persistence(
+            Arc::new(HnswBackend::with_persistence_with_hnsw_params(
                 config.embedding_dimension,
                 config.hnsw_distance,
                 initial_embeddings,
@@ -244,15 +262,21 @@ impl TieredEngine {
                 data_dir,
                 config.fsync_policy,
                 config.snapshot_interval,
+                config.hnsw_m,
+                config.hnsw_ef_construction,
+                config.hnsw_disable_normalization_check,
             )?)
         } else {
             // Without persistence (testing only)
-            Arc::new(HnswBackend::new(
+            Arc::new(HnswBackend::new_with_hnsw_params(
                 config.embedding_dimension,
                 config.hnsw_distance,
                 initial_embeddings,
                 initial_metadata,
                 config.hnsw_max_elements,
+                config.hnsw_m,
+                config.hnsw_ef_construction,
+                config.hnsw_disable_normalization_check,
             )?)
         };
 
@@ -346,7 +370,7 @@ impl TieredEngine {
 
         // Recover cold tier from WAL + snapshot
         let metrics = crate::metrics::MetricsCollector::new();
-        let cold_tier = Arc::new(HnswBackend::recover(
+        let cold_tier = Arc::new(HnswBackend::recover_with_hnsw_params(
             config.embedding_dimension,
             config.hnsw_distance,
             &data_dir_str,
@@ -354,12 +378,16 @@ impl TieredEngine {
             config.fsync_policy,
             config.snapshot_interval,
             metrics,
+            config.hnsw_m,
+            config.hnsw_ef_construction,
+            config.hnsw_disable_normalization_check,
         )?);
 
         // Create fresh hot tier (ephemeral)
         let hot_tier = Arc::new(HotTier::new(
             config.hot_tier_max_size,
             config.hot_tier_max_age,
+            config.hnsw_distance,
         ));
 
         let mut recovered_config = config;
@@ -824,6 +852,25 @@ impl TieredEngine {
         self.batch_delete(&all_ids)
     }
 
+    /// Batch delete documents by structured metadata filter.
+    ///
+    /// Hot tier is scanned (bounded size). Cold tier uses an inverted index fast path
+    /// for common filter shapes and falls back to scan for `Range`.
+    pub fn batch_delete_by_metadata_filter(&self, filter: &MetadataFilter) -> Result<u64> {
+        let hot_ids = self
+            .hot_tier
+            .scan(|meta| crate::metadata_filter::matches(filter, meta));
+
+        let cold_ids = self.cold_tier.ids_for_metadata_filter(filter);
+
+        let mut all_ids = hot_ids;
+        all_ids.extend(cold_ids);
+        all_ids.sort_unstable();
+        all_ids.dedup();
+
+        self.batch_delete(&all_ids)
+    }
+
     /// k-NN search across hot tier and cold tier with result merging
     ///
     /// Search path:
@@ -896,8 +943,9 @@ impl TieredEngine {
         // Step 2: Search Layer 3 (Cold Tier) - HNSW index
         // Only search cold tier if it has documents (dimension > 0)
         let cold_results = if cold_tier_has_docs {
+            let effective_ef_search = ef_search_override.or(Some(self.config.hnsw_ef_search));
             self.cold_tier
-                .knn_search_with_ef(query, k * 2, ef_search_override)?
+                .knn_search_with_ef(query, k * 2, effective_ef_search)?
         } else {
             vec![]
         };
@@ -1034,16 +1082,55 @@ impl TieredEngine {
             stats.current_queue_depth =
                 (self.config.max_concurrent_queries - available_permits) as u64;
         }
-
-        let mut results = Vec::new();
+        let mut results: Vec<SearchResult> = Vec::new();
         let mut partial = false;
+
+        let mut hot_results: Vec<(u64, f32)> = Vec::new();
+        let mut cold_results: Vec<SearchResult> = Vec::new();
 
         // Layer 1: Cache layer (k-NN search pending implementation)
         debug!("Cache layer k-NN search not yet implemented");
 
         // Layer 2: Search hot tier (50ms timeout)
-        // Note: HotTier k-NN search pending implementation, skipping to cold tier
-        debug!("Hot tier k-NN search not yet implemented, skipping to cold tier");
+        let hot_timeout = Duration::from_millis(self.config.hot_tier_timeout_ms);
+        if self.hot_tier_circuit_breaker.is_closed() {
+            match tokio::time::timeout(hot_timeout, async {
+                tokio::task::spawn_blocking({
+                    let query_vec = query.to_vec();
+                    let hot_tier = Arc::clone(&self.hot_tier);
+                    move || hot_tier.knn_search(&query_vec, k)
+                })
+                .await
+            })
+            .await
+            {
+                Ok(Ok(hot)) => {
+                    hot_results = hot;
+                    self.hot_tier_circuit_breaker.record_success();
+                }
+                Ok(Err(e)) => {
+                    self.hot_tier_circuit_breaker.record_failure();
+                    error!("Hot tier task panicked: {}", e);
+                }
+                Err(_) => {
+                    self.hot_tier_circuit_breaker.record_failure();
+                    let mut stats = self.stats.write();
+                    stats.hot_tier_timeouts += 1;
+                    warn!(
+                        "Hot tier timed out after {}ms",
+                        self.config.hot_tier_timeout_ms
+                    );
+                    partial = true;
+                }
+            }
+        } else {
+            // Circuit breaker open - record rejection
+            {
+                let mut stats = self.stats.write();
+                stats.circuit_breaker_rejections += 1;
+            }
+            warn!("Hot tier circuit breaker open, cannot perform k-NN search");
+        }
 
         // Layer 3: Search cold tier (HNSW) (1000ms timeout)
         let cold_timeout = Duration::from_millis(self.config.cold_tier_timeout_ms);
@@ -1058,8 +1145,8 @@ impl TieredEngine {
             })
             .await
             {
-                Ok(Ok(Ok(cold_results))) => {
-                    results.extend(cold_results);
+                Ok(Ok(Ok(cold))) => {
+                    cold_results = cold;
                     self.cold_tier_circuit_breaker.record_success();
                     let mut stats = self.stats.write();
                     stats.cold_tier_searches += 1;
@@ -1093,6 +1180,19 @@ impl TieredEngine {
                 stats.circuit_breaker_rejections += 1;
             }
             warn!("Cold tier circuit breaker open, cannot perform k-NN search");
+        }
+
+        if !hot_results.is_empty() || !cold_results.is_empty() {
+            results = if !hot_results.is_empty() && !cold_results.is_empty() {
+                Self::merge_knn_results(hot_results, cold_results, k)
+            } else if !cold_results.is_empty() {
+                cold_results
+            } else {
+                hot_results
+                    .into_iter()
+                    .map(|(doc_id, distance)| SearchResult { doc_id, distance })
+                    .collect()
+            };
         }
 
         // Permit is automatically dropped here, releasing the semaphore
@@ -2311,7 +2411,7 @@ mod tests {
         // Test that reinsert_failed_documents correctly restores documents to hot tier
         use std::time::Duration;
 
-        let hot_tier = HotTier::new(100, Duration::from_secs(60));
+        let hot_tier = HotTier::new(100, Duration::from_secs(60), DistanceMetric::Cosine);
 
         // Insert initial documents
         hot_tier.insert(1, vec![1.0, 0.0], std::collections::HashMap::new());

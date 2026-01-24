@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -84,7 +85,9 @@ class KyroDB(BaseANN):
             return "cosine"
         if metric in ("euclidean", "l2"):
             return "euclidean"
-        return "cosine"
+        raise ValueError(
+            f"Unsupported metric '{self.metric}'. Supported metrics: angular, cosine, euclidean, l2"
+        )
 
     def _start_server_if_needed(self, dimension: int, max_elements: int) -> None:
         if self._server_proc is not None:
@@ -207,11 +210,12 @@ class KyroDB(BaseANN):
         except Exception as e:
             self._logger.info("BulkLoadHnsw failed (%s); falling back to BulkInsert+Flush", e)
 
+        start_insert = time.time()
         response = self._stub.BulkInsert(self._generate_insert_requests(X))
         if not response.success:
             raise RuntimeError(f"BulkInsert failed: {response.error}")
 
-        elapsed = time.time() - start
+        elapsed = time.time() - start_insert
         self._logger.info("BulkInsert complete: n=%d dim=%d seconds=%.2f", len(X), X.shape[1], elapsed)
 
         flush = self._stub.FlushHotTier(kyrodb_pb2.FlushRequest(force=True))
@@ -302,3 +306,9 @@ class KyroDB(BaseANN):
                 self._server_stderr.close()
         finally:
             self._server_stderr = None
+
+        if self._data_dir is not None:
+            try:
+                shutil.rmtree(self._data_dir, ignore_errors=True)
+            finally:
+                self._data_dir = None

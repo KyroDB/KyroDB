@@ -289,103 +289,7 @@ impl Default for SemanticAdapter {
 /// - 384-dim vectors: ~10-20ns (SIMD-accelerated with AVX2/AVX-512)
 /// - Fallback to scalar on non-AVX2 systems: ~100-200ns
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        unsafe { cosine_similarity_avx2(a, b) }
-    }
-
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    {
-        cosine_similarity_scalar(a, b)
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[target_feature(enable = "avx2")]
-#[target_feature(enable = "fma")]
-unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-
-    let len = a.len().min(b.len());
-    if len == 0 {
-        return 0.0;
-    }
-
-    let mut dot = _mm256_setzero_ps();
-    let mut norm_a = _mm256_setzero_ps();
-    let mut norm_b = _mm256_setzero_ps();
-
-    let chunks = len / 8;
-    let _remainder = len % 8;
-
-    for i in 0..chunks {
-        let offset = i * 8;
-
-        let va = _mm256_loadu_ps(a.as_ptr().add(offset));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(offset));
-
-        dot = _mm256_fmadd_ps(va, vb, dot);
-        norm_a = _mm256_fmadd_ps(va, va, norm_a);
-        norm_b = _mm256_fmadd_ps(vb, vb, norm_b);
-    }
-
-    let mut dot_sum = 0.0f32;
-    let mut norm_a_sum = 0.0f32;
-    let mut norm_b_sum = 0.0f32;
-
-    let dot_array: [f32; 8] = std::mem::transmute(dot);
-    let norm_a_array: [f32; 8] = std::mem::transmute(norm_a);
-    let norm_b_array: [f32; 8] = std::mem::transmute(norm_b);
-
-    for i in 0..8 {
-        dot_sum += dot_array[i];
-        norm_a_sum += norm_a_array[i];
-        norm_b_sum += norm_b_array[i];
-    }
-
-    for i in (chunks * 8)..len {
-        let a_val = a[i];
-        let b_val = b[i];
-        dot_sum += a_val * b_val;
-        norm_a_sum += a_val * a_val;
-        norm_b_sum += b_val * b_val;
-    }
-
-    if norm_a_sum == 0.0 || norm_b_sum == 0.0 {
-        return 0.0;
-    }
-
-    let similarity = dot_sum / (norm_a_sum.sqrt() * norm_b_sum.sqrt());
-    similarity.clamp(0.0, 1.0)
-}
-
-#[allow(dead_code)] // Intentionally kept as fallback for non-AVX2 systems
-#[inline(always)]
-fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
-    let len = a.len().min(b.len());
-    if len == 0 {
-        return 0.0;
-    }
-
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-
-    for i in 0..len {
-        let a_val = a[i];
-        let b_val = b[i];
-
-        dot += a_val * b_val;
-        norm_a += a_val * a_val;
-        norm_b += b_val * b_val;
-    }
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    let similarity = dot / (norm_a.sqrt() * norm_b.sqrt());
-    similarity.clamp(0.0, 1.0)
+    crate::simd::cosine_similarity_f32(a, b).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -430,13 +334,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "input slices must have the same length")]
     fn test_cosine_similarity_mismatched_dimensions() {
         let a = vec![1.0, 2.0, 3.0, 4.0];
         let b = vec![1.0, 2.0];
 
-        // Should use min dimension (2)
-        let similarity = cosine_similarity(&a, &b);
-        assert!(similarity > 0.0);
+        let _ = cosine_similarity(&a, &b);
     }
 
     #[test]

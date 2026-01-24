@@ -38,6 +38,7 @@ Results are saved to `benchmarks/results/` as JSON files.
 benchmarks/
 ├── _generated/             # Generated Python gRPC stubs (auto; ignored by git)
 ├── ann-benchmarks/          # Files for ann-benchmarks integration
+│   ├── __init__.py        # Package marker
 │   ├── module.py          # BaseANN wrapper (upstream-compatible)
 │   ├── config.yml         # ann-benchmarks algorithm definition
 │   ├── Dockerfile         # Docker build (upstream ann-benchmarks repo context)

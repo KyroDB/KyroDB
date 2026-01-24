@@ -232,6 +232,9 @@ pub struct HnswConfig {
 
     /// Distance metric
     pub distance: DistanceMetric,
+
+    /// Disable L2-normalization checks for inner-product vectors (performance opt-out)
+    pub disable_normalization_check: bool,
 }
 
 impl Default for HnswConfig {
@@ -243,6 +246,7 @@ impl Default for HnswConfig {
             ef_search: 50,
             dimension: 768, // Common for sentence transformers
             distance: DistanceMetric::Cosine,
+            disable_normalization_check: false,
         }
     }
 }

@@ -55,7 +55,7 @@ loom = ["dep:loom"]
 
 [dependencies]
 # HNSW vector search
-hnsw_rs = "0.3"
+hnsw_rs = { version = "0.3", features = ["simdeez_f"] }
 anyhow = "1.0"
 
 # RMI for Hybrid Semantic Cache (no external deps, pure Rust)
@@ -119,6 +119,9 @@ tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["use_std", "
 
 # Lock-free ring buffer: ringbuf crate (replaces custom RingBuffer)
 ringbuf = "0.4"
+
+# Metadata inverted index (fast filter evaluation)
+roaring = "0.10"
 
 # Disk space monitoring: platform-specific APIs
 libc = "0.2"  # Unix: statvfs for disk space

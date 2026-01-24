@@ -575,6 +575,9 @@ impl KyroDbService for KyroDBServiceImpl {
         // Store namespace in metadata for filtering during search
         // Namespace is stored as reserved key "__namespace__" to avoid conflicts with user metadata
         let mut metadata = req.metadata;
+        metadata.remove("__tenant_id__");
+        metadata.remove("__tenant_idx__");
+        metadata.remove("__namespace__");
         if let Some(tenant) = &tenant {
             metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
             metadata.insert(
@@ -629,6 +632,7 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<InsertResponse>, Status> {
         let start = Instant::now();
         let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let mut stream = request.into_inner();
 
         let mut total_inserted = 0u64;
@@ -682,6 +686,9 @@ impl KyroDbService for KyroDBServiceImpl {
                 };
 
                 let mut metadata = req.metadata;
+                metadata.remove("__tenant_id__");
+                metadata.remove("__tenant_idx__");
+                metadata.remove("__namespace__");
                 if let Some(tenant) = &tenant {
                     metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
                     metadata.insert(
@@ -789,6 +796,9 @@ impl KyroDbService for KyroDBServiceImpl {
 
             // Build metadata with tenant info
             let mut metadata = req.metadata;
+            metadata.remove("__tenant_id__");
+            metadata.remove("__tenant_idx__");
+            metadata.remove("__namespace__");
             if let Some(tenant) = &tenant {
                 metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
                 metadata.insert(
@@ -895,19 +905,29 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.write().await;
 
+        let metadata = match engine.get_metadata(global_doc_id) {
+            Some(m) => m,
+            None => {
+                return Ok(Response::new(DeleteResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        };
+
+        if let Some(tenant) = &tenant {
+            if metadata.get("__tenant_idx__") != Some(&tenant.tenant_index.to_string()) {
+                return Ok(Response::new(DeleteResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        }
+
         // Enforce namespace boundary (treat mismatch as not-found to avoid leakage).
         if !req.namespace.is_empty() {
-            let metadata = match engine.get_metadata(global_doc_id) {
-                Some(m) => m,
-                None => {
-                    return Ok(Response::new(DeleteResponse {
-                        success: true,
-                        error: String::new(),
-                        existed: false,
-                    }));
-                }
-            };
-
             let doc_namespace = metadata
                 .get("__namespace__")
                 .map(|s| s.as_str())
@@ -978,19 +998,31 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.write().await;
 
+        let existing_metadata = match engine.get_metadata(global_doc_id) {
+            Some(m) => m,
+            None => {
+                return Ok(Response::new(kyrodb::UpdateMetadataResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        };
+
+        if let Some(tenant) = &tenant {
+            let tenant_idx = tenant.tenant_index.to_string();
+            if existing_metadata.get("__tenant_idx__") != Some(&tenant_idx) {
+                return Ok(Response::new(kyrodb::UpdateMetadataResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        }
+
         // Enforce namespace boundary (treat mismatch as not-found to avoid leakage).
         if !req.namespace.is_empty() {
-            let metadata = match engine.get_metadata(global_doc_id) {
-                Some(m) => m,
-                None => {
-                    return Ok(Response::new(kyrodb::UpdateMetadataResponse {
-                        success: true,
-                        error: String::new(),
-                        existed: false,
-                    }));
-                }
-            };
-            let doc_namespace = metadata
+            let doc_namespace = existing_metadata
                 .get("__namespace__")
                 .map(|s| s.as_str())
                 .unwrap_or("");
@@ -1004,6 +1036,9 @@ impl KyroDbService for KyroDBServiceImpl {
         }
 
         let mut metadata = req.metadata;
+        metadata.remove("__tenant_id__");
+        metadata.remove("__tenant_idx__");
+        metadata.remove("__namespace__");
         if let Some(tenant) = &tenant {
             metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
             metadata.insert(
@@ -1305,6 +1340,17 @@ impl KyroDbService for KyroDBServiceImpl {
             }
 
             if found {
+                if let Some(tenant) = &tenant {
+                    let tenant_idx = tenant.tenant_index.to_string();
+                    if metadata.get("__tenant_idx__") != Some(&tenant_idx) {
+                        found = false;
+                        embedding.clear();
+                        metadata.clear();
+                    }
+                }
+            }
+
+            if found {
                 total_found += 1;
             }
 
@@ -1363,12 +1409,25 @@ impl KyroDbService for KyroDBServiceImpl {
                     }
 
                     if req.namespace.is_empty() {
-                        engine.batch_delete(&mapped)
-                    } else {
-                        let namespace = req.namespace.as_str();
+                        let tenant_idx = tenant.tenant_index.to_string();
                         let mut filtered = Vec::with_capacity(mapped.len());
                         for global_id in mapped {
                             if let Some(meta) = engine.get_metadata(global_id) {
+                                if meta.get("__tenant_idx__") == Some(&tenant_idx) {
+                                    filtered.push(global_id);
+                                }
+                            }
+                        }
+                        engine.batch_delete(&filtered)
+                    } else {
+                        let namespace = req.namespace.as_str();
+                        let tenant_idx = tenant.tenant_index.to_string();
+                        let mut filtered = Vec::with_capacity(mapped.len());
+                        for global_id in mapped {
+                            if let Some(meta) = engine.get_metadata(global_id) {
+                                if meta.get("__tenant_idx__") != Some(&tenant_idx) {
+                                    continue;
+                                }
                                 let doc_namespace =
                                     meta.get("__namespace__").map(|s| s.as_str()).unwrap_or("");
                                 if doc_namespace == namespace {
@@ -1396,36 +1455,42 @@ impl KyroDbService for KyroDBServiceImpl {
                 }
             }
             Some(batch_delete_request::DeleteCriteria::Filter(filter)) => {
-                // Use the existing metadata filter logic
+                // Combine tenant/namespace constraints into a structured AND filter so the
+                // cold-tier inverted index can accelerate common cases.
+                use kyrodb_engine::proto::metadata_filter::FilterType;
+                use kyrodb_engine::proto::{AndFilter, ExactMatch, MetadataFilter};
+
+                let mut filters = Vec::new();
+
                 if let Some(tenant) = &tenant {
-                    let tenant_idx = tenant.tenant_index.to_string();
-                    let namespace = req.namespace.clone();
-                    engine.batch_delete_by_filter(move |meta| {
-                        if meta.get("__tenant_idx__") != Some(&tenant_idx) {
-                            return false;
-                        }
-                        if !namespace.is_empty() {
-                            let doc_namespace =
-                                meta.get("__namespace__").map(|s| s.as_str()).unwrap_or("");
-                            if doc_namespace != namespace {
-                                return false;
-                            }
-                        }
-                        kyrodb_engine::metadata_filter::matches(&filter, meta)
-                    })
-                } else {
-                    let namespace = req.namespace.clone();
-                    engine.batch_delete_by_filter(move |meta| {
-                        if !namespace.is_empty() {
-                            let doc_namespace =
-                                meta.get("__namespace__").map(|s| s.as_str()).unwrap_or("");
-                            if doc_namespace != namespace {
-                                return false;
-                            }
-                        }
-                        kyrodb_engine::metadata_filter::matches(&filter, meta)
-                    })
+                    filters.push(MetadataFilter {
+                        filter_type: Some(FilterType::Exact(ExactMatch {
+                            key: "__tenant_idx__".to_string(),
+                            value: tenant.tenant_index.to_string(),
+                        })),
+                    });
                 }
+
+                if !req.namespace.is_empty() {
+                    filters.push(MetadataFilter {
+                        filter_type: Some(FilterType::Exact(ExactMatch {
+                            key: "__namespace__".to_string(),
+                            value: req.namespace.clone(),
+                        })),
+                    });
+                }
+
+                filters.push(filter);
+
+                let combined = if filters.len() == 1 {
+                    filters.pop().unwrap()
+                } else {
+                    MetadataFilter {
+                        filter_type: Some(FilterType::AndFilter(AndFilter { filters })),
+                    }
+                };
+
+                engine.batch_delete_by_metadata_filter(&combined)
             }
             None => {
                 return Err(Status::invalid_argument("No delete criteria provided"));
@@ -1963,6 +2028,10 @@ async fn main() -> anyhow::Result<()> {
         hnsw_max_elements: config.hnsw.max_elements,
         embedding_dimension: config.hnsw.dimension,
         hnsw_distance: config.hnsw.distance,
+        hnsw_m: config.hnsw.m,
+        hnsw_ef_construction: config.hnsw.ef_construction,
+        hnsw_ef_search: config.hnsw.ef_search,
+        hnsw_disable_normalization_check: config.hnsw.disable_normalization_check,
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
         fsync_policy,
         snapshot_interval: config.persistence.snapshot_interval_secs as usize,

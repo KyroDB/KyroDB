@@ -9,13 +9,136 @@ use crate::hnsw_index::{HnswVectorIndex, SearchResult};
 use crate::metrics::MetricsCollector;
 use crate::persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
 use crate::config::DistanceMetric;
+use crate::metadata_filter;
+use crate::proto::MetadataFilter;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
+use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, instrument, trace, warn};
+
+#[derive(Default)]
+struct MetadataInvertedIndex {
+    alive: RoaringTreemap,
+    by_key_value: HashMap<String, HashMap<String, RoaringTreemap>>,
+}
+
+impl MetadataInvertedIndex {
+    fn rebuild_from(
+        embeddings: &[Vec<f32>],
+        metadata: &[HashMap<String, String>],
+    ) -> Self {
+        let mut index = Self::default();
+        let len = std::cmp::min(embeddings.len(), metadata.len());
+        for doc_id in 0..len {
+            if embeddings[doc_id].iter().all(|&x| x == 0.0) {
+                continue;
+            }
+            index.insert_doc(doc_id as u64, &metadata[doc_id]);
+        }
+        index
+    }
+
+    fn insert_doc(&mut self, doc_id: u64, metadata: &HashMap<String, String>) {
+        self.alive.insert(doc_id);
+
+        for (k, v) in metadata.iter() {
+            self.by_key_value
+                .entry(k.clone())
+                .or_default()
+                .entry(v.clone())
+                .or_default()
+                .insert(doc_id);
+        }
+    }
+
+    fn remove_doc(&mut self, doc_id: u64, metadata: &HashMap<String, String>) {
+        self.alive.remove(doc_id);
+
+        for (k, v) in metadata.iter() {
+            if let Some(values) = self.by_key_value.get_mut(k) {
+                if let Some(bitmap) = values.get_mut(v) {
+                    bitmap.remove(doc_id);
+                    if bitmap.is_empty() {
+                        values.remove(v);
+                    }
+                }
+                if values.is_empty() {
+                    self.by_key_value.remove(k);
+                }
+            }
+        }
+    }
+
+    fn replace_doc(&mut self, doc_id: u64, old: &HashMap<String, String>, new: &HashMap<String, String>) {
+        self.remove_doc(doc_id, old);
+        self.insert_doc(doc_id, new);
+    }
+
+    fn bitmap_for_exact(&self, key: &str, value: &str) -> RoaringTreemap {
+        self.by_key_value
+            .get(key)
+            .and_then(|m| m.get(value))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn compile_filter_to_bitmap(
+    filter: &MetadataFilter,
+    index: &MetadataInvertedIndex,
+) -> Option<RoaringTreemap> {
+    use crate::proto::metadata_filter::FilterType;
+
+    match &filter.filter_type {
+        None => Some(index.alive.clone()),
+        Some(FilterType::Exact(exact)) => Some(index.bitmap_for_exact(&exact.key, &exact.value)),
+        Some(FilterType::InMatch(in_match)) => {
+            let mut out = RoaringTreemap::new();
+            for v in &in_match.values {
+                out |= index.bitmap_for_exact(&in_match.key, v);
+            }
+            Some(out)
+        }
+        Some(FilterType::AndFilter(and_filter)) => {
+            if and_filter.filters.is_empty() {
+                return Some(index.alive.clone());
+            }
+            let mut it = and_filter.filters.iter();
+            let first = it.next()?;
+            let mut acc = compile_filter_to_bitmap(first, index)?;
+            for sub in it {
+                let b = compile_filter_to_bitmap(sub, index)?;
+                acc &= b;
+            }
+            Some(acc)
+        }
+        Some(FilterType::OrFilter(or_filter)) => {
+            if or_filter.filters.is_empty() {
+                return Some(RoaringTreemap::new());
+            }
+            let mut acc = RoaringTreemap::new();
+            for sub in &or_filter.filters {
+                let b = compile_filter_to_bitmap(sub, index)?;
+                acc |= b;
+            }
+            Some(acc)
+        }
+        Some(FilterType::NotFilter(not_filter)) => {
+            let sub = not_filter.filter.as_ref()?;
+            let sub_b = compile_filter_to_bitmap(sub, index)?;
+            let mut out = index.alive.clone();
+            out -= &sub_b;
+            Some(out)
+        }
+        // Range requires evaluating actual values.
+        // We fall back to scan for correctness.
+        Some(FilterType::Range(_)) => None,
+    }
+}
 
 /// Disk space warning threshold (alert if free space < 10%)
 const DISK_SPACE_WARNING_THRESHOLD: f64 = 0.10;
@@ -174,6 +297,8 @@ pub struct HnswBackend {
     embeddings: Arc<RwLock<Vec<Vec<f32>>>>,
     /// Metadata storage for O(1) fetch by doc_id
     metadata: Arc<RwLock<Vec<HashMap<String, String>>>>,
+    /// Inverted index for scalable metadata filtering (derived from metadata)
+    metadata_index: Arc<RwLock<MetadataInvertedIndex>>,
     /// Persistence components (optional)
     persistence: Option<PersistenceState>,
 }
@@ -204,6 +329,30 @@ impl HnswBackend {
         metadata: Vec<HashMap<String, String>>,
         max_elements: usize,
     ) -> Result<Self> {
+        Self::new_with_hnsw_params(
+            dimension,
+            distance,
+            embeddings,
+            metadata,
+            max_elements,
+            HnswVectorIndex::DEFAULT_M,
+            HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
+            false,
+        )
+    }
+
+    /// Create new HNSW backend from pre-loaded embeddings (no persistence) with explicit HNSW params.
+    #[instrument(level = "debug", skip(embeddings, metadata), fields(num_docs = embeddings.len(), max_elements, hnsw_m, hnsw_ef_construction))]
+    pub fn new_with_hnsw_params(
+        dimension: usize,
+        distance: DistanceMetric,
+        embeddings: Vec<Vec<f32>>,
+        metadata: Vec<HashMap<String, String>>,
+        max_elements: usize,
+        hnsw_m: usize,
+        hnsw_ef_construction: usize,
+        disable_normalization_check: bool,
+    ) -> Result<Self> {
         if dimension == 0 {
             anyhow::bail!("embedding dimension must be > 0");
         }
@@ -214,13 +363,18 @@ impl HnswBackend {
                 metadata.len()
             );
         }
-        let mut index = HnswVectorIndex::new_with_distance(dimension, max_elements, distance)?;
+
+        let mut index = HnswVectorIndex::new_with_params(
+            dimension,
+            max_elements,
+            distance,
+            hnsw_m,
+            hnsw_ef_construction,
+            disable_normalization_check,
+        )?;
 
         // Build HNSW index from embeddings
-        info!(
-            documents = embeddings.len(),
-            dimension, "building HNSW index"
-        );
+        info!(documents = embeddings.len(), dimension, "building HNSW index");
         for (doc_id, embedding) in embeddings.iter().enumerate() {
             if embedding.len() != dimension {
                 anyhow::bail!(
@@ -234,10 +388,13 @@ impl HnswBackend {
         }
         info!("HNSW index built");
 
+        let metadata_index = MetadataInvertedIndex::rebuild_from(&embeddings, &metadata);
+
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
             embeddings: Arc::new(RwLock::new(embeddings)),
             metadata: Arc::new(RwLock::new(metadata)),
+            metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: None,
         })
     }
@@ -262,6 +419,36 @@ impl HnswBackend {
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
     ) -> Result<Self> {
+        Self::with_persistence_with_hnsw_params(
+            dimension,
+            distance,
+            embeddings,
+            metadata,
+            max_elements,
+            data_dir,
+            fsync_policy,
+            snapshot_interval,
+            HnswVectorIndex::DEFAULT_M,
+            HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
+            false,
+        )
+    }
+
+    /// Create new HNSW backend with persistence enabled and explicit HNSW params.
+    #[instrument(level = "debug", skip(embeddings, metadata, data_dir), fields(num_docs = embeddings.len(), max_elements, snapshot_interval, hnsw_m, hnsw_ef_construction))]
+    pub fn with_persistence_with_hnsw_params(
+        dimension: usize,
+        distance: DistanceMetric,
+        embeddings: Vec<Vec<f32>>,
+        metadata: Vec<HashMap<String, String>>,
+        max_elements: usize,
+        data_dir: impl AsRef<Path>,
+        fsync_policy: FsyncPolicy,
+        snapshot_interval: usize,
+        hnsw_m: usize,
+        hnsw_ef_construction: usize,
+        disable_normalization_check: bool,
+    ) -> Result<Self> {
         if dimension == 0 {
             anyhow::bail!("embedding dimension must be > 0");
         }
@@ -276,7 +463,14 @@ impl HnswBackend {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
 
-        let mut index = HnswVectorIndex::new_with_distance(dimension, max_elements, distance)?;
+        let mut index = HnswVectorIndex::new_with_params(
+            dimension,
+            max_elements,
+            distance,
+            hnsw_m,
+            hnsw_ef_construction,
+            disable_normalization_check,
+        )?;
 
         // Build HNSW index
         info!(
@@ -314,10 +508,13 @@ impl HnswBackend {
             snapshot_interval,
         };
 
+        let metadata_index = MetadataInvertedIndex::rebuild_from(&embeddings, &metadata);
+
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
             embeddings: Arc::new(RwLock::new(embeddings)),
             metadata: Arc::new(RwLock::new(metadata)),
+            metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: Some(persistence),
         })
     }
@@ -348,6 +545,33 @@ impl HnswBackend {
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
         metrics: MetricsCollector,
+    ) -> Result<Self> {
+        Self::recover_with_hnsw_params(
+            embedding_dimension,
+            distance,
+            data_dir,
+            max_elements,
+            fsync_policy,
+            snapshot_interval,
+            metrics,
+            HnswVectorIndex::DEFAULT_M,
+            HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
+            false,
+        )
+    }
+
+    #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval, hnsw_m, hnsw_ef_construction))]
+    pub fn recover_with_hnsw_params(
+        embedding_dimension: usize,
+        distance: DistanceMetric,
+        data_dir: impl AsRef<Path>,
+        max_elements: usize,
+        fsync_policy: FsyncPolicy,
+        snapshot_interval: usize,
+        metrics: MetricsCollector,
+        hnsw_m: usize,
+        hnsw_ef_construction: usize,
+        disable_normalization_check: bool,
     ) -> Result<Self> {
         if embedding_dimension == 0 {
             anyhow::bail!("embedding dimension must be > 0");
@@ -513,28 +737,39 @@ impl HnswBackend {
             );
         }
 
+        // Rebuild HNSW index from recovered embeddings.
+        let mut index = HnswVectorIndex::new_with_params(
+            dimension,
+            max_elements,
+            distance,
+            hnsw_m,
+            hnsw_ef_construction,
+            disable_normalization_check,
+        )?;
+
+        info!(documents = embeddings.len(), dimension, "rebuilding HNSW index from recovered state");
+        for (doc_id, embedding) in embeddings.iter().enumerate() {
+            // Skip tombstones (all-zero embeddings)
+            if embedding.iter().all(|&x| x == 0.0) {
+                continue;
+            }
+            if embedding.len() != dimension {
+                anyhow::bail!(
+                    "embedding dimension mismatch for doc_id {}: expected {}, got {}",
+                    doc_id,
+                    dimension,
+                    embedding.len()
+                );
+            }
+            index.add_vector(doc_id as u64, embedding)?;
+        }
+        info!("HNSW index rebuilt");
+
         if embeddings.is_empty() {
             // It's possible to have an empty DB if it's new, but usually we expect something if recovering.
             // However, allowing empty recovery is safer for new deployments.
             info!("Recovery: no data found (fresh start or empty DB)");
         }
-
-        // Rebuild HNSW index
-        let mut index = HnswVectorIndex::new_with_distance(dimension, max_elements, distance)?;
-        info!(
-            documents = embeddings.len(),
-            dimension, "rebuilding HNSW index after recovery"
-        );
-
-        for (doc_id, embedding) in embeddings.iter().enumerate() {
-            // Skip tombstones (all zeros)
-            if embedding.iter().all(|&x| x == 0.0) {
-                continue;
-            }
-            index.add_vector(doc_id as u64, embedding)?;
-        }
-
-        info!("HNSW index rebuilt");
 
         // Create new active WAL
         let wal_path = data_dir.join(format!("wal_{}.wal", Self::timestamp()));
@@ -556,10 +791,13 @@ impl HnswBackend {
 
         info!(documents = embeddings.len(), "recovery complete");
 
+        let metadata_index = MetadataInvertedIndex::rebuild_from(&embeddings, &metadata);
+
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
             embeddings: Arc::new(RwLock::new(embeddings)),
             metadata: Arc::new(RwLock::new(metadata)),
+            metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: Some(persistence),
         })
     }
@@ -655,6 +893,17 @@ impl HnswBackend {
             embeddings[doc_id_usize] = old_embedding;
             metas[doc_id_usize] = old_metadata;
             return Err(e);
+        }
+
+        // Keep metadata inverted index in sync with metadata/tombstones.
+        {
+            let mut meta_index = self.metadata_index.write();
+            let old_alive = !old_embedding.iter().all(|&x| x == 0.0);
+            if old_alive {
+                meta_index.replace_doc(doc_id, &old_metadata, &metadata_for_wal);
+            } else {
+                meta_index.insert_doc(doc_id, &metadata_for_wal);
+            }
         }
 
         let mut should_create_snapshot = false;
@@ -768,6 +1017,7 @@ impl HnswBackend {
         let mut index = self.index.write();
         let mut embeddings = self.embeddings.write();
         let mut metas = self.metadata.write();
+        let mut meta_index = self.metadata_index.write();
 
         // Pre-allocate capacity
         if max_doc_id >= embeddings.len() {
@@ -797,7 +1047,15 @@ impl HnswBackend {
 
             // Add to HNSW index
             match index.add_vector(doc_id, &embedding) {
-                Ok(_) => loaded += 1,
+                Ok(_) => {
+                    let old_alive = !old_embedding.iter().all(|&x| x == 0.0);
+                    if old_alive {
+                        meta_index.replace_doc(doc_id, &old_metadata, &metas[doc_id_usize]);
+                    } else {
+                        meta_index.insert_doc(doc_id, &metas[doc_id_usize]);
+                    }
+                    loaded += 1;
+                }
                 Err(e) => {
                     embeddings[doc_id_usize] = old_embedding;
                     metas[doc_id_usize] = old_metadata;
@@ -1001,11 +1259,23 @@ impl HnswBackend {
         metadata: HashMap<String, String>,
         merge: bool,
     ) -> Result<bool> {
-        let mut meta_guard = self.metadata.write();
-
-        if doc_id as usize >= meta_guard.len() {
+        // Treat tombstoned documents as non-existent for metadata updates.
+        let doc_id_usize = doc_id as usize;
+        let exists = {
+            let embeddings = self.embeddings.read();
+            doc_id_usize < embeddings.len() && !embeddings[doc_id_usize].iter().all(|&x| x == 0.0)
+        };
+        if !exists {
             return Ok(false);
         }
+
+        let mut meta_guard = self.metadata.write();
+
+        if doc_id_usize >= meta_guard.len() {
+            return Ok(false);
+        }
+
+        let old_metadata = meta_guard[doc_id_usize].clone();
 
         // Apply update
         let updated_metadata = if merge {
@@ -1055,7 +1325,13 @@ impl HnswBackend {
         }
 
         // Update in-memory metadata
-        meta_guard[doc_id as usize] = updated_metadata;
+        meta_guard[doc_id_usize] = updated_metadata.clone();
+
+        // Keep metadata inverted index in sync.
+        {
+            let mut meta_index = self.metadata_index.write();
+            meta_index.replace_doc(doc_id, &old_metadata, &updated_metadata);
+        }
 
         Ok(true)
     }
@@ -1110,14 +1386,19 @@ impl HnswBackend {
         // Update in-memory state (Soft Delete)
         let mut embeddings = self.embeddings.write();
         let mut metas = self.metadata.write();
+        let mut meta_index = self.metadata_index.write();
 
         if doc_id_usize < embeddings.len() {
+            let old_metadata = metas[doc_id_usize].clone();
+
             // Set to zero-vector (tombstone)
             let dim = embeddings[doc_id_usize].len();
             embeddings[doc_id_usize] = vec![0.0; dim];
 
             // Clear metadata
             metas[doc_id_usize].clear();
+
+            meta_index.remove_doc(doc_id, &old_metadata);
 
             Ok(true)
         } else {
@@ -1134,6 +1415,7 @@ impl HnswBackend {
         // Acquire write locks
         let mut embeddings = self.embeddings.write();
         let mut metadata = self.metadata.write();
+        let mut meta_index = self.metadata_index.write();
 
         let mut deleted_count = 0;
         let mut wal_entries = Vec::with_capacity(doc_ids.len());
@@ -1192,13 +1474,16 @@ impl HnswBackend {
         // Apply changes to memory
         for entry in &wal_entries {
             let id_usize = entry.doc_id as usize;
+
+            if let Some(meta) = metadata.get_mut(id_usize) {
+                let old_meta = std::mem::take(meta);
+                meta_index.remove_doc(entry.doc_id, &old_meta);
+            }
+
             // Mark as tombstone
             if let Some(emb) = embeddings.get_mut(id_usize) {
                 let dim = emb.len();
                 *emb = vec![0.0; dim];
-            }
-            if let Some(meta) = metadata.get_mut(id_usize) {
-                meta.clear();
             }
             deleted_count += 1;
         }
@@ -1289,6 +1574,21 @@ impl HnswBackend {
         Ok(results)
     }
 
+    /// Return document IDs matching a structured metadata filter.
+    ///
+    /// Fast path uses the inverted index for `Exact`, `InMatch`, `AndFilter`, `OrFilter`, and `NotFilter`.
+    /// Falls back to `scan()` for `Range` (and any shape we cannot compile) to preserve correctness.
+    pub fn ids_for_metadata_filter(&self, filter: &MetadataFilter) -> Vec<u64> {
+        let meta_index = self.metadata_index.read();
+        if let Some(mut bitmap) = compile_filter_to_bitmap(filter, &meta_index) {
+            // Defensive: ensure tombstones are excluded even if a value bitmap is stale.
+            bitmap &= meta_index.alive.clone();
+            return bitmap.iter().collect();
+        }
+
+        self.scan(|meta| metadata_filter::matches(filter, meta))
+    }
+
     /// Scan all documents and return IDs that match the predicate
     ///
     /// **Performance Warning**:
@@ -1298,21 +1598,38 @@ impl HnswBackend {
     where
         F: Fn(&HashMap<String, String>) -> bool,
     {
-        let metas = self.metadata.read();
-        let embeddings = self.embeddings.read();
+        const CHUNK_SIZE: usize = 4096;
 
-        metas
-            .iter()
-            .enumerate()
-            .filter(|(id, meta)| {
+        let total_len = {
+            let metas = self.metadata.read();
+            let embeddings = self.embeddings.read();
+            std::cmp::min(metas.len(), embeddings.len())
+        };
+
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        while start < total_len {
+            let end = (start + CHUNK_SIZE).min(total_len);
+
+            // Re-acquire locks per chunk to avoid holding them for a full O(N) scan.
+            let metas = self.metadata.read();
+            let embeddings = self.embeddings.read();
+
+            for id in start..end {
                 // Skip tombstones
-                if *id < embeddings.len() && embeddings[*id].iter().all(|&x| x == 0.0) {
-                    return false;
+                if embeddings[id].iter().all(|&x| x == 0.0) {
+                    continue;
                 }
-                predicate(meta)
-            })
-            .map(|(id, _)| id as u64)
-            .collect()
+
+                if predicate(&metas[id]) {
+                    out.push(id as u64);
+                }
+            }
+
+            start = end;
+        }
+
+        out
     }
 
     /// Force fsync on WAL (for periodic fsync policy)
@@ -1425,6 +1742,74 @@ impl HnswBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::metadata_filter::FilterType;
+    use crate::proto::{ExactMatch, MetadataFilter, NotFilter};
+    use std::collections::HashMap;
+
+    fn exact(key: &str, value: &str) -> MetadataFilter {
+        MetadataFilter {
+            filter_type: Some(FilterType::Exact(ExactMatch {
+                key: key.to_string(),
+                value: value.to_string(),
+            })),
+        }
+    }
+
+    #[test]
+    fn metadata_index_tracks_insert_update_delete() -> Result<()> {
+        let backend = HnswBackend::new(
+            3,
+            DistanceMetric::Euclidean,
+            Vec::new(),
+            Vec::new(),
+            128,
+        )?;
+
+        let mut meta = HashMap::new();
+        meta.insert("tag".to_string(), "a".to_string());
+        backend.insert(1, vec![1.0, 0.0, 0.0], meta)?;
+
+        assert_eq!(backend.ids_for_metadata_filter(&exact("tag", "a")), vec![1]);
+
+        let mut updated = HashMap::new();
+        updated.insert("tag".to_string(), "b".to_string());
+        assert!(backend.update_metadata(1, updated, false)?);
+
+        assert!(backend.ids_for_metadata_filter(&exact("tag", "a")).is_empty());
+        assert_eq!(backend.ids_for_metadata_filter(&exact("tag", "b")), vec![1]);
+
+        assert!(backend.delete(1)?);
+        assert!(backend.ids_for_metadata_filter(&exact("tag", "b")).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_index_not_filter_uses_alive_complement() -> Result<()> {
+        let backend = HnswBackend::new(
+            3,
+            DistanceMetric::Euclidean,
+            Vec::new(),
+            Vec::new(),
+            128,
+        )?;
+
+        let mut meta_a = HashMap::new();
+        meta_a.insert("tag".to_string(), "a".to_string());
+        backend.insert(1, vec![1.0, 0.0, 0.0], meta_a)?;
+
+        let mut meta_b = HashMap::new();
+        meta_b.insert("tag".to_string(), "b".to_string());
+        backend.insert(2, vec![0.0, 1.0, 0.0], meta_b)?;
+
+        let not_a = MetadataFilter {
+            filter_type: Some(FilterType::NotFilter(Box::new(NotFilter {
+                filter: Some(Box::new(exact("tag", "a"))),
+            }))),
+        };
+
+        assert_eq!(backend.ids_for_metadata_filter(&not_a), vec![2]);
+        Ok(())
+    }
 
     #[test]
     fn test_hnsw_backend_basic_operations() {

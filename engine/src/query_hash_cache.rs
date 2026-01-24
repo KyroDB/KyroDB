@@ -467,22 +467,7 @@ impl QueryHashCache {
             return 0.0;
         }
 
-        let mut dot = 0.0;
-        let mut mag_a = 0.0;
-        let mut mag_b = 0.0;
-
-        for i in 0..a.len() {
-            dot += a[i] * b[i];
-            mag_a += a[i] * a[i];
-            mag_b += b[i] * b[i];
-        }
-
-        let magnitude = (mag_a * mag_b).sqrt();
-        if magnitude < f32::EPSILON {
-            return 0.0;
-        }
-
-        (dot / magnitude).clamp(-1.0, 1.0)
+        crate::simd::cosine_similarity_f32(a, b)
     }
 
     /// Update LRU queue (move query_hash to back)

@@ -83,6 +83,9 @@ dimension = 768
 # Distance metric: "cosine", "euclidean", or "innerproduct"
 distance = "cosine"
 
+# Disable L2-normalization checks for inner-product vectors (performance opt-out)
+disable_normalization_check = false
+
 # Persistence Configuration (WAL + Snapshots)
 [persistence]
 # Data directory for WAL and snapshots

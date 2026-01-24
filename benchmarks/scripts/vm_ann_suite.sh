@@ -57,10 +57,10 @@ start_server() {
   pkill -9 kyrodb_server 2>/dev/null || true
   sleep 1
 
-  "${pin_cmd[@]}" ./target/release/kyrodb_server --config "$config_path" &
+  "${pin_cmd[@]:-}" ./target/release/kyrodb_server --config "$config_path" &
   SERVER_PID=$!
 
-  # Best-effort health wait
+  # 30s best-effort health wait
   for _ in $(seq 1 60); do
     if command -v curl >/dev/null 2>&1; then
       if curl -sf "http://127.0.0.1:51051/health" >/dev/null 2>&1; then

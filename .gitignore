@@ -119,7 +119,7 @@ bench_server.log
 # Benchmark data (large files - DO NOT COMMIT)
 benchmarks/data/
 benchmarks/_generated/
-benchmarks/results/**
+benchmarks/results/*
 !benchmarks/results/.gitkeep
 benchmark_data/
 *.hdf5

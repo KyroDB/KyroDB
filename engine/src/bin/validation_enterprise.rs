@@ -1379,6 +1379,11 @@ async fn main() -> Result<()> {
         hot_tier_max_age: Duration::from_secs(300), // 5 minutes
         hnsw_max_elements: config.corpus_size * 2,
         embedding_dimension: corpus_embeddings.first().map(|v| v.len()).unwrap_or(768),
+        hnsw_distance: kyrodb_engine::config::DistanceMetric::Cosine,
+        hnsw_m: kyrodb_engine::hnsw_index::HnswVectorIndex::DEFAULT_M,
+        hnsw_ef_construction: kyrodb_engine::hnsw_index::HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
+        hnsw_ef_search: 50,
+        hnsw_disable_normalization_check: false,
         data_dir: None, // No persistence for validation
         fsync_policy: kyrodb_engine::FsyncPolicy::Never,
         snapshot_interval: 10000,

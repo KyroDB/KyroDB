@@ -117,6 +117,11 @@ def main() -> None:
                 "size_bytes": p.stat().st_size,
                 "sha256": _sha256_file(p),
             }
+        else:
+            print(
+                f"Warning: dataset file not found: {p}",
+                file=sys.stderr,
+            )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

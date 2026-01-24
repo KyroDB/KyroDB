@@ -57,6 +57,9 @@ pub mod metadata_filter;
 // Adaptive oversampling for filtered search
 pub mod adaptive_oversampling;
 
+// SIMD-accelerated vector math (runtime-dispatched, safe fallback)
+pub(crate) mod simd;
+
 // Vector search: HNSW k-NN index
 pub mod hnsw_index;
 

@@ -886,6 +886,13 @@ impl Snapshot {
     }
 
     fn from_legacy_v2(legacy: LegacySnapshotV2) -> Self {
+        let assumed = crate::config::DistanceMetric::default();
+        warn!(
+            snapshot_timestamp = legacy.timestamp,
+            doc_count = legacy.documents.len(),
+            assumed_distance = ?assumed,
+            "LegacySnapshotV2 missing distance metric; assuming default. Verify metric to avoid incorrect search results."
+        );
         Self {
             version: 2,
             timestamp: legacy.timestamp,
@@ -893,7 +900,7 @@ impl Snapshot {
             dimension: legacy.dimension,
             documents: legacy.documents,
             metadata: legacy.metadata,
-            distance: crate::config::DistanceMetric::default(),
+            distance: assumed,
         }
     }
 }

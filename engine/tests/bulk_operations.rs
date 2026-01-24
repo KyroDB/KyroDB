@@ -9,7 +9,11 @@ use tempfile::TempDir;
 
 #[test]
 fn test_hot_tier_bulk_fetch() {
-    let hot_tier = HotTier::new(100, Duration::from_secs(60));
+    let hot_tier = HotTier::new(
+        100,
+        Duration::from_secs(60),
+        kyrodb_engine::config::DistanceMetric::Cosine,
+    );
 
     // Insert docs
     for i in 0..10 {

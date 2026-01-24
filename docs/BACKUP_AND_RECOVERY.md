@@ -103,6 +103,12 @@ PARENT_ID=$(./target/release/kyrodb_backup list --format json | jq -r '.[0].id')
 
 **When to use**: Hourly, between full backups, for continuous protection.
 
+## Migration Notes
+
+### Legacy Snapshots Without Distance Metric
+
+Legacy snapshot formats (LegacySnapshotV2) do not store the distance metric. During migration, KyroDB assumes the default metric (`DistanceMetric::default()`) and emits a warning with the snapshot timestamp and document count. If the original index used a different metric, search results may be incorrect after recovery. Validate the configured distance metric against the dataset used for the snapshot before resuming production traffic.
+
 ## Backup Schedule (Recommended)
 
 ```bash

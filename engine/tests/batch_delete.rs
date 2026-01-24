@@ -9,7 +9,7 @@ use tempfile::TempDir;
 
 #[test]
 fn test_hot_tier_batch_delete() {
-    let hot_tier = HotTier::new(100, Duration::from_secs(60));
+    let hot_tier = HotTier::new(100, Duration::from_secs(60), DistanceMetric::Cosine);
 
     // Insert docs
     for i in 0..10 {

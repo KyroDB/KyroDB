@@ -82,6 +82,7 @@ DATASETS = {
     "gist-960-euclidean": "https://ann-benchmarks.com/gist-960-euclidean.hdf5",
     "mnist-784-euclidean": "https://ann-benchmarks.com/mnist-784-euclidean.hdf5",
     "fashion-mnist-784-euclidean": "https://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5",
+    "deep-image-96-angular": "https://ann-benchmarks.com/deep-image-96-angular.hdf5",
 }
 
 
@@ -160,10 +161,23 @@ def download_dataset(name: str, data_dir: Path) -> Path:
     try:
         urllib.request.urlretrieve(url, filepath)
     except Exception:
+        if filepath.exists():
+            try:
+                filepath.unlink()
+            except Exception:
+                pass
         # Fallback to http for older environments.
         http_url = url.replace("https://", "http://", 1)
         print(f"  HTTPS download failed; retrying via HTTP: {http_url}")
-        urllib.request.urlretrieve(http_url, filepath)
+        try:
+            urllib.request.urlretrieve(http_url, filepath)
+        except Exception:
+            if filepath.exists():
+                try:
+                    filepath.unlink()
+                except Exception:
+                    pass
+            raise
     print(f"Downloaded to {filepath}")
     return filepath
 
@@ -181,10 +195,14 @@ def load_dataset(filepath: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def compute_recall(results: List[Tuple[int, float]], ground_truth: np.ndarray, k: int) -> float:
     """Compute recall@k.
-    
+
     Note: ground_truth is 0-indexed but our doc_ids are 1-indexed,
     so we subtract 1 from result doc_ids to compare.
+
+    k must be > 0.
     """
+    if k <= 0:
+        raise ValueError("k must be a positive integer")
     if len(results) == 0:
         return 0.0
     gt_set = set(int(x) for x in ground_truth[:k])
@@ -284,7 +302,11 @@ class KyroDBBenchmark:
             elapsed = time.time() - start
             
             if response.success:
-                rate = response.avg_insert_rate if response.avg_insert_rate > 0 else n_vectors / elapsed
+                rate = (
+                    response.avg_insert_rate
+                    if response.avg_insert_rate > 0
+                    else (n_vectors / elapsed if elapsed > 0 else 0)
+                )
                 print(f"  Loaded {response.total_loaded:,} vectors in {response.load_duration_ms/1000:.1f}s ({rate:,.0f} vec/s)")
                 print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s (total including gRPC)")
                 return
@@ -303,26 +325,37 @@ class KyroDBBenchmark:
                 # Now flush to HNSW
                 self.flush_to_hnsw()
                 elapsed = time.time() - start
-                print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
+                rate = n_vectors / elapsed if elapsed > 0 else 0
+                print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({rate:,.0f} vec/s)")
                 return
         except grpc.RpcError as e:
             print(f"  Bulk insert not available ({e.code()}), using individual inserts...")
         
         # Fallback to individual inserts (slowest)
+        failed_inserts = 0
         for i, vec in enumerate(vectors):
             req = kyrodb_pb2.InsertRequest(
                 doc_id=i + 1,  # doc_id must be >= 1
                 embedding=list(map(float, vec))
             )
-            self._stub.Insert(req)
+            try:
+                self._stub.Insert(req)
+            except grpc.RpcError as e:
+                failed_inserts += 1
+                if failed_inserts == 1:
+                    print(f"  Warning: Insert failed for doc_id={i+1}: {e.code()}")
                     
             if (i + 1) % 50000 == 0:
                 elapsed = time.time() - start
-                rate = (i + 1) / elapsed
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
                 print(f"  {i+1:,}/{n_vectors:,} ({rate:,.0f} vec/s)")
+
+        if failed_inserts > 0:
+            print(f"  Warning: {failed_inserts} inserts failed")
                 
         elapsed = time.time() - start
-        print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({n_vectors/elapsed:,.0f} vec/s)")
+        rate = n_vectors / elapsed if elapsed > 0 else 0
+        print(f"Indexed {n_vectors:,} vectors in {elapsed:.1f}s ({rate:,.0f} vec/s)")
         # Flush after individual inserts too
         self.flush_to_hnsw()
         

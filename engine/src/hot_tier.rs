@@ -17,6 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::DistanceMetric;
+use crate::simd;
+
 /// Hot tier statistics
 #[derive(Debug, Clone, Default)]
 pub struct HotTierStats {
@@ -32,6 +35,7 @@ pub struct HotTierStats {
 #[derive(Debug, Clone)]
 struct HotDocument {
     embedding: Vec<f32>,
+    embedding_l2_norm: f32,
     metadata: HashMap<String, String>,
     inserted_at: Instant,
 }
@@ -47,6 +51,8 @@ struct HotDocument {
 pub struct HotTier {
     documents: Arc<RwLock<HashMap<u64, HotDocument>>>,
     stats: Arc<RwLock<HotTierStats>>,
+
+    distance: DistanceMetric,
 
     /// Flush when hot tier reaches this size
     max_size: usize,
@@ -65,12 +71,13 @@ impl HotTier {
     /// # Defaults
     /// - `max_size`: 10,000 documents (tune based on write throughput)
     /// - `max_age`: 60 seconds (tune based on freshness requirements)
-    pub fn new(max_size: usize, max_age: Duration) -> Self {
+    pub fn new(max_size: usize, max_age: Duration, distance: DistanceMetric) -> Self {
         Self {
             documents: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(HotTierStats::default())),
             max_size,
             max_age,
+            distance,
         }
     }
 
@@ -78,8 +85,10 @@ impl HotTier {
     ///
     /// This is fast (no HNSW index update), just a HashMap insert.
     pub fn insert(&self, doc_id: u64, embedding: Vec<f32>, metadata: HashMap<String, String>) {
+        let embedding_l2_norm = Self::l2_norm(&embedding);
         let doc = HotDocument {
             embedding,
+            embedding_l2_norm,
             metadata,
             inserted_at: Instant::now(),
         };
@@ -354,22 +363,56 @@ impl HotTier {
             return Vec::new();
         }
 
-        // Compute distances for all documents in hot tier
-        let mut distances: Vec<(u64, f32)> = docs
-            .iter()
-            .map(|(doc_id, doc)| {
-                let distance = Self::cosine_distance(query, &doc.embedding);
-                (*doc_id, distance)
-            })
-            .collect();
+        let distance_metric = self.distance;
 
-        // Sort by distance ascending (smaller distance = better match)
-        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Compute query norm once for cosine.
+        let query_l2_norm = match distance_metric {
+            DistanceMetric::Cosine => Self::l2_norm(query),
+            _ => 0.0,
+        };
 
-        // Truncate to k results
-        distances.truncate(k);
+        // Use a bounded list for top-k to avoid sorting all N documents.
+        // Complexity: O(n * k) in worst case, but k is typically small (<= 100).
+        let mut top: Vec<(u64, f32)> = Vec::with_capacity(k);
 
-        distances
+        for (doc_id, doc) in docs.iter() {
+            let distance = match distance_metric {
+                DistanceMetric::Cosine => Self::cosine_distance_with_cached_norm(
+                    query,
+                    query_l2_norm,
+                    &doc.embedding,
+                    doc.embedding_l2_norm,
+                ),
+                DistanceMetric::Euclidean => Self::l2_distance(query, &doc.embedding),
+                DistanceMetric::InnerProduct => Self::dot_distance(query, &doc.embedding),
+            };
+
+            if !distance.is_finite() {
+                continue;
+            }
+
+            if top.len() < k {
+                top.push((*doc_id, distance));
+                continue;
+            }
+
+            // Find current worst (max distance) among top-k.
+            let mut worst_idx = 0usize;
+            let mut worst_dist = top[0].1;
+            for (idx, &(_, d)) in top.iter().enumerate().skip(1) {
+                if d > worst_dist {
+                    worst_dist = d;
+                    worst_idx = idx;
+                }
+            }
+
+            if distance < worst_dist {
+                top[worst_idx] = (*doc_id, distance);
+            }
+        }
+
+        top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        top
     }
 
     /// Compute cosine distance between two embeddings
@@ -389,30 +432,56 @@ impl HotTier {
     /// - SIMD vectorization (8× speedup on AVX2)
     /// - Pre-normalize embeddings (skip magnitude computation)
     #[inline]
+    #[allow(dead_code)]
     fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
         if a.len() != b.len() || a.is_empty() {
             return f32::INFINITY; // Invalid comparison
         }
 
-        let mut dot = 0.0;
-        let mut mag_a = 0.0;
-        let mut mag_b = 0.0;
+        Self::cosine_distance_with_cached_norm(a, Self::l2_norm(a), b, Self::l2_norm(b))
+    }
 
-        for i in 0..a.len() {
-            dot += a[i] * b[i];
-            mag_a += a[i] * a[i];
-            mag_b += b[i] * b[i];
+    #[inline]
+    fn cosine_distance_with_cached_norm(
+        a: &[f32],
+        a_l2_norm: f32,
+        b: &[f32],
+        b_l2_norm: f32,
+    ) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return f32::INFINITY;
+        }
+        if a_l2_norm <= f32::EPSILON || b_l2_norm <= f32::EPSILON {
+            return f32::INFINITY;
         }
 
-        let magnitude = (mag_a * mag_b).sqrt();
-        if magnitude < f32::EPSILON {
-            return f32::INFINITY; // Degenerate case: zero vector
-        }
+        let dot = simd::dot_f32(a, b);
 
-        let cosine_similarity = (dot / magnitude).clamp(-1.0, 1.0);
-
-        // Convert similarity [-1, 1] to distance [0, 2]
+        let cosine_similarity = (dot / (a_l2_norm * b_l2_norm)).clamp(-1.0, 1.0);
         1.0 - cosine_similarity
+    }
+
+    #[inline]
+    fn l2_norm(v: &[f32]) -> f32 {
+        simd::l2_norm_f32(v)
+    }
+
+    #[inline]
+    fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return f32::INFINITY;
+        }
+        simd::l2_distance_f32(a, b)
+    }
+
+    #[inline]
+    fn dot_distance(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return f32::INFINITY;
+        }
+        let dot = simd::dot_f32(a, b);
+        // Match anndists::DistDot: distance = 1 - dot (expects L2-normalized vectors).
+        1.0 - dot
     }
 
     /// Re-insert documents that failed to flush
@@ -439,8 +508,10 @@ impl HotTier {
         let reinsert_count = documents.len();
 
         for (doc_id, embedding, metadata) in documents {
+            let embedding_l2_norm = Self::l2_norm(&embedding);
             let doc = HotDocument {
                 embedding,
+                embedding_l2_norm,
                 metadata,
                 inserted_at: Instant::now(), // Use current timestamp
             };
@@ -460,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_insert_get() {
-        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
         let mut metadata = HashMap::new();
         metadata.insert("key".to_string(), "value".to_string());
 
@@ -484,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_size_threshold() {
-        let hot_tier = HotTier::new(3, Duration::from_secs(3600)); // 3 docs max
+        let hot_tier = HotTier::new(3, Duration::from_secs(3600), DistanceMetric::Cosine); // 3 docs max
 
         hot_tier.insert(1, vec![0.1], HashMap::new());
         hot_tier.insert(2, vec![0.2], HashMap::new());
@@ -498,7 +569,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_drain() {
-        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
 
         hot_tier.insert(1, vec![0.1], HashMap::new());
         hot_tier.insert(2, vec![0.2], HashMap::new());
@@ -520,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_hit_rate() {
-        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
 
         hot_tier.insert(1, vec![0.1], HashMap::new());
 
@@ -537,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_age_threshold() {
-        let hot_tier = HotTier::new(10000, Duration::from_millis(100)); // 100ms age
+        let hot_tier = HotTier::new(10000, Duration::from_millis(100), DistanceMetric::Cosine); // 100ms age
 
         hot_tier.insert(1, vec![0.1], HashMap::new());
 
@@ -551,7 +622,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_knn_search_basic() {
-        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
 
         // Insert 3 documents with normalized embeddings
         // Doc 1: [1.0, 0.0, 0.0] (normalized)
@@ -579,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_knn_search_empty() {
-        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
 
         let query = vec![1.0, 0.0, 0.0];
         let results = hot_tier.knn_search(&query, 5);
@@ -590,7 +661,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_knn_search_fewer_than_k() {
-        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
 
         // Insert 2 documents
         hot_tier.insert(1, vec![1.0, 0.0], HashMap::new());
@@ -606,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_knn_search_identical_vector() {
-        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
 
         // Insert document
         let embedding = vec![0.5, 0.5, 0.707];
@@ -662,7 +733,7 @@ mod tests {
 
     #[test]
     fn test_hot_tier_knn_search_k_zero() {
-        let hot_tier = HotTier::new(1000, Duration::from_secs(60));
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
 
         hot_tier.insert(1, vec![1.0, 0.0], HashMap::new());
 
