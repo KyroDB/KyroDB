@@ -143,9 +143,9 @@ run_dataset_suite() {
   local dataset="$1"
   local dim="$2"
   local distance="$3"
+  local m="$4"
+  local ef_c="$5"
 
-  local m=16
-  local ef_c=200
   local max_elements=2000000
   local data_dir="$RESULTS_ROOT/data_${dataset//[^a-zA-Z0-9]/_}"
   local cfg="$RESULTS_ROOT/server_${dataset//[^a-zA-Z0-9]/_}.toml"
@@ -197,8 +197,12 @@ run_dataset_suite() {
 
 trap stop_server EXIT
 
-run_dataset_suite "sift-128-euclidean" 128 "euclidean"
-run_dataset_suite "glove-100-angular" 100 "cosine"
-run_dataset_suite "gist-960-euclidean" 960 "euclidean"
+# Dimension-aware HNSW parameters for optimal recall/QPS trade-off:
+# - SIFT-128:  M=16, ef_c=200 (standard, works well for low-dim)
+# - GloVe-100: M=16, ef_c=200 (standard)
+# - GIST-960:  M=32, ef_c=400 (high-dim needs more connectivity)
+run_dataset_suite "sift-128-euclidean" 128 "euclidean" 16 200
+run_dataset_suite "glove-100-angular" 100 "cosine" 16 200
+run_dataset_suite "gist-960-euclidean" 960 "euclidean" 32 400
 
 echo "Done. Results in: $RESULTS_ROOT"
