@@ -13,6 +13,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 RESULTS_ROOT="benchmarks/results/vm_suite_$(date -u +%Y%m%d_%H%M%S)"
+# Auto-clean previous runs to keep the results directory fresh
+rm -rf benchmarks/results/*
 mkdir -p "$RESULTS_ROOT"
 
 echo "Results: $RESULTS_ROOT"
@@ -36,7 +38,7 @@ if missing:
 PY
 
 # Build server
-cargo build --release --locked --bin kyrodb_server
+cargo build --release --bin kyrodb_server
 
 # Generate gRPC stubs (required by benchmarks/run_benchmark.py)
 python3 benchmarks/scripts/gen_grpc_stubs.py
