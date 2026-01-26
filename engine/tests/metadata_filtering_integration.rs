@@ -12,6 +12,12 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 
+fn unit_vec_128(idx: usize) -> Vec<f32> {
+    let mut v = vec![0.0; 128];
+    v[idx % 128] = 1.0;
+    v
+}
+
 struct TestEngineGuard {
     engine: TieredEngine,
     _temp_dir: TempDir,
@@ -56,7 +62,7 @@ fn create_test_engine() -> TestEngineGuard {
 
     let cache_strategy = Box::new(kyrodb_engine::cache_strategy::LruCacheStrategy::new(10));
     let query_cache = Arc::new(kyrodb_engine::QueryHashCache::new(10, 0.8));
-    let initial_embeddings = vec![vec![0.0; 128]];
+    let initial_embeddings = vec![unit_vec_128(0)];
     let initial_metadata = vec![HashMap::new()];
 
     let engine = TieredEngine::new(
@@ -80,11 +86,11 @@ async fn test_exact_match_filtering() {
 
     let mut meta1 = HashMap::new();
     meta1.insert("category".to_string(), "A".to_string());
-    engine.insert(1, vec![1.0; 128], meta1).unwrap();
+    engine.insert(1, unit_vec_128(1), meta1).unwrap();
 
     let mut meta2 = HashMap::new();
     meta2.insert("category".to_string(), "B".to_string());
-    engine.insert(2, vec![0.9; 128], meta2).unwrap();
+    engine.insert(2, unit_vec_128(2), meta2).unwrap();
 
     let filter = MetadataFilter {
         filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::Exact(
@@ -108,11 +114,11 @@ async fn test_range_filtering_gte() {
 
     let mut meta1 = HashMap::new();
     meta1.insert("score".to_string(), "50".to_string());
-    engine.insert(1, vec![1.0; 128], meta1).unwrap();
+    engine.insert(1, unit_vec_128(1), meta1).unwrap();
 
     let mut meta2 = HashMap::new();
     meta2.insert("score".to_string(), "75".to_string());
-    engine.insert(2, vec![0.9; 128], meta2).unwrap();
+    engine.insert(2, unit_vec_128(2), meta2).unwrap();
 
     let filter = MetadataFilter {
         filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::Range(
@@ -139,12 +145,12 @@ async fn test_and_filtering() {
     let mut meta1 = HashMap::new();
     meta1.insert("category".to_string(), "A".to_string());
     meta1.insert("status".to_string(), "active".to_string());
-    engine.insert(1, vec![1.0; 128], meta1).unwrap();
+    engine.insert(1, unit_vec_128(1), meta1).unwrap();
 
     let mut meta2 = HashMap::new();
     meta2.insert("category".to_string(), "A".to_string());
     meta2.insert("status".to_string(), "inactive".to_string());
-    engine.insert(2, vec![0.9; 128], meta2).unwrap();
+    engine.insert(2, unit_vec_128(2), meta2).unwrap();
 
     let filter = MetadataFilter {
         filter_type: Some(
@@ -184,15 +190,15 @@ async fn test_or_filtering() {
 
     let mut meta1 = HashMap::new();
     meta1.insert("category".to_string(), "A".to_string());
-    engine.insert(1, vec![1.0; 128], meta1).unwrap();
+    engine.insert(1, unit_vec_128(1), meta1).unwrap();
 
     let mut meta2 = HashMap::new();
     meta2.insert("category".to_string(), "B".to_string());
-    engine.insert(2, vec![0.9; 128], meta2).unwrap();
+    engine.insert(2, unit_vec_128(2), meta2).unwrap();
 
     let mut meta3 = HashMap::new();
     meta3.insert("category".to_string(), "C".to_string());
-    engine.insert(3, vec![0.8; 128], meta3).unwrap();
+    engine.insert(3, unit_vec_128(3), meta3).unwrap();
 
     let filter = MetadataFilter {
         filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::OrFilter(
@@ -235,11 +241,11 @@ async fn test_not_filter() {
 
     let mut meta1 = HashMap::new();
     meta1.insert("type".to_string(), "foo".to_string());
-    engine.insert(1, vec![1.0; 128], meta1).unwrap();
+    engine.insert(1, unit_vec_128(1), meta1).unwrap();
 
     let mut meta2 = HashMap::new();
     meta2.insert("type".to_string(), "bar".to_string());
-    engine.insert(2, vec![0.9; 128], meta2).unwrap();
+    engine.insert(2, unit_vec_128(2), meta2).unwrap();
 
     let filter = MetadataFilter {
         filter_type: Some(
@@ -269,15 +275,15 @@ async fn test_in_match_filtering() {
 
     let mut meta1 = HashMap::new();
     meta1.insert("status".to_string(), "pending".to_string());
-    engine.insert(1, vec![1.0; 128], meta1).unwrap();
+    engine.insert(1, unit_vec_128(1), meta1).unwrap();
 
     let mut meta2 = HashMap::new();
     meta2.insert("status".to_string(), "completed".to_string());
-    engine.insert(2, vec![0.9; 128], meta2).unwrap();
+    engine.insert(2, unit_vec_128(2), meta2).unwrap();
 
     let mut meta3 = HashMap::new();
     meta3.insert("status".to_string(), "failed".to_string());
-    engine.insert(3, vec![0.8; 128], meta3).unwrap();
+    engine.insert(3, unit_vec_128(3), meta3).unwrap();
 
     let filter = MetadataFilter {
         filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::InMatch(
@@ -307,7 +313,7 @@ async fn test_concurrent_filtered_search_no_race_conditions() {
         let mut meta = HashMap::new();
         meta.insert("category".to_string(), format!("cat_{}", i % 10));
         meta.insert("score".to_string(), i.to_string());
-        let embedding = vec![i as f32 / 100.0; 128];
+        let embedding = unit_vec_128(i as usize);
         engine.write().await.insert(i, embedding, meta).unwrap();
     }
 
@@ -345,7 +351,7 @@ async fn test_filter_with_missing_metadata_fields() {
 
     let mut meta1 = HashMap::new();
     meta1.insert("category".to_string(), "A".to_string());
-    engine.insert(1, vec![1.0; 128], meta1).unwrap();
+    engine.insert(1, unit_vec_128(1), meta1).unwrap();
 
     let filter = MetadataFilter {
         filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::Exact(
@@ -365,7 +371,7 @@ async fn test_empty_metadata() {
     let engine = create_test_engine();
 
     let meta1 = HashMap::new();
-    engine.insert(1, vec![1.0; 128], meta1).unwrap();
+    engine.insert(1, unit_vec_128(1), meta1).unwrap();
 
     let filter = MetadataFilter {
         filter_type: Some(kyrodb_engine::proto::metadata_filter::FilterType::Exact(

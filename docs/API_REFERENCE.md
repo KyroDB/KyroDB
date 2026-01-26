@@ -3,7 +3,7 @@
 KyroDB provides two interfaces:
 
 1. **gRPC API** (primary) - Vector operations, high performance
-2. **HTTP API** (observability only) - Monitoring and health checks
+2. **HTTP observability endpoints** - Monitoring and health checks
 
 ## gRPC API (Vector Operations)
 
@@ -11,9 +11,8 @@ All vector operations use gRPC for performance and efficiency.
 
 ### Protocol Details
 
-- **Server**: `127.0.0.1:50051` (default, configurable via `--port`)
-- **Credentials**: TLS optional (disable in dev with environment: `KYRODB_GRPC_TLS=false`)
-- **Timeout**: 30 seconds (configurable per request)
+- **Server**: `127.0.0.1:50051` by default (configurable via `--port` or config file)
+- **TLS**: configurable in the server config; see [Configuration Management](CONFIGURATION_MANAGEMENT.md)
 
 ### Service Definition
 
@@ -24,12 +23,16 @@ Complete service definitions are in `engine/proto/kyrodb.proto`.
 **Write Operations**:
 - `Insert(InsertRequest) → InsertResponse` - Insert single vector
 - `BulkInsert(stream InsertRequest) → InsertResponse` - Bulk insert (streaming)
+- `BulkLoadHnsw(stream InsertRequest) → BulkLoadResponse` - Bulk load directly into HNSW (benchmark/migration)
 - `Delete(DeleteRequest) → DeleteResponse` - Delete by ID
+- `BatchDelete(BatchDeleteRequest) → BatchDeleteResponse` - Delete by IDs or filter
+- `UpdateMetadata(UpdateMetadataRequest) → UpdateMetadataResponse` - Update metadata only
 
 **Read Operations**:
 - `Query(QueryRequest) → QueryResponse` - Point lookup by ID
 - `Search(SearchRequest) → SearchResponse` - k-NN search
 - `BulkSearch(stream SearchRequest) → stream SearchResponse` - Batch search
+- `BulkQuery(BulkQueryRequest) → BulkQueryResponse` - Bulk point lookup
 
 **Admin**:
 - `Health(HealthRequest) → HealthResponse` - Health check
@@ -39,6 +42,8 @@ Complete service definitions are in `engine/proto/kyrodb.proto`.
 - `GetConfig(ConfigRequest) → ConfigResponse` - Get server config
 
 ### Message Types
+
+## Insert
 
 **InsertRequest**:
 ```protobuf
@@ -50,12 +55,18 @@ message InsertRequest {
 }
 ```
 
+## Search
+
 **SearchRequest**:
 ```protobuf
 message SearchRequest {
   repeated float query_embedding = 1;   // Query vector
   uint32 k = 2;                         // Top-k results (1-1000)
-  string namespace = 3;                 // Optional namespace filter
+  float min_score = 3;                  // Optional score threshold
+  string namespace = 4;                 // Optional namespace filter
+  bool include_embeddings = 5;          // Include embeddings in results
+  MetadataFilter filter = 6;            // Structured metadata filter
+  uint32 ef_search = 7;                 // Optional ef_search override (0 = default)
 }
 ```
 
@@ -67,29 +78,30 @@ from kyrodb_pb2 import InsertRequest, SearchRequest
 from kyrodb_pb2_grpc import KyroDBServiceStub
 
 # Connect to server
-channel = grpc.aio.secure_channel(
-    '127.0.0.1:50051',
-    grpc.aio.ssl_channel_credentials()
-)
+channel = grpc.insecure_channel('127.0.0.1:50051')
 stub = KyroDBServiceStub(channel)
 
 # Insert a vector
-response = await stub.Insert(InsertRequest(
+response = stub.Insert(InsertRequest(
     doc_id=1,
     embedding=[0.1, 0.2, 0.3, 0.4]
 ))
-print(f"Inserted: {response.doc_id}")
+if not response.success:
+  raise RuntimeError(response.error)
+print(f"Insert OK (tier={response.tier}, inserted_at={response.inserted_at})")
 
 # Search for similar vectors
-results = await stub.Search(SearchRequest(
-    query_embedding=[0.1, 0.2, 0.3, 0.4],
-    k=10
+results = stub.Search(SearchRequest(
+  query_embedding=[0.1, 0.2, 0.3, 0.4],
+  k=10,
+  min_score=-1.0,
+  include_embeddings=False
 ))
 
 for result in results.results:
     print(f"doc_id: {result.doc_id}, score: {result.score}")
 
-await channel.close()
+channel.close()
 ```
 
 ### Example: Go Client
@@ -116,7 +128,14 @@ func main() {
 }
 ```
 
-## HTTP API (Observability Only)
+## HTTP Observability Endpoints
+
+These endpoints are read-only and used for monitoring:
+
+- `GET /health` - Liveness check
+- `GET /ready` - Readiness check
+- `GET /slo` - SLO breach status
+- `GET /metrics` - Prometheus metrics
 
 ### Base URL
 

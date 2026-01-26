@@ -18,6 +18,17 @@ port = 50051
 # HTTP observability port (auto-calculated as gRPC port + 1000 if omitted)
 # http_port = 51051
 
+# HTTP observability host (defaults to server.host if omitted)
+# Use this to bind observability endpoints to a restricted interface.
+# http_host = "127.0.0.1"
+
+# Authentication policy for HTTP observability endpoints:
+# - "disabled": no auth on /metrics,/health,/ready,/slo
+# - "metrics_and_slo": require auth for /metrics and /slo
+# - "all": require auth for all observability endpoints
+# Note: any non-"disabled" value requires auth.enabled=true.
+# observability_auth = "metrics_and_slo"
+
 # Maximum concurrent connections
 max_connections = 10000
 
@@ -49,6 +60,29 @@ strategy = "learned"
 
 # Training interval for Hybrid Semantic Cache (seconds)
 training_interval_secs = 600  # 10 minutes
+
+# Enable the background retraining task in the server.
+# If disabled, the learned predictor will remain in bootstrap mode.
+enable_training_task = true
+
+# Access logger window size (number of recent access events retained for training).
+# Larger values can improve training stability at the cost of memory.
+logger_window_size = 1000000
+
+# Predictor capacity multiplier relative to cache capacity.
+# The predictor stores hotness metadata; keeping this larger than cache capacity
+# reduces churn for workloads with a large working set.
+predictor_capacity_multiplier = 4
+
+# Query cache (L1b) settings
+query_cache_capacity = 100
+# Cosine similarity threshold for semantic query matches.
+# Tune per embedding model and workload.
+query_cache_similarity_threshold = 0.52
+
+# Optional override for hot-tier max age (seconds).
+# If omitted, the server uses training_interval_secs.
+# hot_tier_max_age_secs = 600
 
 # Minimum access count before training RMI
 min_training_samples = 100

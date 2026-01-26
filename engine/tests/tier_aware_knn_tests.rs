@@ -386,7 +386,7 @@ fn test_knn_only_hot_tier() {
 
     // Setup: One document in cold tier (HNSW requires at least one for dimensionality)
     // But we'll primarily query documents in hot tier
-    let initial_embeddings = vec![create_normalized_embedding(vec![0.0, 0.0])];
+    let initial_embeddings = vec![create_normalized_embedding(vec![1.0, 0.0])];
     let initial_metadata = vec![HashMap::new()];
 
     let cache = LruCacheStrategy::new(5);

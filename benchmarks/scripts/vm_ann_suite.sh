@@ -13,8 +13,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 RESULTS_ROOT="benchmarks/results/vm_suite_$(date -u +%Y%m%d_%H%M%S)"
-# Auto-clean previous runs to keep the results directory fresh
-rm -rf benchmarks/results/*
+# Optional cleanup: set CLEAN_RESULTS=true to remove prior results.
+if [[ "${CLEAN_RESULTS:-}" == "true" ]]; then
+  rm -rf benchmarks/results/*
+fi
 mkdir -p "$RESULTS_ROOT"
 
 echo "Results: $RESULTS_ROOT"
@@ -59,7 +61,7 @@ start_server() {
   pkill -9 kyrodb_server 2>/dev/null || true
   sleep 1
 
-  "${pin_cmd[@]:-}" ./target/release/kyrodb_server --config "$config_path" &
+  ${pin_cmd[@]+${pin_cmd[@]}} ./target/release/kyrodb_server --config "$config_path" &
   SERVER_PID=$!
 
   # 30s best-effort health wait

@@ -35,11 +35,13 @@ def main() -> None:
     if not proto_path.exists():
         raise SystemExit(f"Proto not found: {proto_path}")
 
+    proto_name = proto_path.stem
+
     out_dir = (repo_root / args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Ensure importable package (even though the generated files use absolute imports).
-    (out_dir / "__init__.py").write_text("\n")
+    (out_dir / "__init__.py").touch(exist_ok=True)
 
     # Run protoc.
     include_dir = str(proto_path.parent)
@@ -55,11 +57,14 @@ def main() -> None:
     if rc != 0:
         raise SystemExit(f"protoc failed with exit code {rc}")
 
-    # grpc_tools generates absolute import `import kyrodb_pb2 as ...`; keep stubs colocated.
-    grpc_file = out_dir / "kyrodb_pb2_grpc.py"
+    # grpc_tools generates absolute import `import <proto>_pb2 as ...`; keep stubs colocated.
+    grpc_file = out_dir / f"{proto_name}_pb2_grpc.py"
     if grpc_file.exists():
         text = grpc_file.read_text()
-        text = text.replace("import kyrodb_pb2 as ", "from . import kyrodb_pb2 as ")
+        text = text.replace(
+            f"import {proto_name}_pb2 as ",
+            f"from . import {proto_name}_pb2 as ",
+        )
         grpc_file.write_text(text)
 
     print(f"Generated stubs in: {out_dir}")

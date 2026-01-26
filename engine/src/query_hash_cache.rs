@@ -134,7 +134,7 @@ impl QueryHashCache {
     ///
     /// # Parameters
     /// - `capacity`: Maximum number of queries to cache (e.g., 100-1000)
-    /// - `similarity_threshold`: Minimum cosine similarity for match (e.g., 0.82)
+    /// - `similarity_threshold`: Minimum cosine similarity for match (e.g., 0.52)
     ///
     /// # Memory Usage
     /// Approximately `capacity × 1600 bytes` for 384-dim embeddings

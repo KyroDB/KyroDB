@@ -72,6 +72,15 @@ pub struct ServerConfig {
     /// HTTP observability server port (defaults to gRPC port + 1000)
     pub http_port: Option<u16>,
 
+    /// HTTP observability server host (defaults to `server.host` if omitted)
+    ///
+    /// This allows binding the observability endpoints to a different interface
+    /// (e.g., loopback-only) without changing the gRPC bind address.
+    pub http_host: Option<String>,
+
+    /// Authentication policy for HTTP observability endpoints.
+    pub observability_auth: ObservabilityAuthMode,
+
     /// Maximum number of concurrent connections
     pub max_connections: usize,
 
@@ -91,12 +100,28 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 50051,
             http_port: None,
+            http_host: None,
+            observability_auth: ObservabilityAuthMode::Disabled,
             max_connections: 10_000,
             connection_timeout_secs: 300,
             shutdown_timeout_secs: 30,
             tls: TlsConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservabilityAuthMode {
+    /// No authentication on HTTP observability endpoints.
+    #[default]
+    Disabled,
+
+    /// Require auth for `/metrics` and `/slo` only.
+    MetricsAndSlo,
+
+    /// Require auth for `/metrics`, `/health`, `/ready`, and `/slo`.
+    All,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,6 +158,35 @@ pub struct CacheConfig {
 
     /// Training interval for Hybrid Semantic Cache (seconds)
     pub training_interval_secs: u64,
+
+    /// Whether to run the background training task in `kyrodb_server`.
+    ///
+    /// When enabled, the server logs accesses into an in-memory ring buffer and
+    /// periodically retrains the learned cache predictor.
+    pub enable_training_task: bool,
+
+    /// Access logger ring buffer capacity (number of access events).
+    ///
+    /// Memory usage is roughly `capacity × 24 bytes`.
+    pub logger_window_size: usize,
+
+    /// Predictor capacity multiplier relative to L1a cache capacity.
+    ///
+    /// The predictor can track more candidates than the cache can hold;
+    /// retraining then selects the hottest subset.
+    pub predictor_capacity_multiplier: usize,
+
+    /// Query cache (L1b) capacity (number of cached queries).
+    pub query_cache_capacity: usize,
+
+    /// Query cache (L1b) cosine similarity threshold for semantic matches.
+    pub query_cache_similarity_threshold: f32,
+
+    /// Optional max age (seconds) for Hot Tier flush decisions.
+    ///
+    /// If not set, the server falls back to `training_interval_secs` for
+    /// backward compatibility.
+    pub hot_tier_max_age_secs: Option<u64>,
 
     /// Training window duration (seconds) - how far back to consider accesses
     pub training_window_secs: u64,
@@ -180,6 +234,12 @@ impl Default for CacheConfig {
             capacity: 10_000,
             strategy: CacheStrategy::Learned,
             training_interval_secs: 600,
+            enable_training_task: true,
+            logger_window_size: 1_000_000,
+            predictor_capacity_multiplier: 4,
+            query_cache_capacity: 100,
+            query_cache_similarity_threshold: 0.52,
+            hot_tier_max_age_secs: None,
             training_window_secs: 3600,
             recency_halflife_secs: 1800,
             min_training_samples: 100,
@@ -251,21 +311,16 @@ impl Default for HnswConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DistanceMetric {
     /// Cosine similarity (1 - cosine distance)
+    #[default]
     Cosine,
     /// Euclidean distance (L2)
     Euclidean,
     /// Inner product (dot product)
     InnerProduct,
-}
-
-impl Default for DistanceMetric {
-    fn default() -> Self {
-        DistanceMetric::Cosine
-    }
 }
 
 // ============================================================================
@@ -594,6 +649,13 @@ impl KyroDbConfig {
             self.server.port
         );
 
+        if let Some(http_host) = &self.server.http_host {
+            anyhow::ensure!(
+                !http_host.trim().is_empty(),
+                "server.http_host cannot be empty when set"
+            );
+        }
+
         // Validate HTTP port (auto-calculated or explicit)
         // Note: Since port is u16, it's automatically <= 65535
         // But we check for overflow when auto-calculating (port + 1000)
@@ -624,6 +686,16 @@ impl KyroDbConfig {
             self.cache.capacity
         );
         anyhow::ensure!(
+            self.cache.query_cache_capacity > 0,
+            "query_cache_capacity must be > 0, got {}",
+            self.cache.query_cache_capacity
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.cache.query_cache_similarity_threshold),
+            "query_cache_similarity_threshold must be in [0.0, 1.0], got {}",
+            self.cache.query_cache_similarity_threshold
+        );
+        anyhow::ensure!(
             self.cache.ab_test_split >= 0.0 && self.cache.ab_test_split <= 1.0,
             "A/B test split must be in [0.0, 1.0], got {}",
             self.cache.ab_test_split
@@ -640,6 +712,24 @@ impl KyroDbConfig {
             "training_interval_secs must be > 0, got {}",
             self.cache.training_interval_secs
         );
+
+        anyhow::ensure!(
+            self.cache.logger_window_size > 0,
+            "self.cache.logger_window_size must be > 0, got {}",
+            self.cache.logger_window_size
+        );
+        anyhow::ensure!(
+            self.cache.predictor_capacity_multiplier > 0,
+            "self.cache.predictor_capacity_multiplier must be > 0, got {}",
+            self.cache.predictor_capacity_multiplier
+        );
+        if let Some(age) = self.cache.hot_tier_max_age_secs {
+            anyhow::ensure!(
+                age > 0,
+                "self.cache.hot_tier_max_age_secs must be > 0 when set, got {:?}",
+                self.cache.hot_tier_max_age_secs
+            );
+        }
 
         // HNSW validation - basic bounds
         anyhow::ensure!(
@@ -738,6 +828,13 @@ impl KyroDbConfig {
                 "api_keys_file must be provided when authentication is enabled"
             );
         }
+
+        if self.server.observability_auth != ObservabilityAuthMode::Disabled {
+            anyhow::ensure!(
+                self.auth.enabled,
+                "server.observability_auth requires auth.enabled=true"
+            );
+        }
         anyhow::ensure!(
             self.auth.usage_export_interval_secs > 0,
             "usage_export_interval_secs must be > 0, got {}",
@@ -773,6 +870,14 @@ impl KyroDbConfig {
         self.server
             .http_port
             .unwrap_or_else(|| self.server.port.saturating_add(1000))
+    }
+
+    /// Get the HTTP observability host (defaults to the gRPC host)
+    pub fn http_host(&self) -> &str {
+        self.server
+            .http_host
+            .as_deref()
+            .unwrap_or_else(|| self.server.host.as_str())
     }
 
     /// Get connection timeout as Duration

@@ -23,10 +23,13 @@
 use anyhow::Context;
 use clap::Parser;
 use kyrodb_engine::{
-    cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
+    access_logger::AccessPatternLogger,
+    cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy, SharedLearnedCacheStrategy},
+    config::ObservabilityAuthMode,
     AuthManager, ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
     RateLimiter, TenantInfo, TieredEngine, TieredEngineConfig,
 };
+use kyrodb_engine::training_task::{spawn_training_task, TrainingConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,11 +42,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // HTTP server for observability endpoints
 use axum::{
     body::Body,
+    middleware,
     extract::State as AxumState,
     http::{header::CONTENT_TYPE, HeaderValue, Response as HttpResponse, StatusCode},
     routing::get,
     Router,
 };
+use axum::middleware::Next;
 use tower_http::trace::TraceLayer;
 
 // Generated protobuf code
@@ -65,6 +70,12 @@ const MAX_EMBEDDING_DIM: usize = 4096;
 
 /// Maximum batch size for bulk operations to prevent memory exhaustion
 const MAX_BATCH_SIZE: usize = 10000;
+
+/// BulkSearch micro-batch size to amortize per-request overhead
+const BULK_SEARCH_BATCH_SIZE: usize = 128;
+
+/// Maximum time to wait for a BulkSearch micro-batch (milliseconds)
+const BULK_SEARCH_MAX_WAIT_MS: u64 = 2;
 
 /// Minimum valid document ID (0 is reserved)
 const MIN_DOC_ID: u64 = 1;
@@ -161,8 +172,13 @@ impl TenantIdMapper {
 
         let map_snapshot = map.clone();
         let path = self.path.clone();
-        Self::persist_map_atomic(&path, &map_snapshot)?;
-        Ok(next_idx)
+        match Self::persist_map_atomic(&path, &map_snapshot) {
+            Ok(()) => Ok(next_idx),
+            Err(e) => {
+                map.remove(tenant_id);
+                Err(e)
+            }
+        }
     }
 
     fn persist_map_atomic(
@@ -268,6 +284,11 @@ struct KyroDBServiceImpl {
     state: Arc<ServerState>,
 }
 
+struct SearchPlan {
+    search_k: usize,
+    ef_search_override: Option<usize>,
+}
+
 impl KyroDBServiceImpl {
     #[allow(clippy::result_large_err)]
     fn tenant_context<T>(&self, request: &Request<T>) -> Result<Option<TenantContext>, Status> {
@@ -324,15 +345,14 @@ impl KyroDBServiceImpl {
         }
     }
 
-    async fn handle_search_request(
+    #[allow(clippy::result_large_err)]
+    fn validate_search_request(
         &self,
         tenant: Option<&TenantContext>,
-        req: SearchRequest,
-    ) -> Result<SearchResponse, Status> {
-        let start = Instant::now();
+        req: &SearchRequest,
+    ) -> Result<SearchPlan, Status> {
         self.enforce_rate_limit(tenant)?;
 
-        // Validate input
         if req.query_embedding.is_empty() {
             self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument("query_embedding cannot be empty"));
@@ -356,7 +376,6 @@ impl KyroDBServiceImpl {
                 MAX_KNN_K
             )));
         }
-
         if req.ef_search > 10_000 {
             self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument(
@@ -364,9 +383,6 @@ impl KyroDBServiceImpl {
             ));
         }
 
-        // Adaptive oversampling based on filter complexity
-        // Namespace filtering also requires oversampling since we filter post-fetch
-        let _has_filter = req.filter.is_some();
         let has_namespace = !req.namespace.is_empty();
         let base_oversampling = if let Some(ref filter) = req.filter {
             kyrodb_engine::adaptive_oversampling::calculate_oversampling_factor(filter)
@@ -382,48 +398,41 @@ impl KyroDBServiceImpl {
             .saturating_mul(oversampling_factor)
             .min(10_000);
 
-        let engine = self.state.engine.read().await;
-
         let ef_search_override = if req.ef_search == 0 {
             None
         } else {
             Some(req.ef_search as usize)
         };
 
-        let results = engine
-            .knn_search_with_ef(&req.query_embedding, search_k, ef_search_override)
-            .map_err(|e| {
-                self.state.metrics.record_query_failure();
-                self.state.metrics.record_error(ErrorCategory::Internal);
-                Status::internal(format!("Search failed: {}", e))
-            })?;
+        Ok(SearchPlan {
+            search_k,
+            ef_search_override,
+        })
+    }
 
-        let latency_ns = start.elapsed().as_nanos() as u64;
-        self.state.metrics.record_query_latency(latency_ns);
-        self.state.metrics.record_hnsw_search(latency_ns);
+    fn convert_distance_to_score(&self, dist: f32) -> f32 {
+        use kyrodb_engine::config::DistanceMetric;
 
-        // Convert engine distance to API score (higher is better).
-        // - Cosine: distance in [0, 2], score = 1 - distance (in [-1, 1])
-        // - Euclidean/L2: score = -distance (avoids clamping, preserves ordering and magnitude)
-        // - Inner product: engine returns a distance-like value; use -distance for monotonicity
-        let convert_distance_to_score = |dist: f32| -> f32 {
-            use kyrodb_engine::config::DistanceMetric;
+        match self.state.app_config.hnsw.distance {
+            DistanceMetric::Cosine => 1.0 - dist,
+            DistanceMetric::Euclidean | DistanceMetric::InnerProduct => -dist,
+        }
+    }
 
-            match self.state.app_config.hnsw.distance {
-                DistanceMetric::Cosine => 1.0 - dist,
-                DistanceMetric::Euclidean | DistanceMetric::InnerProduct => -dist,
-            }
-        };
-
-        let mut final_results = Vec::new();
-        final_results.reserve(req.k as usize);
+    fn build_search_response(
+        &self,
+        tenant: Option<&TenantContext>,
+        req: &SearchRequest,
+        results: Vec<kyrodb_engine::SearchResult>,
+        engine: &TieredEngine,
+        latency_ns: u64,
+    ) -> SearchResponse {
+        let mut final_results = Vec::with_capacity(req.k as usize);
         let mut candidates = results.into_iter();
 
-        // Metadata fetch is only required when we need it for correctness (tenancy/namespace/filtering).
-        // For pure ANN benchmarking workloads, skipping metadata avoids significant overhead.
+        let has_namespace = !req.namespace.is_empty();
         let needs_metadata = tenant.is_some() || has_namespace || req.filter.is_some();
 
-        // Iterate candidates until we fill k results or run out
         while final_results.len() < req.k as usize {
             let candidate = match candidates.next() {
                 Some(c) => c,
@@ -436,14 +445,12 @@ impl KyroDBServiceImpl {
                 }
             }
 
-            // Check min_score first (cheap)
-            let score = convert_distance_to_score(candidate.distance);
+            let score = self.convert_distance_to_score(candidate.distance);
             if req.min_score > 0.0 && score < req.min_score {
                 continue;
             }
 
             let metadata = if needs_metadata {
-                // Fetch metadata only when required for correctness.
                 let metadata = engine.get_metadata(candidate.doc_id).unwrap_or_default();
 
                 if let Some(tenant) = tenant {
@@ -453,7 +460,6 @@ impl KyroDBServiceImpl {
                     }
                 }
 
-                // Filter by namespace if specified
                 if has_namespace {
                     let doc_namespace = metadata
                         .get("__namespace__")
@@ -464,7 +470,6 @@ impl KyroDBServiceImpl {
                     }
                 }
 
-                // Apply metadata filter if present
                 if let Some(filter) = &req.filter {
                     if !kyrodb_engine::metadata_filter::matches(filter, &metadata) {
                         continue;
@@ -473,10 +478,9 @@ impl KyroDBServiceImpl {
 
                 metadata
             } else {
-                std::collections::HashMap::new()
+                HashMap::new()
             };
 
-            // Fetch embedding if requested (expensive)
             let embedding = if req.include_embeddings {
                 engine.query(candidate.doc_id, None).unwrap_or_default()
             } else {
@@ -499,13 +503,130 @@ impl KyroDBServiceImpl {
         let latency_ms = latency_ns as f64 / 1_000_000.0;
 
         let total_found = final_results.len() as u32;
-        Ok(SearchResponse {
+        SearchResponse {
             results: final_results,
             total_found,
             search_latency_ms: latency_ms as f32,
             search_path: search_response::SearchPath::Unknown as i32,
             error: String::new(),
-        })
+        }
+    }
+
+    async fn handle_search_request(
+        &self,
+        tenant: Option<&TenantContext>,
+        req: SearchRequest,
+    ) -> Result<SearchResponse, Status> {
+        let start = Instant::now();
+        let plan = self.validate_search_request(tenant, &req)?;
+
+        let engine = self.state.engine.read().await;
+
+        let results = engine
+            .knn_search_with_ef(&req.query_embedding, plan.search_k, plan.ef_search_override)
+            .map_err(|e| {
+                self.state.metrics.record_query_failure();
+                self.state.metrics.record_error(ErrorCategory::Internal);
+                Status::internal(format!("Search failed: {}", e))
+            })?;
+
+        let latency_ns = start.elapsed().as_nanos() as u64;
+        self.state.metrics.record_query_latency(latency_ns);
+        self.state.metrics.record_hnsw_search(latency_ns);
+
+        Ok(self.build_search_response(tenant, &req, results, &engine, latency_ns))
+    }
+
+    async fn handle_search_requests_batch(
+        &self,
+        tenant: Option<&TenantContext>,
+        requests: Vec<SearchRequest>,
+    ) -> Vec<Result<SearchResponse, Status>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results: Vec<Option<Result<SearchResponse, Status>>> = vec![None; requests.len()];
+        let mut groups: HashMap<Option<usize>, Vec<(usize, SearchRequest, SearchPlan)>> =
+            HashMap::new();
+
+        for (idx, req) in requests.into_iter().enumerate() {
+            match self.validate_search_request(tenant, &req) {
+                Ok(plan) => {
+                    groups
+                        .entry(plan.ef_search_override)
+                        .or_default()
+                        .push((idx, req, plan));
+                }
+                Err(e) => {
+                    results[idx] = Some(Err(e));
+                }
+            }
+        }
+
+        let engine = self.state.engine.read().await;
+
+        for (ef_search_override, group) in groups {
+            let max_search_k = group
+                .iter()
+                .map(|(_, _, plan)| plan.search_k)
+                .max()
+                .unwrap_or(0);
+
+            let queries: Vec<Vec<f32>> = group
+                .iter()
+                .map(|(_, req, _)| req.query_embedding.clone())
+                .collect();
+
+            let batch_start = Instant::now();
+
+            let batch_results = engine
+                .knn_search_batch_with_ef(&queries, max_search_k, ef_search_override)
+                .map_err(|e| {
+                    self.state.metrics.record_error(ErrorCategory::Internal);
+                    Status::internal(format!("Search failed: {}", e))
+                });
+
+            match batch_results {
+                Ok(batch_results) => {
+                    let latency_ns = batch_start.elapsed().as_nanos() as u64;
+                    let batch_len = group.len().max(1) as u64;
+                    let per_request_latency_ns = latency_ns / batch_len;
+                    for ((idx, req, _plan), candidates) in
+                        group.into_iter().zip(batch_results.into_iter())
+                    {
+                        self.state
+                            .metrics
+                            .record_query_latency(per_request_latency_ns);
+                        self.state
+                            .metrics
+                            .record_hnsw_search(per_request_latency_ns);
+                        let response = self.build_search_response(
+                            tenant,
+                            &req,
+                            candidates,
+                            &engine,
+                            per_request_latency_ns,
+                        );
+                        results[idx] = Some(Ok(response));
+                    }
+                }
+                Err(status) => {
+                    let status_code = status.code();
+                    let status_message = status.message().to_string();
+                    for (idx, _req, _plan) in group {
+                        self.state.metrics.record_query_failure();
+                        self.state.metrics.record_error(ErrorCategory::Internal);
+                        results[idx] = Some(Err(Status::new(status_code, status_message.clone())));
+                    }
+                }
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(Status::internal("missing batch result"))))
+            .collect()
     }
 }
 
@@ -744,6 +865,7 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<BulkLoadResponse>, Status> {
         let start = Instant::now();
         let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let mut stream = request.into_inner();
 
         // Stream ingestion in bounded chunks.
@@ -814,6 +936,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
             if documents.len() >= MAX_BATCH_SIZE {
                 let batch = std::mem::take(&mut documents);
+                let batch_len = batch.len() as u64;
                 let engine = self.state.engine.write().await;
                 match engine.bulk_load_cold_tier(batch) {
                     Ok((loaded, failed, _duration_ms, _rate)) => {
@@ -822,7 +945,9 @@ impl KyroDbService for KyroDBServiceImpl {
                     }
                     Err(e) => {
                         error!(error = %e, "BulkLoadHnsw: batch load failed");
-                        return Err(Status::internal(format!("Bulk load failed: {}", e)));
+                        last_error = format!("Bulk load failed: {}", e);
+                        total_failed_insertion += batch_len;
+                        break;
                     }
                 }
             }
@@ -830,6 +955,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         if !documents.is_empty() {
             let batch = std::mem::take(&mut documents);
+            let batch_len = batch.len() as u64;
             let engine = self.state.engine.write().await;
             match engine.bulk_load_cold_tier(batch) {
                 Ok((loaded, failed, _duration_ms, _rate)) => {
@@ -838,7 +964,8 @@ impl KyroDbService for KyroDBServiceImpl {
                 }
                 Err(e) => {
                     error!(error = %e, "BulkLoadHnsw: final batch load failed");
-                    return Err(Status::internal(format!("Bulk load failed: {}", e)));
+                    last_error = format!("Bulk load failed: {}", e);
+                    total_failed_insertion += batch_len;
                 }
             }
         }
@@ -1230,38 +1357,116 @@ impl KyroDbService for KyroDBServiceImpl {
         };
 
         tokio::spawn(async move {
-            let mut batch_count: u64 = 0;
+            let mut total_count: usize = 0;
+            let mut pending: Vec<SearchRequest> = Vec::with_capacity(BULK_SEARCH_BATCH_SIZE);
 
             loop {
-                tokio::select! {
-                    _ = tx.closed() => {
-                        // Client dropped the response stream.
-                        return;
-                    }
-                    next = stream.message() => {
-                        let req = match next {
-                            Ok(Some(r)) => r,
-                            Ok(None) => return,
-                            Err(e) => {
+                if tx.is_closed() {
+                    return;
+                }
+
+                if pending.is_empty() {
+                    tokio::select! {
+                        _ = tx.closed() => {
+                            return;
+                        }
+                        next = stream.message() => {
+                            let req = match next {
+                                Ok(Some(r)) => r,
+                                Ok(None) => return,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(Status::internal(format!("stream error: {}", e))))
+                                        .await;
+                                    return;
+                                }
+                            };
+
+                            if let Err(status) = service.enforce_rate_limit(tenant.as_ref()) {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
+
+                            total_count += 1;
+                            if total_count > MAX_BATCH_SIZE {
                                 let _ = tx
-                                    .send(Err(Status::internal(format!("stream error: {}", e))))
+                                    .send(Err(Status::resource_exhausted(format!(
+                                        "bulk_search batch size exceeds maximum {}",
+                                        MAX_BATCH_SIZE
+                                    ))))
                                     .await;
                                 return;
                             }
-                        };
 
-                        batch_count += 1;
-                        if batch_count > MAX_BATCH_SIZE as u64 {
+                            pending.push(req);
+                        }
+                    }
+                } else {
+                    let next = tokio::time::timeout(
+                        Duration::from_millis(BULK_SEARCH_MAX_WAIT_MS),
+                        stream.message(),
+                    )
+                    .await;
+
+                    match next {
+                        Ok(Ok(Some(req))) => {
+                            if let Err(status) = service.enforce_rate_limit(tenant.as_ref()) {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
+                            total_count += 1;
+                            if total_count > MAX_BATCH_SIZE {
+                                let _ = tx
+                                    .send(Err(Status::resource_exhausted(format!(
+                                        "bulk_search batch size exceeds maximum {}",
+                                        MAX_BATCH_SIZE
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                            pending.push(req);
+                        }
+                        Ok(Ok(None)) => {
+                            if !pending.is_empty() {
+                                let batch = std::mem::take(&mut pending);
+                                let responses = service
+                                    .handle_search_requests_batch(tenant.as_ref(), batch)
+                                    .await;
+                                for resp in responses {
+                                    if tx.send(resp).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        Ok(Err(e)) => {
                             let _ = tx
-                                .send(Err(Status::resource_exhausted(format!(
-                                    "bulk_search batch size exceeds maximum {}",
-                                    MAX_BATCH_SIZE
-                                ))))
+                                .send(Err(Status::internal(format!("stream error: {}", e))))
                                 .await;
                             return;
                         }
+                        Err(_) => {
+                            let batch = std::mem::take(&mut pending);
+                            let responses = service
+                                .handle_search_requests_batch(tenant.as_ref(), batch)
+                                .await;
+                            for resp in responses {
+                                if tx.send(resp).await.is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
 
-                        let resp = service.handle_search_request(tenant.as_ref(), req).await;
+                if pending.len() >= BULK_SEARCH_BATCH_SIZE {
+                    let batch = std::mem::take(&mut pending);
+                    let responses = service
+                        .handle_search_requests_batch(tenant.as_ref(), batch)
+                        .await;
+                    for resp in responses {
                         if tx.send(resp).await.is_err() {
                             return;
                         }
@@ -1853,6 +2058,59 @@ async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRespo
         })
 }
 
+async fn observability_auth_middleware(
+    AxumState(state): AxumState<Arc<ServerState>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> HttpResponse<Body> {
+    let mode = state.app_config.server.observability_auth;
+    if mode == ObservabilityAuthMode::Disabled {
+        return next.run(req).await;
+    }
+
+    let path = req.uri().path();
+    let requires_auth = match mode {
+        ObservabilityAuthMode::Disabled => false,
+        ObservabilityAuthMode::MetricsAndSlo => matches!(path, "/metrics" | "/slo"),
+        ObservabilityAuthMode::All => true,
+    };
+
+    if !requires_auth {
+        return next.run(req).await;
+    }
+
+    let auth = match state.auth.as_ref() {
+        Some(auth) => auth,
+        None => {
+            let mut resp = HttpResponse::new(Body::from("auth not initialized"));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return resp;
+        }
+    };
+
+    let api_key = req
+        .headers()
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            req.headers()
+                .get(AUTHORIZATION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::to_string)
+        });
+
+    match api_key.and_then(|k| auth.validate(&k)) {
+        Some(_tenant) => next.run(req).await,
+        None => {
+            let mut resp = HttpResponse::new(Body::from("unauthorized"));
+            *resp.status_mut() = StatusCode::UNAUTHORIZED;
+            resp
+        }
+    }
+}
+
 // ============================================================================
 // SERVER INITIALIZATION
 // ============================================================================
@@ -2024,7 +2282,12 @@ async fn main() -> anyhow::Result<()> {
     let engine_config = TieredEngineConfig {
         hot_tier_max_size: config.cache.capacity,
         hot_tier_hard_limit: config.cache.capacity * 2, // 2x soft limit for emergency eviction
-        hot_tier_max_age: Duration::from_secs(config.cache.training_interval_secs),
+        hot_tier_max_age: Duration::from_secs(
+            config
+                .cache
+                .hot_tier_max_age_secs
+                .unwrap_or(config.cache.training_interval_secs),
+        ),
         hnsw_max_elements: config.hnsw.max_elements,
         embedding_dimension: config.hnsw.dimension,
         hnsw_distance: config.hnsw.distance,
@@ -2046,28 +2309,59 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(16);
 
     // Initialize or recover engine
-    info!("Initializing TieredEngine with A/B testing (LRU vs learned strategy)...");
+    info!("Initializing TieredEngine with configured cache strategy...");
 
-    // Helper to create cache strategy (Two-level cache architecture)
+    // Helper to create cache strategy (L1a) and expose learned strategy for training.
     let create_cache_strategy = || {
         let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache.capacity));
 
-        let learned_predictor = LearnedCachePredictor::new(config.cache.capacity)
-            .context("Failed to create Hybrid Semantic Cache predictor")?;
+        let predictor_capacity = config
+            .cache
+            .capacity
+            .saturating_mul(config.cache.predictor_capacity_multiplier.max(1))
+            .min(config.hnsw.max_elements.max(1));
 
-        // NOTE: Semantic logic moved to QueryHashCache (L1b) in two-level architecture
+        let learned_predictor = LearnedCachePredictor::with_config(
+            predictor_capacity,
+            config.cache.admission_threshold,
+            Duration::from_secs(config.cache.training_window_secs),
+            Duration::from_secs(config.cache.recency_halflife_secs),
+            Duration::from_secs(config.cache.training_interval_secs),
+        )
+        .context("Failed to create Hybrid Semantic Cache predictor")?;
+        let mut learned_predictor = learned_predictor;
+        learned_predictor.set_auto_tune(config.cache.auto_tune_threshold);
+        learned_predictor.set_target_utilization(config.cache.target_utilization);
+
+        // NOTE: Semantic logic moved to QueryHashCache (L1b) in two-level architecture.
         let learned_strategy = Arc::new(LearnedCacheStrategy::new(
             config.cache.capacity,
             learned_predictor,
         ));
 
-        // NOTE: Query clustering and prefetching moved to separate layers in two-level architecture
-        // Prefetching will be re-enabled as a separate service layer in future updates
+        let (strategy_box, learned_for_training): (
+            Box<dyn kyrodb_engine::CacheStrategy>,
+            Option<Arc<LearnedCacheStrategy>>,
+        ) = match config.cache.strategy {
+            kyrodb_engine::config::CacheStrategy::Lru => {
+                (Box::new(LruCacheStrategy::new(config.cache.capacity)), None)
+            }
+            kyrodb_engine::config::CacheStrategy::Learned => {
+                (
+                    Box::new(SharedLearnedCacheStrategy::new(learned_strategy.clone())),
+                    Some(learned_strategy.clone()),
+                )
+            }
+            kyrodb_engine::config::CacheStrategy::AbTest => (
+                Box::new(AbTestSplitter::new(lru_strategy.clone(), learned_strategy.clone())),
+                Some(learned_strategy.clone()),
+            ),
+        };
 
-        Ok::<Box<dyn kyrodb_engine::CacheStrategy>, anyhow::Error>(Box::new(AbTestSplitter::new(
-            lru_strategy.clone(),
-            learned_strategy.clone(),
-        )))
+        Ok::<(Box<dyn kyrodb_engine::CacheStrategy>, Option<Arc<LearnedCacheStrategy>>), anyhow::Error>((
+            strategy_box,
+            learned_for_training,
+        ))
     };
 
     info!(
@@ -2075,12 +2369,12 @@ async fn main() -> anyhow::Result<()> {
         config.cache.enable_query_clustering, config.cache.enable_prefetching
     );
 
-    let cache_strategy = create_cache_strategy()?;
+    let (cache_strategy, mut learned_strategy_for_training) = create_cache_strategy()?;
 
     // Create query cache (L1b) - semantic similarity-based
     let query_cache = Arc::new(kyrodb_engine::QueryHashCache::new(
-        100,  // capacity: 100 query hashes
-        0.82, // similarity threshold from SemanticConfig default
+        config.cache.query_cache_capacity,
+        config.cache.query_cache_similarity_threshold,
     ));
 
     let data_dir_path = config.persistence.data_dir.clone();
@@ -2099,7 +2393,7 @@ async fn main() -> anyhow::Result<()> {
             )
         };
 
-    let engine = if should_attempt_recovery {
+    let mut engine = if should_attempt_recovery {
         info!("MANIFEST found, attempting recovery...");
 
         let data_dir_for_recover = data_dir_path.to_string_lossy().to_string();
@@ -2147,8 +2441,13 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                let fallback_cache_strategy = create_cache_strategy()?;
-                let query_cache_fallback = Arc::new(kyrodb_engine::QueryHashCache::new(100, 0.82));
+                let (fallback_cache_strategy, fallback_learned_strategy_for_training) =
+                    create_cache_strategy()?;
+                learned_strategy_for_training = fallback_learned_strategy_for_training;
+                let query_cache_fallback = Arc::new(kyrodb_engine::QueryHashCache::new(
+                    config.cache.query_cache_capacity,
+                    config.cache.query_cache_similarity_threshold,
+                ));
                 create_empty_engine(fallback_cache_strategy, query_cache_fallback)?
             }
         }
@@ -2169,11 +2468,75 @@ async fn main() -> anyhow::Result<()> {
 
     info!("TieredEngine initialized successfully with configured cache optimizations");
 
+    // Enable learned-cache training end-to-end:
+    // - attach access logger so queries generate training events
+    // - spawn periodic retraining task to update predictor
+    let should_run_training = config.cache.enable_training_task
+        && learned_strategy_for_training.is_some()
+        && config.cache.training_interval_secs > 0;
+
+    let access_logger = if should_run_training {
+        Some(Arc::new(parking_lot::RwLock::new(AccessPatternLogger::new(
+            config.cache.logger_window_size.max(1),
+        ))))
+    } else {
+        None
+    };
+
+    if let Some(logger) = &access_logger {
+        engine.set_access_logger(logger.clone());
+    }
+
     // Wrap engine in Arc<RwLock> for concurrent access
     let engine_arc = Arc::new(RwLock::new(engine));
 
     // Create metrics collector
     let metrics = MetricsCollector::new();
+
+    if should_run_training {
+        let learned_strategy = learned_strategy_for_training
+            .expect("should_run_training implies learned strategy exists");
+        let logger = access_logger.expect("should_run_training implies access logger exists");
+
+        let training_config = TrainingConfig {
+            interval: Duration::from_secs(config.cache.training_interval_secs),
+            window_duration: Duration::from_secs(config.cache.training_window_secs),
+            recency_halflife: Duration::from_secs(config.cache.recency_halflife_secs),
+            min_events_for_training: config.cache.min_training_samples.max(1),
+            rmi_capacity: config
+                .cache
+                .capacity
+                .saturating_mul(config.cache.predictor_capacity_multiplier.max(1))
+                .min(config.hnsw.max_elements.max(1)),
+            admission_threshold: config.cache.admission_threshold,
+            auto_tune_enabled: config.cache.auto_tune_threshold,
+            target_utilization: config.cache.target_utilization,
+        };
+
+        let training_shutdown_rx = shutdown_tx.subscribe();
+        let _training_handle = spawn_training_task(
+            logger,
+            learned_strategy,
+            training_config,
+            None,
+            Some(metrics.clone()),
+            training_shutdown_rx,
+        )
+        .await;
+
+        info!(
+            interval_secs = config.cache.training_interval_secs,
+            window_secs = config.cache.training_window_secs,
+            logger_window_size = config.cache.logger_window_size,
+            "Learned cache background retraining enabled"
+        );
+    } else {
+        info!(
+            enabled = config.cache.enable_training_task,
+            strategy = ?config.cache.strategy,
+            "Learned cache background retraining disabled"
+        );
+    }
 
     // Spawn background flush task with graceful shutdown
     let mut flush_shutdown_rx = shutdown_tx.subscribe();
@@ -2230,7 +2593,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Build HTTP router for observability endpoints
-    let http_app = Router::new()
+    let mut http_app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
@@ -2238,10 +2601,17 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
+    if config.server.observability_auth != ObservabilityAuthMode::Disabled {
+        http_app = http_app.layer(middleware::from_fn_with_state(
+            state.clone(),
+            observability_auth_middleware,
+        ));
+    }
+
     // HTTP port for observability (from config)
     let http_port = config.http_port();
     let http_addr =
-        format!("{}:{}", config.server.host, http_port).parse::<std::net::SocketAddr>()?;
+        format!("{}:{}", config.http_host(), http_port).parse::<std::net::SocketAddr>()?;
 
     info!(
         "HTTP observability server listening on http://{}",

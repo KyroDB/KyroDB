@@ -238,6 +238,7 @@ async fn warm_up_queries(config: &Config, dataset: Arc<Vec<Vec<f32>>>) -> Result
         let request = SearchRequest {
             query_embedding: embedding.clone(),
             k: 10,
+            ef_search: 0,
             min_score: -1.0,
             namespace: String::new(),
             include_embeddings: false,
@@ -286,6 +287,7 @@ async fn run_worker(
                 let request = SearchRequest {
                     query_embedding,
                     k: 10,
+                    ef_search: 0,
                     min_score: -1.0,
                     namespace: String::new(),
                     include_embeddings: false,

@@ -2,56 +2,39 @@
 
 Understand how KyroDB works internally.
 
-## System Overview
+## System overview
 
-KyroDB is a vector database with **two-level L1 cache** optimized for RAG workloads:
+KyroDB is a gRPC-first vector database with a two-level L1 cache, a hot tier, and an HNSW cold tier. HTTP endpoints are used only for observability.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Client Application                    │
+│                    Client Applications                   │
 └────────────────────────┬────────────────────────────────┘
-                         │ HTTP/gRPC
+                         │ gRPC (data plane)
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │                     KyroDB Server                        │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │   Layer 1a: Document Cache (RMI Frequency)         │ │
-│  │  • Predicts hot documents via learned index        │ │
-│  │  • 63.5% hit rate (validated)                      │ │
-│  │  • <10ns prediction latency                        │ │
+│  │   Layer 1a: Document Cache                          │ │
 │  └────────────────────────────────────────────────────┘ │
 │                         │ miss                           │
 │                         ▼                                │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │   Layer 1b: Query Cache (Semantic Similarity)      │ │
-│  │  • Caches paraphrased queries                      │ │
-│  │  • 10.1% additional hit rate (validated)           │ │
-│  │  • <1μs similarity scan                            │ │
+│  │   Layer 1b: Query Cache                             │ │
 │  └────────────────────────────────────────────────────┘ │
-│                         │ Combined L1: 73.5% hit rate    │
 │                         │ miss                           │
 │                         ▼                                │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │          Layer 2: Hot Tier (HashMap)               │ │
-│  │  • Recent writes buffer                            │ │
-│  │  • Fast exact lookups (<200ns)                     │ │
-│  │  • Periodic flush to cold tier                     │ │
+│  │   Layer 2: Hot Tier (recent writes)                 │ │
 │  └────────────────────────────────────────────────────┘ │
-│                         │                                │
-│                         │ Not in hot tier                │
+│                         │ miss                           │
 │                         ▼                                │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │          Layer 3: Cold Tier (HNSW)                 │ │
-│  │  • Bulk of data (millions of vectors)              │ │
-│  │  • k-NN approximate search                         │ │
-│  │  • <1ms P99 latency @ 10M vectors                  │ │
+│  │   Layer 3: Cold Tier (HNSW index)                   │ │
 │  └────────────────────────────────────────────────────┘ │
 │                                                          │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │          Persistence Layer (WAL + Snapshots)       │ │
-│  │  • Write-Ahead Log (durability)                    │ │
-│  │  • Periodic snapshots (fast recovery)              │ │
-│  │  • Checksummed for integrity                       │ │
+│  │   Persistence (WAL + Snapshots)                    │ │
 │  └────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────┘
                          │
@@ -61,163 +44,43 @@ KyroDB is a vector database with **two-level L1 cache** optimized for RAG worklo
                    └──────────┘
 ```
 
----
+HTTP observability endpoints:
 
-## Query Flow (Read Path)
+- `GET /metrics`
+- `GET /health`
+- `GET /ready`
+- `GET /slo`
 
-**Step-by-step when you search for a vector:**
+## Read path (search)
 
-```
-1. Client sends search request
-   │
-   ├─► HTTP POST /v1/search
-   │   Body: {"query_embedding": [...], "k": 10}
-   │
-2. Server receives request
-   │
-   ├─► Parse JSON
-   ├─► Validate embedding dimension
-   ├─► Extract query vector
-   │
-3. Layer 1a: Check Document Cache (RMI Frequency)
-   │
-   ├─► RMI predicts if document is "hot" by doc_id
-   ├─► If predicted hot: check cache
-   │   │
-   │   ├─► Cache hit (63.5% of queries)
-   │   │   └─► Return cached vector (<10ns)
-   │   │
-   │   └─► Cache miss
-   │       └─► Continue to Layer 1b
-   │
-4. Layer 1b: Check Query Cache (Semantic Similarity)
-   │
-   ├─► Hash query embedding, check for similar cached queries
-   │   │
-   │   ├─► Exact match or similarity >0.25
-   │   │   └─► Return cached result (10.1% additional hit rate, <1μs)
-   │   │
-   │   └─► Query cache miss
-   │       └─► Continue to Layer 2
-   │
-5. Layer 2: Check Hot Tier
-   │
-   ├─► HashMap lookup for recent writes
-   │   │
-   │   ├─► Found in hot tier
-   │   │   └─► Return vector (<200ns)
-   │   │
-   │   └─► Not in hot tier
-   │       └─► Continue to Layer 3
-   │
-6. Layer 3: HNSW Search
-   │
-   ├─► k-NN approximate search
-   ├─► Returns top-k nearest neighbors
-   ├─► Sorted by cosine similarity
-   │   └─► Return results (<1ms P99)
-   │
-7. Cache admission decisions
-   │
-   ├─► L1a: RMI predictor decides if doc should be cached
-   ├─► L1b: Always cache query→doc mapping
-   └─► Log access for RMI training (every 15 sec)
+1. Client sends a gRPC `Search` request.
+2. The server validates the request and passes it to `TieredEngine`.
+3. `TieredEngine` checks L1a (document cache), then L1b (query cache), then the hot tier, then HNSW.
+4. Results are filtered by tenant metadata, namespace, and filters when applicable.
+5. The server returns a `SearchResponse`.
 
-Total latency:
-• L1a hit: <10ns (63.5% of queries)
-• L1b hit: <1μs (10.1% of queries)
-• Combined L1: 73.5% hit rate
-• Hot tier: <200ns
-• Cold tier: <1ms (P99)
-```
+## Write path (insert)
 
----
+1. Client sends a gRPC `Insert` or `BulkInsert` request.
+2. The server validates and writes to the WAL and hot tier.
+3. Background flushes move hot-tier entries into the HNSW cold tier.
+4. Snapshots are created at the interval set by `persistence.snapshot_interval_secs`.
 
-## Insert Flow (Write Path)
+## Persistence
 
-**Step-by-step when you insert a vector:**
+- WAL and snapshots live under `persistence.data_dir`.
+- Recovery on startup uses the MANIFEST + snapshot + WAL tail.
 
-```
-1. Client sends insert request
-   │
-   ├─► HTTP POST /v1/insert
-   │   Body: {"doc_id": "doc_123", "embedding": [...]}
-   │
-2. Server receives request
-   │
-   ├─► Parse JSON
-   ├─► Validate embedding dimension
-   │
-3. Write to WAL (durability)
-   │
-   ├─► Append insert operation to log
-   ├─► fsync() to disk (configurable)
-   └─► WAL write complete (crash-safe)
-   │
-4. Write to Hot Tier
-   │
-   ├─► Insert into in-memory BTree
-   └─► Immediately queryable
-   │
-5. Return success to client
-   │
-   └─► Response: {"status": "ok", "doc_id": "doc_123"}
-   │
-6. Background flush (every 10 minutes)
-   │
-   ├─► Move hot tier vectors to HNSW index
-   ├─► Rebuild HNSW with new vectors
-   ├─► Atomic swap (no downtime)
-   └─► Clear hot tier
+## Backups and recovery
 
-Insert latency:
-• WAL write: ~100μs (with fsync)
-• Hot tier insert: ~1μs
-• Total: ~100μs P99
-```
+- Use the `kyrodb_backup` CLI for create/list/restore/verify/prune.
+- Restores require confirmation via `BACKUP_ALLOW_CLEAR=true` or a custom restore workflow.
 
----
+## Related documentation
 
-## Backup Flow
-
-**How backups work:**
-
-```
-Full Backup:
-1. Flush hot tier to cold tier
-2. Create snapshot of HNSW index
-3. Copy WAL + snapshot to backup directory
-4. Generate checksum
-5. Store metadata (timestamp, doc count, size)
-
-Incremental Backup:
-1. Track last backup timestamp
-2. Copy only new WAL segments since last backup
-3. Generate checksum
-4. Store metadata
-
-Retention Policy:
-• Keep all backups from last 24 hours
-• Keep daily backups from last 7 days
-• Keep weekly backups from last 30 days
-• Keep monthly backups from last 365 days
-```
-
----
-
-## Recovery Flow
-
-**How recovery from backup works:**
-
-```
-1. Stop server (if running)
-   │
-2. Clear target directory
-   │
-   ├─► Safety check: require BACKUP_ALLOW_CLEAR=1
-   └─► Remove old data
-   │
-3. Restore snapshot
+- [API Reference](API_REFERENCE.md)
+- [Configuration Guide](CONFIGURATION_MANAGEMENT.md)
+- [Backup and Recovery](BACKUP_AND_RECOVERY.md)
    │
    ├─► Copy HNSW index files
    ├─► Verify checksums

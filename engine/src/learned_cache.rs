@@ -365,9 +365,6 @@ impl LearnedCachePredictor {
         let limit = self.target_hot_entries.min(hotness_vec.len());
         let selected = self.select_with_diversity(&hotness_vec, limit);
 
-        eprintln!("DEBUG: train_from_accesses computed {} total docs, selected {} for storage (target={})",
-                  hotness_vec.len(), selected.len(), self.target_hot_entries);
-
         self.recalibrate_threshold(&selected);
 
         // Update HashMap atomically

@@ -1,6 +1,6 @@
 use kyrodb_engine::{
-    cache_strategy::LruCacheStrategy, persistence::FsyncPolicy, HnswBackend, HotTier,
-    QueryHashCache, TieredEngine, TieredEngineConfig, DistanceMetric,
+    cache_strategy::LruCacheStrategy, persistence::FsyncPolicy, DistanceMetric, HnswBackend,
+    HotTier, QueryHashCache, TieredEngine, TieredEngineConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ fn test_hot_tier_batch_delete() {
 
     // Insert docs
     for i in 0..10 {
-        hot_tier.insert(i, vec![i as f32], HashMap::new());
+        hot_tier.insert(i, vec![1.0], HashMap::new());
     }
 
     assert_eq!(hot_tier.len(), 10);
@@ -34,7 +34,7 @@ fn test_hot_tier_batch_delete() {
 #[test]
 fn test_hnsw_backend_batch_delete() {
     let temp_dir = TempDir::new().unwrap();
-    let embeddings = vec![vec![0.1], vec![1.0], vec![2.0], vec![3.0]];
+    let embeddings = vec![vec![1.0], vec![-1.0], vec![1.0], vec![-1.0]];
     let metadata = vec![HashMap::new(); 4];
 
     let backend = HnswBackend::with_persistence(
@@ -79,7 +79,7 @@ fn test_tiered_engine_batch_delete() {
     };
 
     // Initial cold tier data: 0, 1
-    let initial_embeddings = vec![vec![0.1], vec![1.0]];
+    let initial_embeddings = vec![vec![1.0], vec![-1.0]];
     let initial_metadata = vec![HashMap::new(), HashMap::new()];
 
     let cache_strategy = Box::new(LruCacheStrategy::new(100));
@@ -95,8 +95,8 @@ fn test_tiered_engine_batch_delete() {
     .unwrap();
 
     // Insert into hot tier: 2, 3
-    engine.insert(2, vec![2.0], HashMap::new()).unwrap();
-    engine.insert(3, vec![3.0], HashMap::new()).unwrap();
+    engine.insert(2, vec![1.0], HashMap::new()).unwrap();
+    engine.insert(3, vec![-1.0], HashMap::new()).unwrap();
 
     // Batch delete: 0 (cold), 2 (hot), 99 (missing)
     let ids = vec![0, 2, 99];
@@ -126,7 +126,7 @@ fn test_tiered_engine_batch_delete_by_filter() {
     let mut m1 = HashMap::new();
     m1.insert("cat".to_string(), "B".to_string());
 
-    let initial_embeddings = vec![vec![0.1], vec![1.0]];
+    let initial_embeddings = vec![vec![1.0], vec![-1.0]];
     let initial_metadata = vec![m0, m1];
 
     let cache_strategy = Box::new(LruCacheStrategy::new(100));
@@ -147,8 +147,8 @@ fn test_tiered_engine_batch_delete_by_filter() {
     let mut m3 = HashMap::new();
     m3.insert("cat".to_string(), "C".to_string());
 
-    engine.insert(2, vec![2.0], m2).unwrap();
-    engine.insert(3, vec![3.0], m3).unwrap();
+    engine.insert(2, vec![1.0], m2).unwrap();
+    engine.insert(3, vec![-1.0], m3).unwrap();
 
     // Delete where cat=A (should delete 0 and 2)
     let count = engine

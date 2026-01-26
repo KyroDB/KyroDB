@@ -66,6 +66,7 @@ pub async fn spawn_training_task(
     learned_strategy: Arc<LearnedCacheStrategy>,
     config: TrainingConfig,
     cycle_counter: Option<Arc<AtomicU64>>,
+    metrics: Option<MetricsCollector>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -100,9 +101,13 @@ pub async fn spawn_training_task(
                             if let Some(counter) = &cycle_counter {
                                 counter.fetch_add(1, Ordering::Relaxed);
                             }
+
+                            if let Some(ref m) = metrics {
+                                m.record_training_cycle();
+                            }
                         }
                         Err(e) => {
-                            eprintln!("Training task error: {}", e);
+                            error!(error = %e, "Training task error");
                         }
                     }
                 }
@@ -230,6 +235,7 @@ impl TrainingTaskSupervisor {
                     self.learned_strategy.clone(),
                     self.config.clone(),
                     None,
+                    Some(self.metrics.clone()),
                     task_shutdown_rx,
                 )
                 .await;
@@ -336,7 +342,8 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
         let handle =
-            spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
+            spawn_training_task(logger.clone(), strategy.clone(), config, None, None, shutdown_rx)
+                .await;
 
         // Wait for multiple training cycles
         sleep(Duration::from_secs(3)).await;
@@ -374,7 +381,8 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
         let handle =
-            spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
+            spawn_training_task(logger.clone(), strategy.clone(), config, None, None, shutdown_rx)
+                .await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -411,7 +419,8 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
         let handle =
-            spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
+            spawn_training_task(logger.clone(), strategy.clone(), config, None, None, shutdown_rx)
+                .await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -479,7 +488,7 @@ mod tests {
 
         let config = TrainingConfig::default();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let handle = spawn_training_task(logger, strategy, config, None, shutdown_rx).await;
+        let handle = spawn_training_task(logger, strategy, config, None, None, shutdown_rx).await;
 
         // Task should be cancellable
         handle.abort();

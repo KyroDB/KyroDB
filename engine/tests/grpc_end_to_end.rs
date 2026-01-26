@@ -18,6 +18,14 @@ use kyrodb::{FlushRequest, InsertRequest, QueryRequest, SearchRequest};
 
 type GrpcClient = KyroDbServiceClient<tonic::transport::Channel>;
 
+fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+    v
+}
+
 async fn wait_for_server(endpoint: &str, timeout: Duration) -> Result<GrpcClient> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -111,7 +119,7 @@ async fn end_to_end_insert_query_search() -> Result<()> {
 
     let doc_id = 42u64;
     // Use 768 dimensions to match server default config
-    let embedding: Vec<f32> = (0..768).map(|i| i as f32 * 0.001).collect();
+    let embedding: Vec<f32> = normalize((0..768).map(|i| i as f32 * 0.001).collect());
 
     let insert_request = InsertRequest {
         doc_id,

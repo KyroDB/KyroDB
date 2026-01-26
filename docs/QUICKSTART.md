@@ -4,7 +4,7 @@ Get KyroDB running in 5 minutes.
 
 ## Prerequisites
 
-- **Rust 1.70+**: [Install Rust](https://rustup.rs/)
+- **Rust (stable)**: [Install Rust](https://rustup.rs/)
 - **4GB RAM minimum**
 - **Linux or macOS** (Windows untested)
 
@@ -36,41 +36,67 @@ ls target/release/kyrodb_*
   --data-dir ./data
 ```
 
-**Server starts in seconds**. You should see:
+**Server starts in seconds**. Logs indicate:
 ```
-KyroDB server listening on 127.0.0.1:50051
-HTTP observability on http://127.0.0.1:51051
+gRPC server listening on 127.0.0.1:50051
+HTTP observability on http://127.0.0.1:51051 (default = gRPC port + 1000)
 ```
 
 ## 3. Insert Your First Vector
 
-KyroDB uses **gRPC** for vector operations. Use the load tester tool to interact with the server:
+KyroDB uses **gRPC** for all vector operations. Here is a minimal Python example that inserts one vector using the `Insert(InsertRequest) → InsertResponse` RPC.
 
 ```bash
-# The load_tester tool includes commands for vector operations
-./target/release/kyrodb_load_tester --help
+# Install Python gRPC tooling
+python -m pip install --upgrade grpcio grpcio-tools
+
+# Generate Python stubs from the repo proto
+python -m grpc_tools.protoc \
+  -Iengine/proto \
+  --python_out=. \
+  --grpc_python_out=. \
+  engine/proto/kyrodb.proto
 ```
 
-Or use a gRPC client library (Python, Go, Node.js, etc.) to call the gRPC service.
+```python
+import grpc
 
-**Example**: Insert a vector using the HTTP observability endpoints (read-only):
+import kyrodb_pb2
+import kyrodb_pb2_grpc
 
-```bash
-# Note: HTTP endpoints are for observability only, not vector operations
-# Vector operations must use gRPC
 
-# Check server health
-curl http://127.0.0.1:51051/health
+def main() -> None:
+  channel = grpc.insecure_channel("127.0.0.1:50051")
+  stub = kyrodb_pb2_grpc.KyroDBServiceStub(channel)
+
+  # The server's embedding dimension must match the request embedding length.
+  # Default config uses 768, so we build a simple 768-dim vector.
+  embedding = [0.0] * 768
+  embedding[0] = 0.1
+  embedding[1] = 0.2
+
+  resp = stub.Insert(
+    kyrodb_pb2.InsertRequest(
+      doc_id=1,
+      embedding=embedding,
+      metadata={"source": "quickstart"},
+      namespace="default",
+    )
+  )
+  print(resp)
+
+  channel.close()
+
+
+if __name__ == "__main__":
+  main()
 ```
+
+For advanced usage and all RPCs, see [engine/proto/kyrodb.proto](../engine/proto/kyrodb.proto) and [API Reference](API_REFERENCE.md).
 
 ## 4. Search for Similar Vectors
 
-Vector search operations use gRPC. Refer to the gRPC service definition for API details.
-
-```bash
-# See gRPC proto definition for search API
-cat engine/proto/kyrodb.proto | grep -A 20 "rpc Search"
-```
+Vector search operations use gRPC. See the [API Reference](API_REFERENCE.md#search) for required fields and examples.
 
 ## 5. Check System Health
 
@@ -118,6 +144,7 @@ See [Configuration Guide](CONFIGURATION_MANAGEMENT.md) for all options.
   list
 
 # Restore from a backup (requires backup ID from list command)
+export BACKUP_ALLOW_CLEAR=true
 ./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
@@ -134,8 +161,8 @@ See [Backup Guide](BACKUP_AND_RECOVERY.md) for backup strategies.
 watch -n 2 'curl -s http://127.0.0.1:51051/metrics | grep kyrodb_'
 
 # Key metrics to watch:
-# - kyrodb_cache_hit_rate: Should be >40%
-# - kyrodb_query_latency_ns{percentile="99"}: Should be <10000000 (10ms in nanoseconds)
+# - kyrodb_cache_hit_rate: Cache hit rate (0.0-1.0)
+# - kyrodb_query_latency_ns{percentile="99"}: P99 query latency in nanoseconds
 # - kyrodb_hnsw_searches_total: HNSW k-NN searches performed
 ```
 

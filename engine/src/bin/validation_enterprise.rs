@@ -757,6 +757,7 @@ struct SemanticWorkloadGenerator {
 }
 
 impl SemanticWorkloadGenerator {
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         corpus_embeddings: Arc<Vec<Vec<f32>>>,
         query_embeddings: Arc<Vec<Vec<f32>>>,
@@ -820,7 +821,7 @@ impl SemanticWorkloadGenerator {
         }
 
         let doc_sampler = ZipfSampler::new(corpus_size, zipf_exponent, 0x5EEDFACE)?;
-        let cold_ratio = cold_traffic_ratio.max(0.0).min(1.0);
+        let cold_ratio = cold_traffic_ratio.clamp(0.0, 1.0);
         let sticky_query_map = Arc::new(RwLock::new(HashMap::new()));
         {
             let mut guard = sticky_query_map.write().await;
@@ -858,9 +859,9 @@ impl SemanticWorkloadGenerator {
         {
             let mut rng = self.rng.write().await;
             if rng.gen::<f64>() < self.cold_traffic_ratio {
-                let doc_id = rng.gen_range(0..self.corpus_size) as u64;
+                let doc_id = rng.gen_range(0..self.corpus_size);
                 // For cold traffic, return a random query index (still seeds sticky map)
-                let query_idx = rng.gen_range(0..self.query_space_size.max(1)) as usize;
+                let query_idx = rng.gen_range(0..self.query_space_size.max(1));
                 drop(rng);
                 self.cold_query_count.fetch_add(1, Ordering::Relaxed);
                 self.new_query_samples.fetch_add(1, Ordering::Relaxed);
@@ -890,9 +891,11 @@ impl SemanticWorkloadGenerator {
                 let should_reuse = rng.gen::<f64>() < self.query_reuse_probability;
                 drop(rng);
 
-                if should_reuse && existing_query.is_some() {
-                    self.sticky_reuse_hits.fetch_add(1, Ordering::Relaxed);
-                    return (existing_query.unwrap(), doc_id);
+                if should_reuse {
+                    if let Some(existing_query) = existing_query {
+                        self.sticky_reuse_hits.fetch_add(1, Ordering::Relaxed);
+                        return (existing_query, doc_id);
+                    }
                 }
 
                 // Pick new query from pool (simulates paraphrase variation)
@@ -979,24 +982,13 @@ fn build_paraphrase_pools(
     let mut pools: HashMap<u64, Vec<usize>> = HashMap::with_capacity(corpus_size as usize);
 
     for doc_id in 0..corpus_size {
-        if let Some(indices) = doc_to_queries.get(&(doc_id as u64)) {
+        if let Some(indices) = doc_to_queries.get(&doc_id) {
             // Store query indices directly (no hashing needed)
-            pools.insert(doc_id as u64, indices.clone());
+            pools.insert(doc_id, indices.clone());
         }
     }
 
     pools
-}
-
-fn synthetic_query_hash(doc_id: u64, slot: u64) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    doc_id.hash(&mut hasher);
-    slot.hash(&mut hasher);
-    0x9E3779B97F4A7C15u64.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Hash embedding vector to u64 for cache key
@@ -1307,8 +1299,7 @@ async fn main() -> Result<()> {
     let diversity = predictor_capacity
         .checked_next_power_of_two()
         .unwrap_or(predictor_capacity)
-        .max(128)
-        .min(2048);
+        .clamp(128, 2048);
     learned_predictor.set_diversity_buckets(diversity);
     // Target 2.5× cache capacity (~175 docs) for Zipf 1.4 distribution
     let hot_target = (learned_cache_capacity as f32 * 2.5) as usize;
@@ -1533,6 +1524,7 @@ async fn main() -> Result<()> {
         learned_strategy_for_training.clone(),
         training_config,
         Some(training_cycles.clone()),
+        None,
         shutdown_rx,
     )
     .await;
@@ -1803,7 +1795,7 @@ async fn main() -> Result<()> {
 
         // Calculate actual memory usage estimates
         let query_emb_mb = if let Some(ref qe) = query_embeddings {
-            (qe.len() * qe.get(0).map_or(384, |v| v.len()) * 4) as f64 / 1_048_576.0
+            (qe.len() * qe.first().map_or(384, |v| v.len()) * 4) as f64 / 1_048_576.0
         } else {
             0.0
         };

@@ -6,7 +6,7 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 
 **Start here:**
 1. [**Quick Start**](QUICKSTART.md) - Get running in 5 minutes
-2. [**API Reference**](API_REFERENCE.md) - HTTP endpoints and examples
+2. [**API Reference**](API_REFERENCE.md) - gRPC API and message types
 3. [**Architecture**](ARCHITECTURE.md) - How KyroDB works
 
 ## For Operators
@@ -54,11 +54,11 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 ## Quick Links
 
 **Common Tasks:**
-- [Insert a vector](API_REFERENCE.md#post-v1insert)
-- [Search for similar vectors](API_REFERENCE.md#post-v1search)
+- [Insert a vector](API_REFERENCE.md#insert)
+- [Search for similar vectors](API_REFERENCE.md#search)
 - [Create a backup](BACKUP_AND_RECOVERY.md#full-backup)
 - [Restore from backup](BACKUP_AND_RECOVERY.md#restore-from-backup)
-- [Check server health](API_REFERENCE.md#get-health)
+- [Check server health](API_REFERENCE.md#http-observability-endpoints)
 - [View metrics](OBSERVABILITY.md#key-metrics)
 - [Fix high latency](OPERATIONS.md#high-p99-latency)
 - [Fix low cache hit rate](OPERATIONS.md#low-cache-hit-rate)
@@ -73,8 +73,8 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 
 ## External Resources
 
-- [GitHub Repository](https://github.com/kyrodb/kyrodb)
-- [Issue Tracker](https://github.com/kyrodb/kyrodb/issues)
+- [GitHub Repository](https://github.com/vatskishan03/KyroDB)
+- [Issue Tracker](https://github.com/vatskishan03/KyroDB/issues)
 
 ---
 
@@ -82,4 +82,4 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 
 1. **Check the docs** - Use the index above to find relevant guides
 2. **Search issues** - Someone may have had the same problem
-4. **File an issue** - For bugs or feature requests
+3. **File an issue** - For bugs or feature requests

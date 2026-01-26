@@ -11,6 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
+fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+    v
+}
+
 /// Test full A/B test flow: query → cache check → HNSW search → cache admission → stats
 #[tokio::test]
 async fn test_full_ab_test_flow() {
@@ -23,6 +31,7 @@ async fn test_full_ab_test_flow() {
         let embedding: Vec<f32> = (0..dim)
             .map(|j| (i * dim as u64 + j as u64) as f32 * 0.01)
             .collect();
+        let embedding = normalize(embedding);
         hnsw.add_vector(i, &embedding).unwrap();
     }
 
@@ -42,6 +51,7 @@ async fn test_full_ab_test_flow() {
         let query: Vec<f32> = (0..dim)
             .map(|j| (i * dim as u64 + j as u64) as f32 * 0.01)
             .collect();
+        let query = normalize(query);
         let doc_id = i % 100;
 
         // Get strategy for this query
@@ -129,6 +139,7 @@ async fn test_cache_hit_rate_improves() {
         let embedding: Vec<f32> = (0..dim)
             .map(|j| (i * dim as u64 + j as u64) as f32 * 0.01)
             .collect();
+        let embedding = normalize(embedding);
         hnsw.add_vector(i, &embedding).unwrap();
     }
 
@@ -141,6 +152,7 @@ async fn test_cache_hit_rate_improves() {
         let query: Vec<f32> = (0..dim)
             .map(|j| (i * dim as u64 + j as u64) as f32 * 0.01)
             .collect();
+        let query = normalize(query);
         let doc_id = i % 100;
 
         if strategy.get_cached(doc_id).is_some() {
@@ -244,7 +256,8 @@ async fn test_background_training_updates_predictor() {
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
     let handle =
-        spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
+        spawn_training_task(logger.clone(), strategy.clone(), config, None, None, shutdown_rx)
+            .await;
 
     // Wait for training cycle
     tokio::time::sleep(Duration::from_secs(2)).await;

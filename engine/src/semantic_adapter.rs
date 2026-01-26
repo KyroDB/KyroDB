@@ -40,10 +40,10 @@ pub struct SemanticConfig {
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            // Lower threshold (0.65) to engage semantic layer for mid-tier docs
+            // Lower high-confidence threshold (0.60) to engage semantic layer for mid-tier docs
             high_confidence_threshold: 0.60,
             low_confidence_threshold: 0.25,
-            semantic_similarity_threshold: 0.82,
+            semantic_similarity_threshold: 0.80,
             max_cached_embeddings: 100_000,
             similarity_scan_limit: 2_000,
         }
@@ -73,14 +73,21 @@ pub struct SemanticStats {
 ///
 /// Strategy:
 /// 1. Check frequency-based prediction (4-8ns)
-/// 2. If high confidence (>0.8): definitely cache (fast path)
-/// 3. If low confidence (<0.3): definitely don't cache (fast path)
-/// 4. If uncertain (0.3-0.8): check semantic similarity (slow path)
+/// 2. If high confidence (>= 0.60): definitely cache (fast path)
+/// 3. If low confidence (<= 0.25): definitely don't cache (fast path)
+/// 4. If uncertain: check semantic similarity (slow path)
 /// 5. Hybrid decision: average frequency + semantic scores
 pub struct SemanticAdapter {
     /// Embedding cache: doc_id -> embedding
     /// Bounded at max_cached_embeddings with FIFO eviction
     embedding_cache: Arc<RwLock<HashMap<u64, Vec<f32>>>>,
+
+    /// Expected embedding dimension for cached vectors.
+    ///
+    /// This is set on first successful cache insert and validated on every
+    /// subsequent insert to prevent dimension mismatches from panicking later
+    /// during cosine similarity computation.
+    expected_embedding_dim: Arc<RwLock<Option<usize>>>,
 
     /// Configuration
     config: SemanticConfig,
@@ -101,6 +108,7 @@ impl SemanticAdapter {
             embedding_cache: Arc::new(RwLock::new(HashMap::with_capacity(
                 config.max_cached_embeddings,
             ))),
+            expected_embedding_dim: Arc::new(RwLock::new(None)),
             config,
             stats: Arc::new(RwLock::new(SemanticStats::default())),
         }
@@ -139,7 +147,7 @@ impl SemanticAdapter {
 
         // Strong semantic matches can override frequency in two tiers:
         // 1. Extremely similar embeddings (>=0.96) skip frequency checks entirely
-        // 2. Above semantic threshold (default 0.82) can admit with relaxed freq floor
+        // 2. Above semantic threshold (default 0.80) can admit with relaxed freq floor
         if semantic_score >= 0.96 {
             return true;
         }
@@ -193,6 +201,9 @@ impl SemanticAdapter {
         let mut max_similarity = 0.0f32;
 
         for (_, cached_embedding) in cache.iter().skip(scan_start) {
+            if query_embedding.len() != cached_embedding.len() {
+                continue;
+            }
             let similarity = cosine_similarity(query_embedding, cached_embedding);
 
             // Handle NaN/Inf from zero vectors
@@ -229,7 +240,29 @@ impl SemanticAdapter {
     /// # Parameters
     /// - `doc_id`: Document ID
     /// - `embedding`: Embedding vector (will be cloned)
-    pub fn cache_embedding(&self, doc_id: u64, embedding: Vec<f32>) {
+    pub fn cache_embedding(&self, doc_id: u64, embedding: Vec<f32>) -> anyhow::Result<()> {
+        if embedding.is_empty() {
+            anyhow::bail!("embedding cannot be empty");
+        }
+
+        let embedding_dim = embedding.len();
+        {
+            let mut expected_dim = self.expected_embedding_dim.write();
+            match *expected_dim {
+                None => {
+                    *expected_dim = Some(embedding_dim);
+                }
+                Some(expected) if expected != embedding_dim => {
+                    anyhow::bail!(
+                        "embedding dimension mismatch: expected {} found {}",
+                        expected,
+                        embedding_dim
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+
         let mut cache = self.embedding_cache.write();
 
         // Bounded eviction: remove oldest if at capacity
@@ -245,6 +278,8 @@ impl SemanticAdapter {
         // Update stats
         let mut stats = self.stats.write();
         stats.cached_embeddings = cache.len();
+
+        Ok(())
     }
 
     /// Get current statistics
@@ -259,6 +294,10 @@ impl SemanticAdapter {
 
     /// Clear embedding cache (for testing or memory pressure)
     pub fn clear_cache(&self) {
+        {
+            let mut expected_dim = self.expected_embedding_dim.write();
+            *expected_dim = None;
+        }
         let mut cache = self.embedding_cache.write();
         cache.clear();
 
@@ -392,12 +431,16 @@ mod tests {
 
         // Cache 100 embeddings to get past cold-start threshold
         for i in 0..100 {
-            adapter.cache_embedding(i, vec![i as f32 / 100.0; 384]);
+            adapter
+                .cache_embedding(i, vec![i as f32 / 100.0; 384])
+                .unwrap();
         }
 
         // Cache a similar embedding
         let cached_embedding = vec![1.0; 384];
-        adapter.cache_embedding(100, cached_embedding.clone());
+        adapter
+            .cache_embedding(100, cached_embedding.clone())
+            .unwrap();
 
         // Query with very similar embedding
         let query_embedding = vec![0.99; 384];
@@ -419,7 +462,7 @@ mod tests {
 
         // Cache some embeddings
         for i in 0..10 {
-            adapter.cache_embedding(i, vec![i as f32; 384]);
+            adapter.cache_embedding(i, vec![i as f32; 384]).unwrap();
         }
 
         assert_eq!(adapter.cache_size(), 10);
@@ -439,7 +482,7 @@ mod tests {
 
         // Cache 10 embeddings (exceeds capacity)
         for i in 0..10 {
-            adapter.cache_embedding(i, vec![i as f32; 384]);
+            adapter.cache_embedding(i, vec![i as f32; 384]).unwrap();
         }
 
         // Should only keep 5 (most recent)
@@ -450,8 +493,8 @@ mod tests {
     fn test_semantic_adapter_clear_cache() {
         let adapter = SemanticAdapter::new();
 
-        adapter.cache_embedding(1, vec![1.0; 384]);
-        adapter.cache_embedding(2, vec![2.0; 384]);
+        adapter.cache_embedding(1, vec![1.0; 384]).unwrap();
+        adapter.cache_embedding(2, vec![2.0; 384]).unwrap();
 
         assert_eq!(adapter.cache_size(), 2);
 
@@ -478,7 +521,7 @@ mod tests {
                     adapter_clone.should_cache(0.5, &embedding);
 
                     // Cache embedding
-                    adapter_clone.cache_embedding(doc_id, embedding);
+                    let _ = adapter_clone.cache_embedding(doc_id, embedding);
                 }
             });
             handles.push(handle);
@@ -498,7 +541,7 @@ mod tests {
 
         assert_eq!(config.high_confidence_threshold, 0.60);
         assert_eq!(config.low_confidence_threshold, 0.25);
-        assert_eq!(config.semantic_similarity_threshold, 0.82);
+        assert_eq!(config.semantic_similarity_threshold, 0.80);
         assert_eq!(config.max_cached_embeddings, 100_000);
         assert_eq!(config.similarity_scan_limit, 2000);
     }

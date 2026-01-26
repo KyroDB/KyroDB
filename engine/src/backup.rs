@@ -975,7 +975,7 @@ pub struct S3Client {
 impl S3Client {
     /// Create a new S3 client
     pub async fn new(bucket: String, prefix: String) -> Result<Self> {
-        let config = aws_config::load_from_env().await;
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = aws_sdk_s3::Client::new(&config);
 
         info!(
@@ -1102,7 +1102,7 @@ impl S3Client {
             "Starting multipart upload: {} ({} bytes, {} chunks)",
             key,
             file_size,
-            (file_size + chunk_size - 1) / chunk_size
+            file_size.div_ceil(chunk_size)
         );
 
         // Initiate multipart upload
@@ -1332,7 +1332,7 @@ impl S3Client {
             if let Some(key) = object.key() {
                 if key.ends_with(".tar") {
                     // Extract backup ID from key
-                    if let Some(filename) = key.split('/').last() {
+                    if let Some(filename) = key.split('/').next_back() {
                         if let Some(id_str) = filename
                             .strip_prefix("backup_")
                             .and_then(|s| s.strip_suffix(".tar"))

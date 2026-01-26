@@ -9,7 +9,7 @@
 // Performance: ~100ns per check (HashMap lookup + bucket update)
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -121,6 +121,9 @@ impl TokenBucket {
 pub struct RateLimiter {
     /// Per-tenant token buckets (lazy initialized)
     buckets: Arc<parking_lot::RwLock<HashMap<String, Arc<Mutex<TokenBucket>>>>>,
+    /// Tenants already warned about capacity mismatch (avoid log spam)
+    #[allow(dead_code)]
+    warned_tenants: Arc<parking_lot::RwLock<HashSet<String>>>,
 }
 
 impl RateLimiter {
@@ -128,6 +131,7 @@ impl RateLimiter {
     pub fn new() -> Self {
         Self {
             buckets: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            warned_tenants: Arc::new(parking_lot::RwLock::new(HashSet::new())),
         }
     }
 
@@ -161,12 +165,18 @@ impl RateLimiter {
                         tenant_id, bucket_capacity, max_qps
                     );
                     #[cfg(not(debug_assertions))]
-                    tracing::warn!(
-                        tenant_id = %tenant_id,
-                        existing_capacity = bucket_capacity,
-                        requested_qps = max_qps,
-                        "Rate limit mismatch: using existing bucket capacity"
-                    );
+                    {
+                        let mut warned = self.warned_tenants.write();
+                        if !warned.contains(tenant_id) {
+                            tracing::warn!(
+                                tenant_id = %tenant_id,
+                                existing_capacity = bucket_capacity,
+                                requested_qps = max_qps,
+                                "Rate limit mismatch: using existing bucket capacity"
+                            );
+                            warned.insert(tenant_id.to_string());
+                        }
+                    }
                 }
 
                 let bucket = Arc::clone(bucket);
@@ -207,12 +217,14 @@ impl RateLimiter {
         if let Some(bucket) = buckets.get(tenant_id) {
             bucket.lock().reset();
         }
+        self.warned_tenants.write().remove(tenant_id);
     }
 
     /// Clear all rate limit state (for testing)
     #[cfg(test)]
     pub fn clear(&self) {
         self.buckets.write().clear();
+        self.warned_tenants.write().clear();
     }
 
     /// Get count of tracked tenants

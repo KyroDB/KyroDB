@@ -35,7 +35,7 @@ Incoming Query
 │  L1b: Query Cache                       │
 │  "Have we seen a similar query before?" │
 │  • Matches paraphrased queries          │
-│  • Cosine similarity > 0.25 threshold   │
+│  • Cosine similarity >= 0.52 threshold  │
 │  • Hit rate: ~10% additional            │
 └─────────────────────────────────────────┘
       │ (miss)
@@ -55,11 +55,16 @@ Incoming Query
 The document cache predicts which documents are "hot" based on access frequency patterns.
 
 **How it works:**
-1. Access logger tracks every document access with timestamps
-2. RMI (Recursive Model Index) trains on access patterns every 10 minutes
-3. Each document gets a "hotness score" (0.0 to 1.0)
-4. Documents above the threshold are cached
-5. On cache full, LRU eviction removes oldest entries
+1. The engine can log accesses (doc_id + timestamp) via the access logger.
+2. Cache hits are served from the L1a document cache (an in-memory vector cache keyed by `doc_id`).
+3. On misses, the engine fetches from lower tiers and then makes an admission decision:
+      - **LRU strategy**: always admits.
+      - **Learned strategy**: admits based on the predictor if it has been trained; otherwise it operates in a bootstrap mode and admits.
+4. When the cache is full, eviction is LRU.
+
+Note on retraining:
+- The background retraining loop (`training_task::spawn_training_task`) periodically rebuilds the predictor from access logs and swaps it into the learned strategy.
+- In `kyrodb_server`, this is controlled by `cache.enable_training_task`.
 
 **Why it works for RAG:**
 RAG workloads follow Zipfian distributions - a small subset of documents (FAQs, popular topics) receive most queries. The RMI learns this pattern and pre-caches hot documents.
@@ -71,7 +76,7 @@ The query cache handles a different problem: paraphrased queries asking the same
 **How it works:**
 1. Store query embeddings with their results
 2. For new queries, compute cosine similarity against cached queries
-3. If similarity > 0.25, return the cached result
+3. If similarity >= 0.52, return the cached result
 4. On cache full, LRU eviction removes oldest entries
 
 **Why it works for RAG:**
@@ -99,38 +104,25 @@ Combined, they cover more scenarios than either alone.
 
 ### Default Settings
 
-```yaml
-cache:
-  # L1a: Document cache
-  document_cache_capacity: 180
-  training_interval_secs: 600
-  
-  # L1b: Query cache  
-  query_cache_capacity: 300
-  similarity_threshold: 0.25
-```
+The current `kyrodb_server` behavior is:
+
+- L1a capacity is driven by `cache.capacity`.
+- Background retraining is controlled by:
+      - `cache.enable_training_task` (default: true)
+      - `cache.training_interval_secs`, `cache.training_window_secs`, `cache.recency_halflife_secs`
+      - `cache.logger_window_size` (access log ring buffer size)
+      - `cache.predictor_capacity_multiplier` (predictor tracks more candidates than cache)
+- L1b (query cache) is configurable:
+      - `cache.query_cache_capacity` (default: 100)
+      - `cache.query_cache_similarity_threshold` (default: 0.52)
+
+The `0.52` default comes from a quick empirical check using the bundled
+MS MARCO query embeddings (see `scripts/evaluate_query_cache_threshold.py`).
+On that dataset, thresholds in the 0.8+ range yield near-zero similarity hits.
 
 ### Tuning Guidelines
 
-**Document cache capacity:**
-- Set to ~2-3% of your corpus size
-- Larger capacity = more memory, diminishing returns on hit rate
-- Default: 180 documents
-
-**Query cache capacity:**
-- Set based on query variety
-- High paraphrase rate = larger cache helps
-- Default: 300 queries
-
-**Similarity threshold:**
-- Lower = more hits, risk of false matches
-- Higher = fewer hits, more accurate
-- Default: 0.25 (tuned on MS MARCO dataset)
-
-**Training interval:**
-- More frequent = faster adaptation to pattern changes
-- Less frequent = lower CPU overhead
-- Default: 600 seconds (10 minutes)
+If you are tuning hit rate, the biggest knobs are working-set size vs L1a capacity and the amount of query repetition/paraphrasing (which drives L1b effectiveness). If you want the learned admission behavior (as opposed to always-admit bootstrap behavior), the retraining task needs to be wired into the production server.
 
 ## Performance Characteristics
 
@@ -167,12 +159,14 @@ This bimodal distribution is expected and shows the cache is working correctly.
 | Component | Memory |
 |-----------|--------|
 | L1a (180 docs, 384-dim) | ~280 KB |
-| L1b (300 queries, 384-dim) | ~460 KB |
+| L1b (100 queries, 384-dim) | ~155 KB |
 | RMI predictor | ~50 KB |
-| Access logger (ring buffer) | ~3 MB |
-| **Total L1 overhead** | **~4 MB** |
+| Access logger (ring buffer, 1,000,000 events) | ~24 MB |
+| **Total L1 overhead** | **~25 MB** |
 
 ### Validated Results (12-Hour Test)
+
+These figures are from the validation harness, not a production guarantee.
 
 | Metric | Value |
 |--------|-------|
@@ -187,27 +181,16 @@ This bimodal distribution is expected and shows the cache is working correctly.
 
 ## Metrics
 
-KyroDB exposes cache metrics via the `/metrics` endpoint:
+KyroDB exposes metrics via the HTTP `/metrics` endpoint. In the current server implementation, cache metrics are exported at an aggregate level (not split into L1a vs L1b):
 
 ```
-# L1a (Document Cache)
-kyrodb_l1a_cache_hits_total
-kyrodb_l1a_cache_misses_total
-kyrodb_l1a_hit_rate
+# Cache
+kyrodb_cache_hits_total
+kyrodb_cache_misses_total
+kyrodb_cache_hit_rate
 
-# L1b (Query Cache)
-kyrodb_l1b_cache_hits_total
-kyrodb_l1b_cache_misses_total
-kyrodb_l1b_exact_hits_total
-kyrodb_l1b_similarity_hits_total
-kyrodb_l1b_hit_rate
-
-# Combined
-kyrodb_l1_combined_hit_rate
-
-# Training
-kyrodb_rmi_training_duration_seconds
-kyrodb_rmi_training_cycles_total
+# Training task (only increments if a training loop is running)
+kyrodb_training_cycles_completed_total
 ```
 
 ## Troubleshooting
@@ -216,14 +199,14 @@ kyrodb_rmi_training_cycles_total
 
 **Possible causes:**
 1. **High cold traffic ratio**: If >40% of queries are for never-seen documents, hit rate will be lower
-2. **Cache too small**: Increase `document_cache_capacity` and `query_cache_capacity`
+2. **Cache too small**: Increase `cache.capacity` and `cache.query_cache_capacity`
 3. **Workload not Zipfian**: Uniform access patterns don't benefit from frequency prediction
 4. **Short training window**: RMI needs time to learn patterns
 
 **Diagnosis:**
 ```bash
 # Check hit rate breakdown
-curl localhost:51051/metrics | grep kyrodb_l1
+curl localhost:51051/metrics | grep kyrodb_cache
 ```
 
 ### High Memory Usage

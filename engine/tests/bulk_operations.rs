@@ -46,7 +46,7 @@ fn test_hot_tier_bulk_fetch() {
 
 #[test]
 fn test_hnsw_backend_bulk_fetch() {
-    let embeddings = vec![vec![0.1], vec![1.0], vec![2.0]];
+    let embeddings = vec![vec![1.0], vec![-1.0], vec![1.0]];
     let metadata = vec![
         HashMap::from([("id".to_string(), "0".to_string())]),
         HashMap::from([("id".to_string(), "1".to_string())]),
@@ -71,7 +71,7 @@ fn test_hnsw_backend_bulk_fetch() {
     // Check 0
     assert!(results[0].is_some());
     let (emb0, _meta0) = results[0].as_ref().unwrap();
-    assert_eq!(emb0[0], 0.1);
+    assert_eq!(emb0[0], 1.0);
 
     // Check 2
     assert!(results[1].is_some());
@@ -91,7 +91,7 @@ fn test_tiered_engine_bulk_query() {
     };
 
     // Initial cold tier data
-    let initial_embeddings = vec![vec![100.0]];
+    let initial_embeddings = vec![vec![1.0]];
     let initial_metadata = vec![HashMap::from([("loc".to_string(), "cold".to_string())])];
 
     let cache_strategy = Box::new(LruCacheStrategy::new(100));
@@ -109,7 +109,7 @@ fn test_tiered_engine_bulk_query() {
     // Insert into hot tier
     let mut meta_hot = HashMap::new();
     meta_hot.insert("loc".to_string(), "hot".to_string());
-    engine.insert(1, vec![200.0], meta_hot).unwrap();
+    engine.insert(1, vec![-1.0], meta_hot).unwrap();
 
     // Bulk query (0 is in cold, 1 is in hot, 2 is missing)
     let ids = vec![0, 1, 2];
@@ -121,13 +121,13 @@ fn test_tiered_engine_bulk_query() {
     // 0 (cold)
     assert!(results[0].is_some());
     let (emb0, meta0) = results[0].as_ref().unwrap();
-    assert_eq!(emb0[0], 100.0);
+    assert_eq!(emb0[0], 1.0);
     assert_eq!(meta0.get("loc").unwrap(), "cold");
 
     // 1 (hot)
     assert!(results[1].is_some());
     let (emb1, meta1) = results[1].as_ref().unwrap();
-    assert_eq!(emb1[0], 200.0);
+    assert_eq!(emb1[0], -1.0);
     assert_eq!(meta1.get("loc").unwrap(), "hot");
 
     // 2 (missing)

@@ -75,7 +75,9 @@ def collect_environment(extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
     if git_dirty_output is not None:
         env["git"]["dirty"] = bool(git_dirty_output.strip())
     elif env["git"]["commit"] is not None:
-        env["git"]["dirty"] = False
+        # We have a commit hash but couldn't determine dirty state (e.g., git missing).
+        # Treat this as unknown rather than clean.
+        env["git"]["dirty"] = None
 
     # Best-effort system probes (Linux VM friendly; safe to ignore if missing).
     env["system"] = {
@@ -126,7 +128,7 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = collect_environment(extra=extra)
-    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 if __name__ == "__main__":

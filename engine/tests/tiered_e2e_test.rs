@@ -10,12 +10,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+    v
+}
+
 #[test]
 fn test_three_tier_query_journey() {
     // Setup: 10 initial documents
     let mut initial_embeddings = Vec::new();
     for i in 0..10 {
-        initial_embeddings.push(vec![i as f32 / 10.0, 1.0 - i as f32 / 10.0]);
+        initial_embeddings.push(normalize(vec![i as f32 / 10.0, 1.0 - i as f32 / 10.0]));
     }
 
     // Create empty metadata for initial documents
@@ -56,10 +64,10 @@ fn test_three_tier_query_journey() {
     // Step 2: Insert new documents (should go to hot tier)
     println!("\n=== Step 2: Hot tier inserts ===");
     engine
-        .insert(100, vec![0.25, 0.75], HashMap::new())
+        .insert(100, normalize(vec![0.25, 0.75]), HashMap::new())
         .unwrap();
     engine
-        .insert(101, vec![0.30, 0.70], HashMap::new())
+        .insert(101, normalize(vec![0.30, 0.70]), HashMap::new())
         .unwrap();
 
     // Query documents in hot tier (before flush)
@@ -74,7 +82,7 @@ fn test_three_tier_query_journey() {
     println!("\n=== Step 3: Flushing to cold tier ===");
     // Insert one more to trigger flush (hot_tier_max_size=3)
     engine
-        .insert(102, vec![0.35, 0.65], HashMap::new())
+        .insert(102, normalize(vec![0.35, 0.65]), HashMap::new())
         .unwrap();
     let flushed = engine.flush_hot_tier(false).unwrap();
     println!("Flushed {} documents", flushed);
@@ -82,7 +90,8 @@ fn test_three_tier_query_journey() {
 
     // Query a DIFFERENT document (101) that was flushed but not cached
     // This should hit cold tier (not cache, not hot tier)
-    let result = engine.query(101, Some(&[0.30, 0.70]));
+    let query_101 = normalize(vec![0.30, 0.70]);
+    let result = engine.query(101, Some(&query_101));
     assert!(
         result.is_some(),
         "Doc 101 should be in cold tier after flush"
@@ -122,7 +131,7 @@ fn test_three_tier_query_journey() {
 
     // Step 5: K-NN search across all tiers
     println!("\n=== Step 5: K-NN search ===");
-    let query = vec![0.5, 0.5];
+    let query = normalize(vec![0.5, 0.5]);
     let results = engine.knn_search(&query, 5).unwrap();
 
     assert_eq!(results.len(), 5, "Should return top 5 nearest neighbors");
@@ -155,7 +164,11 @@ fn test_persistence_across_all_tiers() {
 
     // Step 1: Create engine with persistence
     {
-        let initial_embeddings = vec![vec![1.0, 0.0], vec![0.8, 0.2], vec![0.6, 0.4]];
+        let initial_embeddings = vec![
+            normalize(vec![1.0, 0.0]),
+            normalize(vec![0.8, 0.2]),
+            normalize(vec![0.6, 0.4]),
+        ];
         let initial_metadata = vec![HashMap::new(); initial_embeddings.len()];
 
         let cache = LruCacheStrategy::new(10);
@@ -182,18 +195,28 @@ fn test_persistence_across_all_tiers() {
         println!("\n=== Step 1: Writing data ===");
 
         // Insert to hot tier and flush
-        engine.insert(10, vec![0.4, 0.6], HashMap::new()).unwrap();
-        engine.insert(11, vec![0.2, 0.8], HashMap::new()).unwrap();
+        engine
+            .insert(10, normalize(vec![0.4, 0.6]), HashMap::new())
+            .unwrap();
+        engine
+            .insert(11, normalize(vec![0.2, 0.8]), HashMap::new())
+            .unwrap();
         engine.flush_hot_tier(false).unwrap();
 
         // Insert more (should trigger snapshot at 5 inserts)
-        engine.insert(20, vec![0.1, 0.9], HashMap::new()).unwrap();
-        engine.insert(21, vec![0.0, 1.0], HashMap::new()).unwrap();
+        engine
+            .insert(20, normalize(vec![0.1, 0.9]), HashMap::new())
+            .unwrap();
+        engine
+            .insert(21, normalize(vec![0.0, 1.0]), HashMap::new())
+            .unwrap();
         engine.flush_hot_tier(false).unwrap();
 
         // Query to populate cache
-        engine.query(10, Some(&[0.4, 0.6]));
-        engine.query(11, Some(&[0.2, 0.8]));
+        let query_10 = normalize(vec![0.4, 0.6]);
+        let query_11 = normalize(vec![0.2, 0.8]);
+        engine.query(10, Some(&query_10));
+        engine.query(11, Some(&query_11));
 
         println!("Inserted docs: 0, 1, 2 (initial), 10, 11, 20, 21");
         println!("Stats: {:?}", engine.stats());
@@ -310,16 +333,20 @@ fn test_concurrent_tier_access() {
     // Thread 2: Inserts
     let engine2 = Arc::clone(&engine);
     handles.push(thread::spawn(move || {
+        let embedding = normalize(vec![0.5, 0.5]);
         for i in 100..110 {
-            engine2.insert(i, vec![0.5, 0.5], HashMap::new()).unwrap();
+            engine2
+                .insert(i, embedding.clone(), HashMap::new())
+                .unwrap();
         }
     }));
 
     // Thread 3: K-NN searches
     let engine3 = Arc::clone(&engine);
     handles.push(thread::spawn(move || {
+        let query = normalize(vec![0.5, 0.5]);
         for _ in 0..5 {
-            engine3.knn_search(&[0.5, 0.5], 5).unwrap();
+            engine3.knn_search(&query, 5).unwrap();
         }
     }));
 
@@ -375,7 +402,9 @@ fn test_query_path_layering() {
 
     // Step 3: Insert new doc to hot tier
     println!("Step 3: Insert doc 100 to hot tier");
-    engine.insert(100, vec![0.5, 0.5], HashMap::new()).unwrap();
+    engine
+        .insert(100, normalize(vec![0.5, 0.5]), HashMap::new())
+        .unwrap();
 
     // Step 4: Query doc 100 (hot tier hit)
     println!("Step 4: Query doc 100 from hot tier");

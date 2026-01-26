@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.request
@@ -135,6 +136,7 @@ def _collect_metadata(
             },
             "git_commit": _run_capture(["git", "rev-parse", "HEAD"]),
             "grpc_target": f"{args.host}:{args.port}",
+            "ef_search": int(args.ef_search),
             "concurrency": int(args.concurrency),
             "bulk_search": bool(args.bulk_search),
             "warmup_queries": int(args.warmup_queries),
@@ -144,7 +146,40 @@ def _collect_metadata(
     }
 
 
-def download_dataset(name: str, data_dir: Path) -> Path:
+def _normalize_rows_in_place(arr: np.ndarray) -> np.ndarray:
+    """L2-normalize each row of a 2D array.
+
+    Returns the normalized array. This may allocate a new array when a dtype
+    conversion to float32 is required, so callers must use the returned value.
+
+    This is required for ANN-Benchmarks "angular" datasets when using dot/cosine
+    distance implementations that assume unit vectors.
+    """
+    if arr.ndim != 2:
+        raise ValueError(f"expected 2D array, got shape={arr.shape}")
+    if arr.dtype != np.float32:
+        # Avoid silent float64 costs.
+        arr = arr.astype(np.float32, copy=False)
+    norms = np.linalg.norm(arr, axis=1)
+    # Avoid division by zero for degenerate vectors.
+    norms = np.maximum(norms, 1e-12)
+    arr /= norms[:, None]
+    return arr
+
+
+def _download_url_to_file(url: str, filepath: Path, *, timeout: int) -> None:
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        with open(filepath, "wb") as f:
+            shutil.copyfileobj(response, f)
+
+
+def download_dataset(
+    name: str,
+    data_dir: Path,
+    *,
+    allow_insecure_download: bool,
+    timeout: int = 300,
+) -> Path:
     """Download benchmark dataset if not present."""
     data_dir.mkdir(parents=True, exist_ok=True)
     filepath = data_dir / f"{name}.hdf5"
@@ -157,20 +192,27 @@ def download_dataset(name: str, data_dir: Path) -> Path:
     if not url:
         raise ValueError(f"Unknown dataset: {name}. Available: {list(DATASETS.keys())}")
     
-    print(f"Downloading {name} from {url}...")
+    print(f"Downloading {name} from {url} (timeout={timeout}s)...")
     try:
-        urllib.request.urlretrieve(url, filepath)
+        _download_url_to_file(url, filepath, timeout=timeout)
     except Exception:
         if filepath.exists():
             try:
                 filepath.unlink()
             except Exception:
                 pass
-        # Fallback to http for older environments.
+        if not allow_insecure_download:
+            raise RuntimeError(
+                "HTTPS download failed. To allow an insecure HTTP retry, pass --allow-insecure-download."
+            )
+
         http_url = url.replace("https://", "http://", 1)
-        print(f"  HTTPS download failed; retrying via HTTP: {http_url}")
+        print(
+            f"WARNING: insecure download enabled; retrying via HTTP: {http_url}",
+            file=sys.stderr,
+        )
         try:
-            urllib.request.urlretrieve(http_url, filepath)
+            _download_url_to_file(http_url, filepath, timeout=timeout)
         except Exception:
             if filepath.exists():
                 try:
@@ -205,10 +247,13 @@ def compute_recall(results: List[Tuple[int, float]], ground_truth: np.ndarray, k
         raise ValueError("k must be a positive integer")
     if len(results) == 0:
         return 0.0
-    gt_set = set(int(x) for x in ground_truth[:k])
+    gt_k = min(k, int(len(ground_truth)))
+    if gt_k <= 0:
+        return 0.0
+    gt_set = set(int(x) for x in ground_truth[:gt_k])
     # Convert 1-indexed doc_ids back to 0-indexed for comparison with ground truth
     result_set = set(int(r[0]) - 1 for r in results[:k])
-    return len(gt_set & result_set) / k
+    return len(gt_set & result_set) / gt_k
 
 
 class KyroDBBenchmark:
@@ -607,7 +652,15 @@ class KyroDBBenchmark:
             "qps": float(np.mean([x["qps"] for x in per_run])),
             "avg_latency_ms": float(np.mean([x["avg_latency_ms"] for x in per_run])),
             "p50_latency_ms": float(np.mean([x["p50_latency_ms"] for x in per_run])),
+            "p50_latency_ms_range": [
+                float(min(x["p50_latency_ms"] for x in per_run)),
+                float(max(x["p50_latency_ms"] for x in per_run)),
+            ],
             "p99_latency_ms": float(np.mean([x["p99_latency_ms"] for x in per_run])),
+            "p99_latency_ms_range": [
+                float(min(x["p99_latency_ms"] for x in per_run)),
+                float(max(x["p99_latency_ms"] for x in per_run)),
+            ],
             "total_queries": len(queries),
             "per_run": per_run,
         }
@@ -653,6 +706,17 @@ def main():
         action="store_true",
         help="Use gRPC BulkSearch streaming API to reduce per-query overhead.",
     )
+    parser.add_argument(
+        "--allow-insecure-download",
+        action="store_true",
+        help="Allow insecure HTTP dataset downloads if HTTPS fails (not recommended).",
+    )
+    parser.add_argument(
+        "--download-timeout-secs",
+        type=int,
+        default=300,
+        help="Dataset download timeout in seconds (applies to HTTPS and HTTP fallback).",
+    )
     parser.add_argument("--skip-index", action="store_true",
                         help="Skip indexing (assume data already loaded)")
     parser.add_argument("--output-dir", type=str, default="benchmarks/results",
@@ -666,7 +730,12 @@ def main():
     
     # Download and load dataset
     data_dir = Path("benchmarks/data")
-    filepath = download_dataset(args.dataset, data_dir)
+    filepath = download_dataset(
+        args.dataset,
+        data_dir,
+        allow_insecure_download=bool(args.allow_insecure_download),
+        timeout=int(args.download_timeout_secs),
+    )
     train, test, neighbors = load_dataset(filepath)
     
     # Limit queries if needed
@@ -676,6 +745,14 @@ def main():
     
     # Run benchmark
     dataset_metric = "angular" if args.dataset.endswith("-angular") else "euclidean"
+
+    # Correctness: ANN-Benchmarks angular datasets expect unit-normalized vectors.
+    # Normalize once here to avoid dist-function ambiguity in the server/index layer.
+    if dataset_metric == "angular":
+        print("Normalizing embeddings (L2) for angular/cosine correctness...")
+        train = _normalize_rows_in_place(train)
+        test = _normalize_rows_in_place(test)
+
     benchmark = KyroDBBenchmark(
         host=args.host,
         port=args.port,
@@ -727,6 +804,9 @@ def main():
     output_data: Dict[str, Any] = {
         "dataset": args.dataset,
         "k": args.k,
+        "ef_search": int(args.ef_search),
+        "concurrency": int(args.concurrency),
+        "bulk_search": bool(args.bulk_search),
         "n_train": int(len(train)),
         "n_queries": int(len(test)),
         "dimension": int(train.shape[1]),
@@ -741,7 +821,7 @@ def main():
         "results": results,
     }
     
-    with open(output_file, 'w') as f:
+    with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(output_data, f, indent=2)
         
     print(f"\nResults saved to {output_file}")

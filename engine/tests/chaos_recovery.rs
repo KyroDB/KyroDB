@@ -312,6 +312,14 @@ fn test_snapshot_corruption_metrics() {
 async fn test_tiered_query_normal_operation() {
     use kyrodb_engine::{LruCacheStrategy, TieredEngine, TieredEngineConfig};
 
+    fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        v
+    }
+
     let cache = LruCacheStrategy::new(100);
     let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
     let embeddings = vec![
@@ -336,7 +344,7 @@ async fn test_tiered_query_normal_operation() {
         TieredEngine::new(Box::new(cache), query_cache, embeddings, metadata, config).unwrap();
 
     // Query should succeed through normal tier access
-    let query = vec![0.5, 0.5, 0.0, 0.0];
+    let query = normalize(vec![0.5, 0.5, 0.0, 0.0]);
     let results = engine.knn_search_with_timeouts(&query, 2).await;
 
     assert!(results.is_ok(), "Should get results from cold tier");

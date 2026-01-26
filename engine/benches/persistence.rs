@@ -3,7 +3,7 @@
 //! Measures WAL logging overhead for different fsync policies.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use kyrodb_engine::{FsyncPolicy, HnswBackend};
+use kyrodb_engine::{DistanceMetric, FsyncPolicy, HnswBackend};
 use tempfile::TempDir;
 
 fn bench_insert_with_persistence(c: &mut Criterion) {
@@ -23,9 +23,17 @@ fn bench_insert_with_persistence(c: &mut Criterion) {
                 let dir = TempDir::new().unwrap();
                 let data_dir = dir.path();
 
-                let backend =
-                    HnswBackend::with_persistence(128, vec![], vec![], 100, data_dir, *policy, 16)
-                        .unwrap();
+                let backend = HnswBackend::with_persistence(
+                    128,
+                    DistanceMetric::Euclidean,
+                    vec![],
+                    vec![],
+                    100,
+                    data_dir,
+                    *policy,
+                    16,
+                )
+                .unwrap();
 
                 let mut doc_id = 100;
 
@@ -61,6 +69,7 @@ fn bench_snapshot_creation(c: &mut Criterion) {
 
             let backend = HnswBackend::with_persistence(
                 128,
+                DistanceMetric::Euclidean,
                 embeddings.clone(),
                 metadata_vec,
                 *size * 2,
@@ -97,6 +106,7 @@ fn bench_recovery(c: &mut Criterion) {
 
             let backend = HnswBackend::with_persistence(
                 128,
+                DistanceMetric::Euclidean,
                 embeddings.clone(),
                 metadata_vec,
                 size_val * 2,
@@ -116,6 +126,7 @@ fn bench_recovery(c: &mut Criterion) {
                 b.iter(|| {
                     let _recovered = HnswBackend::recover(
                         128,
+                        DistanceMetric::Euclidean,
                         dir.path(),
                         *size_val * 2,
                         FsyncPolicy::Never,

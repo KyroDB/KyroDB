@@ -1030,8 +1030,13 @@ mod tests {
         let documents = vec![(1, vec![0.1, 0.2]), (2, vec![0.3, 0.4])];
 
         let metadata = vec![(1, HashMap::new()), (2, HashMap::new())];
-        let snapshot = Snapshot::new(2, crate::config::DistanceMetric::Cosine, documents, metadata)
-            .unwrap();
+        let snapshot = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            documents,
+            metadata,
+        )
+        .unwrap();
         snapshot.save(&snapshot_path).unwrap();
 
         // Load snapshot

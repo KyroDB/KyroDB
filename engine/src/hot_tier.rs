@@ -14,11 +14,16 @@
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::DistanceMetric;
 use crate::simd;
+
+use tracing::warn;
+
+static DOT_DISTANCE_NON_NORMALIZED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Hot tier statistics
 #[derive(Debug, Clone, Default)]
@@ -352,6 +357,8 @@ impl HotTier {
     ///
     /// # Note
     /// This does NOT update hit/miss stats since it's a search operation, not a lookup.
+    ///
+    /// For `DistanceMetric::InnerProduct`, correctness assumes embeddings are L2-normalized.
     pub fn knn_search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
         if k == 0 {
             return Vec::new();
@@ -479,9 +486,45 @@ impl HotTier {
         if a.len() != b.len() || a.is_empty() {
             return f32::INFINITY;
         }
+
+        let norm_a = Self::l2_norm(a);
+        let norm_b = Self::l2_norm(b);
+
+        let eps = 0.02_f32;
+        if (norm_a - 1.0).abs() > eps || (norm_b - 1.0).abs() > eps {
+            if !DOT_DISTANCE_NON_NORMALIZED_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    norm_a,
+                    norm_b,
+                    eps,
+                    "DistanceMetric::InnerProduct expects L2-normalized vectors; computing cosine-normalized dot distance"
+                );
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                (norm_a - 1.0).abs() <= eps,
+                "dot_distance expects L2-normalized vectors: norm_a={}",
+                norm_a
+            );
+            debug_assert!(
+                (norm_b - 1.0).abs() <= eps,
+                "dot_distance expects L2-normalized vectors: norm_b={}",
+                norm_b
+            );
+        }
+
+        let denom = norm_a * norm_b;
+        if denom <= f32::EPSILON {
+            return f32::INFINITY;
+        }
+
         let dot = simd::dot_f32(a, b);
-        // Match anndists::DistDot: distance = 1 - dot (expects L2-normalized vectors).
-        1.0 - dot
+        let dot_normalized = (dot / denom).clamp(-1.0, 1.0);
+        // Match anndists::DistDot under the L2-normalized assumption.
+        1.0 - dot_normalized
     }
 
     /// Re-insert documents that failed to flush

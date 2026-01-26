@@ -159,7 +159,7 @@ class KyroDB(BaseANN):
                 assert self._channel is not None
                 grpc.channel_ready_future(self._channel).result(timeout=1.0)
                 return
-            except BaseException as e:
+            except Exception as e:
                 last_err = e
                 time.sleep(0.2)
 
@@ -173,9 +173,11 @@ class KyroDB(BaseANN):
                 stderr_tail = None
 
         if stderr_tail:
+            self._cleanup_server()
             raise RuntimeError(
                 f"kyrodb_server failed to become ready: {last_err}; stderr tail:\n{stderr_tail}"
             )
+        self._cleanup_server()
         raise RuntimeError(f"kyrodb_server failed to become ready: {last_err}")
 
     def _generate_insert_requests(self, X: np.ndarray):
@@ -222,7 +224,7 @@ class KyroDB(BaseANN):
         if not flush.success:
             raise RuntimeError(f"FlushHotTier failed: {flush.error}")
 
-    def set_query_arguments(self, ef_search: int = None, **kwargs) -> None:
+    def set_query_arguments(self, ef_search: Optional[int] = None, **kwargs) -> None:
         if ef_search is not None:
             self.ef_search = int(ef_search)
         if kwargs.get("args") and len(kwargs["args"]) > 0:
@@ -247,7 +249,8 @@ class KyroDB(BaseANN):
         )
 
         resp = self._stub.Search(req)
-        return [(int(r.doc_id), float(self._score_to_distance(r.score))) for r in resp.results]
+        # ann-benchmarks expects 0-indexed dataset row ids; KyroDB uses doc_ids starting at 1.
+        return [(int(r.doc_id) - 1, float(self._score_to_distance(r.score))) for r in resp.results]
 
     def batch_query(self, X: np.ndarray, k: int) -> List[List[Tuple[int, float]]]:
         self._connect()
@@ -263,7 +266,9 @@ class KyroDB(BaseANN):
 
         out: List[List[Tuple[int, float]]] = []
         for resp in self._stub.BulkSearch(gen()):
-            out.append([(int(r.doc_id), float(self._score_to_distance(r.score))) for r in resp.results])
+            out.append(
+                [(int(r.doc_id) - 1, float(self._score_to_distance(r.score))) for r in resp.results]
+            )
         return out
 
     def get_memory_usage(self) -> float:
@@ -275,7 +280,7 @@ class KyroDB(BaseANN):
         except Exception:
             return 0.0
 
-    def done(self) -> None:
+    def _cleanup_server(self) -> None:
         try:
             if self._channel is not None:
                 self._channel.close()
@@ -312,3 +317,6 @@ class KyroDB(BaseANN):
                 shutil.rmtree(self._data_dir, ignore_errors=True)
             finally:
                 self._data_dir = None
+
+    def done(self) -> None:
+        self._cleanup_server()

@@ -144,7 +144,8 @@ docs/ENGINEERING_STATUS.md
 docs/VISION.md
 .venv/       
 simulation.html
-KyroQL
+benchmarks/scripts/analyze_vm_suite.py
+docs/BENCHMARK_REPORT_vm_suite_20260124_175225.md
 
 
                                                                                                                                                                                                                                                                                                                                                                         

@@ -368,6 +368,7 @@ async fn main() -> Result<()> {
         learned_strategy.clone(),
         training_config,
         None,
+        None,
         shutdown_rx,
     )
     .await;

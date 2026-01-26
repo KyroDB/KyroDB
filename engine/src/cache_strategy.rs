@@ -237,7 +237,9 @@ impl CacheStrategy for LearnedCacheStrategy {
             trace!(doc_id, strategy = %self.name, "bootstrap admit (untrained predictor)");
             // During bootstrap, also cache embedding in semantic adapter if present
             if let Some(ref adapter) = self.semantic_adapter {
-                adapter.cache_embedding(doc_id, embedding.to_vec());
+                if let Err(e) = adapter.cache_embedding(doc_id, embedding.to_vec()) {
+                    tracing::warn!(doc_id, error = %e, "SemanticAdapter: cache_embedding rejected");
+                }
             }
             return true;
         }
@@ -258,7 +260,9 @@ impl CacheStrategy for LearnedCacheStrategy {
                     "admit (hybrid semantic+freq)"
                 );
                 // Cache embedding for future semantic lookups
-                adapter.cache_embedding(doc_id, embedding.to_vec());
+                if let Err(e) = adapter.cache_embedding(doc_id, embedding.to_vec()) {
+                    tracing::warn!(doc_id, error = %e, "SemanticAdapter: cache_embedding rejected");
+                }
             } else {
                 trace!(
                     doc_id,

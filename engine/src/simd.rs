@@ -561,8 +561,7 @@ unsafe fn sum_squares_f32_neon(v: &[f32]) -> f32 {
         acc = vmlaq_f32(acc, x, x);
     }
     let mut sum = hadd_f32x4(acc);
-    for i in (chunks * 4)..v.len() {
-        let x = v[i];
+    for &x in v.iter().skip(chunks * 4) {
         sum += x * x;
     }
     sum

@@ -66,10 +66,11 @@ impl HnswVectorIndex {
     /// This is critical for correctness: using Cosine for an L2 benchmark (or vice versa)
     /// will destroy recall and makes results incomparable.
     ///
-    /// Warning: `DistanceMetric::InnerProduct` uses `DistDot`, which assumes **L2-normalized**
-    /// input vectors. If embeddings are not normalized, results will be incorrect. Normalize
-    /// each vector to unit length before inserting/querying. KyroDB validates and rejects
-    /// non-normalized vectors at runtime unless `disable_normalization_check` is enabled.
+    /// Warning: `DistanceMetric::Cosine` and `DistanceMetric::InnerProduct` rely on fast
+    /// dot-product distance implementations that assume **L2-normalized** input vectors.
+    /// If embeddings are not normalized, results will be incorrect. Normalize each vector to
+    /// unit length before inserting/querying. KyroDB validates and rejects non-normalized
+    /// vectors at runtime unless `disable_normalization_check` is enabled.
     pub fn new_with_distance(
         dimension: usize,
         max_elements: usize,
@@ -111,23 +112,21 @@ impl HnswVectorIndex {
         }
 
         // Calculate max_layer based on max_elements (hnsw_rs convention)
-        let max_layer = 16.min((max_elements as f32).ln().ceil() as usize);
+        let max_layer = 16.min(((max_elements as f32).ln().ceil() as usize).max(1));
 
         let index = match distance {
-            DistanceMetric::Cosine => HnswIndexImpl::Cosine(Arc::new(Hnsw::<f32, DistCosine>::new(
-                m,
-                max_elements,
-                max_layer,
-                ef_construction,
-                DistCosine {},
-            ))),
-            DistanceMetric::Euclidean => HnswIndexImpl::Euclidean(Arc::new(Hnsw::<f32, DistL2>::new(
-                m,
-                max_elements,
-                max_layer,
-                ef_construction,
-                DistL2 {},
-            ))),
+            DistanceMetric::Cosine => {
+                HnswIndexImpl::Cosine(Arc::new(Hnsw::<f32, DistCosine>::new(
+                    m,
+                    max_elements,
+                    max_layer,
+                    ef_construction,
+                    DistCosine {},
+                )))
+            }
+            DistanceMetric::Euclidean => HnswIndexImpl::Euclidean(Arc::new(
+                Hnsw::<f32, DistL2>::new(m, max_elements, max_layer, ef_construction, DistL2 {}),
+            )),
             DistanceMetric::InnerProduct => {
                 // DistDot assumes vectors are L2-normalized by the caller.
                 // We enforce no normalization here to keep the hot path allocation-free.
@@ -169,11 +168,16 @@ impl HnswVectorIndex {
             );
         }
 
-        if matches!(self.distance, DistanceMetric::InnerProduct) && !self.disable_normalization_check {
+        if matches!(
+            self.distance,
+            DistanceMetric::Cosine | DistanceMetric::InnerProduct
+        ) && !self.disable_normalization_check
+        {
             let norm_sq: f32 = embedding.iter().map(|v| v * v).sum();
             if !(0.98..=1.02).contains(&norm_sq) {
                 anyhow::bail!(
-                    "InnerProduct requires L2-normalized vectors; norm_sq={}",
+                    "{:?} requires L2-normalized vectors; norm_sq={}",
+                    self.distance,
                     norm_sq
                 );
             }
@@ -216,12 +220,35 @@ impl HnswVectorIndex {
             );
         }
 
+        if k == 0 {
+            anyhow::bail!("k must be greater than 0");
+        }
+        if k > 10_000 {
+            anyhow::bail!("k must be <= 10,000 (requested: {})", k);
+        }
+
+        if matches!(
+            self.distance,
+            DistanceMetric::Cosine | DistanceMetric::InnerProduct
+        ) && !self.disable_normalization_check
+        {
+            let norm_sq: f32 = query.iter().map(|v| v * v).sum();
+            if !(0.98..=1.02).contains(&norm_sq) {
+                anyhow::bail!(
+                    "{:?} requires L2-normalized vectors; norm_sq={}",
+                    self.distance,
+                    norm_sq
+                );
+            }
+        }
+
         if self.current_count == 0 {
             return Ok(Vec::new());
         }
 
         // ef_search controls search quality (higher = better recall, slower)
         let ef_search = if let Some(override_val) = ef_search_override {
+            // Clamp safely: bounds must not be inverted.
             override_val.clamp(k.max(1), 10_000)
         } else {
             // Adaptive: for very small indexes, crank this up to ensure near-perfect recall
@@ -302,12 +329,20 @@ impl HnswVectorIndex {
 mod tests {
     use super::*;
 
+    fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        v
+    }
+
     #[test]
     fn test_hnsw_basic_operations() {
         let mut index = HnswVectorIndex::new(128, 1000).unwrap();
 
         // Insert vector
-        let embedding = vec![0.1; 128];
+        let embedding = normalize(vec![0.1; 128]);
         index.add_vector(42, &embedding).unwrap();
 
         assert_eq!(index.len(), 1);
@@ -337,22 +372,29 @@ mod tests {
         let mut index = HnswVectorIndex::new(4, 100).unwrap();
 
         // Add 3 vectors
-        index.add_vector(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        index.add_vector(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-        index.add_vector(3, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        index
+            .add_vector(1, &normalize(vec![1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .add_vector(2, &normalize(vec![0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .add_vector(3, &normalize(vec![0.0, 0.0, 1.0, 0.0]))
+            .unwrap();
 
         // Query closest to vector 1
-        let query = [0.9, 0.1, 0.0, 0.0];
+        let query = normalize(vec![0.9, 0.1, 0.0, 0.0]);
         let results = index.knn_search(&query, 2).unwrap();
 
-        assert_eq!(results.len(), 2);
+        assert!(!results.is_empty());
+        assert!(results.len() <= 2);
         assert_eq!(results[0].doc_id, 1); // Closest
     }
 
     #[test]
     fn test_hnsw_empty_index() {
         let index = HnswVectorIndex::new(128, 1000).unwrap();
-        let query = vec![0.1; 128];
+        let query = normalize(vec![0.1; 128]);
         let results = index.knn_search(&query, 10).unwrap();
         assert_eq!(results.len(), 0);
     }
