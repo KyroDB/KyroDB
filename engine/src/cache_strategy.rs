@@ -198,7 +198,7 @@ impl LearnedCacheStrategy {
         let predictor_cap = predictor.capacity_limit().max(1);
         let desired = cache_capacity
             .saturating_mul(8)
-            .clamp(cache_capacity.max(1), predictor_cap);
+            .clamp(cache_capacity.max(1).min(predictor_cap), predictor_cap);
         let diversity_pow2 = desired.checked_next_power_of_two().unwrap_or(desired);
         let diversity = diversity_pow2.clamp(32, 1024);
         predictor.set_diversity_buckets(diversity);
