@@ -1912,6 +1912,11 @@ impl KyroDbService for KyroDBServiceImpl {
             flush_interval_seconds: engine_config.flush_interval.as_secs(),
             embedding_dimension: app_config.hnsw.dimension as u64,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            hnsw_m: engine_config.hnsw_m as u64,
+            hnsw_ef_construction: engine_config.hnsw_ef_construction as u64,
+            hnsw_ef_search: engine_config.hnsw_ef_search as u64,
+            hnsw_distance: format!("{:?}", engine_config.hnsw_distance),
+            hnsw_disable_normalization_check: engine_config.hnsw_disable_normalization_check,
         }))
     }
 }

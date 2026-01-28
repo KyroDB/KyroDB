@@ -472,4 +472,11 @@ message ConfigResponse {
   // Runtime info
   uint64 embedding_dimension = 8;
   string version = 9;
+
+  // HNSW parameters (critical for benchmark traceability)
+  uint64 hnsw_m = 10;
+  uint64 hnsw_ef_construction = 11;
+  uint64 hnsw_ef_search = 12;
+  string hnsw_distance = 13;
+  bool hnsw_disable_normalization_check = 14;
 }

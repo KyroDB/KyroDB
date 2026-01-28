@@ -52,7 +52,27 @@ except ImportError:
 # Import generated stubs (from benchmarks/ directory, not ann-benchmarks/)
 bench_dir = Path(__file__).parent
 generated_dir = bench_dir / "_generated"
-if not (generated_dir / "kyrodb_pb2.py").exists() or not (generated_dir / "kyrodb_pb2_grpc.py").exists():
+
+# Regenerate stubs if missing or if the source proto changed.
+repo_root = Path(__file__).resolve().parents[1]
+proto_path = repo_root / "engine" / "proto" / "kyrodb.proto"
+proto_hash: Optional[str] = None
+if proto_path.exists():
+    h = hashlib.sha256()
+    with proto_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    proto_hash = h.hexdigest()
+proto_hash_file = generated_dir / ".proto.sha256"
+existing_hash = proto_hash_file.read_text(encoding="utf-8").strip() if proto_hash_file.exists() else None
+
+need_regen = (
+    not (generated_dir / "kyrodb_pb2.py").exists()
+    or not (generated_dir / "kyrodb_pb2_grpc.py").exists()
+    or (proto_hash is not None and existing_hash != proto_hash)
+)
+
+if need_regen:
     # Generate stubs deterministically from the repo proto.
     gen_script = bench_dir / "scripts" / "gen_grpc_stubs.py"
     if not gen_script.exists():
@@ -66,6 +86,9 @@ if not (generated_dir / "kyrodb_pb2.py").exists() or not (generated_dir / "kyrod
     )
     if proc.returncode != 0:
         raise SystemExit(f"Failed to generate gRPC stubs:\n{proc.stdout}")
+    if proto_hash is not None:
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        proto_hash_file.write_text(proto_hash + "\n", encoding="utf-8")
 
 sys.path.insert(0, str(bench_dir))
 
@@ -168,7 +191,20 @@ def _normalize_rows_in_place(arr: np.ndarray) -> np.ndarray:
 
 
 def _download_url_to_file(url: str, filepath: Path, *, timeout: int) -> None:
-    with urllib.request.urlopen(url, timeout=timeout) as response:
+    # ann-benchmarks.com sometimes returns 403 to default Python urllib clients.
+    # Provide a minimal browser-like UA to keep local benchmarking reliable.
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         with open(filepath, "wb") as f:
             shutil.copyfileobj(response, f)
 
@@ -233,6 +269,152 @@ def load_dataset(filepath: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     
     print(f"Loaded dataset: train={train.shape}, test={test.shape}")
     return train, test, neighbors
+
+
+def _exact_topk_indices_for_query(
+    *,
+    train: np.ndarray,
+    train_norms: Optional[np.ndarray],
+    query: np.ndarray,
+    query_norm: Optional[float],
+    k: int,
+    metric: str,
+    chunk_size: int,
+) -> np.ndarray:
+    metric = metric.lower()
+    k = int(k)
+    if k <= 0:
+        return np.empty((0,), dtype=np.int32)
+
+    n = int(train.shape[0])
+    if n == 0:
+        return np.empty((0,), dtype=np.int32)
+
+    best_idx: Optional[np.ndarray] = None
+    best_val: Optional[np.ndarray] = None
+
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        chunk = train[start:end]
+
+        if metric in ("euclidean", "l2"):
+            assert train_norms is not None
+            assert query_norm is not None
+            # ||a-b||^2 = ||a||^2 + ||b||^2 - 2a·b
+            dots = chunk @ query
+            dist = train_norms[start:end] + query_norm - 2.0 * dots
+            # smaller is better
+            local = np.argpartition(dist, min(k, dist.shape[0] - 1))[:k]
+            local_vals = dist[local]
+        else:
+            # For cosine/angular and inner-product, higher dot is better.
+            dots = chunk @ query
+            local = np.argpartition(-dots, min(k, dots.shape[0] - 1))[:k]
+            local_vals = dots[local]
+
+        local_idx = local.astype(np.int64) + start
+
+        if best_idx is None:
+            best_idx = local_idx
+            best_val = local_vals
+            continue
+
+        assert best_val is not None
+        merged_idx = np.concatenate([best_idx, local_idx])
+        merged_val = np.concatenate([best_val, local_vals])
+
+        if metric in ("euclidean", "l2"):
+            keep = np.argpartition(merged_val, min(k, merged_val.shape[0] - 1))[:k]
+        else:
+            keep = np.argpartition(-merged_val, min(k, merged_val.shape[0] - 1))[:k]
+
+        best_idx = merged_idx[keep]
+        best_val = merged_val[keep]
+
+    assert best_idx is not None
+    assert best_val is not None
+
+    # Sort final top-k.
+    if metric in ("euclidean", "l2"):
+        order = np.argsort(best_val)
+    else:
+        order = np.argsort(-best_val)
+    return best_idx[order].astype(np.int32)
+
+
+def recompute_ground_truth_neighbors(
+    *,
+    train: np.ndarray,
+    test: np.ndarray,
+    k: int,
+    metric: str,
+    chunk_size: int = 50_000,
+) -> np.ndarray:
+    """Recompute exact top-k neighbors for the given train/test arrays.
+
+    This is intended for local iteration when `--max-train` truncates the dataset.
+    ANN-Benchmarks ground truth in the HDF5 file is for the full train set.
+    """
+    metric = metric.lower()
+    if metric not in ("euclidean", "l2", "angular", "cosine", "inner_product", "inner-product"):
+        raise ValueError(f"unsupported metric for ground truth recompute: {metric}")
+
+    k = int(k)
+    if k <= 0:
+        raise ValueError("k must be positive")
+
+    train = np.asarray(train, dtype=np.float32)
+    test = np.asarray(test, dtype=np.float32)
+
+    train_norms: Optional[np.ndarray] = None
+    if metric in ("euclidean", "l2"):
+        train_norms = np.sum(train * train, axis=1)
+
+    out = np.empty((int(test.shape[0]), k), dtype=np.int32)
+
+    print(
+        f"Recomputing exact ground truth on current train set: n_train={len(train):,} n_queries={len(test):,} k={k} metric={metric}..."
+    )
+    start_t = time.time()
+
+    for i in range(int(test.shape[0])):
+        q = test[i]
+        q_norm: Optional[float] = None
+        if metric in ("euclidean", "l2"):
+            q_norm = float(np.dot(q, q))
+
+        out[i] = _exact_topk_indices_for_query(
+            train=train,
+            train_norms=train_norms,
+            query=q,
+            query_norm=q_norm,
+            k=k,
+            metric=metric,
+            chunk_size=int(chunk_size),
+        )
+
+        if (i + 1) % 50 == 0 or (i + 1) == int(test.shape[0]):
+            elapsed = time.time() - start_t
+            rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+            print(f"  Ground truth: {i+1}/{len(test)} queries ({rate:,.1f} q/s)")
+
+    elapsed = time.time() - start_t
+    print(f"Ground truth recompute done in {elapsed:.1f}s")
+    return out
+
+
+def _ground_truth_cache_path(
+    *,
+    cache_dir: Path,
+    dataset_name: str,
+    metric: str,
+    n_train: int,
+    n_queries: int,
+    k: int,
+) -> Path:
+    safe_dataset = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in dataset_name)
+    safe_metric = metric.lower().replace("-", "_")
+    return cache_dir / f"gt_{safe_dataset}_{safe_metric}_n{n_train}_q{n_queries}_k{k}.npy"
 
 
 def compute_recall(results: List[Tuple[int, float]], ground_truth: np.ndarray, k: int) -> float:
@@ -684,6 +866,23 @@ def main():
     parser.add_argument("--max-queries", type=int, default=1000,
                         help="Maximum number of queries to run")
     parser.add_argument(
+        "--max-train",
+        type=int,
+        default=0,
+        help=(
+            "Maximum number of train vectors to index (0 indexes all). "
+            "Useful for faster local iteration; note results won't match official ANN datasets when set."
+        ),
+    )
+    parser.add_argument(
+        "--recompute-ground-truth",
+        action="store_true",
+        help=(
+            "When --max-train truncates the dataset, recompute exact top-k ground truth on the truncated train set "
+            "so recall becomes meaningful for iteration. This can be expensive."
+        ),
+    )
+    parser.add_argument(
         "--warmup-queries",
         type=int,
         default=100,
@@ -737,21 +936,95 @@ def main():
         timeout=int(args.download_timeout_secs),
     )
     train, test, neighbors = load_dataset(filepath)
+
+    # Determine dataset metric early; this is needed for ground-truth recomputation.
+    dataset_metric = "angular" if args.dataset.endswith("-angular") else "euclidean"
+
+    # Limit train set for faster local iteration (optional).
+    train_truncated = False
+    if args.max_train and args.max_train > 0 and args.max_train < len(train):
+        train = train[: args.max_train]
+        train_truncated = True
+        print(f"Limiting train set to {len(train):,} vectors (--max-train)")
     
     # Limit queries if needed
     if args.max_queries < len(test):
         test = test[:args.max_queries]
         neighbors = neighbors[:args.max_queries]
-    
-    # Run benchmark
-    dataset_metric = "angular" if args.dataset.endswith("-angular") else "euclidean"
+
+    # ANN-Benchmarks files typically store 100 neighbors; for Recall@k we only need top-k.
+    if neighbors.ndim == 2 and neighbors.shape[1] > int(args.k):
+        neighbors = neighbors[:, : int(args.k)]
 
     # Correctness: ANN-Benchmarks angular datasets expect unit-normalized vectors.
-    # Normalize once here to avoid dist-function ambiguity in the server/index layer.
+    # Normalize once here (after any truncation) to avoid unnecessary work.
     if dataset_metric == "angular":
         print("Normalizing embeddings (L2) for angular/cosine correctness...")
         train = _normalize_rows_in_place(train)
         test = _normalize_rows_in_place(test)
+
+    ground_truth_info: Dict[str, Any] = {
+        "source": "ann-benchmarks",
+        "recomputed": False,
+        "recompute_seconds": None,
+        "cache_path": None,
+        "cache_hit": False,
+        "note": None,
+    }
+
+    # If we truncate the train set, ANN-Benchmarks neighbors are no longer correct.
+    if train_truncated:
+        ground_truth_info["note"] = (
+            "Train set was truncated; ANN-Benchmarks ground truth in the dataset file is computed against the full train set."
+        )
+        if args.recompute_ground_truth:
+            cache_dir = Path("benchmarks/data/gt_cache")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path = _ground_truth_cache_path(
+                cache_dir=cache_dir,
+                dataset_name=args.dataset,
+                metric=dataset_metric,
+                n_train=int(len(train)),
+                n_queries=int(len(test)),
+                k=int(args.k),
+            )
+            ground_truth_info["cache_path"] = str(cache_path)
+
+            expected_shape = (int(len(test)), int(args.k))
+
+            if cache_path.exists():
+                try:
+                    cached = np.load(cache_path)
+                    if cached.shape == expected_shape:
+                        neighbors = cached
+                        ground_truth_info["source"] = "recomputed"
+                        ground_truth_info["recomputed"] = True
+                        ground_truth_info["cache_hit"] = True
+                    else:
+                        print(
+                            f"Ground truth cache shape mismatch; recomputing: cache={cached.shape} expected={expected_shape}"
+                        )
+                except Exception as e:
+                    print(f"Failed to load ground truth cache; recomputing: {e}")
+
+            if not ground_truth_info["cache_hit"]:
+                gt_start = time.time()
+                neighbors = recompute_ground_truth_neighbors(
+                    train=train,
+                    test=test,
+                    k=args.k,
+                    metric=dataset_metric,
+                )
+                ground_truth_info["source"] = "recomputed"
+                ground_truth_info["recomputed"] = True
+                ground_truth_info["recompute_seconds"] = float(time.time() - gt_start)
+                try:
+                    np.save(cache_path, neighbors)
+                    ground_truth_info["cache_path"] = str(cache_path)
+                except Exception as e:
+                    print(f"Failed to write ground truth cache: {e}")
+    
+    # Run benchmark
 
     benchmark = KyroDBBenchmark(
         host=args.host,
@@ -769,6 +1042,13 @@ def main():
             "hot_tier_max_size": int(getattr(resp, "hot_tier_max_size", 0)),
             "hot_tier_max_age_seconds": int(getattr(resp, "hot_tier_max_age_seconds", 0)),
             "hnsw_max_elements": int(getattr(resp, "hnsw_max_elements", 0)),
+            "hnsw_m": int(getattr(resp, "hnsw_m", 0)),
+            "hnsw_ef_construction": int(getattr(resp, "hnsw_ef_construction", 0)),
+            "hnsw_ef_search": int(getattr(resp, "hnsw_ef_search", 0)),
+            "hnsw_distance": getattr(resp, "hnsw_distance", None),
+            "hnsw_disable_normalization_check": bool(
+                getattr(resp, "hnsw_disable_normalization_check", False)
+            ),
             "data_dir": getattr(resp, "data_dir", None),
             "fsync_policy": getattr(resp, "fsync_policy", None),
             "snapshot_interval": int(getattr(resp, "snapshot_interval", 0)),
@@ -807,6 +1087,7 @@ def main():
         "ef_search": int(args.ef_search),
         "concurrency": int(args.concurrency),
         "bulk_search": bool(args.bulk_search),
+        "max_train": int(args.max_train),
         "n_train": int(len(train)),
         "n_queries": int(len(test)),
         "dimension": int(train.shape[1]),
@@ -818,6 +1099,7 @@ def main():
             args=args,
         ),
         "server_config": server_config,
+        "ground_truth": ground_truth_info,
         "results": results,
     }
     

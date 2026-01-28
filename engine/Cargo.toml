@@ -35,6 +35,11 @@ name = "validation_enterprise"
 path = "src/bin/validation_enterprise.rs"
 required-features = ["cli-tools"]
 
+[[bin]]
+name = "hnsw_experiment"
+path = "src/bin/hnsw_experiment.rs"
+required-features = ["dev-tools"]
+
 
 
 [features]
@@ -47,6 +52,8 @@ bench-no-metrics = []
 jemalloc-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 # CLI tools: Optional progress bars and table formatting
 cli-tools = ["indicatif", "tabled", "env_logger"]
+# Developer-only local experiment binaries
+dev-tools = []
 # S3 backup: Optional AWS S3 integration for remote backups
 s3-backup = ["aws-config", "aws-sdk-s3"]
 # Loom testing: Enable loom model checker for concurrency correctness
