@@ -34,39 +34,35 @@ KyroDB's two-level Layer 1 cache combines complementary caching strategies:
 
 | Layer | Strategy | Hit Rate | Purpose |
 |-------|----------|----------|---------|
-| **L1a** | Document-level frequency (RMI) | 50% | Predicts hot documents from access patterns |
-| **L1b** | Query-level semantics | 21% | Matches paraphrased queries via similarity |
+| **L1a** | Learned hotness prediction (freq+recency) | ~63% | Predicts hot documents from access patterns |
+| **L1b** | Semantic search‑result cache | ~10% | Caches top‑k results for similar queries |
 | **Combined** | Hybrid approach | **73.5%** | 2-3× better than LRU baseline (25-35%) |
 
-**Validated Performance** (MS MARCO dataset, 10K documents, 50K queries):
-- 73.5% combined hit rate (L1a: 50.2%, L1b: 21.4%)
-- 17.6ns logging overhead per query
-- 0% memory growth under sustained load
-- 40/40 successful training cycles
+**Validation harness** (workload-dependent; not a production guarantee):
+- ~73.5% combined L1 hit rate (L1a ~63%, L1b ~10%)
+
+See [Two-Level Cache Architecture](docs/TWO_LEVEL_CACHE_ARCHITECTURE.md) for methodology, numbers, and limitations.
 
 ### ⚡ Three-Tier Architecture
 
 ```
 ┌────────────────────────────────────────────────┐
 │  Layer 1: Hybrid Semantic Cache (HSC)         │
-│  • L1a: RMI frequency prediction               │
-│  • L1b: Semantic similarity matching           │
-│  • 73.5% hit rate, <1ms latency                │
+│  • L1a: Learned hotness prediction             │
+│  • L1b: Semantic search‑result cache           │
+│  • ~73.5% combined hit rate (validated harness)│
 └────────────────┬───────────────────────────────┘
                  │ miss (26.5%)
                  ▼
 ┌────────────────────────────────────────────────┐
 │  Layer 2: Hot Tier (Recent Writes)            │
-│  • HashMap for 1000-doc working set            │
-│  • <200ns exact lookups                        │
+│  • In-memory tier for recent writes            │
 └────────────────┬───────────────────────────────┘
                  │ miss
                  ▼
 ┌────────────────────────────────────────────────┐
 │  Layer 3: HNSW Index (Cold Storage)           │
-│  • Millions of vectors                         │
-│  • <1ms P99 @ 10M vectors                      │
-│  • >95% recall @ k=10                          │
+│  • Approximate k-NN search                      │
 │  • WAL + snapshot persistence                  │
 └────────────────────────────────────────────────┘
 ```
@@ -78,7 +74,7 @@ KyroDB's two-level Layer 1 cache combines complementary caching strategies:
 - **Observability**: Prometheus metrics, structured logging, health checks
 - **Flexible Config**: TOML/YAML files + environment variables + CLI args
 - **Quality Metrics**: NDCG@10 for cache admission validation
-- **Auto-Learning**: Background RMI retraining every 10 minutes
+- **Auto-Learning**: Background predictor retraining (optional)
 
 ---
 
@@ -92,7 +88,10 @@ git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
 # Build release binaries
-cargo build --release --features cli-tools
+cargo build --release -p kyrodb-engine
+
+# Optional: build validation binaries and enable table/progress output in CLI tools
+cargo build --release -p kyrodb-engine --features cli-tools
 ```
 
 ### Run Validation Demo
@@ -113,7 +112,7 @@ See the Hybrid Semantic Cache in action with the MS MARCO dataset:
 **Demonstrates**:
 - A/B testing (LRU baseline vs. Hybrid Semantic Cache)
 - Three-tier query flow with automatic cache admission
-- RMI frequency prediction and adaptive thresholding
+- Learned hotness prediction and adaptive thresholding
 - Memory stability under sustained load
 - Automatic retraining cycles
 - NDCG@10 quality metrics
@@ -162,11 +161,13 @@ hnsw:
 
 persistence:
   data_dir: "/var/lib/kyrodb/data"
-  enable_wal: true
   fsync_policy: "data_only"
+  wal_flush_interval_ms: 100
+  snapshot_interval_mutations: 10000
+  max_wal_size_bytes: 104857600
 
 slo:
-  p99_latency_ms: 50.0
+  p99_latency_ms: 10.0
   cache_hit_rate: 0.70
 ```
 
@@ -186,17 +187,14 @@ KYRODB__SERVER__PORT=50051 ./kyrodb_server
 
 ## Performance
 
-### Validated Metrics (MS MARCO Dataset)
+### Validation Harness Results (workload-dependent)
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **L1 Hit Rate** | 73.5% | Combined L1a (50%) + L1b (21%) |
-| **LRU Baseline** | 25-35% | Standard approach |
-| **Improvement** | 2-3× | Over naive LRU |
-| **HNSW Recall** | >95% @ k=10 | Validated accuracy |
-| **HNSW Latency** | <1ms P99 | @ 10M vectors |
-| **Memory Stability** | 0% growth | Sustained load |
-| **Training Success** | 40/40 cycles | 15-second intervals |
+Cache validation (see [Two-Level Cache Architecture](docs/TWO_LEVEL_CACHE_ARCHITECTURE.md)):
+- Combined L1 hit rate: **~73.5%** (L1a ~63.5%, L1b ~10.1%)
+- Bimodal latency: cache hits in microseconds; cold-tier misses in milliseconds
+
+ANN benchmarking:
+- See `benchmarks/README.md` and `benchmarks/results/` for dataset-specific recall/QPS/latency.
 
 ### Latency Distribution (12-Hour Test)
 
@@ -236,8 +234,8 @@ KyroDB is optimized for:
 |-----------|---------|----------|
 | **TieredEngine** | Three-tier orchestrator | [`engine/src/tiered_engine.rs`](engine/src/tiered_engine.rs) |
 | **HnswBackend** | HNSW + persistence | [`engine/src/hnsw_backend.rs`](engine/src/hnsw_backend.rs) |
-| **LearnedCache** | RMI frequency prediction | [`engine/src/learned_cache.rs`](engine/src/learned_cache.rs) |
-| **QueryHashCache** | Semantic similarity (L1b) | [`engine/src/query_hash_cache.rs`](engine/src/query_hash_cache.rs) |
+| **LearnedCache** | Learned hotness prediction | [`engine/src/learned_cache.rs`](engine/src/learned_cache.rs) |
+| **QueryHashCache** | Semantic search‑result cache (L1b) | [`engine/src/query_hash_cache.rs`](engine/src/query_hash_cache.rs) |
 | **HotTier** | Recent writes buffer | [`engine/src/hot_tier.rs`](engine/src/hot_tier.rs) |
 | **AccessLogger** | Pattern tracking | [`engine/src/access_logger.rs`](engine/src/access_logger.rs) |
 | **TrainingTask** | Background retraining | [`engine/src/training_task.rs`](engine/src/training_task.rs) |
@@ -245,7 +243,7 @@ KyroDB is optimized for:
 ### Technology Stack
 
 - **Language**: Rust 1.70+ (performance, safety, zero-cost abstractions)
-- **Vector Search**: `hnswlib-rs` (HNSW k-NN implementation)
+- **Vector Search**: `hnsw_rs` (HNSW k-NN implementation)
 - **Async Runtime**: `tokio` (background tasks, gRPC server)
 - **Serialization**: `serde` (WAL and snapshots)
 - **Memory Profiling**: `jemallocator` (leak detection)

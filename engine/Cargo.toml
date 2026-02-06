@@ -14,16 +14,13 @@ categories = ["database-implementations", "machine-learning"]
 name = "kyrodb_engine"
 path = "src/lib.rs"
 
-# CLI binaries require cli-tools feature
 [[bin]]
 name = "kyrodb_backup"
 path = "src/bin/kyrodb_backup.rs"
-required-features = ["cli-tools"]
 
 [[bin]]
 name = "kyrodb_load_tester"
 path = "src/bin/kyrodb_load_tester.rs"
-required-features = ["cli-tools"]
 
 [[bin]]
 name = "validation_24h"

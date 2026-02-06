@@ -922,6 +922,12 @@ def main():
                         help="Output directory for results")
     
     args = parser.parse_args()
+
+    if args.max_queries < 1:
+        parser.error("--max-queries must be >= 1")
+
+    if args.k < 1:
+        parser.error("--k must be >= 1")
     
     print("="*60)
     print(f"KyroDB Benchmark: {args.dataset}")

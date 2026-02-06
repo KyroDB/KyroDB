@@ -25,6 +25,8 @@ python benchmarks/run_benchmark.py --dataset sift-128-euclidean --k 10
 Notes:
 - The running `kyrodb_server` must be configured with the correct embedding dimension and distance metric for the dataset.
 - The benchmark runner records dataset SHA-256 and basic environment metadata into the result JSON.
+  Configure these via the server config file (`hnsw.dimension` and `hnsw.distance`) passed to `kyrodb_server`.
+  Example: set `hnsw.dimension=128` and `hnsw.distance=euclidean` for `sift-128-euclidean`. See the main README configuration section for details.
 
 ### 3. View Results
 
@@ -45,7 +47,8 @@ benchmarks/
 ├── benchmark.toml           # Default VM benchmark config
 ├── run_benchmark.py        # Local benchmark runner
 ├── scripts/                # VM benchmark helpers
-│   └── vm_ann_suite.sh      # VM ANN suite runner
+│   ├── vm_ann_suite.sh      # VM ANN suite runner
+│   └── soak_12h.sh          # 12-hour soak test harness
 ├── data/                   # Downloaded datasets (auto-created)
 ├── VM_BENCHMARK_PROTOCOL.md # VM benchmark protocol and reporting
 └── results/                # Benchmark results (auto-created)
@@ -63,6 +66,24 @@ bash benchmarks/scripts/vm_ann_suite.sh
 
 Protocol details and reporting expectations are in `benchmarks/VM_BENCHMARK_PROTOCOL.md`.
 
+## 12-Hour Soak Test
+
+The soak harness runs repeated query-only benchmark passes for a fixed duration
+after an initial indexing pass. Use this to validate stability, memory bounds,
+and latency tails over long periods.
+
+```bash
+SOAK_DATASET=glove-100-angular \
+SOAK_EF_SEARCH=200 \
+SOAK_CONCURRENCY=16 \
+SOAK_DURATION_HOURS=12 \
+bash benchmarks/scripts/soak_12h.sh
+```
+
+Optional overrides:
+- `SOAK_MAX_TRAIN` to truncate the dataset for local iteration (recomputes ground truth).
+- `SOAK_CONFIG` to supply a custom server config instead of auto-generated defaults.
+
 ### 1. Setup VM (Standard FX32ms v2)
 
 ```bash
@@ -70,7 +91,7 @@ Protocol details and reporting expectations are in `benchmarks/VM_BENCHMARK_PROT
 ssh azureuser@<vm-ip>
 
 # Clone repository
-git clone https://github.com/vatskishan03/KyroDB.git -b benchmark
+git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
 # Install Rust
@@ -116,10 +137,7 @@ cd ann-benchmarks
 ```
 
 ### 2. Copy KyroDB Algorithm
-
-```bash
-mkdir -p ann_benchmarks/algorithms/kyrodb
-```
+Create the algorithm directory and copy the KyroDB wrapper files below.
 
 ### 3. Build Docker Image
 
@@ -136,7 +154,7 @@ cp /path/to/KyroDB/benchmarks/ann-benchmarks/config.yml ann_benchmarks/algorithm
 # Build image (NOTE: ann-benchmarks install.py accepts --build-arg only once
 # and expects multiple KEY=VALUE pairs after that single flag)
 python install.py --algorithm kyrodb \
-    --build-arg KYRODB_GIT=https://github.com/vatskishan03/KyroDB.git KYRODB_REF=benchmark
+    --build-arg KYRODB_GIT=https://github.com/vatskishan03/KyroDB.git KYRODB_REF=main
 
 # If Docker build fails with: "lock file version `4` was found"
 # you are using an older Rust/Cargo builder image. Use the updated

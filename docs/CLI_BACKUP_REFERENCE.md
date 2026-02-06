@@ -5,7 +5,10 @@ Command-line tool for KyroDB backup and restore operations.
 ## Installation
 
 ```bash
-# Build from source (requires cli-tools feature)
+# Build from source (minimal: JSON output; no tables/progress bars)
+cargo build --bin kyrodb_backup --release
+
+# Optional: enable table output + progress bars
 cargo build --bin kyrodb_backup --release --features cli-tools
 
 # Binary location
@@ -71,10 +74,10 @@ Vectors: 10000
 
 ### 2. List Backups
 
-List all available backups in table or JSON format.
+List all available backups in table or JSON format. The default output format depends on whether the binary was built with `cli-tools`.
 
 ```bash
-# Table format (default, requires cli-tools)
+# Table format (available with `cli-tools`; default only when built with `cli-tools`)
 ./target/release/kyrodb_backup list \
   --data-dir ./data \
   --backup-dir ./backups
@@ -87,7 +90,7 @@ List all available backups in table or JSON format.
 ```
 
 **Options:**
-- `--format <table|json>`: Output format (default: table; table requires `cli-tools`)
+- `--format <table|json>`: Output format. Default is `table` when built with `cli-tools`; otherwise `json`. For stable automation, pass `--format json`.
 
 **Table Output:**
 ```
@@ -277,6 +280,7 @@ LATEST=$(./target/release/kyrodb_backup list \
   --backup-dir ./backups \
   --format json | jq -r '.[0].id')
 
+export BACKUP_ALLOW_CLEAR=true
 ./target/release/kyrodb_backup restore \
   --data-dir ./data \
   --backup-dir ./backups \
@@ -310,6 +314,7 @@ if [ $? -ne 0 ]; then
     --format json | \
     jq -r '.[] | select(.description | contains("Pre-upgrade")) | .id' | \
     head -1)
+  export BACKUP_ALLOW_CLEAR=true
   ./target/release/kyrodb_backup restore \
     --data-dir ./data \
     --backup-dir ./backups \
@@ -328,7 +333,24 @@ The CLI provides clear error messages for common issues:
 $ kyrodb_backup verify
 error: the following required arguments were not provided:
   <backup-id>
+```
 
+### Restore Refuses to Clear Data Directory
+
+When running a restore without `BACKUP_ALLOW_CLEAR` set, the CLI emits:
+
+```
+Error: Cannot clear data directory. Set BACKUP_ALLOW_CLEAR=true environment variable to allow clearing the data directory during restore.
+```
+
+**Solution**: set the environment variable to acknowledge the destructive operation:
+
+```bash
+export BACKUP_ALLOW_CLEAR=true
+./target/release/kyrodb_backup restore --backup-id <backup-id>
+```
+
+```bash
 # Invalid backup ID format
 $ kyrodb_backup verify invalid-uuid
 Error: invalid UUID format

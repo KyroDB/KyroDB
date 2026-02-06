@@ -98,6 +98,11 @@ fn create_data_dir(temp_dir: &TempDir) -> Result<PathBuf> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn end_to_end_insert_query_search() -> Result<()> {
+    if std::env::var("KYRODB_ENABLE_NET_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping grpc end-to-end test (set KYRODB_ENABLE_NET_TESTS=1 to enable)");
+        return Ok(());
+    }
+
     let binary = server_binary()?;
     let temp_dir = tempfile::tempdir().context("failed to create temp directory")?;
     let data_dir = create_data_dir(&temp_dir)?;

@@ -7,8 +7,8 @@
 //! - Durability guarantees with different fsync policies
 
 use kyrodb_engine::{
-    DistanceMetric, FsyncPolicy, HnswBackend, Manifest, Snapshot, WalEntry, WalOp, WalReader,
-    WalWriter,
+    metrics::MetricsCollector, DistanceMetric, FsyncPolicy, HnswBackend, Manifest, Snapshot,
+    WalEntry, WalOp, WalReader, WalWriter,
 };
 use std::collections::HashMap;
 use tempfile::TempDir;
@@ -35,6 +35,7 @@ fn test_wal_basic_operations() {
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         timestamp: 1000,
         metadata: HashMap::new(),
+        seq_no: 1,
     };
 
     let entry2 = WalEntry {
@@ -43,6 +44,7 @@ fn test_wal_basic_operations() {
         embedding: vec![0.5, 0.6, 0.7, 0.8],
         timestamp: 2000,
         metadata: HashMap::new(),
+        seq_no: 2,
     };
 
     writer.append(&entry1).unwrap();
@@ -80,7 +82,7 @@ fn test_snapshot_save_load() {
         .iter()
         .map(|(id, _)| (*id, HashMap::new()))
         .collect();
-    let snapshot = Snapshot::new(4, DistanceMetric::Cosine, documents, metadata).unwrap();
+    let snapshot = Snapshot::new(4, DistanceMetric::Cosine, documents, metadata, 0).unwrap();
     snapshot.save(&snapshot_path).unwrap();
 
     // Load snapshot
@@ -112,6 +114,7 @@ fn test_hnsw_backend_persistence() {
         dir.path(),
         FsyncPolicy::Always,
         10, // Snapshot every 10 inserts
+        1024 * 1024,
     )
     .unwrap();
 
@@ -141,6 +144,7 @@ fn test_hnsw_backend_persistence() {
         100,
         FsyncPolicy::Always,
         10,
+        1024 * 1024,
         metrics.clone(),
     )
     .unwrap();
@@ -183,6 +187,7 @@ fn test_crash_recovery_wal_only() {
             dir.path(),
             FsyncPolicy::Always,
             1000, // High threshold to avoid snapshot
+            1024 * 1024,
         )
         .unwrap();
 
@@ -203,6 +208,7 @@ fn test_crash_recovery_wal_only() {
         100,
         FsyncPolicy::Always,
         1000,
+        1024 * 1024,
         metrics,
     )
     .unwrap();
@@ -211,6 +217,72 @@ fn test_crash_recovery_wal_only() {
     assert_eq!(recovered.len(), 3);
     let doc2 = recovered.fetch_document(2).unwrap();
     assert_eq!(doc2, normalize(vec![0.5, 0.5]));
+}
+
+#[test]
+fn test_recovery_skips_legacy_wal_before_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path();
+
+    let snapshot_name = "snapshot_100.snap";
+    let snapshot_path = data_dir.join(snapshot_name);
+    let documents = vec![(1, vec![1.0, 0.0])];
+    let metadata = documents
+        .iter()
+        .map(|(id, _)| (*id, HashMap::new()))
+        .collect();
+    let snapshot = Snapshot::new(2, DistanceMetric::Euclidean, documents, metadata, 0).unwrap();
+    let snapshot_ts = snapshot.timestamp;
+    snapshot.save(&snapshot_path).unwrap();
+
+    let wal_name = "wal_legacy.wal";
+    let wal_path = data_dir.join(wal_name);
+    let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Never).unwrap();
+    let legacy_before = WalEntry {
+        op: WalOp::Insert,
+        doc_id: 2,
+        embedding: vec![0.0, 1.0],
+        metadata: HashMap::new(),
+        seq_no: 0,
+        timestamp: snapshot_ts.saturating_sub(10),
+    };
+    let legacy_after = WalEntry {
+        op: WalOp::Insert,
+        doc_id: 3,
+        embedding: vec![0.5, 0.5],
+        metadata: HashMap::new(),
+        seq_no: 0,
+        timestamp: snapshot_ts + 10,
+    };
+    writer.append(&legacy_before).unwrap();
+    writer.append(&legacy_after).unwrap();
+    drop(writer);
+
+    let manifest_path = data_dir.join("MANIFEST");
+    let manifest = Manifest {
+        version: 1,
+        latest_snapshot: Some(snapshot_name.to_string()),
+        wal_segments: vec![wal_name.to_string()],
+        last_updated: snapshot_ts,
+    };
+    manifest.save(&manifest_path).unwrap();
+
+    let metrics = MetricsCollector::new();
+    let recovered = HnswBackend::recover(
+        2,
+        DistanceMetric::Euclidean,
+        data_dir,
+        100,
+        FsyncPolicy::Never,
+        10,
+        1024 * 1024,
+        metrics,
+    )
+    .unwrap();
+
+    assert!(recovered.fetch_document(1).is_some());
+    assert!(recovered.fetch_document(2).is_none());
+    assert!(recovered.fetch_document(3).is_some());
 }
 
 #[test]
@@ -228,6 +300,7 @@ fn test_automatic_snapshot_creation() {
         dir.path(),
         FsyncPolicy::Always,
         3, // Snapshot every 3 inserts
+        1024 * 1024,
     )
     .unwrap();
 
@@ -273,6 +346,7 @@ fn test_knn_search_after_recovery() {
             dir.path(),
             FsyncPolicy::Always,
             10,
+            1024 * 1024,
         )
         .unwrap();
 
@@ -288,6 +362,7 @@ fn test_knn_search_after_recovery() {
         100,
         FsyncPolicy::Always,
         10,
+        1024 * 1024,
         metrics,
     )
     .unwrap();
@@ -317,6 +392,7 @@ fn test_fsync_policy_never() {
         dir.path(),
         FsyncPolicy::Never,
         5,
+        1024 * 1024,
     )
     .unwrap();
 
@@ -336,6 +412,7 @@ fn test_fsync_policy_never() {
         100,
         FsyncPolicy::Never,
         5,
+        1024 * 1024,
         metrics,
     )
     .unwrap();

@@ -53,6 +53,7 @@ fn create_test_engine() -> TestEngineGuard {
         data_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
         fsync_policy: kyrodb_engine::FsyncPolicy::Never,
         snapshot_interval: 1000,
+        max_wal_size_bytes: 1024 * 1024,
         flush_interval: Duration::from_secs(60),
         cache_timeout_ms: 10,
         hot_tier_timeout_ms: 50,

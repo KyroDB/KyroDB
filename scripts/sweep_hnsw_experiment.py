@@ -62,6 +62,14 @@ def run_one(bin_path: Path, spec: RunSpec) -> dict[str, str]:
         )
 
     lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise RuntimeError(
+            "unexpected output (need header + row)\n"
+            + "stdout:\n"
+            + proc.stdout
+            + "\n\nstderr:\n"
+            + proc.stderr
+        )
     # Last non-empty line is the single CSV result row.
     row_line = lines[-1]
 
@@ -74,7 +82,17 @@ def run_one(bin_path: Path, spec: RunSpec) -> dict[str, str]:
     if len(cols) != len(vals):
         raise RuntimeError(f"csv column mismatch: {len(cols)} vs {len(vals)}\n{header}\n{row_line}")
 
-    return dict(zip(cols, vals))
+    result = dict(zip(cols, vals))
+    required = {"qps", "recall", "p50_ms", "p99_ms", "m", "ef_construction", "ef_search"}
+    missing = sorted(required.difference(result.keys()))
+    if missing:
+        raise RuntimeError(
+            "missing required columns: "
+            + ", ".join(missing)
+            + f"\ncolumns={cols}\nrow={row_line}"
+        )
+
+    return result
 
 
 def pareto_best(rows: list[dict[str, str]], *, min_recall: float) -> dict[str, str] | None:
@@ -120,6 +138,14 @@ def main() -> int:
     m_list = [int(x) for x in args.m.split(",") if x]
     efc_list = [int(x) for x in args.ef_construction.split(",") if x]
     efs_list = [int(x) for x in args.ef_search.split(",") if x]
+    if not m_list:
+        raise SystemExit("Empty --m list; provide at least one value (e.g., --m 16,24,32)")
+    if not efc_list:
+        raise SystemExit(
+            "Empty --ef-construction list; provide at least one value (e.g., --ef-construction 200,300,400)"
+        )
+    if not efs_list:
+        raise SystemExit("Empty --ef-search list; provide at least one value (e.g., --ef-search 50,100,200)")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

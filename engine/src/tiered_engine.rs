@@ -2,15 +2,22 @@
 //!
 //! Coordinates all tiers:
 //! - **Layer 1a (Document Cache)**: RMI frequency-based cache (hot documents)
-//! - **Layer 1b (Query Cache)**: Semantic similarity-based cache (paraphrased queries)
+//! - **Layer 1b (Query Cache)**: Semantic search-result cache (paraphrased queries)
 //! - **Layer 2 (Hot Tier)**: Recent writes buffer (fast writes, periodic flush)
 //! - **Layer 3 (Cold Tier)**: HNSW index (all documents, approximate k-NN search)
 //!
-//! # Query Path (Two-Level Cache)
+//! # Search Path (k-NN)
 //! ```text
-//! Query → L1a (Doc Cache) → L1b (Query Cache) → L2 (Hot Tier) → L3 (HNSW)
-//!         ↓ hit (47%)       ↓ hit (25%)         ↓ hit (<1%)      ↓ always
-//!       return            return              return           return
+//! Query → L1b (Query Cache) → L2 (Hot Tier) → L3 (HNSW)
+//!         ↓ hit (25%)         ↓ hit (<1%)      ↓ always
+//!       return              return           return
+//! ```
+//!
+//! # Point Lookup Path (doc_id)
+//! ```text
+//! Get → L1a (Doc Cache) → L2 (Hot Tier) → L3 (HNSW)
+//!        ↓ hit (47%)       ↓ hit (<1%)      ↓ always
+//!      return            return           return
 //!
 //! Combined L1 hit rate: 72%+ (L1a + L1b)
 //! ```
@@ -97,6 +104,9 @@ pub struct TieredEngineStats {
     pub circuit_breaker_rejections: u64, // Queries failed due to circuit breaker open
 }
 
+const NORMALIZATION_NORM_SQ_MIN: f32 = 0.98;
+const NORMALIZATION_NORM_SQ_MAX: f32 = 1.02;
+
 /// Configuration for tiered engine
 #[derive(Debug, Clone)]
 pub struct TieredEngineConfig {
@@ -142,6 +152,12 @@ pub struct TieredEngineConfig {
     /// Snapshot interval (create snapshot every N inserts to cold tier)
     pub snapshot_interval: usize,
 
+    /// Maximum WAL size before rotation (bytes).
+    ///
+    /// When the active WAL reaches this size, a new WAL segment is created and
+    /// appended to `MANIFEST`. Old segments can be deleted after a snapshot.
+    pub max_wal_size_bytes: u64,
+
     /// Background flush interval (check hot tier every N seconds)
     pub flush_interval: Duration,
 
@@ -170,6 +186,7 @@ impl Default for TieredEngineConfig {
             data_dir: None,
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 10_000,
+            max_wal_size_bytes: 100 * 1024 * 1024, // 100 MB
             flush_interval: Duration::from_secs(30),
             cache_timeout_ms: 10,         // 10ms for cache
             hot_tier_timeout_ms: 50,      // 50ms for hot tier
@@ -262,6 +279,7 @@ impl TieredEngine {
                 data_dir,
                 config.fsync_policy,
                 config.snapshot_interval,
+                config.max_wal_size_bytes,
                 config.hnsw_m,
                 config.hnsw_ef_construction,
                 config.hnsw_disable_normalization_check,
@@ -377,6 +395,7 @@ impl TieredEngine {
             config.hnsw_max_elements,
             config.fsync_policy,
             config.snapshot_interval,
+            config.max_wal_size_bytes,
             metrics,
             config.hnsw_m,
             config.hnsw_ef_construction,
@@ -487,36 +506,6 @@ impl TieredEngine {
             );
         }
 
-        // Layer 1b: Check query cache (semantic similarity)
-        // Only check if we have a query embedding (needed for similarity matching)
-        if let Some(query_emb) = query_embedding {
-            if let Some(cached_query) = self.query_cache.get(query_emb) {
-                // Query cache hit (L1b) - similarity or exact match
-                {
-                    let mut stats = self.stats.write();
-                    stats.query_cache_hits += 1;
-                } // Lock released
-
-                // Log access for RMI training
-                if let Some(ref logger) = self.access_logger {
-                    logger.write().log_access(cached_query.doc_id, query_emb);
-                } // logger lock released
-
-                debug!(
-                    "L1b hit: doc_id={}, query_hash={}",
-                    cached_query.doc_id, cached_query.query_hash
-                );
-
-                return Some(cached_query.embedding);
-            }
-
-            // Query cache miss (L1b)
-            {
-                let mut stats = self.stats.write();
-                stats.query_cache_misses += 1;
-            } // Lock released
-        }
-
         // Layer 2: Check hot tier with circuit breaker protection
         if !self.hot_tier_circuit_breaker.is_open() {
             if let Some(embedding) = self.hot_tier.get(doc_id) {
@@ -545,13 +534,6 @@ impl TieredEngine {
                     // Insert into L1a document cache (isolated)
                     self.cache_strategy.write().insert_cached(cached);
                 } // cache_strategy lock released
-
-                // L1b admission: Cache in query cache if we have query embedding
-                if let Some(query_emb) = query_embedding {
-                    self.query_cache
-                        .insert(query_emb.to_vec(), doc_id, embedding.clone());
-                    debug!("L1b insert: doc_id={} (from L2 hot tier)", doc_id);
-                }
 
                 // Log access (no other locks held)
                 if let Some(ref logger) = self.access_logger {
@@ -608,13 +590,6 @@ impl TieredEngine {
                     // Insert into L1a document cache (isolated)
                     self.cache_strategy.write().insert_cached(cached);
                 } // cache_strategy lock released
-
-                // L1b admission: Cache in query cache if we have query embedding
-                if let Some(query_emb) = query_embedding {
-                    self.query_cache
-                        .insert(query_emb.to_vec(), doc_id, embedding.clone());
-                    debug!("L1b insert: doc_id={} (from L3 cold tier)", doc_id);
-                }
 
                 // Log access (no other locks held)
                 if let Some(ref logger) = self.access_logger {
@@ -878,8 +853,8 @@ impl TieredEngine {
     /// 2. Layer 3 (Cold Tier): HNSW approximate k-NN search
     /// 3. Merge and deduplicate results from hot + cold tiers
     ///
-    /// Note: Query cache (L1b) is designed for single-document lookups, not k-NN results.
-    /// Future enhancement: Implement full k-NN result caching.
+    /// Note: L1b caches top‑k search results for repeated/semantic queries.
+    /// L1a document cache applies to point lookups (get by id), not k‑NN search.
     ///
     /// # Validation
     /// - `query` dimension must match backend dimension
@@ -924,11 +899,24 @@ impl TieredEngine {
             );
         }
 
-        let query_start = Instant::now();
+        let mut normalized_query = query.to_vec();
+        normalize_in_place_if_needed(self.config.hnsw_distance, &mut normalized_query)?;
+        let query = normalized_query.as_slice();
 
-        // Note: Query cache (L1b) is currently designed for single-document lookups,
-        // not k-NN result vectors. Skipping L1b for k-NN queries.
-        // Future enhancement: Cache full Vec<SearchResult> for k-NN queries.
+        let cacheable = ef_search_override.is_none();
+        if cacheable {
+            if let Some(cached) = self.query_cache.get(query, k) {
+                let mut stats = self.stats.write();
+                stats.query_cache_hits += 1;
+                stats.total_queries += 1;
+                return Ok(cached);
+            } else {
+                let mut stats = self.stats.write();
+                stats.query_cache_misses += 1;
+            }
+        }
+
+        let query_start = Instant::now();
 
         // Step 1: Search Layer 2 (Hot Tier) - recent writes
         // Over-fetch by 2× to ensure good candidates after merging
@@ -970,6 +958,11 @@ impl TieredEngine {
 
         // Step 3: Merge and deduplicate results from hot tier + cold tier
         let merged_results = Self::merge_knn_results(hot_results, cold_results, k);
+
+        if cacheable && !merged_results.is_empty() {
+            self.query_cache
+                .insert_with_k(normalized_query, merged_results.clone(), k);
+        }
 
         debug!(
             "Merged k-NN search completed in {:?}, returned {} results",
@@ -1013,28 +1006,75 @@ impl TieredEngine {
         let backend_dim = (*self.cold_tier).dimension();
         let cold_tier_has_docs = backend_dim != 0;
 
-        if cold_tier_has_docs {
-            for (i, query) in queries.iter().enumerate() {
-                if query.len() != backend_dim {
-                    anyhow::bail!(
-                        "query {} dimension mismatch: expected {} found {}",
-                        i,
-                        backend_dim,
-                        query.len()
-                    );
+        let mut normalized_queries = Vec::with_capacity(queries.len());
+        for (i, query) in queries.iter().enumerate() {
+            if query.is_empty() {
+                anyhow::bail!("query {} embedding cannot be empty", i);
+            }
+            if cold_tier_has_docs && query.len() != backend_dim {
+                anyhow::bail!(
+                    "query {} dimension mismatch: expected {} found {}",
+                    i,
+                    backend_dim,
+                    query.len()
+                );
+            }
+            let mut normalized = query.clone();
+            normalize_in_place_if_needed(self.config.hnsw_distance, &mut normalized)?;
+            normalized_queries.push(normalized);
+        }
+
+        let cacheable = ef_search_override.is_none();
+        let mut cached_results: Vec<Option<Vec<SearchResult>>> = vec![None; queries.len()];
+        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut cache_hits = 0u64;
+        let mut cache_misses = 0u64;
+
+        if cacheable {
+            for (i, query) in normalized_queries.iter().enumerate() {
+                if let Some(cached) = self.query_cache.get(query, k) {
+                    cached_results[i] = Some(cached);
+                    cache_hits += 1;
+                } else {
+                    cache_misses += 1;
+                    miss_indices.push(i);
                 }
+            }
+        } else {
+            miss_indices = (0..normalized_queries.len()).collect();
+        }
+
+        {
+            let mut stats = self.stats.write();
+            stats.total_queries += queries.len() as u64;
+            // cold_tier_searches is incremented below only if the cold tier
+            // search actually executes (guarded by cold_tier_has_docs).
+            if cacheable {
+                stats.query_cache_hits += cache_hits;
+                stats.query_cache_misses += cache_misses;
             }
         }
 
-        let hot_results: Vec<Vec<(u64, f32)>> = queries
+        if miss_indices.is_empty() {
+            let results = cached_results
+                .into_iter()
+                .map(|r| r.expect("cacheable queries should be filled"))
+                .collect();
+            return Ok(results);
+        }
+
+        let miss_queries: Vec<Vec<f32>> = miss_indices
+            .iter()
+            .map(|&i| normalized_queries[i].clone())
+            .collect();
+
+        let hot_results: Vec<Vec<(u64, f32)>> = miss_queries
             .iter()
             .map(|query| self.hot_tier.knn_search(query, k * 2))
             .collect();
 
         {
             let mut stats = self.stats.write();
-            stats.total_queries += queries.len() as u64;
-            stats.cold_tier_searches += queries.len() as u64;
             for hot in &hot_results {
                 if hot.is_empty() {
                     stats.hot_tier_misses += 1;
@@ -1044,14 +1084,40 @@ impl TieredEngine {
             }
         }
 
-        let effective_ef_search = ef_search_override.unwrap_or(self.config.hnsw_ef_search);
-        let cold_results =
-            self.cold_tier
-                .knn_search_batch(queries, k * 2, Some(effective_ef_search))?;
+        let cold_results = if cold_tier_has_docs {
+            let effective_ef_search = ef_search_override.unwrap_or(self.config.hnsw_ef_search);
+            let results = self.cold_tier
+                .knn_search_batch(&miss_queries, k * 2, Some(effective_ef_search))?;
+            {
+                let mut stats = self.stats.write();
+                stats.cold_tier_searches += miss_indices.len() as u64;
+            }
+            results
+        } else {
+            vec![Vec::new(); miss_queries.len()]
+        };
 
+        let mut hot_iter = hot_results.into_iter();
+        let mut cold_iter = cold_results.into_iter();
         let mut merged = Vec::with_capacity(queries.len());
-        for (hot, cold) in hot_results.into_iter().zip(cold_results.into_iter()) {
-            merged.push(Self::merge_knn_results(hot, cold, k));
+        for (i, cached) in cached_results.into_iter().enumerate() {
+            if let Some(cached_results) = cached {
+                merged.push(cached_results);
+                continue;
+            }
+
+            let hot = hot_iter
+                .next()
+                .expect("hot results length mismatch for cache misses");
+            let cold = cold_iter
+                .next()
+                .expect("cold results length mismatch for cache misses");
+            let merged_results = Self::merge_knn_results(hot, cold, k);
+            if cacheable && !merged_results.is_empty() {
+                self.query_cache
+                    .insert_with_k(normalized_queries[i].clone(), merged_results.clone(), k);
+            }
+            merged.push(merged_results);
         }
 
         Ok(merged)
@@ -1134,6 +1200,27 @@ impl TieredEngine {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SearchResult>> {
+        if query.is_empty() {
+            anyhow::bail!("query embedding cannot be empty");
+        }
+        if k == 0 {
+            anyhow::bail!("k must be greater than 0");
+        }
+        if k > 10_000 {
+            anyhow::bail!("k must be <= 10,000 (requested: {})", k);
+        }
+
+        // Validate dimension consistency when cold tier is initialized.
+        let backend_dim = (*self.cold_tier).dimension();
+        let cold_tier_has_docs = backend_dim != 0;
+        if cold_tier_has_docs && query.len() != backend_dim {
+            anyhow::bail!(
+                "query dimension mismatch: expected {} found {}",
+                backend_dim,
+                query.len()
+            );
+        }
+
         // Load shedding: Try to acquire semaphore permit
         // Note: _permit is kept alive to hold the permit until function returns (RAII guard)
         let _permit = match self.query_semaphore.try_acquire() {
@@ -1159,21 +1246,37 @@ impl TieredEngine {
             stats.current_queue_depth =
                 (self.config.max_concurrent_queries - available_permits) as u64;
         }
+
+        let mut normalized_query = query.to_vec();
+        normalize_in_place_if_needed(self.config.hnsw_distance, &mut normalized_query)?;
+
+        if let Some(cached) = self.query_cache.get(&normalized_query, k) {
+            let mut stats = self.stats.write();
+            stats.query_cache_hits += 1;
+            stats.total_queries += 1;
+            return Ok(cached);
+        } else {
+            let mut stats = self.stats.write();
+            stats.query_cache_misses += 1;
+        }
+        {
+            let mut stats = self.stats.write();
+            stats.total_queries += 1;
+        }
         let mut results: Vec<SearchResult> = Vec::new();
         let mut partial = false;
 
         let mut hot_results: Vec<(u64, f32)> = Vec::new();
         let mut cold_results: Vec<SearchResult> = Vec::new();
 
-        // Layer 1: Cache layer (k-NN search pending implementation)
-        debug!("Cache layer k-NN search not yet implemented");
+        // Layer 1: L1b query cache already checked above
 
         // Layer 2: Search hot tier (50ms timeout)
         let hot_timeout = Duration::from_millis(self.config.hot_tier_timeout_ms);
         if self.hot_tier_circuit_breaker.is_closed() {
             match tokio::time::timeout(hot_timeout, async {
                 tokio::task::spawn_blocking({
-                    let query_vec = query.to_vec();
+                    let query_vec = normalized_query.clone();
                     let hot_tier = Arc::clone(&self.hot_tier);
                     let k_candidates = k * 2;
                     move || hot_tier.knn_search(&query_vec, k_candidates)
@@ -1189,6 +1292,7 @@ impl TieredEngine {
                 Ok(Err(e)) => {
                     self.hot_tier_circuit_breaker.record_failure();
                     error!("Hot tier task panicked: {}", e);
+                    partial = true;
                 }
                 Err(_) => {
                     self.hot_tier_circuit_breaker.record_failure();
@@ -1208,14 +1312,15 @@ impl TieredEngine {
                 stats.circuit_breaker_rejections += 1;
             }
             warn!("Hot tier circuit breaker open, cannot perform k-NN search");
+            partial = true;
         }
 
         // Layer 3: Search cold tier (HNSW) (1000ms timeout)
         let cold_timeout = Duration::from_millis(self.config.cold_tier_timeout_ms);
-        if self.cold_tier_circuit_breaker.is_closed() {
+        if cold_tier_has_docs && self.cold_tier_circuit_breaker.is_closed() {
             match tokio::time::timeout(cold_timeout, async {
                 tokio::task::spawn_blocking({
-                    let query_vec = query.to_vec();
+                    let query_vec = normalized_query.clone();
                     let cold_tier = Arc::clone(&self.cold_tier);
                     move || cold_tier.knn_search(&query_vec, k)
                 })
@@ -1233,11 +1338,13 @@ impl TieredEngine {
                     // Cold tier error
                     self.cold_tier_circuit_breaker.record_failure();
                     warn!("Cold tier search failed: {}", e);
+                    partial = true;
                 }
                 Ok(Err(e)) => {
                     // Task join error
                     self.cold_tier_circuit_breaker.record_failure();
                     error!("Cold tier task panicked: {}", e);
+                    partial = true;
                 }
                 Err(_) => {
                     // Timeout
@@ -1251,13 +1358,14 @@ impl TieredEngine {
                     partial = true;
                 }
             }
-        } else {
+        } else if cold_tier_has_docs {
             // Circuit breaker open - record rejection
             {
                 let mut stats = self.stats.write();
                 stats.circuit_breaker_rejections += 1;
             }
             warn!("Cold tier circuit breaker open, cannot perform k-NN search");
+            partial = true;
         }
 
         if !hot_results.is_empty() || !cold_results.is_empty() {
@@ -1294,6 +1402,11 @@ impl TieredEngine {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             results.truncate(k);
+
+            if !partial && !results.is_empty() {
+                self.query_cache
+                    .insert_with_k(normalized_query.clone(), results.clone(), k);
+            }
 
             Ok(results)
         } else {
@@ -1353,8 +1466,18 @@ impl TieredEngine {
             stats.hot_tier_emergency_evictions += 1;
         }
 
+        // Upsert semantics: invalidate point-lookup cache so readers won't observe stale embeddings.
+        self.cache_strategy.write().invalidate(doc_id);
+
+        let mut embedding = embedding;
+        normalize_in_place_if_needed(self.config.hnsw_distance, &mut embedding)?;
+
         // Insert into hot tier (fast)
         self.hot_tier.insert(doc_id, embedding, metadata);
+
+        // L1b caches top‑k search results. Any insert can change k‑NN results, so
+        // clear the search cache to preserve read-your-writes semantics.
+        self.query_cache.clear();
 
         let mut stats = self.stats.write();
         stats.total_inserts += 1;
@@ -1447,12 +1570,16 @@ impl TieredEngine {
     #[instrument(level = "info", skip(self, documents), fields(count = documents.len()))]
     pub fn bulk_load_cold_tier(
         &self,
-        documents: Vec<(u64, Vec<f32>, std::collections::HashMap<String, String>)>,
+        mut documents: Vec<(u64, Vec<f32>, std::collections::HashMap<String, String>)>,
     ) -> Result<(u64, u64, f32, f32)> {
         use std::time::Instant;
 
         let start = Instant::now();
         let total = documents.len() as u64;
+
+        for (_, embedding, _) in documents.iter_mut() {
+            normalize_in_place_if_needed(self.config.hnsw_distance, embedding)?;
+        }
 
         // Collect doc_ids for cache invalidation
         let doc_ids: Vec<u64> = documents.iter().map(|(id, _, _)| *id).collect();
@@ -1460,16 +1587,17 @@ impl TieredEngine {
         // Bulk insert into cold tier (HNSW)
         let (loaded, failed) = self.cold_tier.bulk_insert(documents)?;
 
-        // Invalidate document cache (L1a) and query cache (L1b) for consistency
+        // Invalidate document cache (L1a) for consistency
         {
             let cache = self.cache_strategy.write();
             for doc_id in &doc_ids {
                 cache.invalidate(*doc_id);
             }
         }
-        for doc_id in &doc_ids {
-            self.query_cache.invalidate_doc(*doc_id);
-        }
+
+        // L1b caches search results, so bulk loads can change k‑NN results even if
+        // cached result sets don't explicitly contain the new doc_ids.
+        self.query_cache.clear();
 
         let elapsed = start.elapsed();
         let duration_ms = elapsed.as_secs_f32() * 1000.0;
@@ -1671,6 +1799,30 @@ impl TieredEngine {
     pub fn hot_tier(&self) -> &HotTier {
         &self.hot_tier
     }
+}
+
+fn normalize_in_place_if_needed(distance: DistanceMetric, embedding: &mut [f32]) -> Result<()> {
+    if !matches!(
+        distance,
+        DistanceMetric::Cosine | DistanceMetric::InnerProduct
+    ) {
+        return Ok(());
+    }
+
+    let norm_sq = crate::simd::sum_squares_f32(embedding);
+    if norm_sq <= f32::EPSILON {
+        anyhow::bail!("embedding norm is zero; cannot normalize");
+    }
+    if (NORMALIZATION_NORM_SQ_MIN..=NORMALIZATION_NORM_SQ_MAX).contains(&norm_sq) {
+        return Ok(());
+    }
+
+    let inv_norm = 1.0 / norm_sq.sqrt();
+    for v in embedding {
+        *v *= inv_norm;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

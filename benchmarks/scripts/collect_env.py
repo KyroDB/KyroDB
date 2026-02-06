@@ -91,7 +91,7 @@ def collect_environment(extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
         env["python"]["pip_freeze"] = pip_freeze.splitlines()
 
     if extra:
-        env.update(extra)
+        env["extra"] = extra
 
     return env
 

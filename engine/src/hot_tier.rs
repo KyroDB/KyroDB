@@ -372,9 +372,9 @@ impl HotTier {
 
         let distance_metric = self.distance;
 
-        // Compute query norm once for cosine.
+        // Compute query norm once for cosine/inner-product.
         let query_l2_norm = match distance_metric {
-            DistanceMetric::Cosine => Self::l2_norm(query),
+            DistanceMetric::Cosine | DistanceMetric::InnerProduct => Self::l2_norm(query),
             _ => 0.0,
         };
 
@@ -391,7 +391,12 @@ impl HotTier {
                     doc.embedding_l2_norm,
                 ),
                 DistanceMetric::Euclidean => Self::l2_distance(query, &doc.embedding),
-                DistanceMetric::InnerProduct => Self::dot_distance(query, &doc.embedding),
+                DistanceMetric::InnerProduct => Self::dot_distance_with_cached_norm(
+                    query,
+                    query_l2_norm,
+                    &doc.embedding,
+                    doc.embedding_l2_norm,
+                ),
             };
 
             if !distance.is_finite() {
@@ -482,41 +487,27 @@ impl HotTier {
     }
 
     #[inline]
-    fn dot_distance(a: &[f32], b: &[f32]) -> f32 {
+    fn dot_distance_with_cached_norm(a: &[f32], a_l2_norm: f32, b: &[f32], b_l2_norm: f32) -> f32 {
         if a.len() != b.len() || a.is_empty() {
             return f32::INFINITY;
         }
-
-        let norm_a = Self::l2_norm(a);
-        let norm_b = Self::l2_norm(b);
+        if !a_l2_norm.is_finite() || !b_l2_norm.is_finite() {
+            return f32::INFINITY;
+        }
 
         let eps = 0.02_f32;
-        if (norm_a - 1.0).abs() > eps || (norm_b - 1.0).abs() > eps {
-            if !DOT_DISTANCE_NON_NORMALIZED_WARNED.swap(true, Ordering::Relaxed) {
-                warn!(
-                    norm_a,
-                    norm_b,
-                    eps,
-                    "DistanceMetric::InnerProduct expects L2-normalized vectors; computing cosine-normalized dot distance"
-                );
-            }
-        }
-
-        #[cfg(debug_assertions)]
+        if ((a_l2_norm - 1.0).abs() > eps || (b_l2_norm - 1.0).abs() > eps)
+            && !DOT_DISTANCE_NON_NORMALIZED_WARNED.swap(true, Ordering::Relaxed)
         {
-            debug_assert!(
-                (norm_a - 1.0).abs() <= eps,
-                "dot_distance expects L2-normalized vectors: norm_a={}",
-                norm_a
-            );
-            debug_assert!(
-                (norm_b - 1.0).abs() <= eps,
-                "dot_distance expects L2-normalized vectors: norm_b={}",
-                norm_b
+            warn!(
+                norm_a = a_l2_norm,
+                norm_b = b_l2_norm,
+                eps,
+                "DistanceMetric::InnerProduct expects L2-normalized vectors; computing cosine-normalized dot distance"
             );
         }
 
-        let denom = norm_a * norm_b;
+        let denom = a_l2_norm * b_l2_norm;
         if denom <= f32::EPSILON {
             return f32::INFINITY;
         }

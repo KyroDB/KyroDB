@@ -92,6 +92,7 @@ fn test_hnsw_corruption_recovery() {
         data_dir,
         FsyncPolicy::Always,
         10,
+        1024 * 1024,
     )
     .unwrap();
 
@@ -144,6 +145,7 @@ fn test_hnsw_corruption_recovery() {
         100,
         FsyncPolicy::Always,
         10,
+        1024 * 1024,
         metrics.clone(),
     );
 
@@ -210,6 +212,7 @@ fn test_wal_normal_operation() {
         temp_dir.path(),
         FsyncPolicy::Always,
         10,
+        1024 * 1024,
     )
     .unwrap();
 
@@ -244,6 +247,7 @@ fn test_circuit_breaker_with_backend_operations() {
                 temp_dir.path(),
                 FsyncPolicy::Always,
                 10,
+                1024 * 1024,
             );
 
             if backend.is_ok() {
@@ -282,6 +286,7 @@ fn test_snapshot_corruption_metrics() {
         kyrodb_engine::config::DistanceMetric::Cosine,
         documents.clone(),
         metadata,
+        0,
     )
     .unwrap();
 

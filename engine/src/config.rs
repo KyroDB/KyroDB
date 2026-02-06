@@ -26,7 +26,7 @@ use std::time::Duration;
 
 /// Complete KyroDB configuration with all tunable parameters
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KyroDbConfig {
     /// Server configuration (gRPC and HTTP endpoints)
     pub server: ServerConfig,
@@ -54,6 +54,9 @@ pub struct KyroDbConfig {
 
     /// Timeout configuration for tiered engine operations
     pub timeouts: TimeoutConfig,
+
+    /// Environment declaration (benchmark vs production)
+    pub environment: EnvironmentConfig,
 }
 
 // ============================================================================
@@ -61,7 +64,7 @@ pub struct KyroDbConfig {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// gRPC server host (IPv4 or IPv6)
     pub host: String,
@@ -125,7 +128,7 @@ pub enum ObservabilityAuthMode {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TlsConfig {
     /// Enable TLS for gRPC server
     pub enabled: bool,
@@ -148,7 +151,7 @@ pub struct TlsConfig {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     /// Maximum number of vectors to cache
     pub capacity: usize,
@@ -197,12 +200,6 @@ pub struct CacheConfig {
     /// Minimum access count before training
     pub min_training_samples: usize,
 
-    /// Enable A/B testing between strategies
-    pub enable_ab_testing: bool,
-
-    /// A/B test traffic split (0.0-1.0, fraction for treatment group)
-    pub ab_test_split: f64,
-
     /// Admission threshold for cache (0.0-1.0)
     pub admission_threshold: f32,
 
@@ -211,21 +208,6 @@ pub struct CacheConfig {
 
     /// Target cache utilization for auto-tuning (0.0-1.0)
     pub target_utilization: f32,
-
-    /// Enable query clustering for semantic cache optimization
-    pub enable_query_clustering: bool,
-
-    /// Cosine similarity threshold for query clustering (0.0-1.0)
-    pub clustering_similarity_threshold: f32,
-
-    /// Enable predictive prefetching
-    pub enable_prefetching: bool,
-
-    /// Prefetch threshold - minimum hotness score to prefetch (0.0-1.0)
-    pub prefetch_threshold: f32,
-
-    /// Maximum documents to prefetch per access
-    pub max_prefetch_per_doc: usize,
 }
 
 impl Default for CacheConfig {
@@ -243,16 +225,9 @@ impl Default for CacheConfig {
             training_window_secs: 3600,
             recency_halflife_secs: 1800,
             min_training_samples: 100,
-            enable_ab_testing: false,
-            ab_test_split: 0.5,
             admission_threshold: 0.15,
             auto_tune_threshold: true,
             target_utilization: 0.85,
-            enable_query_clustering: true,
-            clustering_similarity_threshold: 0.85,
-            enable_prefetching: true,
-            prefetch_threshold: 0.10,
-            max_prefetch_per_doc: 5,
         }
     }
 }
@@ -273,7 +248,7 @@ pub enum CacheStrategy {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HnswConfig {
     /// Maximum number of vectors in index
     pub max_elements: usize,
@@ -328,13 +303,10 @@ pub enum DistanceMetric {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PersistenceConfig {
     /// Data directory for WAL and snapshots
     pub data_dir: PathBuf,
-
-    /// Enable write-ahead log
-    pub enable_wal: bool,
 
     /// WAL flush interval (milliseconds, 0 = immediate)
     pub wal_flush_interval_ms: u64,
@@ -342,8 +314,12 @@ pub struct PersistenceConfig {
     /// fsync policy
     pub fsync_policy: FsyncPolicy,
 
-    /// Snapshot interval (seconds, 0 = disabled)
-    pub snapshot_interval_secs: u64,
+    /// Snapshot interval (number of WAL mutations including inserts and deletes, 0 = disabled).
+    ///
+    /// Previously named `snapshot_interval_inserts`; the old key is accepted as a
+    /// backward-compatible alias during deserialization.
+    #[serde(alias = "snapshot_interval_inserts")]
+    pub snapshot_interval_mutations: u64,
 
     /// Maximum WAL size before rotation (bytes)
     pub max_wal_size_bytes: u64,
@@ -362,10 +338,9 @@ impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
-            enable_wal: true,
             wal_flush_interval_ms: 100,
             fsync_policy: FsyncPolicy::DataOnly,
-            snapshot_interval_secs: 3600,          // 1 hour
+            snapshot_interval_mutations: 10_000,
             max_wal_size_bytes: 100 * 1024 * 1024, // 100 MB
             enable_recovery: true,
             allow_fresh_start_on_recovery_failure: false,
@@ -389,7 +364,7 @@ pub enum FsyncPolicy {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SloConfig {
     /// P99 latency threshold (milliseconds)
     pub p99_latency_ms: f64,
@@ -410,7 +385,11 @@ pub struct SloConfig {
 impl Default for SloConfig {
     fn default() -> Self {
         Self {
-            p99_latency_ms: 1.0,
+            // Default to a realistic end-to-end query SLO.
+            //
+            // Note: `kyrodb_query_latency_ns` includes cold-tier HNSW misses, so a 1ms
+            // default would mark the server as degraded/unhealthy for typical workloads.
+            p99_latency_ms: 10.0,
             cache_hit_rate: 0.70,
             error_rate: 0.001,
             availability: 0.999,
@@ -424,7 +403,7 @@ impl Default for SloConfig {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Enable rate limiting
     pub enabled: bool,
@@ -455,7 +434,7 @@ impl Default for RateLimitConfig {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     pub level: LogLevel,
@@ -524,31 +503,14 @@ pub enum LogFormat {
 // Authentication Configuration
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     /// Enable authentication (default: false for backward compatibility)
     pub enabled: bool,
 
     /// Path to API keys file (YAML format)
     pub api_keys_file: Option<PathBuf>,
-
-    /// Path to usage stats export (CSV)
-    pub usage_stats_file: PathBuf,
-
-    /// How often to export usage stats (seconds)
-    pub usage_export_interval_secs: u64,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false, // Disabled by default (backward compatibility)
-            api_keys_file: None,
-            usage_stats_file: PathBuf::from("data/usage_stats.csv"),
-            usage_export_interval_secs: 300, // Every 5 minutes
-        }
-    }
 }
 
 // ============================================================================
@@ -556,7 +518,7 @@ impl Default for AuthConfig {
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TimeoutConfig {
     /// Cache tier timeout in milliseconds (default: 10ms)
     pub cache_ms: u64,
@@ -579,6 +541,32 @@ impl Default for TimeoutConfig {
 }
 
 // ============================================================================
+// Environment Configuration
+// ============================================================================
+
+/// Declares the intended deployment context for this configuration.
+///
+/// When `type` is not `"benchmark"`, the server validates that persistence
+/// settings are safe for production (fsync_policy != none, snapshots enabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentConfig {
+    /// Environment type: `"production"` (default) or `"benchmark"`.
+    /// Benchmark mode permits unsafe persistence settings; any other value
+    /// triggers safety validation on startup.
+    #[serde(rename = "type")]
+    pub environment_type: String,
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            environment_type: "production".to_string(),
+        }
+    }
+}
+
+// ============================================================================
 // Configuration Loading
 // ============================================================================
 
@@ -589,6 +577,7 @@ impl KyroDbConfig {
             .add_source(config::File::with_name(path))
             .add_source(
                 config::Environment::with_prefix("KYRODB")
+                    .prefix_separator("__")
                     .separator("__")
                     .try_parsing(true),
             )
@@ -601,7 +590,7 @@ impl KyroDbConfig {
     }
 
     /// Load configuration with priority chain:
-    /// 1. Environment variables (KYRODB_*)
+    /// 1. Environment variables (KYRODB__*)
     /// 2. Config file (if provided)
     /// 3. Built-in defaults
     pub fn load(config_file: Option<&str>) -> Result<Self> {
@@ -626,6 +615,7 @@ impl KyroDbConfig {
         // Add environment variables (highest priority)
         builder = builder.add_source(
             config::Environment::with_prefix("KYRODB")
+                .prefix_separator("__")
                 .separator("__")
                 .try_parsing(true),
         );
@@ -696,11 +686,6 @@ impl KyroDbConfig {
             self.cache.query_cache_similarity_threshold
         );
         anyhow::ensure!(
-            self.cache.ab_test_split >= 0.0 && self.cache.ab_test_split <= 1.0,
-            "A/B test split must be in [0.0, 1.0], got {}",
-            self.cache.ab_test_split
-        );
-        anyhow::ensure!(
             self.cache.min_training_samples > 0
                 && self.cache.min_training_samples <= self.cache.capacity,
             "min_training_samples must be in range [1, {}], got {}",
@@ -715,19 +700,19 @@ impl KyroDbConfig {
 
         anyhow::ensure!(
             self.cache.logger_window_size > 0,
-            "self.cache.logger_window_size must be > 0, got {}",
+            "logger_window_size must be > 0, got {}",
             self.cache.logger_window_size
         );
         anyhow::ensure!(
             self.cache.predictor_capacity_multiplier > 0,
-            "self.cache.predictor_capacity_multiplier must be > 0, got {}",
+            "predictor_capacity_multiplier must be > 0, got {}",
             self.cache.predictor_capacity_multiplier
         );
         if let Some(age) = self.cache.hot_tier_max_age_secs {
             anyhow::ensure!(
                 age > 0,
-                "self.cache.hot_tier_max_age_secs must be > 0 when set, got {:?}",
-                self.cache.hot_tier_max_age_secs
+                "hot_tier_max_age_secs must be > 0 when set, got {:?}",
+                age
             );
         }
 
@@ -787,24 +772,29 @@ impl KyroDbConfig {
 
         // SLO validation
         anyhow::ensure!(
-            self.slo.p99_latency_ms > 0.0,
-            "SLO P99 latency must be > 0, got {}",
+            self.slo.p99_latency_ms.is_finite() && self.slo.p99_latency_ms > 0.0,
+            "SLO P99 latency must be a finite value > 0, got {}",
             self.slo.p99_latency_ms
         );
         anyhow::ensure!(
-            self.slo.cache_hit_rate >= 0.0 && self.slo.cache_hit_rate <= 1.0,
-            "SLO cache hit rate must be in [0.0, 1.0], got {}",
+            self.slo.cache_hit_rate.is_finite() && (0.0..=1.0).contains(&self.slo.cache_hit_rate),
+            "SLO cache hit rate must be a finite value in [0.0, 1.0], got {}",
             self.slo.cache_hit_rate
         );
         anyhow::ensure!(
-            self.slo.error_rate >= 0.0 && self.slo.error_rate <= 1.0,
-            "SLO error rate must be in [0.0, 1.0], got {}",
+            self.slo.error_rate.is_finite() && (0.0..=1.0).contains(&self.slo.error_rate),
+            "SLO error rate must be a finite value in [0.0, 1.0], got {}",
             self.slo.error_rate
         );
         anyhow::ensure!(
-            self.slo.availability >= 0.0 && self.slo.availability <= 1.0,
-            "SLO availability must be in [0.0, 1.0], got {}",
+            self.slo.availability.is_finite() && (0.0..=1.0).contains(&self.slo.availability),
+            "SLO availability must be a finite value in [0.0, 1.0], got {}",
             self.slo.availability
+        );
+        anyhow::ensure!(
+            self.slo.min_samples > 0,
+            "SLO min_samples must be > 0, got {}",
+            self.slo.min_samples
         );
 
         // Rate limit validation
@@ -821,6 +811,30 @@ impl KyroDbConfig {
             );
         }
 
+        // Environment-aware persistence safety check.
+        // If the environment type is not "benchmark", reject configurations
+        // that disable durability guarantees (these are only safe for benchmarks).
+        if self.environment.environment_type != "benchmark" {
+            if matches!(self.persistence.fsync_policy, FsyncPolicy::None) {
+                anyhow::bail!(
+                    "Unsafe persistence configuration: fsync_policy=\"none\" is only permitted \
+                     when environment.type=\"benchmark\". Current environment type: \"{}\". \
+                     Set fsync_policy to \"data_only\" or \"full\" for production safety, \
+                     or set [environment] type = \"benchmark\" to acknowledge the risk.",
+                    self.environment.environment_type
+                );
+            }
+            if self.persistence.snapshot_interval_mutations == 0 {
+                anyhow::bail!(
+                    "Unsafe persistence configuration: snapshot_interval_mutations=0 (snapshots disabled) \
+                     is only permitted when environment.type=\"benchmark\". Current environment type: \"{}\". \
+                     Set a positive snapshot_interval_mutations for production safety, \
+                     or set [environment] type = \"benchmark\" to acknowledge the risk.",
+                    self.environment.environment_type
+                );
+            }
+        }
+
         // Authentication validation
         if self.auth.enabled {
             anyhow::ensure!(
@@ -835,11 +849,6 @@ impl KyroDbConfig {
                 "server.observability_auth requires auth.enabled=true"
             );
         }
-        anyhow::ensure!(
-            self.auth.usage_export_interval_secs > 0,
-            "usage_export_interval_secs must be > 0, got {}",
-            self.auth.usage_export_interval_secs
-        );
 
         // TLS validation
         if self.server.tls.enabled {
@@ -877,7 +886,7 @@ impl KyroDbConfig {
         self.server
             .http_host
             .as_deref()
-            .unwrap_or_else(|| self.server.host.as_str())
+            .unwrap_or(self.server.host.as_str())
     }
 
     /// Get connection timeout as Duration
@@ -895,9 +904,11 @@ impl KyroDbConfig {
         Duration::from_millis(self.persistence.wal_flush_interval_ms)
     }
 
-    /// Get snapshot interval as Duration
-    pub fn snapshot_interval(&self) -> Duration {
-        Duration::from_secs(self.persistence.snapshot_interval_secs)
+    /// Get snapshot interval as an operation count.
+    ///
+    /// `0` disables automatic snapshots.
+    pub fn snapshot_interval_mutations(&self) -> usize {
+        usize::try_from(self.persistence.snapshot_interval_mutations).unwrap_or(usize::MAX)
     }
 
     /// Get cache training interval as Duration
@@ -905,10 +916,7 @@ impl KyroDbConfig {
         Duration::from_secs(self.cache.training_interval_secs)
     }
 
-    /// Get usage export interval as Duration
-    pub fn usage_export_interval(&self) -> Duration {
-        Duration::from_secs(self.auth.usage_export_interval_secs)
-    }
+    // Usage export is intentionally not part of the Phase 0 server config.
 }
 
 // ============================================================================
@@ -963,13 +971,6 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_ab_test_split() {
-        let mut config = KyroDbConfig::default();
-        config.cache.ab_test_split = 1.5;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
     fn test_http_port_auto_calculation() {
         let config = KyroDbConfig::default();
         assert_eq!(config.http_port(), 51051); // 50051 + 1000
@@ -988,7 +989,7 @@ mod tests {
         assert_eq!(config.connection_timeout(), Duration::from_secs(300));
         assert_eq!(config.shutdown_timeout(), Duration::from_secs(30));
         assert_eq!(config.wal_flush_interval(), Duration::from_millis(100));
-        assert_eq!(config.snapshot_interval(), Duration::from_secs(3600));
+        assert_eq!(config.snapshot_interval_mutations(), 10_000);
         assert_eq!(config.cache_training_interval(), Duration::from_secs(600));
     }
 

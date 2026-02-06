@@ -89,7 +89,8 @@ def _wait_for_log_line(
     echo: bool,
 ) -> None:
     start = time.time()
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        raise RuntimeError("server stdout is not captured (expected stdout=PIPE)")
 
     while True:
         if proc.poll() is not None:
@@ -204,7 +205,8 @@ def _run_benchmark(
 
     # Stream output so long indexing doesn't look like a hang.
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    assert p.stdout is not None
+    if p.stdout is None:
+        raise RuntimeError("benchmark stdout is not captured (expected stdout=PIPE)")
     captured: List[str] = []
     try:
         for line in p.stdout:
@@ -355,17 +357,25 @@ def main() -> int:
     build_specs: List[BuildSpec] = [BuildSpec(m=m, ef_construction=efc) for m in m_list for efc in efc_list]
     query_specs: List[QuerySpec] = [QuerySpec(ef_search=ef) for ef in efs_list]
 
+    base_port = int(args.base_port)
+    if base_port < 0 or base_port > 65535:
+        raise SystemExit(f"--base-port must be in [0, 65535], got {base_port}")
+    max_port = base_port + len(build_specs) - 1
+    if max_port > 65535:
+        raise SystemExit(
+            f"--base-port {base_port} with {len(build_specs)} builds exceeds max port 65535 (max would be {max_port})"
+        )
+
     for idx, build in enumerate(build_specs):
-        port = int(args.base_port) + idx
+        port = base_port + idx
         data_dir = run_dir / "data" / f"m{build.m}_efc{build.ef_construction}"
         results_dir = run_dir / "results" / f"m{build.m}_efc{build.ef_construction}"
         results_dir.mkdir(parents=True, exist_ok=True)
 
-        if data_dir.exists() and not args.keep_data:
+        already_indexed = _has_manifest(data_dir) and bool(args.skip_index_if_present)
+        if data_dir.exists() and not args.keep_data and not already_indexed:
             shutil.rmtree(data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
-
-        already_indexed = _has_manifest(data_dir) and bool(args.skip_index_if_present)
 
         env = os.environ.copy()
 

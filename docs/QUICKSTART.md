@@ -15,14 +15,17 @@ Get KyroDB running in 5 minutes.
 git clone https://github.com/vatskishan03/KyroDB.git
 cd KyroDB
 
-# Build release binaries with all CLI tools enabled
-cargo build --release --features cli-tools
+# Build release binary for the kyrodb-engine package
+cargo build --release -p kyrodb-engine
+
+# Optional: build validation binaries and enable table/progress output in CLI tools
+cargo build --release -p kyrodb-engine --features cli-tools
 
 # Binaries created in ./target/release/
 ls target/release/kyrodb_*
 ```
 
-**Note**: The `--features cli-tools` flag is required to build all binaries (server, load tester, backup tool). Without it, you'll get a compile error on the backup binary.
+**Note**: `cli-tools` is optional. When built without `cli-tools`, `kyrodb_backup` defaults to JSON output and table/progress output is disabled. The validation binaries (`validation_24h`, `validation_enterprise`) require `cli-tools`.
 
 ## 2. Start the Server
 
@@ -58,6 +61,12 @@ python -m grpc_tools.protoc \
   engine/proto/kyrodb.proto
 ```
 
+Save the Python snippet below as `quickstart.py` in the KyroDB repository root (the same directory where `kyrodb_pb2.py` and `kyrodb_pb2_grpc.py` were generated), then run:
+
+```bash
+python quickstart.py
+```
+
 ```python
 import grpc
 
@@ -66,26 +75,24 @@ import kyrodb_pb2_grpc
 
 
 def main() -> None:
-  channel = grpc.insecure_channel("127.0.0.1:50051")
-  stub = kyrodb_pb2_grpc.KyroDBServiceStub(channel)
+  with grpc.insecure_channel("127.0.0.1:50051") as channel:
+    stub = kyrodb_pb2_grpc.KyroDBServiceStub(channel)
 
-  # The server's embedding dimension must match the request embedding length.
-  # Default config uses 768, so we build a simple 768-dim vector.
-  embedding = [0.0] * 768
-  embedding[0] = 0.1
-  embedding[1] = 0.2
+    # The server's embedding dimension must match the request embedding length.
+    # Default config uses 768, so we build a simple 768-dim vector.
+    embedding = [0.0] * 768
+    embedding[0] = 0.1
+    embedding[1] = 0.2
 
-  resp = stub.Insert(
-    kyrodb_pb2.InsertRequest(
-      doc_id=1,
-      embedding=embedding,
-      metadata={"source": "quickstart"},
-      namespace="default",
+    resp = stub.Insert(
+      kyrodb_pb2.InsertRequest(
+        doc_id=1,
+        embedding=embedding,
+        metadata={"source": "quickstart"},
+        namespace="default",
+      )
     )
-  )
-  print(resp)
-
-  channel.close()
+    print(resp)
 
 
 if __name__ == "__main__":

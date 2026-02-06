@@ -290,12 +290,20 @@ proptest! {
         // Insert multiple vectors (at least 5) to avoid hnsw_rs destructor edge case
         let insert_count = 5.min(count);
         for i in 0..insert_count {
-            let vector = normalize(vec![0.5 + (i as f32) * 0.01; dimension]);
+            let mut raw = Vec::with_capacity(dimension);
+            for j in 0..dimension {
+                raw.push(0.5 + (i as f32) * 0.01 + (j as f32) * 0.001);
+            }
+            let vector = normalize(raw);
             let result = idx.add_vector(i as u64, &vector);
             prop_assert!(result.is_ok());
         }
 
-        let query = normalize(vec![0.3; dimension]);
+        let mut qraw = Vec::with_capacity(dimension);
+        for j in 0..dimension {
+            qraw.push(0.3 + (j as f32) * 0.002);
+        }
+        let query = normalize(qraw);
         let search_k = k.min(insert_count);
         let results = idx.knn_search(&query, search_k);
         prop_assert!(results.is_ok());

@@ -36,6 +36,8 @@ pub struct HnswVectorIndex {
     max_elements: usize,
     current_count: usize,
     distance: DistanceMetric,
+    m: usize,
+    ef_construction: usize,
     disable_normalization_check: bool,
 }
 
@@ -146,6 +148,8 @@ impl HnswVectorIndex {
             max_elements,
             current_count: 0,
             distance,
+            m,
+            ef_construction,
             disable_normalization_check,
         })
     }
@@ -280,7 +284,6 @@ impl HnswVectorIndex {
         Ok(results)
     }
 
-    /// Get index statistics
     pub fn len(&self) -> usize {
         self.current_count
     }
@@ -297,8 +300,24 @@ impl HnswVectorIndex {
         self.max_elements
     }
 
+    pub fn is_full(&self) -> bool {
+        self.current_count >= self.max_elements
+    }
+
     pub fn distance_metric(&self) -> DistanceMetric {
         self.distance
+    }
+
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    pub fn ef_construction(&self) -> usize {
+        self.ef_construction
+    }
+
+    pub fn normalization_check_disabled(&self) -> bool {
+        self.disable_normalization_check
     }
 
     /// Estimate memory usage assuming M=16, avg 2 layers/node, +10% overhead
@@ -311,8 +330,8 @@ impl HnswVectorIndex {
         let vector_data_bytes = self.current_count * self.dimension * std::mem::size_of::<f32>();
 
         // Graph structure (neighbors + edge weights)
-        // Assuming max_nb_connection=16, average 2 layers per node
-        let max_nb_connection = 16;
+        // Assuming max_nb_connection=self.m, average 2 layers per node
+        let max_nb_connection = self.m;
         let avg_layers = 2;
         let graph_bytes =
             self.current_count * max_nb_connection * avg_layers * std::mem::size_of::<usize>();

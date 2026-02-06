@@ -22,14 +22,16 @@
 
 use anyhow::Context;
 use clap::Parser;
+use kyrodb_engine::training_task::{spawn_training_task, TrainingConfig};
 use kyrodb_engine::{
     access_logger::AccessPatternLogger,
-    cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy, SharedLearnedCacheStrategy},
+    cache_strategy::{
+        AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy, SharedLearnedCacheStrategy,
+    },
     config::ObservabilityAuthMode,
     AuthManager, ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
-    RateLimiter, TenantInfo, TieredEngine, TieredEngineConfig,
+    RateLimiter, SloThresholds, TenantInfo, TieredEngine, TieredEngineConfig,
 };
-use kyrodb_engine::training_task::{spawn_training_task, TrainingConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,15 +42,15 @@ use tracing::{error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // HTTP server for observability endpoints
+use axum::middleware::Next;
 use axum::{
     body::Body,
-    middleware,
     extract::State as AxumState,
     http::{header::CONTENT_TYPE, HeaderValue, Response as HttpResponse, StatusCode},
+    middleware,
     routing::get,
     Router,
 };
-use axum::middleware::Next;
 use tower_http::trace::TraceLayer;
 
 // Generated protobuf code
@@ -79,6 +81,10 @@ const BULK_SEARCH_MAX_WAIT_MS: u64 = 2;
 
 /// Minimum valid document ID (0 is reserved)
 const MIN_DOC_ID: u64 = 1;
+
+/// Maximum total documents for a single bulk_load_hnsw stream to prevent
+/// runaway CPU/disk usage. Configurable via max_total_documents if needed.
+const MAX_TOTAL_BULK_LOAD_DOCUMENTS: u64 = 10_000_000;
 
 /// Maximum k value for k-NN search to prevent excessive computation
 const MAX_KNN_K: u32 = 1000;
@@ -245,7 +251,7 @@ impl TenantIdMapper {
     fn to_global_doc_id(tenant_index: u32, local_doc_id: u64) -> Result<u64, Status> {
         if local_doc_id > u32::MAX as u64 {
             return Err(Status::invalid_argument(
-                "doc_id exceeds tenant-local max (u32)",
+                "DOC_ID_OUT_OF_RANGE: doc_id exceeds tenant-local max (u32)",
             ));
         }
         Ok(((tenant_index as u64) << 32) | local_doc_id)
@@ -878,10 +884,25 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let mut total_loaded = 0u64;
         let mut total_failed_insertion = 0u64;
+        let mut total_received = 0u64;
 
         info!("BulkLoadHnsw: starting streaming load");
 
         while let Some(req) = stream.message().await? {
+            // Re-check rate limit per batch boundary to prevent long-running
+            // streams from bypassing per-tenant limits.
+            self.enforce_rate_limit(tenant.as_ref())?;
+
+            total_received += 1;
+
+            // Enforce total document cap to prevent runaway resource consumption
+            if total_received > MAX_TOTAL_BULK_LOAD_DOCUMENTS {
+                last_error = format!(
+                    "Total document limit exceeded: received {} documents, max is {}",
+                    total_received, MAX_TOTAL_BULK_LOAD_DOCUMENTS
+                );
+                return Err(Status::resource_exhausted(&last_error));
+            }
             // Validate doc_id
             if req.doc_id < MIN_DOC_ID {
                 validation_errors += 1;
@@ -935,6 +956,8 @@ impl KyroDbService for KyroDBServiceImpl {
             documents.push((global_doc_id, req.embedding, metadata));
 
             if documents.len() >= MAX_BATCH_SIZE {
+                // Re-check rate limit before each batch ingestion
+                self.enforce_rate_limit(tenant.as_ref())?;
                 let batch = std::mem::take(&mut documents);
                 let batch_len = batch.len() as u64;
                 let engine = self.state.engine.write().await;
@@ -1225,7 +1248,6 @@ impl KyroDbService for KyroDBServiceImpl {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let start = Instant::now();
         let tenant = self.tenant_context(&request)?;
         self.enforce_rate_limit(tenant.as_ref())?;
         let req = request.into_inner();
@@ -1240,45 +1262,47 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.read().await;
 
+        // Fetch metadata first to enforce tenant/namespace checks without
+        // revealing existence via embedding lookup timing.
+        let metadata = engine.get_metadata(global_doc_id).unwrap_or_default();
+
+        if let Some(tenant) = &tenant {
+            let expected = tenant.tenant_index.to_string();
+            if metadata.get("__tenant_idx__") != Some(&expected) {
+                // Hide cross-tenant existence.
+                return Ok(Response::new(QueryResponse {
+                    found: false,
+                    doc_id: req.doc_id,
+                    embedding: vec![],
+                    metadata: HashMap::new(),
+                    served_from: query_response::Tier::Unknown as i32,
+                    error: String::new(),
+                }));
+            }
+        }
+
+        if !req.namespace.is_empty() {
+            let doc_namespace = metadata
+                .get("__namespace__")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if doc_namespace != req.namespace {
+                // Hide cross-namespace existence.
+                return Ok(Response::new(QueryResponse {
+                    found: false,
+                    doc_id: req.doc_id,
+                    embedding: vec![],
+                    metadata: HashMap::new(),
+                    served_from: query_response::Tier::Unknown as i32,
+                    error: String::new(),
+                }));
+            }
+        }
+
+        let start = Instant::now();
         match engine.query(global_doc_id, None) {
             Some(embedding) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-                // Fetch metadata for the document
-                let metadata = engine.get_metadata(global_doc_id).unwrap_or_default();
-
-                if let Some(tenant) = &tenant {
-                    let expected = tenant.tenant_index.to_string();
-                    if metadata.get("__tenant_idx__") != Some(&expected) {
-                        // Hide cross-tenant existence.
-                        return Ok(Response::new(QueryResponse {
-                            found: false,
-                            doc_id: req.doc_id,
-                            embedding: vec![],
-                            metadata: HashMap::new(),
-                            served_from: query_response::Tier::Unknown as i32,
-                            error: String::new(),
-                        }));
-                    }
-                }
-
-                if !req.namespace.is_empty() {
-                    let doc_namespace = metadata
-                        .get("__namespace__")
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    if doc_namespace != req.namespace {
-                        // Hide cross-namespace existence.
-                        return Ok(Response::new(QueryResponse {
-                            found: false,
-                            doc_id: req.doc_id,
-                            embedding: vec![],
-                            metadata: HashMap::new(),
-                            served_from: query_response::Tier::Unknown as i32,
-                            error: String::new(),
-                        }));
-                    }
-                }
 
                 info!(
                     doc_id = req.doc_id,
@@ -2025,6 +2049,7 @@ async fn ready_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRes
 /// SLO status endpoint for alerting systems
 async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let slo = state.metrics.slo_status();
+    let thresholds = state.metrics.slo_thresholds();
 
     // Always return 200 OK for SLO status (breaches reported in body)
     let status_code = StatusCode::OK;
@@ -2043,10 +2068,11 @@ async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRespo
             "availability": slo.current_availability,
         },
         "slo_thresholds": {
-            "p99_latency_ns": 1_000_000, // 1ms
-            "min_cache_hit_rate": 0.70,
-            "max_error_rate": 0.001,
-            "min_availability": 0.999,
+            "p99_latency_ns": thresholds.p99_latency_ns,
+            "min_cache_hit_rate": thresholds.min_cache_hit_rate,
+            "max_error_rate": thresholds.max_error_rate,
+            "min_availability": thresholds.min_availability,
+            "min_samples": thresholds.min_samples,
         },
     });
 
@@ -2185,6 +2211,15 @@ async fn main() -> anyhow::Result<()> {
     // Validate final configuration
     config.validate()?;
 
+    info!(
+        p99_latency_ms = config.slo.p99_latency_ms,
+        cache_hit_rate = config.slo.cache_hit_rate,
+        error_rate = config.slo.error_rate,
+        availability = config.slo.availability,
+        min_samples = config.slo.min_samples,
+        "SLO thresholds configured"
+    );
+
     // Initialize auth/tenancy (must be ready before serving)
     let (auth, tenant_id_mapper, rate_limiter) = if config.auth.enabled {
         let api_keys_file = config
@@ -2200,7 +2235,16 @@ async fn main() -> anyhow::Result<()> {
         let tenant_map_path = config.persistence.data_dir.join("tenants.json");
         let tenant_id_mapper = TenantIdMapper::load_or_create(tenant_map_path, &tenants)?;
 
-        (Some(auth), Some(tenant_id_mapper), Some(RateLimiter::new()))
+        let global_limit = if config.rate_limit.enabled {
+            Some(config.rate_limit.max_qps_global as u32)
+        } else {
+            None
+        };
+        (
+            Some(auth),
+            Some(tenant_id_mapper),
+            Some(RateLimiter::new_with_global(global_limit)),
+        )
     } else {
         (None, None, None)
     };
@@ -2302,7 +2346,8 @@ async fn main() -> anyhow::Result<()> {
         hnsw_disable_normalization_check: config.hnsw.disable_normalization_check,
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
         fsync_policy,
-        snapshot_interval: config.persistence.snapshot_interval_secs as usize,
+        snapshot_interval: config.snapshot_interval_mutations(),
+        max_wal_size_bytes: config.persistence.max_wal_size_bytes,
         flush_interval: config.wal_flush_interval(),
         cache_timeout_ms: config.timeouts.cache_ms,
         hot_tier_timeout_ms: config.timeouts.hot_tier_ms,
@@ -2338,7 +2383,7 @@ async fn main() -> anyhow::Result<()> {
         learned_predictor.set_auto_tune(config.cache.auto_tune_threshold);
         learned_predictor.set_target_utilization(config.cache.target_utilization);
 
-        // NOTE: Semantic logic moved to QueryHashCache (L1b) in two-level architecture.
+        // NOTE: L1b query cache handles semantic search‑result reuse.
         let learned_strategy = Arc::new(LearnedCacheStrategy::new(
             config.cache.capacity,
             learned_predictor,
@@ -2351,32 +2396,31 @@ async fn main() -> anyhow::Result<()> {
             kyrodb_engine::config::CacheStrategy::Lru => {
                 (Box::new(LruCacheStrategy::new(config.cache.capacity)), None)
             }
-            kyrodb_engine::config::CacheStrategy::Learned => {
-                (
-                    Box::new(SharedLearnedCacheStrategy::new(learned_strategy.clone())),
-                    Some(learned_strategy.clone()),
-                )
-            }
+            kyrodb_engine::config::CacheStrategy::Learned => (
+                Box::new(SharedLearnedCacheStrategy::new(learned_strategy.clone())),
+                Some(learned_strategy.clone()),
+            ),
             kyrodb_engine::config::CacheStrategy::AbTest => (
-                Box::new(AbTestSplitter::new(lru_strategy.clone(), learned_strategy.clone())),
+                Box::new(AbTestSplitter::new(
+                    lru_strategy.clone(),
+                    learned_strategy.clone(),
+                )),
                 Some(learned_strategy.clone()),
             ),
         };
 
-        Ok::<(Box<dyn kyrodb_engine::CacheStrategy>, Option<Arc<LearnedCacheStrategy>>), anyhow::Error>((
-            strategy_box,
-            learned_for_training,
-        ))
+        Ok::<
+            (
+                Box<dyn kyrodb_engine::CacheStrategy>,
+                Option<Arc<LearnedCacheStrategy>>,
+            ),
+            anyhow::Error,
+        >((strategy_box, learned_for_training))
     };
-
-    info!(
-        "Features: clustering={}, prefetching={}",
-        config.cache.enable_query_clustering, config.cache.enable_prefetching
-    );
 
     let (cache_strategy, mut learned_strategy_for_training) = create_cache_strategy()?;
 
-    // Create query cache (L1b) - semantic similarity-based
+    // Create query cache (L1b) - semantic search‑result cache
     let query_cache = Arc::new(kyrodb_engine::QueryHashCache::new(
         config.cache.query_cache_capacity,
         config.cache.query_cache_similarity_threshold,
@@ -2481,9 +2525,9 @@ async fn main() -> anyhow::Result<()> {
         && config.cache.training_interval_secs > 0;
 
     let access_logger = if should_run_training {
-        Some(Arc::new(parking_lot::RwLock::new(AccessPatternLogger::new(
-            config.cache.logger_window_size.max(1),
-        ))))
+        Some(Arc::new(parking_lot::RwLock::new(
+            AccessPatternLogger::new(config.cache.logger_window_size.max(1)),
+        )))
     } else {
         None
     };
@@ -2495,8 +2539,9 @@ async fn main() -> anyhow::Result<()> {
     // Wrap engine in Arc<RwLock> for concurrent access
     let engine_arc = Arc::new(RwLock::new(engine));
 
-    // Create metrics collector
-    let metrics = MetricsCollector::new();
+    // Create metrics collector with configured SLO thresholds.
+    let metrics =
+        MetricsCollector::new_with_slo_thresholds(SloThresholds::from_config(&config.slo));
 
     if should_run_training {
         let learned_strategy = learned_strategy_for_training
@@ -2735,10 +2780,25 @@ async fn main() -> anyhow::Result<()> {
                 .ensure_tenant(&tenant.tenant_id)
                 .map_err(|e| Status::internal(format!("tenant mapping error: {}", e)))?;
 
+            let rate_limit_enabled = state_for_interceptor.app_config.rate_limit.enabled;
+            let default_max_qps = state_for_interceptor
+                .app_config
+                .rate_limit
+                .max_qps_per_connection as u32;
+            let effective_max_qps = if tenant.max_qps == 0 {
+                if rate_limit_enabled {
+                    default_max_qps.max(1)
+                } else {
+                    u32::MAX
+                }
+            } else {
+                tenant.max_qps
+            };
+
             req.extensions_mut().insert(TenantContext {
                 tenant_id: tenant.tenant_id,
                 tenant_index,
-                max_qps: tenant.max_qps,
+                max_qps: effective_max_qps,
             });
 
             Ok(req)

@@ -3,6 +3,7 @@
 // Design:
 // - Token bucket algorithm: Fixed refill rate, burst capacity
 // - Per-tenant buckets: HashMap<tenant_id, TokenBucket>
+// - Optional global bucket for total QPS cap
 // - Smooth refill: Fractional tokens for consistent rate
 // - Lock per bucket: Minimize contention (not global lock)
 //
@@ -70,6 +71,14 @@ impl TokenBucket {
         }
     }
 
+    /// Refund one consumed token (best-effort).
+    ///
+    /// Used to maintain fairness when a downstream/global limit rejects after a tenant token
+    /// was already consumed.
+    pub fn refund_one(&mut self) {
+        self.tokens = (self.tokens + 1.0).min(self.capacity as f64);
+    }
+
     /// Refill tokens based on elapsed time
     ///
     /// Tokens = min(capacity, current_tokens + (elapsed_seconds * refill_rate))
@@ -124,14 +133,22 @@ pub struct RateLimiter {
     /// Tenants already warned about capacity mismatch (avoid log spam)
     #[allow(dead_code)]
     warned_tenants: Arc<parking_lot::RwLock<HashSet<String>>>,
+    /// Optional global token bucket (shared across all tenants)
+    global_bucket: Option<Mutex<TokenBucket>>,
 }
 
 impl RateLimiter {
     /// Create new empty rate limiter
     pub fn new() -> Self {
+        Self::new_with_global(None)
+    }
+
+    /// Create rate limiter with optional global QPS cap.
+    pub fn new_with_global(max_qps_global: Option<u32>) -> Self {
         Self {
             buckets: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             warned_tenants: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            global_bucket: max_qps_global.map(TokenBucket::new).map(Mutex::new),
         }
     }
 
@@ -181,7 +198,21 @@ impl RateLimiter {
 
                 let bucket = Arc::clone(bucket);
                 drop(buckets); // Release read lock before acquiring mutex
-                return bucket.lock().try_consume();
+
+                // Consume tenant token first.
+                if !bucket.lock().try_consume() {
+                    return false;
+                }
+
+                // Consume global token only after tenant passes.
+                if let Some(global) = &self.global_bucket {
+                    if !global.lock().try_consume() {
+                        bucket.lock().refund_one();
+                        return false;
+                    }
+                }
+
+                return true;
             }
         }
 
@@ -197,9 +228,20 @@ impl RateLimiter {
             )
         };
 
-        // Consume token after releasing write lock
-        let result = bucket.lock().try_consume();
-        result
+        // Consume tenant token after releasing write lock.
+        if !bucket.lock().try_consume() {
+            return false;
+        }
+
+        // Consume global token only after tenant passes.
+        if let Some(global) = &self.global_bucket {
+            if !global.lock().try_consume() {
+                bucket.lock().refund_one();
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Get current available tokens for tenant (for observability)

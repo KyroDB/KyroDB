@@ -46,6 +46,7 @@ fn test_hnsw_backend_batch_delete() {
         temp_dir.path(),
         FsyncPolicy::Never,
         100,
+        1024 * 1024,
     )
     .unwrap();
 
@@ -63,9 +64,8 @@ fn test_hnsw_backend_batch_delete() {
     assert!(!backend.exists(2));
     assert!(backend.exists(3));
 
-    // Verify tombstones are all zeros
-    let emb0 = backend.fetch_document(0).unwrap();
-    assert!(emb0.iter().all(|&x| x == 0.0));
+    // Deleted documents should not be fetchable via external IDs.
+    assert!(backend.fetch_document(0).is_none());
 }
 
 #[test]

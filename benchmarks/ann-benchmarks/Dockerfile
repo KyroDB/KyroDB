@@ -16,7 +16,8 @@ FROM rust:1.86-bookworm AS builder
 # Default to the public KyroDB repo so ann-benchmarks runs do not depend on
 # caller environment variables being set correctly.
 ARG KYRODB_GIT=https://github.com/KyroDB/KyroDB.git
-ARG KYRODB_REF=benchmark
+# Optional git ref (branch/tag/commit SHA). If unset, uses the repo default branch.
+ARG KYRODB_REF=
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -27,17 +28,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install grpcio-tools for protobuf generation
-RUN pip3 install --no-cache-dir --break-system-packages grpcio-tools==1.60.0
+# Install grpcio-tools for protobuf generation (pin versions for reproducibility).
+RUN pip3 install --no-cache-dir --break-system-packages \
+    grpcio-tools==1.60.2 \
+    protobuf==4.28.2
 
 WORKDIR /src
 
 # Clone KyroDB repo
-RUN git clone --depth 1 "$KYRODB_GIT" /src/kyrodb \
+RUN git clone "$KYRODB_GIT" /src/kyrodb \
     && if [ -n "$KYRODB_REF" ]; then \
             cd /src/kyrodb \
-            && git fetch --depth 1 origin "$KYRODB_REF" \
-            && git checkout --detach FETCH_HEAD; \
+            && git fetch --tags --prune --no-recurse-submodules origin \
+            && git checkout --detach "$KYRODB_REF"; \
         fi
 
 WORKDIR /src/kyrodb
@@ -70,8 +73,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # KyroDB wrapper uses gRPC and generated protobuf stubs.
 RUN pip install --no-cache-dir --break-system-packages \
-    grpcio==1.60.0 \
-    protobuf==4.25.3
+    grpcio==1.60.2 \
+    protobuf==4.28.2
 
 # Copy algorithm files from the Docker build context.
 #
@@ -84,6 +87,7 @@ COPY . /home/app/ann_benchmarks/algorithms/kyrodb
 # Copy generated protobuf stubs
 COPY --from=builder /src/stubs/kyrodb_pb2.py /home/app/ann_benchmarks/algorithms/kyrodb/
 COPY --from=builder /src/stubs/kyrodb_pb2_grpc.py /home/app/ann_benchmarks/algorithms/kyrodb/
+RUN touch /home/app/ann_benchmarks/algorithms/kyrodb/__init__.py
 
 # Copy KyroDB server binary
 COPY --from=builder /src/kyrodb/target/release/kyrodb_server /usr/local/bin/kyrodb_server
@@ -96,4 +100,3 @@ ENV KYRODB_HOST=127.0.0.1
 ENV KYRODB_PORT=50051
 
 EXPOSE 50051 51051
-

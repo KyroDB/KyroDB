@@ -43,8 +43,12 @@ enum Commands {
 
     #[command(about = "List all available backups")]
     List {
-        #[arg(long, default_value = "table", help = "Output format: table or json")]
-        format: String,
+        #[arg(
+            long,
+            value_parser = ["table", "json"],
+            help = "Output format: table or json"
+        )]
+        format: Option<String>,
     },
 
     #[command(about = "Restore database from a backup")]
@@ -180,6 +184,14 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let format = format.unwrap_or_else(|| {
+                if cfg!(feature = "cli-tools") {
+                    "table".to_string()
+                } else {
+                    "json".to_string()
+                }
+            });
+
             if format == "json" {
                 println!("{}", serde_json::to_string_pretty(&backups)?);
             } else {
@@ -212,7 +224,9 @@ fn main() -> Result<()> {
                 }
                 #[cfg(not(feature = "cli-tools"))]
                 {
-                    println!("Table format requires cli-tools feature. Use --format json instead.");
+                    anyhow::bail!(
+                        "Table format requires building with the `cli-tools` feature. Use --format json instead."
+                    );
                 }
             }
         }
@@ -380,6 +394,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cli-tools")]
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;

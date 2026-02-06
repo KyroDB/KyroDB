@@ -255,9 +255,15 @@ async fn test_background_training_updates_predictor() {
     };
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-    let handle =
-        spawn_training_task(logger.clone(), strategy.clone(), config, None, None, shutdown_rx)
-            .await;
+    let handle = spawn_training_task(
+        logger.clone(),
+        strategy.clone(),
+        config,
+        None,
+        None,
+        shutdown_rx,
+    )
+    .await;
 
     // Wait for training cycle
     tokio::time::sleep(Duration::from_secs(2)).await;

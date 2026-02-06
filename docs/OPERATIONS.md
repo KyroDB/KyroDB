@@ -40,6 +40,26 @@ Key metrics (all available via `/metrics`):
 - `kyrodb_inserts_failed`
 - `kyrodb_ready`
 
+## Restarting the Server
+
+Common restart commands (choose the one that matches your deployment):
+
+```bash
+# systemd (replace service name)
+sudo systemctl restart kyrodb.service
+
+# Docker (single container)
+docker restart <container>
+
+# Docker Compose
+docker compose restart <service>
+# or: docker-compose restart <service>
+
+# Process manager
+pm2 restart <name>
+# or: kill -HUP <pid>  # if your manager supports reload on HUP
+```
+
 ## Health check fails (503)
 
 ### Diagnosis
@@ -65,6 +85,15 @@ dmesg | grep -i "i/o error" | tail -20
 ```
 
 Free space or move the data directory to faster storage, then restart the server.
+
+#### Moving the data directory safely
+
+1. Stop the server process (systemd/Docker/process manager).
+2. Create a backup (recommended) or copy the directory as a fallback.
+3. Move `persistence.data_dir` to the new location (fast SSD / local NVMe).
+4. Update your config (`persistence.data_dir`) or pass `--data-dir <PATH>` / `KYRODB_DATA_DIR`.
+5. Verify the move completed and permissions are correct (file counts/checksums as needed).
+6. Restart the server and verify `/health`, `/ready`, and logs. If validation fails, revert using the backup.
 
 #### WAL circuit breaker open
 
@@ -117,10 +146,18 @@ Restart the server after changes.
 
 ## Data corruption or failed recovery
 
-Use the backup tool to restore a known-good state. See the backup guide for full recovery workflows.
+Use the backup tool to restore a known-good state. See the [backup guide](BACKUP_AND_RECOVERY.md) for full recovery workflows.
+
+> **DESTRUCTIVE OPERATION WARNING**: Setting `BACKUP_ALLOW_CLEAR=true` enables the restore command to **permanently delete all existing data** in the target `--data-dir`. This action is irreversible. Before running restore with this flag:
+> 1. Ensure you have a verified, current backup of the data directory.
+> 2. Confirm that losing all data in the target directory is acceptable.
+> 3. Understand that the directory contents will be fully replaced by the backup being restored.
+>
+> Only use `BACKUP_ALLOW_CLEAR=true` when data loss in the target directory is intentional.
 
 ```bash
 kyrodb_backup list --backup-dir ./backups --format json
+export BACKUP_ALLOW_CLEAR=true
 kyrodb_backup restore --backup-id <BACKUP_ID> --data-dir ./data --backup-dir ./backups
 ```
 
@@ -133,7 +170,7 @@ du -sh ./backups
 kyrodb_backup prune --keep-daily 7 --keep-weekly 4 --data-dir ./data --backup-dir ./backups
 ```
 
-If you do not build with the `cli-tools` feature, use `--format json` for `kyrodb_backup list`.
+When built without the `cli-tools` feature, `kyrodb_backup list` only supports JSON output—use `--format json`. Enabling `cli-tools` adds the human-readable formats.
 
 ## Monitoring checklist
 

@@ -78,6 +78,11 @@ from kyrodb_pb2 import InsertRequest, SearchRequest
 from kyrodb_pb2_grpc import KyroDBServiceStub
 
 # Connect to server
+# WARNING: grpc.insecure_channel is for local development and testing ONLY.
+# It transmits data in plaintext with no authentication or encryption.
+# For production, use grpc.secure_channel with TLS credentials:
+#   credentials = grpc.ssl_channel_credentials(root_cert, private_key, cert_chain)
+#   channel = grpc.secure_channel('host:port', credentials)
 channel = grpc.insecure_channel('127.0.0.1:50051')
 stub = KyroDBServiceStub(channel)
 
@@ -253,7 +258,7 @@ curl http://localhost:51051/slo
     "max_error_rate": 0.001,
     "min_availability": 0.999,
     "min_cache_hit_rate": 0.7,
-    "p99_latency_ns": 1000000
+    "p99_latency_ns": 10000000
   }
 }
 ```
@@ -262,36 +267,37 @@ curl http://localhost:51051/slo
 
 ## Authentication
 
-API key authentication is available (disabled by default).
-
-### Enable in config.yaml
+API key authentication is optional (disabled by default). Enable it in `config.yaml`:
 
 ```yaml
 auth:
   enabled: true
-  api_keys_file: /etc/kyrodb/api_keys.yaml
+  api_keys_file: "data/api_keys.yaml"
 ```
 
-### API Key Format
-
-File: `/etc/kyrodb/api_keys.yaml`
+Example `data/api_keys.yaml`:
 
 ```yaml
 api_keys:
-  - key: "kyrodb_prod_xyz123"
-    namespace: "production"
-    permissions: ["read", "write", "admin"]
-  - key: "kyrodb_read_only_abc456"
-    namespace: "staging"
-    permissions: ["read"]
+  - key: kyro_acme_corp_a3f9d8e2c1b4567890abcdef12345678
+    tenant_id: acme_corp
+    tenant_name: Acme Corporation
+    max_qps: 1000          # optional (0 or omitted uses server defaults)
+    max_vectors: 10000000
+    created_at: "2025-10-01T00:00:00Z"  # optional (ISO 8601)
+    enabled: true
 ```
+
+> **Note on `max_vectors`**: The `max_vectors` field is validated at load time (must be > 0), but **enforcement on inserts is not yet implemented**. The server will not reject inserts after a tenant exceeds this value. Insert-time quota enforcement is planned for a future release. Until then, operators should use external monitoring (e.g., Prometheus metrics, disk quotas, or proxy-level checks) to track and limit per-tenant vector counts. `max_qps` is enforced as described above.
+
+For details (including observability endpoint auth), see [Authentication](AUTHENTICATION.md).
 
 ### Using with gRPC
 
 Include API key in metadata:
 
 ```python
-metadata = [('authorization', f'Bearer kyrodb_prod_xyz123')]
+metadata = [("authorization", "Bearer kyro_acme_corp_a3f9d8e2c1b4567890abcdef12345678")]
 channel = grpc.aio.secure_channel('127.0.0.1:50051', credentials=...)
 stub = KyroDBServiceStub(channel)
 

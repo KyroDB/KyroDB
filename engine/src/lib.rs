@@ -185,7 +185,7 @@ pub use tiered_engine::{TieredEngine, TieredEngineConfig, TieredEngineStats};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats};
 
 // Metrics and observability components
-pub use metrics::{ErrorCategory, HealthStatus, MetricsCollector, SloStatus};
+pub use metrics::{ErrorCategory, HealthStatus, MetricsCollector, SloStatus, SloThresholds};
 
 // Configuration components
 pub use config::{

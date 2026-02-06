@@ -7,9 +7,9 @@
 # Notes:
 # - Keep grpc/protobuf versions in sync with `benchmarks/ann-benchmarks/Dockerfile`.
 
-grpcio==1.60.0
-grpcio-tools==1.60.0
-protobuf==4.25.3
+grpcio==1.60.2
+grpcio-tools==1.60.2
+protobuf==4.28.2
 numpy==1.26.4
 h5py==3.10.0
 matplotlib==3.8.2

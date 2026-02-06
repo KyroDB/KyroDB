@@ -108,8 +108,7 @@ class KyroDB(BaseANN):
         env["KYRODB__HNSW__MAX_ELEMENTS"] = str(int(max_elements))
 
         # Bench runs should measure ANN performance, not durability.
-        env.setdefault("KYRODB__PERSISTENCE__ENABLE_WAL", "false")
-        env.setdefault("KYRODB__PERSISTENCE__SNAPSHOT_INTERVAL_SECS", "0")
+        env.setdefault("KYRODB__PERSISTENCE__SNAPSHOT_INTERVAL_MUTATIONS", "0")
         env.setdefault("KYRODB__PERSISTENCE__FSYNC_POLICY", "none")
 
         # Keep thread counts bounded and explicit for reproducibility.
@@ -227,6 +226,7 @@ class KyroDB(BaseANN):
     def set_query_arguments(self, ef_search: Optional[int] = None, **kwargs) -> None:
         if ef_search is not None:
             self.ef_search = int(ef_search)
+            return
         if kwargs.get("args") and len(kwargs["args"]) > 0:
             self.ef_search = int(kwargs["args"][0])
 

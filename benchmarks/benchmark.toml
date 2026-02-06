@@ -1,9 +1,16 @@
+# WARNING: This configuration is for BENCHMARKING ONLY.
+# It disables durability guarantees (fsync_policy = "none", snapshots disabled)
+# and is UNSAFE for production use. Do NOT deploy with these settings.
+#
 # KyroDB Benchmark Configuration
 # Optimized for Azure FX32ms v2 (32 vCPUs, 730 GB RAM)
 # Maximum performance settings for comprehensive benchmarking
 
+[environment]
+type = "benchmark"  # Signals to the application that this config is benchmark-only
+
 [server]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 50051
 http_port = 51051
 
@@ -14,10 +21,8 @@ enabled = false
 # Hot tier hard limit is derived by the server (currently: hard_limit = capacity * 2).
 capacity = 2000000            # 2M cache capacity -> 4M derived hot tier hard limit
 strategy = "lru"             # Use simple LRU for benchmark consistency
-enable_ab_testing = false
-enable_query_clustering = false
-enable_prefetching = false
 auto_tune_threshold = false
+enable_training_task = false
 
 [hnsw]
 # HNSW parameters for large-scale benchmarking
@@ -30,10 +35,15 @@ dimension = 128              # SIFT-128 dimension
 distance = "euclidean"       # SIFT uses L2 distance
 
 [persistence]
+# BENCHMARK-ONLY PERSISTENCE SETTINGS
+# These values disable durability guarantees for maximum throughput.
+# Programmatic validation should reject startup if environment.type != "benchmark"
+# when these unsafe values are detected.
 data_dir = "./benchmark_data"
-enable_wal = false            # Disable WAL for pure benchmark speed
-fsync_policy = "none"         # No fsync for benchmarks
-snapshot_interval_secs = 0    # Disable snapshots during benchmark
+fsync_policy = "none"         # No fsync for benchmarks (UNSAFE for production)
+wal_flush_interval_ms = 100
+snapshot_interval_mutations = 0 # Disable snapshots during benchmark (UNSAFE for production)
+max_wal_size_bytes = 1073741824 # 1 GB (avoid rotations during long runs)
 
 [logging]
 level = "warn"               # Minimal logging for benchmarks

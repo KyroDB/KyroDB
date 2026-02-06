@@ -52,6 +52,9 @@ const SLO_MAX_ERROR_RATE: f64 = 0.001;
 /// SLO: Minimum availability (99.9%)
 const SLO_MIN_AVAILABILITY: f64 = 0.999;
 
+/// SLO: Minimum sample size before alerting
+const SLO_MIN_SAMPLES: u64 = 100;
+
 /// Number of latency buckets for histogram (P50, P95, P99)
 const LATENCY_BUCKETS: usize = 1000;
 
@@ -127,6 +130,8 @@ struct MetricsInner {
     // Server State
     start_time: Instant,
     ready: AtomicU64, // 0 = not ready, 1 = ready
+
+    slo_thresholds: SloThresholds,
 }
 
 /// Latency histogram for computing percentiles
@@ -179,6 +184,42 @@ pub struct SloStatus {
     pub insufficient_data: bool, // True when no queries have been processed yet
 }
 
+/// SLO thresholds used by the metrics/health system.
+#[derive(Debug, Clone, Copy)]
+pub struct SloThresholds {
+    pub p99_latency_ns: u64,
+    pub min_cache_hit_rate: f64,
+    pub max_error_rate: f64,
+    pub min_availability: f64,
+    pub min_samples: u64,
+}
+
+impl Default for SloThresholds {
+    fn default() -> Self {
+        Self {
+            p99_latency_ns: SLO_P99_LATENCY_NS,
+            min_cache_hit_rate: SLO_MIN_CACHE_HIT_RATE,
+            max_error_rate: SLO_MAX_ERROR_RATE,
+            min_availability: SLO_MIN_AVAILABILITY,
+            min_samples: SLO_MIN_SAMPLES,
+        }
+    }
+}
+
+impl SloThresholds {
+    pub fn from_config(cfg: &crate::config::SloConfig) -> Self {
+        let p99_latency_ns = (cfg.p99_latency_ms * 1_000_000.0).ceil().max(1.0) as u64;
+
+        Self {
+            p99_latency_ns,
+            min_cache_hit_rate: cfg.cache_hit_rate,
+            max_error_rate: cfg.error_rate,
+            min_availability: cfg.availability,
+            min_samples: cfg.min_samples as u64,
+        }
+    }
+}
+
 // ============================================================================
 // IMPLEMENTATION
 // ============================================================================
@@ -186,6 +227,10 @@ pub struct SloStatus {
 impl MetricsCollector {
     /// Create new metrics collector
     pub fn new() -> Self {
+        Self::new_with_slo_thresholds(SloThresholds::default())
+    }
+
+    pub fn new_with_slo_thresholds(slo_thresholds: SloThresholds) -> Self {
         Self {
             inner: Arc::new(MetricsInner {
                 total_queries: AtomicU64::new(0),
@@ -233,8 +278,13 @@ impl MetricsCollector {
 
                 start_time: Instant::now(),
                 ready: AtomicU64::new(0),
+                slo_thresholds,
             }),
         }
+    }
+
+    pub fn slo_thresholds(&self) -> SloThresholds {
+        self.inner.slo_thresholds
     }
 
     // ========================================================================
@@ -566,8 +616,10 @@ impl MetricsCollector {
         let total = self.inner.total_queries.load(Ordering::Relaxed);
         let failed = self.inner.failed_queries.load(Ordering::Relaxed);
 
+        let thresholds = self.inner.slo_thresholds;
+
         // Check if we have sufficient data to make SLO assessments
-        let insufficient_data = total < 10;
+        let insufficient_data = total < thresholds.min_samples;
 
         let p99 = if total > 0 {
             self.inner.query_latencies.write().percentile(99.0)
@@ -601,10 +653,11 @@ impl MetricsCollector {
 
         SloStatus {
             // Don't flag breaches if we don't have enough data yet
-            p99_latency_breached: !insufficient_data && p99 > SLO_P99_LATENCY_NS,
-            cache_hit_rate_breached: !insufficient_data && cache_hit_rate < SLO_MIN_CACHE_HIT_RATE,
-            error_rate_breached: !insufficient_data && error_rate > SLO_MAX_ERROR_RATE,
-            availability_breached: !insufficient_data && availability < SLO_MIN_AVAILABILITY,
+            p99_latency_breached: !insufficient_data && p99 > thresholds.p99_latency_ns,
+            cache_hit_rate_breached: !insufficient_data
+                && cache_hit_rate < thresholds.min_cache_hit_rate,
+            error_rate_breached: !insufficient_data && error_rate > thresholds.max_error_rate,
+            availability_breached: !insufficient_data && availability < thresholds.min_availability,
             current_p99_ns: p99,
             current_cache_hit_rate: cache_hit_rate,
             current_error_rate: error_rate,
@@ -1079,9 +1132,12 @@ mod tests {
 
     #[test]
     fn test_metrics_collection() {
-        let metrics = MetricsCollector::new();
+        let metrics = MetricsCollector::new_with_slo_thresholds(SloThresholds {
+            min_samples: 10,
+            ..SloThresholds::default()
+        });
 
-        // Record enough queries to pass insufficient_data threshold (need >10)
+        // Record enough queries to pass insufficient_data threshold (need >=10)
         for i in 0..8 {
             if i < 7 {
                 metrics.record_query_latency(100_000); // 100us
@@ -1179,7 +1235,7 @@ mod tests {
         let metrics = MetricsCollector::new();
         metrics.mark_ready();
 
-        // Record only 5 queries (below threshold of 10)
+        // Record only 5 queries (below min_samples threshold)
         for _ in 0..5 {
             metrics.record_query_latency(2_000_000); // 2ms - would breach SLO
         }

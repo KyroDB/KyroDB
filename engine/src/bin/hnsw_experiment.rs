@@ -64,6 +64,22 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if args.dim == 0 {
+        anyhow::bail!("--dim must be > 0");
+    }
+    if args.n == 0 {
+        anyhow::bail!("--n must be > 0");
+    }
+    if args.queries == 0 {
+        anyhow::bail!("--queries must be > 0");
+    }
+    if args.k == 0 {
+        anyhow::bail!("--k must be > 0");
+    }
+    if args.k > args.n {
+        anyhow::bail!("--k must be <= --n (got k={}, n={})", args.k, args.n);
+    }
+
     let distance_metric: DistanceMetric = args.distance.into();
     let ef_search_list = if args.ef_search.is_empty() {
         vec![10, 50, 100, 200, 400, 800]
@@ -120,7 +136,12 @@ fn main() -> Result<()> {
 
     // Compute exact results once (optional)
     let exact_topk = if args.exact_recall {
-        Some(compute_exact_topk(&embeddings, &queries, args.k, distance_metric))
+        Some(compute_exact_topk(
+            &embeddings,
+            &queries,
+            args.k,
+            distance_metric,
+        ))
     } else {
         None
     };
@@ -151,8 +172,12 @@ fn main() -> Result<()> {
             }
         }
         let batch_elapsed = batch_start.elapsed();
-
-        let qps = (queries.len() as f64) / batch_elapsed.as_secs_f64();
+        let elapsed_secs = batch_elapsed.as_secs_f64();
+        let qps = if queries.is_empty() || elapsed_secs == 0.0 {
+            0.0
+        } else {
+            (queries.len() as f64) / elapsed_secs
+        };
         let (p50_ms, p99_ms) = percentiles_ms(&mut durations);
 
         let recall = if args.exact_recall {
@@ -190,8 +215,13 @@ fn generate_vectors(
 ) -> Vec<Vec<f32>> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut v: Vec<f32> = (0..dimension).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
-        if matches!(distance, DistanceMetric::Cosine | DistanceMetric::InnerProduct) {
+        let mut v: Vec<f32> = (0..dimension)
+            .map(|_| rng.gen_range(-1.0f32..1.0f32))
+            .collect();
+        if matches!(
+            distance,
+            DistanceMetric::Cosine | DistanceMetric::InnerProduct
+        ) {
             l2_normalize_in_place(&mut v);
         }
         out.push(v);

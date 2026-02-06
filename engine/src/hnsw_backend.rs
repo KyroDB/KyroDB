@@ -12,11 +12,13 @@ use crate::metrics::MetricsCollector;
 use crate::persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
 use crate::proto::MetadataFilter;
 use anyhow::{Context, Result};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -28,11 +30,11 @@ struct MetadataInvertedIndex {
 }
 
 impl MetadataInvertedIndex {
-    fn rebuild_from(embeddings: &[Vec<f32>], metadata: &[HashMap<String, String>]) -> Self {
+    fn rebuild_from(metadata: &[HashMap<String, String>], alive: &[Option<u64>]) -> Self {
         let mut index = Self::default();
-        let len = std::cmp::min(embeddings.len(), metadata.len());
+        let len = std::cmp::min(metadata.len(), alive.len());
         for doc_id in 0..len {
-            if embeddings[doc_id].iter().all(|&x| x == 0.0) {
+            if alive[doc_id].is_none() {
                 continue;
             }
             index.insert_doc(doc_id as u64, &metadata[doc_id]);
@@ -114,6 +116,14 @@ impl MetadataInvertedIndex {
     }
 }
 
+#[derive(Default)]
+struct DocumentStore {
+    embeddings: Vec<Vec<f32>>,
+    metadata: Vec<HashMap<String, String>>,
+    external_to_internal: HashMap<u64, usize>,
+    internal_to_external: Vec<Option<u64>>,
+}
+
 fn compile_filter_to_bitmap(
     filter: &MetadataFilter,
     index: &MetadataInvertedIndex,
@@ -172,6 +182,10 @@ const DISK_SPACE_WARNING_THRESHOLD: f64 = 0.10;
 
 /// Disk space critical threshold (reject writes if free space < 5%)
 const DISK_SPACE_CRITICAL_THRESHOLD: f64 = 0.05;
+
+/// Normalization tolerance for cosine/inner-product vectors (squared L2 norm).
+const NORMALIZATION_NORM_SQ_MIN: f32 = 0.98;
+const NORMALIZATION_NORM_SQ_MAX: f32 = 1.02;
 
 /// Disk space information
 #[derive(Debug, Clone)]
@@ -319,11 +333,8 @@ fn check_and_warn_disk_space(path: impl AsRef<Path>) -> Result<bool> {
 /// **Usage**: Cache strategies call `fetch_document` on cache miss.
 pub struct HnswBackend {
     index: Arc<RwLock<HnswVectorIndex>>,
-    /// Pre-loaded embeddings for O(1) fetch by doc_id
-    /// This avoids storing embeddings in HNSW graph (memory optimization)
-    embeddings: Arc<RwLock<Vec<Vec<f32>>>>,
-    /// Metadata storage for O(1) fetch by doc_id
-    metadata: Arc<RwLock<Vec<HashMap<String, String>>>>,
+    /// Document storage and ID mapping (internal contiguous IDs)
+    doc_store: Arc<RwLock<DocumentStore>>,
     /// Inverted index for scalable metadata filtering (derived from metadata)
     metadata_index: Arc<RwLock<MetadataInvertedIndex>>,
     /// Persistence components (optional)
@@ -336,8 +347,152 @@ struct PersistenceState {
     wal: Arc<RwLock<WalWriter>>,
     inserts_since_snapshot: Arc<RwLock<usize>>,
     snapshot_interval: usize,
+    next_wal_seq: Arc<AtomicU64>,
+    snapshot_lock: Arc<RwLock<()>>,
+    manifest_lock: Arc<Mutex<()>>,
+    fsync_policy: FsyncPolicy,
+    max_wal_size_bytes: u64,
+}
+
+impl PersistenceState {
+    fn rotate_wal_if_needed(&self, wal_guard: &mut WalWriter) -> Result<bool> {
+        if self.max_wal_size_bytes == 0 || wal_guard.bytes_written() < self.max_wal_size_bytes {
+            return Ok(false);
+        }
+
+        let old_path = wal_guard.path().to_path_buf();
+
+        let new_wal_path = self
+            .data_dir
+            .join(format!("wal_{}.wal", HnswBackend::file_id()));
+        let new_wal_name = new_wal_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        // Create the file first, but do not start writing to it until the MANIFEST references it.
+        let new_writer = WalWriter::create(&new_wal_path, self.fsync_policy)?;
+
+        let _manifest_guard = self.manifest_lock.lock();
+        let manifest_path = self.data_dir.join("MANIFEST");
+        if !manifest_path.exists() {
+            anyhow::bail!(
+                "MANIFEST missing at {}; refusing to rotate WAL to avoid data loss",
+                manifest_path.display()
+            );
+        }
+        let mut manifest = Manifest::load(&manifest_path)?;
+        manifest.wal_segments.push(new_wal_name);
+        manifest.save(&manifest_path)?;
+
+        *wal_guard = new_writer;
+        info!(
+            old = %old_path.display(),
+            new = %new_wal_path.display(),
+            max_wal_size_bytes = self.max_wal_size_bytes,
+            "rotated WAL segment"
+        );
+        Ok(true)
+    }
 }
 impl HnswBackend {
+    /// Compact tombstones by rebuilding the in-memory HNSW index and document store.
+    ///
+    /// KyroDB uses soft deletes (tombstones) because `hnsw_rs` does not support deletions.
+    /// Over time, tombstones can consume HNSW capacity (`max_elements`). This compaction:
+    /// - Drops tombstones from the document store (compacts internal IDs)
+    /// - Rebuilds the HNSW graph from live documents only
+    /// - Rebuilds the metadata inverted index
+    ///
+    /// This is a stop-the-world operation for writers (and blocks readers while rebuilding).
+    fn compact_tombstones(&self) -> Result<usize> {
+        let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.write());
+
+        // Capture index construction params before we swap it.
+        let (dimension, capacity, distance, m, ef_construction, disable_norm_check) = {
+            let idx = self.index.read();
+            (
+                idx.dimension(),
+                idx.capacity(),
+                idx.distance_metric(),
+                idx.m(),
+                idx.ef_construction(),
+                idx.normalization_check_disabled(),
+            )
+        };
+
+        let mut index = self.index.write();
+        let mut store = self.doc_store.write();
+
+        let tombstones = store
+            .internal_to_external
+            .iter()
+            .filter(|v| v.is_none())
+            .count();
+        if tombstones == 0 {
+            drop(store);
+            drop(index);
+            drop(snapshot_guard);
+            return Ok(0);
+        }
+
+        let live = store.external_to_internal.len();
+        info!(
+            tombstones,
+            live, capacity, "compacting tombstones by rebuilding HNSW index"
+        );
+
+        let old_embeddings = std::mem::take(&mut store.embeddings);
+        let old_metadata = std::mem::take(&mut store.metadata);
+        let old_internal_to_external = std::mem::take(&mut store.internal_to_external);
+
+        store.embeddings = Vec::with_capacity(live);
+        store.metadata = Vec::with_capacity(live);
+        store.internal_to_external = Vec::with_capacity(live);
+        store.external_to_internal.clear();
+
+        for ((embedding, metadata), ext) in old_embeddings
+            .into_iter()
+            .zip(old_metadata.into_iter())
+            .zip(old_internal_to_external.into_iter())
+        {
+            let Some(external_id) = ext else { continue };
+            let internal_id = store.embeddings.len();
+            store.embeddings.push(embedding);
+            store.metadata.push(metadata);
+            store.internal_to_external.push(Some(external_id));
+            store.external_to_internal.insert(external_id, internal_id);
+        }
+
+        // Rebuild HNSW index from compacted live docs.
+        let mut new_index = HnswVectorIndex::new_with_params(
+            dimension,
+            capacity,
+            distance,
+            m,
+            ef_construction,
+            disable_norm_check,
+        )?;
+        for (internal_id, embedding) in store.embeddings.iter().enumerate() {
+            new_index.add_vector(internal_id as u64, embedding)?;
+        }
+        *index = new_index;
+
+        // Rebuild metadata inverted index to match compacted internal IDs.
+        let new_meta_index =
+            MetadataInvertedIndex::rebuild_from(&store.metadata, &store.internal_to_external);
+        let mut meta_index = self.metadata_index.write();
+        *meta_index = new_meta_index;
+
+        drop(store);
+        drop(index);
+        drop(meta_index);
+        drop(snapshot_guard);
+
+        Ok(tombstones)
+    }
+
     /// Create new HNSW backend from pre-loaded embeddings (no persistence)
     ///
     /// # Parameters
@@ -374,7 +529,7 @@ impl HnswBackend {
     pub fn new_with_hnsw_params(
         dimension: usize,
         distance: DistanceMetric,
-        embeddings: Vec<Vec<f32>>,
+        mut embeddings: Vec<Vec<f32>>,
         metadata: Vec<HashMap<String, String>>,
         max_elements: usize,
         hnsw_m: usize,
@@ -406,7 +561,10 @@ impl HnswBackend {
             documents = embeddings.len(),
             dimension, "building HNSW index"
         );
-        for (doc_id, embedding) in embeddings.iter().enumerate() {
+        for (doc_id, embedding) in embeddings.iter_mut().enumerate() {
+            if embedding.iter().all(|&x| x == 0.0) {
+                continue;
+            }
             if embedding.len() != dimension {
                 anyhow::bail!(
                     "embedding dimension mismatch for doc_id {}: expected {}, got {}",
@@ -415,16 +573,40 @@ impl HnswBackend {
                     embedding.len()
                 );
             }
+            normalize_in_place_if_needed(distance, embedding)?;
             index.add_vector(doc_id as u64, embedding)?;
         }
         info!("HNSW index built");
 
-        let metadata_index = MetadataInvertedIndex::rebuild_from(&embeddings, &metadata);
+        let mut doc_store = DocumentStore {
+            embeddings,
+            metadata,
+            ..Default::default()
+        };
+        doc_store
+            .internal_to_external
+            .reserve(doc_store.embeddings.len());
+        for internal_id in 0..doc_store.embeddings.len() {
+            let alive = !doc_store.embeddings[internal_id].iter().all(|&x| x == 0.0);
+            if alive {
+                let external_id = internal_id as u64;
+                doc_store.internal_to_external.push(Some(external_id));
+                doc_store
+                    .external_to_internal
+                    .insert(external_id, internal_id);
+            } else {
+                doc_store.internal_to_external.push(None);
+            }
+        }
+
+        let metadata_index = MetadataInvertedIndex::rebuild_from(
+            &doc_store.metadata,
+            &doc_store.internal_to_external,
+        );
 
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
-            embeddings: Arc::new(RwLock::new(embeddings)),
-            metadata: Arc::new(RwLock::new(metadata)),
+            doc_store: Arc::new(RwLock::new(doc_store)),
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: None,
         })
@@ -450,6 +632,7 @@ impl HnswBackend {
         data_dir: impl AsRef<Path>,
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
+        max_wal_size_bytes: u64,
     ) -> Result<Self> {
         Self::with_persistence_with_hnsw_params(
             dimension,
@@ -460,6 +643,7 @@ impl HnswBackend {
             data_dir,
             fsync_policy,
             snapshot_interval,
+            max_wal_size_bytes,
             HnswVectorIndex::DEFAULT_M,
             HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
             false,
@@ -472,12 +656,13 @@ impl HnswBackend {
     pub fn with_persistence_with_hnsw_params(
         dimension: usize,
         distance: DistanceMetric,
-        embeddings: Vec<Vec<f32>>,
+        mut embeddings: Vec<Vec<f32>>,
         metadata: Vec<HashMap<String, String>>,
         max_elements: usize,
         data_dir: impl AsRef<Path>,
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
+        max_wal_size_bytes: u64,
         hnsw_m: usize,
         hnsw_ef_construction: usize,
         disable_normalization_check: bool,
@@ -510,7 +695,10 @@ impl HnswBackend {
             documents = embeddings.len(),
             dimension, "building HNSW index (persistence)"
         );
-        for (doc_id, embedding) in embeddings.iter().enumerate() {
+        for (doc_id, embedding) in embeddings.iter_mut().enumerate() {
+            if embedding.iter().all(|&x| x == 0.0) {
+                continue;
+            }
             if embedding.len() != dimension {
                 anyhow::bail!(
                     "embedding dimension mismatch for doc_id {}: expected {}, got {}",
@@ -519,12 +707,13 @@ impl HnswBackend {
                     embedding.len()
                 );
             }
+            normalize_in_place_if_needed(distance, embedding)?;
             index.add_vector(doc_id as u64, embedding)?;
         }
         info!("HNSW index built (persistence)");
 
         // Create initial WAL
-        let wal_path = data_dir.join(format!("wal_{}.wal", Self::timestamp()));
+        let wal_path = data_dir.join(format!("wal_{}.wal", Self::file_id()));
         let wal = WalWriter::create(&wal_path, fsync_policy)?;
 
         // Update manifest
@@ -539,17 +728,53 @@ impl HnswBackend {
             wal: Arc::new(RwLock::new(wal)),
             inserts_since_snapshot: Arc::new(RwLock::new(0)),
             snapshot_interval,
+            next_wal_seq: Arc::new(AtomicU64::new(1)),
+            snapshot_lock: Arc::new(RwLock::new(())),
+            manifest_lock: Arc::new(Mutex::new(())),
+            fsync_policy,
+            max_wal_size_bytes,
         };
 
-        let metadata_index = MetadataInvertedIndex::rebuild_from(&embeddings, &metadata);
+        let mut doc_store = DocumentStore {
+            embeddings,
+            metadata,
+            ..Default::default()
+        };
+        doc_store
+            .internal_to_external
+            .reserve(doc_store.embeddings.len());
+        for internal_id in 0..doc_store.embeddings.len() {
+            let alive = !doc_store.embeddings[internal_id].iter().all(|&x| x == 0.0);
+            if alive {
+                let external_id = internal_id as u64;
+                doc_store.internal_to_external.push(Some(external_id));
+                doc_store
+                    .external_to_internal
+                    .insert(external_id, internal_id);
+            } else {
+                doc_store.internal_to_external.push(None);
+            }
+        }
 
-        Ok(Self {
+        let metadata_index = MetadataInvertedIndex::rebuild_from(
+            &doc_store.metadata,
+            &doc_store.internal_to_external,
+        );
+
+        let backend = Self {
             index: Arc::new(RwLock::new(index)),
-            embeddings: Arc::new(RwLock::new(embeddings)),
-            metadata: Arc::new(RwLock::new(metadata)),
+            doc_store: Arc::new(RwLock::new(doc_store)),
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: Some(persistence),
-        })
+        };
+
+        // Durability: initial state must be recoverable even if no user-triggered snapshot
+        // occurs before a crash. Persist a baseline snapshot on initialization.
+        if !backend.is_empty() {
+            backend.create_snapshot()?;
+        }
+
+        Ok(backend)
     }
 
     /// Recover from WAL + snapshot
@@ -561,15 +786,7 @@ impl HnswBackend {
     /// 4. Rebuild HNSW index
     /// 5. Create new active WAL
     #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval))]
-    /// Recover from WAL + snapshot
-    ///
-    /// # Recovery Flow
-    /// 1. Load manifest
-    /// 2. Load latest snapshot with fallback recovery (if corrupted)
-    /// 3. Replay WAL entries since snapshot
-    /// 4. Rebuild HNSW index
-    /// 5. Create new active WAL
-    #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval))]
+    #[allow(clippy::too_many_arguments)]
     pub fn recover(
         embedding_dimension: usize,
         distance: DistanceMetric,
@@ -577,6 +794,7 @@ impl HnswBackend {
         max_elements: usize,
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
+        max_wal_size_bytes: u64,
         metrics: MetricsCollector,
     ) -> Result<Self> {
         Self::recover_with_hnsw_params(
@@ -586,6 +804,7 @@ impl HnswBackend {
             max_elements,
             fsync_policy,
             snapshot_interval,
+            max_wal_size_bytes,
             metrics,
             HnswVectorIndex::DEFAULT_M,
             HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
@@ -602,6 +821,7 @@ impl HnswBackend {
         max_elements: usize,
         fsync_policy: FsyncPolicy,
         snapshot_interval: usize,
+        max_wal_size_bytes: u64,
         metrics: MetricsCollector,
         hnsw_m: usize,
         hnsw_ef_construction: usize,
@@ -622,10 +842,11 @@ impl HnswBackend {
         let manifest = Manifest::load(&manifest_path)?;
 
         // Load snapshot with fallback recovery (if exists)
-        let mut embeddings: Vec<Vec<f32>> = Vec::new();
-        let mut metadata: Vec<HashMap<String, String>> = Vec::new();
+        let mut documents: HashMap<u64, (Vec<f32>, HashMap<String, String>)> = HashMap::new();
         let mut dimension = embedding_dimension;
+        let mut snapshot_last_wal_seq = 0u64;
         let mut snapshot_timestamp = 0u64;
+        let mut max_wal_seq = 0u64;
 
         if let Some(snapshot_name) = &manifest.latest_snapshot {
             let snapshot_path = data_dir.join(snapshot_name);
@@ -650,11 +871,12 @@ impl HnswBackend {
                         }
                     }
 
-                    if snapshot.distance != distance {
+                    let snapshot_distance = snapshot.distance.unwrap_or_default();
+                    if snapshot_distance != distance {
                         anyhow::bail!(
                             "configured distance metric {:?} does not match snapshot distance metric {:?}",
                             distance,
-                            snapshot.distance
+                            snapshot_distance
                         );
                     }
                     dimension = if snapshot_has_docs {
@@ -662,45 +884,35 @@ impl HnswBackend {
                     } else {
                         embedding_dimension
                     };
+                    snapshot_last_wal_seq = snapshot.last_wal_seq;
                     snapshot_timestamp = snapshot.timestamp;
-
-                    // Restore embeddings and metadata preserving doc_id → index mapping.
-                    // Empty snapshots are valid (no docs); keep vectors empty.
-                    let max_doc_id = snapshot.documents.iter().map(|(id, _)| *id).max();
-
-                    let max_meta_id = snapshot.metadata.iter().map(|(id, _)| *id).max();
-
-                    let max_id = match (max_doc_id, max_meta_id) {
-                        (None, None) => None,
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
-                    };
-
-                    if let Some(max_id) = max_id {
-                        let max_id_usize = max_id as usize;
-                        embeddings = vec![vec![0.0; dimension]; max_id_usize + 1];
-                        metadata = vec![HashMap::new(); max_id_usize + 1];
-                    } else {
-                        embeddings = Vec::new();
-                        metadata = Vec::new();
+                    if snapshot_last_wal_seq > max_wal_seq {
+                        max_wal_seq = snapshot_last_wal_seq;
                     }
 
+                    // Restore documents from snapshot.
+                    documents.clear();
                     for (doc_id, embedding) in snapshot.documents {
-                        embeddings[doc_id as usize] = embedding;
+                        documents.insert(doc_id, (embedding, HashMap::new()));
                     }
-
                     for (doc_id, meta) in snapshot.metadata {
-                        metadata[doc_id as usize] = meta;
+                        if let Some((_, meta_slot)) = documents.get_mut(&doc_id) {
+                            *meta_slot = meta;
+                        } else {
+                            warn!(
+                                doc_id,
+                                "snapshot metadata entry missing corresponding document"
+                            );
+                        }
                     }
 
                     if recovered_from_fallback {
                         warn!(
-                            documents = embeddings.len(),
+                            documents = documents.len(),
                             "snapshot loaded from fallback (primary corrupted)"
                         );
                     } else {
-                        info!(documents = embeddings.len(), "snapshot loaded successfully");
+                        info!(documents = documents.len(), "snapshot loaded successfully");
                     }
                 }
                 Err(e) => {
@@ -726,13 +938,34 @@ impl HnswBackend {
             let entries = reader.read_all()?;
 
             for entry in entries {
-                // Skip entries older than snapshot timestamp (already included in snapshot)
-                if snapshot_timestamp > 0 && entry.timestamp <= snapshot_timestamp {
+                if entry.seq_no > max_wal_seq {
+                    max_wal_seq = entry.seq_no;
+                }
+
+                // Skip entries already captured in snapshot (sequence-based)
+                if snapshot_last_wal_seq > 0
+                    && entry.seq_no > 0
+                    && entry.seq_no <= snapshot_last_wal_seq
+                {
+                    trace!(
+                        doc_id = entry.doc_id,
+                        entry_seq = entry.seq_no,
+                        snapshot_seq = snapshot_last_wal_seq,
+                        "skipping entry captured by snapshot"
+                    );
+                    continue;
+                }
+                // Legacy WAL entries (seq_no == 0) are skipped based on snapshot timestamp.
+                if entry.seq_no == 0
+                    && snapshot_timestamp > 0
+                    && entry.timestamp > 0
+                    && entry.timestamp <= snapshot_timestamp
+                {
                     trace!(
                         doc_id = entry.doc_id,
                         entry_ts = entry.timestamp,
                         snapshot_ts = snapshot_timestamp,
-                        "skipping entry older than snapshot"
+                        "skipping legacy entry captured by snapshot timestamp"
                     );
                     continue;
                 }
@@ -747,26 +980,19 @@ impl HnswBackend {
                                 entry.embedding.len()
                             );
                         }
-
-                        let doc_id = entry.doc_id as usize;
-                        if doc_id >= embeddings.len() {
-                            embeddings.resize(doc_id + 1, vec![0.0; dimension]);
-                            metadata.resize(doc_id + 1, HashMap::new());
-                        }
-                        embeddings[doc_id] = entry.embedding;
-                        metadata[doc_id] = entry.metadata;
+                        documents.insert(entry.doc_id, (entry.embedding, entry.metadata));
                     }
                     WalOp::Delete => {
-                        let doc_id = entry.doc_id as usize;
-                        if doc_id < embeddings.len() {
-                            embeddings[doc_id] = vec![0.0; dimension];
-                            metadata[doc_id].clear();
-                        }
+                        documents.remove(&entry.doc_id);
                     }
                     WalOp::UpdateMetadata => {
-                        let doc_id = entry.doc_id as usize;
-                        if doc_id < metadata.len() {
-                            metadata[doc_id] = entry.metadata;
+                        if let Some((_, meta)) = documents.get_mut(&entry.doc_id) {
+                            *meta = entry.metadata;
+                        } else {
+                            warn!(
+                                doc_id = entry.doc_id,
+                                "WAL metadata update for missing document"
+                            );
                         }
                     }
                 }
@@ -780,7 +1006,7 @@ impl HnswBackend {
             );
         }
 
-        // Rebuild HNSW index from recovered embeddings.
+        // Rebuild HNSW index from recovered documents.
         let mut index = HnswVectorIndex::new_with_params(
             dimension,
             max_elements,
@@ -790,15 +1016,23 @@ impl HnswBackend {
             disable_normalization_check,
         )?;
 
+        let mut docs_vec: Vec<(u64, Vec<f32>, HashMap<String, String>)> = documents
+            .into_iter()
+            .map(|(doc_id, (embedding, metadata))| (doc_id, embedding, metadata))
+            .collect();
+        docs_vec.sort_unstable_by_key(|(doc_id, _, _)| *doc_id);
+
         info!(
-            documents = embeddings.len(),
+            documents = docs_vec.len(),
             dimension, "rebuilding HNSW index from recovered state"
         );
-        for (doc_id, embedding) in embeddings.iter().enumerate() {
-            // Skip tombstones (all-zero embeddings)
-            if embedding.iter().all(|&x| x == 0.0) {
-                continue;
-            }
+
+        let mut doc_store = DocumentStore::default();
+        doc_store.embeddings.reserve(docs_vec.len());
+        doc_store.metadata.reserve(docs_vec.len());
+        doc_store.internal_to_external.reserve(docs_vec.len());
+
+        for (doc_id, embedding, metadata) in docs_vec {
             if embedding.len() != dimension {
                 anyhow::bail!(
                     "embedding dimension mismatch for doc_id {}: expected {}, got {}",
@@ -807,18 +1041,25 @@ impl HnswBackend {
                     embedding.len()
                 );
             }
-            index.add_vector(doc_id as u64, embedding)?;
+            let mut embedding = embedding;
+            normalize_in_place_if_needed(distance, &mut embedding)?;
+            let internal_id = doc_store.embeddings.len();
+            index.add_vector(internal_id as u64, &embedding)?;
+            doc_store.embeddings.push(embedding);
+            doc_store.metadata.push(metadata);
+            doc_store.internal_to_external.push(Some(doc_id));
+            doc_store.external_to_internal.insert(doc_id, internal_id);
         }
         info!("HNSW index rebuilt");
 
-        if embeddings.is_empty() {
+        if doc_store.external_to_internal.is_empty() {
             // It's possible to have an empty DB if it's new, but usually we expect something if recovering.
             // However, allowing empty recovery is safer for new deployments.
             info!("Recovery: no data found (fresh start or empty DB)");
         }
 
         // Create new active WAL
-        let wal_path = data_dir.join(format!("wal_{}.wal", Self::timestamp()));
+        let wal_path = data_dir.join(format!("wal_{}.wal", Self::file_id()));
         let wal = WalWriter::create(&wal_path, fsync_policy)?;
 
         // Update manifest
@@ -833,16 +1074,26 @@ impl HnswBackend {
             wal: Arc::new(RwLock::new(wal)),
             inserts_since_snapshot: Arc::new(RwLock::new(0)),
             snapshot_interval,
+            next_wal_seq: Arc::new(AtomicU64::new(max_wal_seq.saturating_add(1))),
+            snapshot_lock: Arc::new(RwLock::new(())),
+            manifest_lock: Arc::new(Mutex::new(())),
+            fsync_policy,
+            max_wal_size_bytes,
         };
 
-        info!(documents = embeddings.len(), "recovery complete");
+        info!(
+            documents = doc_store.external_to_internal.len(),
+            "recovery complete"
+        );
 
-        let metadata_index = MetadataInvertedIndex::rebuild_from(&embeddings, &metadata);
+        let metadata_index = MetadataInvertedIndex::rebuild_from(
+            &doc_store.metadata,
+            &doc_store.internal_to_external,
+        );
 
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
-            embeddings: Arc::new(RwLock::new(embeddings)),
-            metadata: Arc::new(RwLock::new(metadata)),
+            doc_store: Arc::new(RwLock::new(doc_store)),
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: Some(persistence),
         })
@@ -855,6 +1106,13 @@ impl HnswBackend {
             .as_secs()
     }
 
+    fn file_id() -> u64 {
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is set before Unix epoch (1970-01-01) - this should never happen on a properly configured system");
+        u64::try_from(dur.as_micros()).unwrap_or(u64::MAX)
+    }
+
     /// Get vector dimension
     pub fn dimension(&self) -> usize {
         self.index.read().dimension()
@@ -862,7 +1120,7 @@ impl HnswBackend {
 
     /// Get number of documents
     pub fn len(&self) -> usize {
-        self.embeddings.read().len()
+        self.doc_store.read().external_to_internal.len()
     }
 
     /// Check if backend is empty
@@ -872,11 +1130,10 @@ impl HnswBackend {
 
     /// Lightweight existence check that avoids cloning embeddings
     pub fn exists(&self, doc_id: u64) -> bool {
-        let embeddings = self.embeddings.read();
-        embeddings
-            .get(doc_id as usize)
-            .map(|embedding| embedding.iter().any(|&x| x != 0.0))
-            .unwrap_or(false)
+        self.doc_store
+            .read()
+            .external_to_internal
+            .contains_key(&doc_id)
     }
 
     /// Insert new document (with WAL logging if persistence enabled)
@@ -887,7 +1144,7 @@ impl HnswBackend {
     /// - `metadata`: Document metadata
     ///
     /// # Durability
-    /// - If persistence enabled: Update in-memory → HNSW insert → Append to WAL → fsync (if Always)
+    /// - If persistence enabled: Append to WAL → HNSW insert → Update in-memory → fsync (per policy)
     /// - Triggers snapshot creation if `inserts_since_snapshot >= snapshot_interval`
     #[instrument(level = "trace", skip(self, embedding, metadata), fields(doc_id, dim = embedding.len()))]
     pub fn insert(
@@ -916,90 +1173,185 @@ impl HnswBackend {
             );
         }
 
-        // Update in-memory index and embeddings
-        let mut index = self.index.write();
-        let mut embeddings = self.embeddings.write();
-        let mut metas = self.metadata.write();
+        let mut embedding = embedding;
+        let mut attempted_compaction = false;
+        loop {
+            let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
 
-        let doc_id_usize = doc_id as usize;
-        if doc_id_usize >= embeddings.len() {
-            embeddings.resize(doc_id_usize + 1, vec![0.0; embedding.len()]);
-            metas.resize(doc_id_usize + 1, HashMap::new());
-        }
+            // Update in-memory index and document store
+            let mut index = self.index.write();
+            let mut store = self.doc_store.write();
 
-        let old_embedding = embeddings[doc_id_usize].clone();
-        let old_metadata = metas[doc_id_usize].clone();
+            let old_internal_id = store.external_to_internal.get(&doc_id).copied();
+            let old_metadata = old_internal_id.map(|id| store.metadata[id].clone());
 
-        let embedding_for_wal = embedding.clone();
-        let metadata_for_wal = metadata.clone();
+            let distance = index.distance_metric();
+            normalize_in_place_if_needed(distance, &mut embedding)?;
 
-        embeddings[doc_id_usize] = embedding;
-        metas[doc_id_usize] = metadata;
-        if let Err(e) = index.add_vector(doc_id, &embedding_for_wal) {
-            embeddings[doc_id_usize] = old_embedding;
-            metas[doc_id_usize] = old_metadata;
-            return Err(e);
-        }
+            if index.is_full() {
+                let tombstones = store
+                    .internal_to_external
+                    .iter()
+                    .filter(|v| v.is_none())
+                    .count();
+                drop(store);
+                drop(index);
+                drop(snapshot_guard);
 
-        let old_alive_for_meta_index = !old_embedding.iter().all(|&x| x == 0.0);
+                if !attempted_compaction && tombstones > 0 {
+                    attempted_compaction = true;
+                    let reclaimed = self.compact_tombstones()?;
+                    if reclaimed > 0 {
+                        continue;
+                    }
+                }
 
-        let mut should_create_snapshot = false;
-        if let Some(ref persistence) = self.persistence {
-            let entry = WalEntry {
-                op: WalOp::Insert,
-                doc_id,
-                embedding: embedding_for_wal,
-                metadata: metadata_for_wal,
-                timestamp: Self::timestamp(),
-            };
-
-            persistence.wal.write().append(&entry)?;
-
-            // Track inserts for snapshot trigger
-            let mut inserts = persistence.inserts_since_snapshot.write();
-            *inserts += 1;
-
-            if *inserts >= persistence.snapshot_interval {
-                debug!(
-                    inserts = *inserts,
-                    interval = persistence.snapshot_interval,
-                    "snapshot interval reached; creating snapshot"
+                anyhow::bail!(
+                    "HNSW index full: {} elements (max {})",
+                    self.index.read().len(),
+                    self.index.read().capacity()
                 );
-                should_create_snapshot = true;
             }
-        }
 
-        // Important: release the in-memory write locks before snapshot creation.
-        // Snapshot creation needs to acquire read locks on embeddings/metadata, and
-        // performing disk I/O while holding write locks would block writers.
-        drop(index);
-        drop(embeddings);
+            let internal_id = store.embeddings.len();
 
-        // Keep metadata inverted index in sync with metadata/tombstones.
-        // Do this after releasing the index/embeddings locks to avoid lock-order deadlocks.
-        {
-            let mut meta_index = self.metadata_index.write();
-            if old_alive_for_meta_index {
-                meta_index.replace_doc(doc_id, &old_metadata, &metas[doc_id_usize]);
-            } else {
-                meta_index.insert_doc(doc_id, &metas[doc_id_usize]);
+            let embedding_for_wal = embedding.clone();
+            let metadata_for_wal = metadata.clone();
+            let metadata_for_index = metadata.clone();
+
+            // Write-ahead: WAL must be durable before mutating in-memory state.
+            if let Some(ref persistence) = self.persistence {
+                let manifest_path = persistence.data_dir.join("MANIFEST");
+                if !manifest_path.exists() {
+                    anyhow::bail!(
+                        "MANIFEST missing at {}; refusing to append WAL to avoid unrecoverable data loss",
+                        manifest_path.display()
+                    );
+                }
+
+                let seq_no = persistence.next_wal_seq.fetch_add(1, Ordering::SeqCst);
+                let entry = WalEntry {
+                    op: WalOp::Insert,
+                    doc_id,
+                    embedding: embedding_for_wal,
+                    metadata: metadata_for_wal,
+                    seq_no,
+                    timestamp: Self::timestamp(),
+                };
+
+                let mut wal = persistence.wal.write();
+                wal.append(&entry)?;
+                if let Err(e) = persistence.rotate_wal_if_needed(&mut wal) {
+                    error!(
+                        error = %e,
+                        doc_id,
+                        wal_seq_no = seq_no,
+                        "failed to rotate WAL segment; continuing with current WAL"
+                    );
+                }
             }
+
+            if let Err(e) = index.add_vector(internal_id as u64, &embedding) {
+                // WAL already contains the insert, but the in-memory index update failed.
+                // This should be extremely rare (we pre-check capacity/dim), but we must
+                // prevent "phantom" inserts on recovery for an operation we are failing.
+                if let Some(ref persistence) = self.persistence {
+                    let rollback_seq_no = persistence.next_wal_seq.fetch_add(1, Ordering::SeqCst);
+                    let rollback = WalEntry {
+                        op: WalOp::Delete,
+                        doc_id,
+                        embedding: Vec::new(),
+                        metadata: HashMap::new(),
+                        seq_no: rollback_seq_no,
+                        timestamp: Self::timestamp(),
+                    };
+
+                    let mut wal = persistence.wal.write();
+                    if let Err(rollback_err) = wal.append(&rollback) {
+                        error!(
+                            error = %rollback_err,
+                            doc_id,
+                            rollback_seq_no,
+                            "failed to append WAL rollback after failed HNSW insert; aborting to avoid inconsistent state"
+                        );
+                        std::process::abort();
+                    }
+                    if let Err(rotate_err) = persistence.rotate_wal_if_needed(&mut wal) {
+                        error!(
+                            error = %rotate_err,
+                            doc_id,
+                            rollback_seq_no,
+                            "failed to rotate WAL after rollback; continuing with current WAL"
+                        );
+                    }
+                }
+
+                return Err(e).context("HNSW insert failed after WAL append");
+            }
+
+            store.embeddings.push(std::mem::take(&mut embedding));
+            store.metadata.push(metadata);
+            store.internal_to_external.push(Some(doc_id));
+            store.external_to_internal.insert(doc_id, internal_id);
+
+            // Upsert semantics: keep the newest internal id live and tombstone the previous one.
+            if let Some(old_internal_id) = old_internal_id {
+                store.internal_to_external[old_internal_id] = None;
+                store.metadata[old_internal_id].clear();
+            }
+
+            let mut should_create_snapshot = false;
+            if let Some(ref persistence) = self.persistence {
+                // Track inserts for snapshot trigger (only after WAL append succeeds).
+                let mut inserts = persistence.inserts_since_snapshot.write();
+                *inserts += 1;
+
+                if persistence.snapshot_interval > 0 && *inserts >= persistence.snapshot_interval {
+                    debug!(
+                        inserts = *inserts,
+                        interval = persistence.snapshot_interval,
+                        "snapshot interval reached; creating snapshot"
+                    );
+                    should_create_snapshot = true;
+                }
+            }
+
+            // Keep metadata inverted index in sync with metadata/tombstones.
+            // Lock order is doc_store -> metadata_index to avoid deadlocks.
+            {
+                let mut meta_index = self.metadata_index.write();
+                meta_index.insert_doc(internal_id as u64, &metadata_for_index);
+                if let (Some(old_internal_id), Some(old_metadata)) = (old_internal_id, old_metadata)
+                {
+                    meta_index.remove_doc(old_internal_id as u64, &old_metadata);
+                }
+            }
+
+            // Important: release the in-memory write locks before snapshot creation.
+            // Snapshot creation needs to acquire read locks on the document store, and
+            // performing disk I/O while holding write locks would block writers.
+            drop(index);
+            drop(store);
+
+            drop(snapshot_guard);
+
+            if should_create_snapshot {
+                // Snapshotting is best-effort after a committed insert. The WAL already contains
+                // the mutation, so we do not fail the user operation if a snapshot write fails.
+                if let Err(e) = self.create_snapshot() {
+                    error!(error = %e, "failed to create snapshot after insert");
+                }
+            }
+
+            return Ok(());
         }
-
-        drop(metas);
-
-        if should_create_snapshot {
-            self.create_snapshot()?;
-        }
-
-        Ok(())
     }
 
     /// Bulk insert documents directly into HNSW index.
     ///
     /// This method is optimized for loading large batches of vectors quickly:
     /// - Acquires write locks once (not per-vector)
-    /// - Pre-allocates capacity for embeddings/metadata arrays
+    /// - Pre-allocates capacity for document store arrays
     /// - Validates all dimensions upfront before inserting
     /// - Logs progress for long-running operations
     ///
@@ -1054,6 +1406,8 @@ impl HnswBackend {
             );
         }
 
+        let _snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
+
         // Validate all dimensions upfront (fail fast)
         for (doc_id, embedding, _) in &documents {
             if embedding.len() != expected_dim {
@@ -1066,56 +1420,59 @@ impl HnswBackend {
             }
         }
 
-        // Find max doc_id for pre-allocation
-        let max_doc_id = documents.iter().map(|(id, _, _)| *id).max().unwrap_or(0) as usize;
-
         // Acquire all write locks once
         let mut index = self.index.write();
-        let mut embeddings = self.embeddings.write();
-        let mut metas = self.metadata.write();
-        let mut meta_index = self.metadata_index.write();
+        let mut store = self.doc_store.write();
+        let distance = index.distance_metric();
 
-        // Pre-allocate capacity
-        if max_doc_id >= embeddings.len() {
-            embeddings.resize(max_doc_id + 1, vec![0.0; expected_dim]);
-            metas.resize(max_doc_id + 1, HashMap::new());
-        }
+        // Pre-allocate capacity for new inserts
+        store.embeddings.reserve(documents.len());
+        store.metadata.reserve(documents.len());
+        store.internal_to_external.reserve(documents.len());
 
         let mut loaded = 0u64;
         let mut failed = 0u64;
         let log_interval = std::cmp::max(total / 20, 10000); // Log every 5% or 10K
+        let mut seen_ids = std::collections::HashSet::with_capacity(documents.len());
+        let mut meta_updates: Vec<(u64, HashMap<String, String>)> = Vec::new();
 
         for (i, (doc_id, embedding, metadata)) in documents.into_iter().enumerate() {
-            let doc_id_usize = doc_id as usize;
-
-            // Ensure capacity for this specific doc_id
-            if doc_id_usize >= embeddings.len() {
-                embeddings.resize(doc_id_usize + 1, vec![0.0; expected_dim]);
-                metas.resize(doc_id_usize + 1, HashMap::new());
+            if !seen_ids.insert(doc_id) {
+                if failed < 10 {
+                    tracing::warn!(doc_id, "bulk_insert: duplicate doc_id within batch");
+                }
+                failed += 1;
+                continue;
             }
 
-            let old_embedding = embeddings[doc_id_usize].clone();
-            let old_metadata = metas[doc_id_usize].clone();
+            if store.external_to_internal.contains_key(&doc_id) {
+                if failed < 10 {
+                    tracing::warn!(doc_id, "bulk_insert: doc_id already exists");
+                }
+                failed += 1;
+                continue;
+            }
 
-            // Store embedding and metadata
-            embeddings[doc_id_usize] = embedding.clone();
-            metas[doc_id_usize] = metadata;
-
-            // Add to HNSW index
-            match index.add_vector(doc_id, &embedding) {
+            let internal_id = store.embeddings.len();
+            let mut embedding = embedding;
+            if let Err(e) = normalize_in_place_if_needed(distance, &mut embedding) {
+                if failed < 10 {
+                    tracing::warn!(doc_id, error = %e, "bulk_insert: failed to normalize embedding");
+                }
+                failed += 1;
+                continue;
+            }
+            match index.add_vector(internal_id as u64, &embedding) {
                 Ok(_) => {
-                    let old_alive = !old_embedding.iter().all(|&x| x == 0.0);
-                    if old_alive {
-                        meta_index.replace_doc(doc_id, &old_metadata, &metas[doc_id_usize]);
-                    } else {
-                        meta_index.insert_doc(doc_id, &metas[doc_id_usize]);
-                    }
+                    let metadata_for_index = metadata.clone();
+                    store.embeddings.push(embedding);
+                    store.metadata.push(metadata);
+                    store.internal_to_external.push(Some(doc_id));
+                    store.external_to_internal.insert(doc_id, internal_id);
+                    meta_updates.push((internal_id as u64, metadata_for_index));
                     loaded += 1;
                 }
                 Err(e) => {
-                    embeddings[doc_id_usize] = old_embedding;
-                    metas[doc_id_usize] = old_metadata;
-                    // Log first few failures, then throttle
                     if failed < 10 {
                         tracing::warn!(doc_id, error = %e, "bulk_insert: failed to add vector");
                     }
@@ -1133,6 +1490,16 @@ impl HnswBackend {
                     rate_per_sec = rate as u64,
                     "bulk_insert progress"
                 );
+            }
+        }
+
+        drop(store);
+        drop(index);
+
+        if !meta_updates.is_empty() {
+            let mut meta_index = self.metadata_index.write();
+            for (internal_id, meta) in meta_updates {
+                meta_index.insert_doc(internal_id, &meta);
             }
         }
 
@@ -1173,31 +1540,40 @@ impl HnswBackend {
             );
         }
 
-        let embeddings = self.embeddings.read();
-        let metas = self.metadata.read();
+        let snapshot_guard = persistence.snapshot_lock.write();
+        let last_wal_seq = persistence
+            .next_wal_seq
+            .load(Ordering::SeqCst)
+            .saturating_sub(1);
+
+        let store = self.doc_store.read();
 
         // Create snapshot object
-        // Collect a consistent view of documents. This clones embeddings while holding
+        // Collect a consistent view of documents. This clones embeddings/metadata while holding
         // the read lock to ensure snapshot consistency. We drop the read lock before
         // performing the potentially slow file I/O below to avoid blocking writers
         // for the duration of the save.
-        let documents: Vec<(u64, Vec<f32>)> = embeddings
+        let documents: Vec<(u64, Vec<f32>)> = store
+            .internal_to_external
             .iter()
             .enumerate()
-            .filter(|(_, emb)| !emb.iter().all(|&x| x == 0.0)) // Skip tombstones
-            .map(|(id, emb)| (id as u64, emb.clone()))
+            .filter_map(|(internal_id, external_id)| {
+                external_id.map(|doc_id| (doc_id, store.embeddings[internal_id].clone()))
+            })
             .collect();
 
-        let metadata_vec: Vec<(u64, HashMap<String, String>)> = metas
+        let metadata_vec: Vec<(u64, HashMap<String, String>)> = store
+            .internal_to_external
             .iter()
             .enumerate()
-            .filter(|(id, _)| *id < embeddings.len() && !embeddings[*id].iter().all(|&x| x == 0.0)) // Match documents
-            .map(|(id, meta)| (id as u64, meta.clone()))
+            .filter_map(|(internal_id, external_id)| {
+                external_id.map(|doc_id| (doc_id, store.metadata[internal_id].clone()))
+            })
             .collect();
 
         // Release locks before heavy I/O (snapshot.save)
-        drop(embeddings);
-        drop(metas);
+        drop(store);
+        drop(snapshot_guard);
 
         let dimension = if documents.is_empty() {
             0
@@ -1207,37 +1583,45 @@ impl HnswBackend {
 
         let doc_count = documents.len();
         let distance = self.index.read().distance_metric();
-        let snapshot = Snapshot::new(dimension, distance, documents, metadata_vec)?;
+        let snapshot = Snapshot::new(dimension, distance, documents, metadata_vec, last_wal_seq)?;
 
         // Save snapshot with timestamp
-        let snapshot_timestamp = Self::timestamp();
+        let snapshot_timestamp = Self::file_id();
         let snapshot_name = format!("snapshot_{}.snap", snapshot_timestamp);
         let snapshot_path = persistence.data_dir.join(&snapshot_name);
         snapshot.save(&snapshot_path)?;
         info!(path = %snapshot_path.display(), docs = doc_count, timestamp = snapshot_timestamp, "snapshot saved");
 
-        // Update manifest
+        // Update manifest and compact WAL segments.
+        //
+        // Important: serialize MANIFEST read/modify/write with WAL rotation to avoid lost updates.
+        let _manifest_guard = persistence.manifest_lock.lock();
         let manifest_path = persistence.data_dir.join("MANIFEST");
-        let mut manifest = Manifest::load_or_create(&manifest_path)?;
+        if !manifest_path.exists() {
+            anyhow::bail!(
+                "MANIFEST missing at {}; cannot safely update snapshot metadata",
+                manifest_path.display()
+            );
+        }
+        let mut manifest = Manifest::load(&manifest_path)?;
         manifest.latest_snapshot = Some(snapshot_name.clone());
-        manifest.save(&manifest_path)?;
 
-        // WAL Compaction: Delete old WAL segments that are fully captured in the snapshot
-        // This prevents unbounded disk usage growth
+        // WAL Compaction: Delete old WAL segments that are fully captured in the snapshot.
+        // This prevents unbounded disk usage growth when WAL rotation is enabled.
         let compacted = self.compact_old_wal_segments(
             &persistence.data_dir,
-            snapshot_timestamp,
+            last_wal_seq,
+            snapshot.timestamp,
             &mut manifest,
         )?;
         if compacted > 0 {
             info!(
                 compacted_segments = compacted,
-                snapshot_ts = snapshot_timestamp,
+                snapshot_seq = last_wal_seq,
                 "WAL compaction complete"
             );
-            // Save updated manifest after compaction
-            manifest.save(&manifest_path)?;
         }
+        manifest.save(&manifest_path)?;
 
         // Reset insert counter
         *persistence.inserts_since_snapshot.write() = 0;
@@ -1257,13 +1641,17 @@ impl HnswBackend {
     /// **Called by**: Cache strategies on cache miss
     #[instrument(level = "trace", skip(self), fields(doc_id))]
     pub fn fetch_document(&self, doc_id: u64) -> Option<Vec<f32>> {
-        self.embeddings.read().get(doc_id as usize).cloned()
+        let store = self.doc_store.read();
+        let internal_id = store.external_to_internal.get(&doc_id)?;
+        store.embeddings.get(*internal_id).cloned()
     }
 
     /// Fetch document metadata by ID (O(1) lookup)
     #[instrument(level = "trace", skip(self), fields(doc_id))]
     pub fn fetch_metadata(&self, doc_id: u64) -> Option<HashMap<String, String>> {
-        self.metadata.read().get(doc_id as usize).cloned()
+        let store = self.doc_store.read();
+        let internal_id = store.external_to_internal.get(&doc_id)?;
+        store.metadata.get(*internal_id).cloned()
     }
 
     /// Bulk fetch documents by ID (O(1) lookup)
@@ -1273,24 +1661,15 @@ impl HnswBackend {
     #[instrument(level = "trace", skip(self), fields(count = doc_ids.len()))]
     #[allow(clippy::type_complexity)]
     pub fn bulk_fetch(&self, doc_ids: &[u64]) -> Vec<Option<(Vec<f32>, HashMap<String, String>)>> {
-        let embeddings = self.embeddings.read();
-        let metadata = self.metadata.read();
+        let store = self.doc_store.read();
 
         doc_ids
             .iter()
             .map(|&id| {
-                let id_usize = id as usize;
-                if id_usize < embeddings.len() && id_usize < metadata.len() {
-                    let emb = &embeddings[id_usize];
-                    // Check for tombstone (all zeros)
-                    if emb.iter().all(|&x| x == 0.0) {
-                        None
-                    } else {
-                        Some((emb.clone(), metadata[id_usize].clone()))
-                    }
-                } else {
-                    None
-                }
+                let internal_id = store.external_to_internal.get(&id)?;
+                let emb = store.embeddings.get(*internal_id)?;
+                let meta = store.metadata.get(*internal_id)?;
+                Some((emb.clone(), meta.clone()))
             })
             .collect()
     }
@@ -1315,31 +1694,26 @@ impl HnswBackend {
         metadata: HashMap<String, String>,
         merge: bool,
     ) -> Result<bool> {
-        // Treat tombstoned documents as non-existent for metadata updates.
-        // Hold embeddings read lock across metadata update to prevent concurrent delete().
-        let doc_id_usize = doc_id as usize;
-        let embeddings = self.embeddings.read();
-        let mut meta_guard = self.metadata.write();
+        let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
 
-        if doc_id_usize >= embeddings.len() || doc_id_usize >= meta_guard.len() {
-            return Ok(false);
-        }
+        let mut store = self.doc_store.write();
+        let internal_id = match store.external_to_internal.get(&doc_id) {
+            Some(id) => *id,
+            None => return Ok(false),
+        };
 
-        let exists = !embeddings[doc_id_usize].iter().all(|&x| x == 0.0);
-        if !exists {
-            return Ok(false);
-        }
-
-        let old_metadata = meta_guard[doc_id_usize].clone();
+        let old_metadata = store.metadata[internal_id].clone();
 
         // Apply update
         let updated_metadata = if merge {
-            let mut merged = meta_guard[doc_id as usize].clone();
+            let mut merged = old_metadata.clone();
             merged.extend(metadata);
             merged
         } else {
             metadata
         };
+
+        let mut should_snapshot = false;
 
         // Log to WAL before updating in-memory state
         if let Some(ref persistence) = self.persistence {
@@ -1351,41 +1725,66 @@ impl HnswBackend {
                 );
             }
 
+            let manifest_path = persistence.data_dir.join("MANIFEST");
+            if !manifest_path.exists() {
+                anyhow::bail!(
+                    "MANIFEST missing at {}; refusing to append WAL to avoid unrecoverable data loss",
+                    manifest_path.display()
+                );
+            }
+
+            let seq_no = persistence.next_wal_seq.fetch_add(1, Ordering::SeqCst);
             let entry = WalEntry {
                 op: WalOp::UpdateMetadata,
                 doc_id,
                 embedding: vec![], // No embedding for metadata-only update
                 metadata: updated_metadata.clone(),
+                seq_no,
                 timestamp: Self::timestamp(),
             };
-            persistence.wal.write().append(&entry)?;
+            let mut wal = persistence.wal.write();
+            wal.append(&entry)?;
+            if let Err(e) = persistence.rotate_wal_if_needed(&mut wal) {
+                error!(
+                    error = %e,
+                    doc_id,
+                    wal_seq_no = seq_no,
+                    "failed to rotate WAL segment; continuing with current WAL"
+                );
+            }
 
             // Track inserts/updates for snapshot trigger
             // We count metadata updates towards snapshot interval to ensure WAL doesn't grow unbounded
             let mut inserts = persistence.inserts_since_snapshot.write();
             *inserts += 1;
 
-            if *inserts >= persistence.snapshot_interval {
+            if persistence.snapshot_interval > 0 && *inserts >= persistence.snapshot_interval {
+                should_snapshot = true;
                 debug!(
                     inserts = *inserts,
                     interval = persistence.snapshot_interval,
                     "snapshot interval reached (metadata update); creating snapshot"
                 );
-                drop(inserts); // Release lock before snapshot
-                               // Note: We ignore snapshot errors here to avoid failing the update
-                if let Err(e) = self.create_snapshot() {
-                    error!(error = %e, "failed to create snapshot after metadata update");
-                }
             }
         }
 
         // Update in-memory metadata
-        meta_guard[doc_id_usize] = updated_metadata.clone();
+        store.metadata[internal_id] = updated_metadata.clone();
+        drop(store);
 
         // Keep metadata inverted index in sync.
         {
             let mut meta_index = self.metadata_index.write();
-            meta_index.replace_doc(doc_id, &old_metadata, &updated_metadata);
+            meta_index.replace_doc(internal_id as u64, &old_metadata, &updated_metadata);
+        }
+
+        drop(snapshot_guard);
+
+        if should_snapshot {
+            // Note: We ignore snapshot errors here to avoid failing the update
+            if let Err(e) = self.create_snapshot() {
+                error!(error = %e, "failed to create snapshot after metadata update");
+            }
         }
 
         Ok(true)
@@ -1403,21 +1802,30 @@ impl HnswBackend {
     /// # Behavior
     /// - Logs Delete op to WAL
     /// - Clears metadata
-    /// - Sets embedding to all-zeros (tombstone)
+    /// - Removes external ID mapping (tombstone)
     /// - Does NOT remove from HNSW index immediately (soft delete)
     /// - Filtered out during search
     #[instrument(level = "debug", skip(self), fields(doc_id))]
     pub fn delete(&self, doc_id: u64) -> Result<bool> {
         // Check existence first to avoid logging unnecessary WAL entries
-        let doc_id_usize = doc_id as usize;
-        let exists = {
-            let embeddings = self.embeddings.read();
-            doc_id_usize < embeddings.len() && !embeddings[doc_id_usize].iter().all(|&x| x == 0.0)
+        let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
+
+        let mut store = self.doc_store.write();
+        let internal_id = match store.external_to_internal.get(&doc_id) {
+            Some(id) => *id,
+            None => return Ok(false),
         };
 
-        if !exists {
+        if store
+            .internal_to_external
+            .get(internal_id)
+            .and_then(|v| *v)
+            .is_none()
+        {
             return Ok(false);
         }
+
+        let mut should_snapshot = false;
 
         // Log to WAL
         if let Some(ref persistence) = self.persistence {
@@ -1428,38 +1836,66 @@ impl HnswBackend {
                 );
             }
 
+            let manifest_path = persistence.data_dir.join("MANIFEST");
+            if !manifest_path.exists() {
+                anyhow::bail!(
+                    "MANIFEST missing at {}; refusing to append WAL to avoid unrecoverable data loss",
+                    manifest_path.display()
+                );
+            }
+
+            let seq_no = persistence.next_wal_seq.fetch_add(1, Ordering::SeqCst);
             let entry = WalEntry {
                 op: WalOp::Delete,
                 doc_id,
                 embedding: vec![],
                 metadata: HashMap::new(),
+                seq_no,
                 timestamp: Self::timestamp(),
             };
-            persistence.wal.write().append(&entry)?;
+            let mut wal = persistence.wal.write();
+            wal.append(&entry)?;
+            if let Err(e) = persistence.rotate_wal_if_needed(&mut wal) {
+                error!(
+                    error = %e,
+                    doc_id,
+                    wal_seq_no = seq_no,
+                    "failed to rotate WAL segment; continuing with current WAL"
+                );
+            }
+
+            // Count deletes towards snapshot interval to bound WAL growth.
+            let mut inserts = persistence.inserts_since_snapshot.write();
+            *inserts += 1;
+            if persistence.snapshot_interval > 0 && *inserts >= persistence.snapshot_interval {
+                should_snapshot = true;
+                debug!(
+                    inserts = *inserts,
+                    interval = persistence.snapshot_interval,
+                    "snapshot interval reached (delete); creating snapshot"
+                );
+            }
         }
 
         // Update in-memory state (Soft Delete)
-        let mut embeddings = self.embeddings.write();
-        let mut metas = self.metadata.write();
+        let old_metadata = store.metadata[internal_id].clone();
+        store.internal_to_external[internal_id] = None;
+        store.external_to_internal.remove(&doc_id);
+        store.metadata[internal_id].clear();
+        drop(store);
+
         let mut meta_index = self.metadata_index.write();
+        meta_index.remove_doc(internal_id as u64, &old_metadata);
 
-        if doc_id_usize < embeddings.len() {
-            let old_metadata = metas[doc_id_usize].clone();
+        drop(snapshot_guard);
 
-            // Set to zero-vector (tombstone)
-            let dim = embeddings[doc_id_usize].len();
-            embeddings[doc_id_usize] = vec![0.0; dim];
-
-            // Clear metadata
-            metas[doc_id_usize].clear();
-
-            meta_index.remove_doc(doc_id, &old_metadata);
-
-            Ok(true)
-        } else {
-            // Should be covered by initial check, but safe fallback
-            Ok(false)
+        if should_snapshot {
+            if let Err(e) = self.create_snapshot() {
+                error!(error = %e, "failed to create snapshot after delete");
+            }
         }
+
+        Ok(true)
     }
 
     /// Batch delete documents by ID
@@ -1467,32 +1903,40 @@ impl HnswBackend {
     /// Efficiently deletes multiple documents with a single lock acquisition and batched WAL write.
     #[instrument(skip(self, doc_ids), fields(count = doc_ids.len()))]
     pub fn batch_delete(&self, doc_ids: &[u64]) -> Result<u64> {
-        // Acquire write locks
-        let mut embeddings = self.embeddings.write();
-        let mut metadata = self.metadata.write();
-        let mut meta_index = self.metadata_index.write();
+        // Acquire write lock for document store
+        let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
 
+        let mut store = self.doc_store.write();
         let mut deleted_count = 0;
         let mut wal_entries = Vec::with_capacity(doc_ids.len());
+        let mut deletes: Vec<(u64, usize, HashMap<String, String>)> = Vec::new();
         let timestamp = Self::timestamp();
 
         // First pass: identify valid deletes and prepare WAL entries
         for &doc_id in doc_ids {
-            let id_usize = doc_id as usize;
-            if id_usize < embeddings.len() {
-                let emb = &embeddings[id_usize];
-                // Check if not already tombstone
-                if !emb.iter().all(|&x| x == 0.0) {
-                    // Valid delete
-                    wal_entries.push(WalEntry {
-                        op: WalOp::Delete,
-                        doc_id,
-                        embedding: Vec::new(),
-                        metadata: HashMap::new(),
-                        timestamp,
-                    });
-                }
+            let internal_id = match store.external_to_internal.get(&doc_id) {
+                Some(id) => *id,
+                None => continue,
+            };
+
+            if store
+                .internal_to_external
+                .get(internal_id)
+                .and_then(|v| *v)
+                .is_none()
+            {
+                continue;
             }
+
+            wal_entries.push(WalEntry {
+                op: WalOp::Delete,
+                doc_id,
+                embedding: Vec::new(),
+                metadata: HashMap::new(),
+                seq_no: 0,
+                timestamp,
+            });
+            deletes.push((doc_id, internal_id, store.metadata[internal_id].clone()));
         }
 
         if wal_entries.is_empty() {
@@ -1510,13 +1954,37 @@ impl HnswBackend {
                 );
             }
 
-            persistence.wal.write().append_batch(&wal_entries)?;
+            let manifest_path = persistence.data_dir.join("MANIFEST");
+            if !manifest_path.exists() {
+                anyhow::bail!(
+                    "MANIFEST missing at {}; refusing to append WAL to avoid unrecoverable data loss",
+                    manifest_path.display()
+                );
+            }
+
+            let base_seq = persistence
+                .next_wal_seq
+                .fetch_add(wal_entries.len() as u64, Ordering::SeqCst);
+            for (idx, entry) in wal_entries.iter_mut().enumerate() {
+                entry.seq_no = base_seq + idx as u64;
+            }
+
+            let mut wal = persistence.wal.write();
+            wal.append_batch(&wal_entries)?;
+            if let Err(e) = persistence.rotate_wal_if_needed(&mut wal) {
+                error!(
+                    error = %e,
+                    docs = wal_entries.len(),
+                    wal_seq_no_base = base_seq,
+                    "failed to rotate WAL segment after batch delete; continuing with current WAL"
+                );
+            }
 
             // Update snapshot counter
             let mut inserts = persistence.inserts_since_snapshot.write();
             *inserts += wal_entries.len();
 
-            if *inserts >= persistence.snapshot_interval {
+            if persistence.snapshot_interval > 0 && *inserts >= persistence.snapshot_interval {
                 should_snapshot = true;
                 debug!(
                     inserts = *inserts,
@@ -1526,26 +1994,30 @@ impl HnswBackend {
             }
         }
 
+        let mut removed_meta: Vec<(u64, HashMap<String, String>)> = Vec::new();
+
         // Apply changes to memory
-        for entry in &wal_entries {
-            let id_usize = entry.doc_id as usize;
-
-            if let Some(meta) = metadata.get_mut(id_usize) {
-                let old_meta = std::mem::take(meta);
-                meta_index.remove_doc(entry.doc_id, &old_meta);
+        for (doc_id, internal_id, old_meta) in deletes {
+            if store.internal_to_external.get(internal_id).and_then(|v| *v) == Some(doc_id) {
+                store.internal_to_external[internal_id] = None;
+                store.external_to_internal.remove(&doc_id);
+                store.metadata[internal_id].clear();
+                removed_meta.push((internal_id as u64, old_meta));
+                deleted_count += 1;
             }
-
-            // Mark as tombstone
-            if let Some(emb) = embeddings.get_mut(id_usize) {
-                let dim = emb.len();
-                *emb = vec![0.0; dim];
-            }
-            deleted_count += 1;
         }
 
         // Release locks before snapshot
-        drop(embeddings);
-        drop(metadata);
+        drop(store);
+
+        if !removed_meta.is_empty() {
+            let mut meta_index = self.metadata_index.write();
+            for (internal_id, old_meta) in removed_meta {
+                meta_index.remove_doc(internal_id, &old_meta);
+            }
+        }
+
+        drop(snapshot_guard);
 
         if should_snapshot {
             if let Err(e) = self.create_snapshot() {
@@ -1604,29 +2076,50 @@ impl HnswBackend {
         }
 
         let index = self.index.read();
-        let embeddings = self.embeddings.read();
+        let distance = index.distance_metric();
+        let normalized_query = normalize_query_if_needed(distance, query)?;
+        let store = self.doc_store.read();
 
         // Oversample to account for tombstones (deleted documents)
         // We ask for more results, then filter out deleted ones
         // Heuristic: fetch 2x, capped at max allowed to avoid index errors
         let search_k = std::cmp::min(k * 2, 10_000);
-        let mut results = index.knn_search_with_ef(query, search_k, ef_search_override)?;
+        let mut results =
+            index.knn_search_with_ef(normalized_query.as_ref(), search_k, ef_search_override)?;
 
-        // Filter out tombstones (all-zero embeddings)
+        // Filter out tombstones and map internal IDs to external IDs
         results.retain(|r| {
-            let id = r.doc_id as usize;
-            if id < embeddings.len() {
-                // Check if embedding is all zeros (tombstone)
-                !embeddings[id].iter().all(|&x| x == 0.0)
-            } else {
-                false // Should not happen if index is consistent
-            }
+            let internal_id = r.doc_id as usize;
+            store
+                .internal_to_external
+                .get(internal_id)
+                .and_then(|v| *v)
+                .is_some()
+        });
+
+        // Ensure deterministic ordering after filtering.
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Truncate to requested k
         results.truncate(k);
 
-        Ok(results)
+        let mut mapped = Vec::with_capacity(results.len());
+        for r in results {
+            let internal_id = r.doc_id as usize;
+            if let Some(external_id) = store.internal_to_external.get(internal_id).and_then(|v| *v)
+            {
+                mapped.push(SearchResult {
+                    doc_id: external_id,
+                    distance: r.distance,
+                });
+            }
+        }
+
+        Ok(mapped)
     }
 
     /// Batch k-NN search for multiple queries in parallel.
@@ -1679,6 +2172,7 @@ impl HnswBackend {
         }
 
         let search_k = std::cmp::min(k * 2, 10_000);
+        let distance = self.index.read().distance_metric();
 
         // Process queries in parallel
         let results: Vec<Result<Vec<SearchResult>>> = queries
@@ -1686,23 +2180,46 @@ impl HnswBackend {
             .map(|query| {
                 // Acquire read locks inside the Rayon closure so we don't capture non-Send guards.
                 let index = self.index.read();
-                let mut results = index.knn_search_with_ef(query, search_k, ef_search_override)?;
+                let normalized_query = normalize_query_if_needed(distance, query)?;
+                let mut results = index.knn_search_with_ef(
+                    normalized_query.as_ref(),
+                    search_k,
+                    ef_search_override,
+                )?;
                 drop(index);
 
-                let embeddings = self.embeddings.read();
+                let store = self.doc_store.read();
 
-                // Filter out tombstones (all-zero embeddings)
+                // Filter out tombstones and map internal IDs to external IDs
                 results.retain(|r| {
-                    let id = r.doc_id as usize;
-                    if id < embeddings.len() {
-                        !embeddings[id].iter().all(|&x| x == 0.0)
-                    } else {
-                        false
-                    }
+                    let internal_id = r.doc_id as usize;
+                    store
+                        .internal_to_external
+                        .get(internal_id)
+                        .and_then(|v| *v)
+                        .is_some()
                 });
 
+                results.sort_by(|a, b| {
+                    a.distance
+                        .partial_cmp(&b.distance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 results.truncate(k);
-                Ok(results)
+
+                let mut mapped = Vec::with_capacity(results.len());
+                for r in results {
+                    let internal_id = r.doc_id as usize;
+                    if let Some(external_id) =
+                        store.internal_to_external.get(internal_id).and_then(|v| *v)
+                    {
+                        mapped.push(SearchResult {
+                            doc_id: external_id,
+                            distance: r.distance,
+                        });
+                    }
+                }
+                Ok(mapped)
             })
             .collect();
 
@@ -1715,11 +2232,20 @@ impl HnswBackend {
     /// Fast path uses the inverted index for `Exact`, `InMatch`, `AndFilter`, `OrFilter`, and `NotFilter`.
     /// Falls back to `scan()` for `Range` (and any shape we cannot compile) to preserve correctness.
     pub fn ids_for_metadata_filter(&self, filter: &MetadataFilter) -> Vec<u64> {
+        let store = self.doc_store.read();
         let meta_index = self.metadata_index.read();
         if let Some(mut bitmap) = compile_filter_to_bitmap(filter, &meta_index) {
             // Defensive: ensure tombstones are excluded even if a value bitmap is stale.
             bitmap &= meta_index.alive.clone();
-            return bitmap.iter().collect();
+            return bitmap
+                .iter()
+                .filter_map(|internal_id| {
+                    store
+                        .internal_to_external
+                        .get(internal_id as usize)
+                        .and_then(|v| *v)
+                })
+                .collect();
         }
 
         self.scan(|meta| metadata_filter::matches(filter, meta))
@@ -1734,17 +2260,17 @@ impl HnswBackend {
     where
         F: Fn(&HashMap<String, String>) -> bool,
     {
-        let metas = self.metadata.read();
-        let embeddings = self.embeddings.read();
-        let total_len = std::cmp::min(metas.len(), embeddings.len());
+        let store = self.doc_store.read();
+        let total_len = std::cmp::min(store.metadata.len(), store.internal_to_external.len());
 
         let mut out = Vec::new();
         for id in 0..total_len {
-            if embeddings[id].iter().all(|&x| x == 0.0) {
-                continue;
-            }
-            if predicate(&metas[id]) {
-                out.push(id as u64);
+            let external_id = match store.internal_to_external[id] {
+                Some(doc_id) => doc_id,
+                None => continue,
+            };
+            if predicate(&store.metadata[id]) {
+                out.push(external_id);
             }
         }
 
@@ -1761,12 +2287,14 @@ impl HnswBackend {
 
     /// Compact old WAL segments that are fully captured in the snapshot
     ///
-    /// Deletes WAL files where all entries have timestamp <= snapshot_timestamp.
+    /// Deletes WAL files where all entries are covered by the snapshot, using
+    /// sequence numbers when available and falling back to timestamps for legacy entries.
     /// This prevents unbounded disk usage from accumulating WAL segments.
     ///
     /// # Parameters
     /// - `data_dir`: Directory containing WAL files
-    /// - `snapshot_timestamp`: Timestamp of the just-created snapshot
+    /// - `snapshot_last_wal_seq`: Last WAL sequence number included in the snapshot
+    /// - `snapshot_timestamp`: Snapshot timestamp (for legacy WAL entries)
     /// - `manifest`: Manifest to update (removes deleted WAL segments)
     ///
     /// # Returns
@@ -1776,15 +2304,21 @@ impl HnswBackend {
     /// - Only deletes WAL segments listed in manifest (controlled cleanup)
     /// - Always keeps the current active WAL segment (last in list)
     /// - Updates manifest atomically after successful deletion
-    #[instrument(level = "debug", skip(self, data_dir, manifest), fields(snapshot_ts = snapshot_timestamp))]
+    #[instrument(level = "debug", skip(self, data_dir, manifest), fields(snapshot_seq = snapshot_last_wal_seq, snapshot_ts = snapshot_timestamp))]
     fn compact_old_wal_segments(
         &self,
         data_dir: &Path,
+        snapshot_last_wal_seq: u64,
         snapshot_timestamp: u64,
         manifest: &mut Manifest,
     ) -> Result<usize> {
         let mut deleted_count = 0;
         let mut segments_to_keep = Vec::new();
+
+        if snapshot_last_wal_seq == 0 && snapshot_timestamp == 0 {
+            warn!("snapshot has no sequence or timestamp; skipping WAL compaction for safety");
+            return Ok(0);
+        }
 
         // Always keep the last WAL segment (active WAL)
         let active_wal_index = manifest.wal_segments.len().saturating_sub(1);
@@ -1796,58 +2330,109 @@ impl HnswBackend {
                 continue;
             }
 
-            // Extract timestamp from WAL filename (format: "wal_{timestamp}.wal")
-            let wal_timestamp = wal_name
-                .strip_prefix("wal_")
-                .and_then(|s| s.strip_suffix(".wal"))
-                .and_then(|s| s.parse::<u64>().ok());
+            let wal_path = data_dir.join(wal_name);
+            if !wal_path.exists() {
+                warn!(wal_segment = wal_name, "WAL segment missing; skipping");
+                continue;
+            }
 
-            match wal_timestamp {
-                Some(ts) if ts <= snapshot_timestamp => {
-                    // This WAL segment is fully captured in snapshot - safe to delete
-                    let wal_path = data_dir.join(wal_name);
+            let mut reader = match WalReader::open(&wal_path) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    warn!(wal_segment = wal_name, error = %e, "failed to open WAL segment; keeping");
+                    segments_to_keep.push(wal_name.clone());
+                    continue;
+                }
+            };
 
-                    match std::fs::remove_file(&wal_path) {
-                        Ok(()) => {
-                            debug!(
-                                wal_segment = wal_name,
-                                wal_ts = ts,
-                                snapshot_ts = snapshot_timestamp,
-                                "deleted old WAL segment",
-                            );
-                            deleted_count += 1;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // Already deleted or never existed - not an error
-                            warn!(
-                                wal_segment = wal_name,
-                                "WAL segment already missing (skipping)"
-                            );
-                            deleted_count += 1; // Still count as "compacted"
-                        }
-                        Err(e) => {
-                            // Log error but continue - don't fail compaction for one bad file
-                            error!(
-                                wal_segment = wal_name,
-                                error = %e,
-                                "failed to delete old WAL segment",
-                            );
-                            segments_to_keep.push(wal_name.clone()); // Keep in manifest
-                        }
+            let entries = match reader.read_all() {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!(wal_segment = wal_name, error = %e, "failed to read WAL segment; keeping");
+                    segments_to_keep.push(wal_name.clone());
+                    continue;
+                }
+            };
+
+            if reader.corrupted_entries() > 0 {
+                warn!(
+                    wal_segment = wal_name,
+                    corrupted = reader.corrupted_entries(),
+                    "WAL segment has corrupted entries; keeping for safety"
+                );
+                segments_to_keep.push(wal_name.clone());
+                continue;
+            }
+
+            let mut max_seq = 0u64;
+            let mut max_timestamp = 0u64;
+            let mut has_unknown_timestamp = false;
+            let mut has_legacy = false;
+            let mut all_entries_covered = true;
+            for entry in &entries {
+                if entry.seq_no == 0 {
+                    has_legacy = true;
+                    if entry.timestamp == 0 {
+                        has_unknown_timestamp = true;
+                    } else if entry.timestamp > max_timestamp {
+                        max_timestamp = entry.timestamp;
+                    }
+                } else if entry.seq_no > max_seq {
+                    max_seq = entry.seq_no;
+                }
+
+                let covered = if entry.seq_no > 0 && snapshot_last_wal_seq > 0 {
+                    entry.seq_no <= snapshot_last_wal_seq
+                } else if entry.seq_no == 0 && snapshot_timestamp > 0 && entry.timestamp > 0 {
+                    entry.timestamp <= snapshot_timestamp
+                } else {
+                    false
+                };
+
+                if !covered {
+                    all_entries_covered = false;
+                }
+            }
+
+            if has_legacy && has_unknown_timestamp {
+                warn!(
+                    wal_segment = wal_name,
+                    "WAL segment contains legacy entries without timestamps; keeping"
+                );
+                segments_to_keep.push(wal_name.clone());
+                continue;
+            }
+
+            if all_entries_covered {
+                match std::fs::remove_file(&wal_path) {
+                    Ok(()) => {
+                        debug!(
+                            wal_segment = wal_name,
+                            wal_max_seq = max_seq,
+                            wal_max_ts = max_timestamp,
+                            snapshot_seq = snapshot_last_wal_seq,
+                            snapshot_ts = snapshot_timestamp,
+                            "deleted old WAL segment",
+                        );
+                        deleted_count += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        warn!(
+                            wal_segment = wal_name,
+                            "WAL segment already missing (skipping)"
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            wal_segment = wal_name,
+                            error = %e,
+                            "failed to delete old WAL segment",
+                        );
+                        segments_to_keep.push(wal_name.clone());
                     }
                 }
-                Some(_) => {
-                    // WAL segment newer than snapshot - keep it
-                    segments_to_keep.push(wal_name.clone());
-                }
-                None => {
-                    // Failed to parse timestamp - keep segment for safety
-                    warn!(
-                        wal_segment = wal_name,
-                        "failed to parse WAL timestamp; keeping segment"
-                    );
-                    segments_to_keep.push(wal_name.clone());
-                }
+            } else {
+                segments_to_keep.push(wal_name.clone());
             }
         }
 
@@ -1856,6 +2441,61 @@ impl HnswBackend {
 
         Ok(deleted_count)
     }
+}
+
+fn normalize_in_place_if_needed(distance: DistanceMetric, embedding: &mut [f32]) -> Result<()> {
+    if !matches!(
+        distance,
+        DistanceMetric::Cosine | DistanceMetric::InnerProduct
+    ) {
+        return Ok(());
+    }
+
+    let norm_sq = crate::simd::sum_squares_f32(embedding);
+    if norm_sq <= f32::EPSILON {
+        anyhow::bail!(
+            "embedding norm is zero; cannot normalize for {:?}",
+            distance
+        );
+    }
+    if (NORMALIZATION_NORM_SQ_MIN..=NORMALIZATION_NORM_SQ_MAX).contains(&norm_sq) {
+        return Ok(());
+    }
+
+    let inv_norm = 1.0 / norm_sq.sqrt();
+    for v in embedding {
+        *v *= inv_norm;
+    }
+
+    Ok(())
+}
+
+fn normalize_query_if_needed<'a>(
+    distance: DistanceMetric,
+    query: &'a [f32],
+) -> Result<Cow<'a, [f32]>> {
+    if !matches!(
+        distance,
+        DistanceMetric::Cosine | DistanceMetric::InnerProduct
+    ) {
+        return Ok(Cow::Borrowed(query));
+    }
+
+    let norm_sq = crate::simd::sum_squares_f32(query);
+    if norm_sq <= f32::EPSILON {
+        anyhow::bail!("query embedding norm is zero; cannot normalize");
+    }
+    if (NORMALIZATION_NORM_SQ_MIN..=NORMALIZATION_NORM_SQ_MAX).contains(&norm_sq) {
+        return Ok(Cow::Borrowed(query));
+    }
+
+    let mut normalized = query.to_vec();
+    let inv_norm = 1.0 / norm_sq.sqrt();
+    for v in &mut normalized {
+        *v *= inv_norm;
+    }
+
+    Ok(Cow::Owned(normalized))
 }
 
 #[cfg(test)]
@@ -2015,7 +2655,8 @@ mod tests {
             100,
             data_dir,
             FsyncPolicy::Never,
-            5, // Snapshot every 5 inserts
+            5,    // Snapshot every 5 inserts
+            1024, // Rotate WAL aggressively to exercise compaction
         )
         .unwrap();
 
@@ -2104,6 +2745,7 @@ mod tests {
             temp_dir.path(),
             FsyncPolicy::Never,
             100,
+            1024 * 1024,
         )
         .unwrap();
 

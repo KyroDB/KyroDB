@@ -8,31 +8,22 @@ The two-level L1 cache combines two complementary caching strategies:
 
 | Layer | Name | Strategy | Hit Rate |
 |-------|------|----------|----------|
-| L1a | Document Cache | Frequency prediction (RMI) | ~63% |
-| L1b | Query Cache | Semantic similarity | ~10% |
+| L1a | Document Cache | Learned hotness prediction (freq+recency) | ~63% |
+| L1b | Semantic search‑result cache | Semantic similarity | ~10% |
 | **Combined** | | | **~73%** |
 
 Traditional LRU caches achieve 25-35% hit rates on typical RAG workloads. KyroDB's two-level cache delivers 2-3x improvement.
 
 ## How It Works
 
-### Query Flow
+### Search Query Flow (k‑NN)
 
 ```
 Incoming Query
       │
       ▼
 ┌─────────────────────────────────────────┐
-│  L1a: Document Cache                    │
-│  "Is this document frequently accessed?"│
-│  • RMI predicts document hotness        │
-│  • O(1) lookup by doc_id                │
-│  • Hit rate: ~63%                       │
-└─────────────────────────────────────────┘
-      │ (miss)
-      ▼
-┌─────────────────────────────────────────┐
-│  L1b: Query Cache                       │
+│  L1b: Semantic search‑result cache      │
 │  "Have we seen a similar query before?" │
 │  • Matches paraphrased queries          │
 │  • Cosine similarity >= 0.52 threshold  │
@@ -42,15 +33,53 @@ Incoming Query
       ▼
 ┌─────────────────────────────────────────┐
 │  L2: Hot Tier (recent writes)           │
+│  BTree keyed by doc_id; holds recently  │
+│  inserted/updated vectors. Entries age  │
+│  out after hot_tier_max_age_secs or are │
+│  flushed when size limits are reached.  │
+│  Queries hit L2 on L1 miss before       │
+│  falling through to L3.                 │
 └─────────────────────────────────────────┘
       │ (miss)
       ▼
 ┌─────────────────────────────────────────┐
 │  L3: Cold Tier (HNSW index)             │
+│  Long-term vector storage backed by the │
+│  HNSW index. Data is compacted here     │
+│  from L2 during background flushes.     │
+│  Handles k-NN search for the full       │
+│  indexed dataset.                       │
 └─────────────────────────────────────────┘
 ```
 
-### L1a: Document Cache (RMI Frequency Prediction)
+### Point Lookup Flow (doc_id)
+
+```
+Incoming Get (doc_id)
+      │
+      ▼
+┌─────────────────────────────────────────┐
+│  L1a: Document Cache                    │
+│  "Is this document frequently accessed?"│
+│  • Predictor estimates document hotness │
+│  • O(1) lookup by doc_id                │
+│  • Hit rate: ~63%                       │
+└─────────────────────────────────────────┘
+      │ (miss)
+      ▼
+┌─────────────────────────────────────────┐
+│  L2: Hot Tier (recent writes)           │
+│  BTree lookup by doc_id for recent data │
+└─────────────────────────────────────────┘
+      │ (miss)
+      ▼
+┌─────────────────────────────────────────┐
+│  L3: Cold Tier (HNSW index)             │
+│  Full indexed dataset (persistent)      │
+└─────────────────────────────────────────┘
+```
+
+### L1a: Document Cache (Learned hotness prediction)
 
 The document cache predicts which documents are "hot" based on access frequency patterns.
 
@@ -67,17 +96,19 @@ Note on retraining:
 - In `kyrodb_server`, this is controlled by `cache.enable_training_task`.
 
 **Why it works for RAG:**
-RAG workloads follow Zipfian distributions - a small subset of documents (FAQs, popular topics) receive most queries. The RMI learns this pattern and pre-caches hot documents.
+RAG workloads follow Zipfian distributions - a small subset of documents (FAQs, popular topics) receive most queries. The predictor learns this pattern and pre-caches hot documents.
 
-### L1b: Query Cache (Semantic Similarity)
+### L1b: Semantic search‑result cache (Semantic similarity)
 
 The query cache handles a different problem: paraphrased queries asking the same thing.
 
 **How it works:**
-1. Store query embeddings with their results
+1. Store query embeddings with their top‑k search results (k = number of neighbors requested per search, e.g., `k=10` in benchmarks; controlled by the `SearchRequest.k` field)
 2. For new queries, compute cosine similarity against cached queries
-3. If similarity >= 0.52, return the cached result
+3. If similarity >= 0.52, return the cached top‑k results
 4. On cache full, LRU eviction removes oldest entries
+
+Changing `k` affects cache memory and reuse: larger `k` stores more results per cached query (higher memory, potentially better downstream recall), while smaller `k` reduces memory footprint but may under‑serve rerankers that expect a deeper candidate set.
 
 **Why it works for RAG:**
 Users ask the same question in different ways:
@@ -85,7 +116,7 @@ Users ask the same question in different ways:
 - "Password reset instructions"
 - "Can't log in, need to change password"
 
-All these queries should return the same document. The query cache catches these paraphrases.
+All these queries should return the same evidence set (top‑k). The query cache catches these paraphrases.
 
 ## Why Two Levels?
 
@@ -117,8 +148,13 @@ The current `kyrodb_server` behavior is:
       - `cache.query_cache_similarity_threshold` (default: 0.52)
 
 The `0.52` default comes from a quick empirical check using the bundled
-MS MARCO query embeddings (see `scripts/evaluate_query_cache_threshold.py`).
-On that dataset, thresholds in the 0.8+ range yield near-zero similarity hits.
+MS MARCO query embeddings (see `scripts/evaluate_query_cache_threshold.py --pairs 20000`).
+On that dataset:
+
+- `t=0.52` yields **TPR=0.396**, **FPR≈0.0000**, **FNR=0.604** (balanced sample).
+- Thresholds in the **0.8+** range yield near‑zero similarity hits.
+
+This reflects the tradeoff: lower thresholds increase hit rate but risk semantic drift; higher thresholds are stricter but often miss paraphrases. As a rule of thumb, use **~0.5–0.65** for higher recall/hit rate and **~0.7–0.8** for stricter reuse. Values **>0.8** are extremely strict and often produce minimal hits (including on the MS MARCO sample); only use them if your workload has very consistent paraphrases and you can tolerate low cache hit rate.
 
 ### Tuning Guidelines
 
@@ -159,8 +195,8 @@ This bimodal distribution is expected and shows the cache is working correctly.
 | Component | Memory |
 |-----------|--------|
 | L1a (180 docs, 384-dim) | ~280 KB |
-| L1b (100 queries, 384-dim) | ~155 KB |
-| RMI predictor | ~50 KB |
+| L1b (100 queries, 384-dim, k=10) | ~170 KB |
+| Predictor | ~50 KB |
 | Access logger (ring buffer, 1,000,000 events) | ~24 MB |
 | **Total L1 overhead** | **~25 MB** |
 
@@ -193,6 +229,8 @@ kyrodb_cache_hit_rate
 kyrodb_training_cycles_completed_total
 ```
 
+The L1a/L1b hit rates shown in **Validated Results** come from the validation harness instrumentation (not from the aggregate `/metrics` counters).
+
 ## Troubleshooting
 
 ### Low Hit Rate (< 60%)
@@ -201,7 +239,7 @@ kyrodb_training_cycles_completed_total
 1. **High cold traffic ratio**: If >40% of queries are for never-seen documents, hit rate will be lower
 2. **Cache too small**: Increase `cache.capacity` and `cache.query_cache_capacity`
 3. **Workload not Zipfian**: Uniform access patterns don't benefit from frequency prediction
-4. **Short training window**: RMI needs time to learn patterns
+4. **Short training window**: predictor needs time to learn patterns
 
 **Diagnosis:**
 ```bash
@@ -212,8 +250,8 @@ curl localhost:51051/metrics | grep kyrodb_cache
 ### High Memory Usage
 
 **Possible causes:**
-1. **Cache capacity too large**: Reduce `document_cache_capacity`
-2. **Access logger too large**: Reduce `logger_window_size`
+1. **Cache capacity too large**: Reduce `cache.capacity`
+2. **Access logger too large**: Reduce `cache.logger_window_size`
 
 **Diagnosis:**
 ```bash
@@ -224,7 +262,7 @@ curl localhost:51051/metrics | grep kyrodb_memory
 ### Slow Training
 
 **Possible causes:**
-1. **Large access log**: RMI training time scales with log size
+1. **Large access log**: predictor training time scales with log size
 2. **Too frequent training**: Increase `training_interval_secs`
 
 **Diagnosis:**

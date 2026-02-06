@@ -1,6 +1,6 @@
 //! Query Hash Cache - L1b Cache Layer for Semantic Similarity
 //!
-//! **Purpose**: Cache query→document mappings based on semantic similarity.
+//! **Purpose**: Cache query→top‑k search results based on semantic similarity.
 //! Complements the document-level cache (L1a) by caching paraphrased queries.
 //!
 //! # Architecture
@@ -13,7 +13,7 @@
 //! - "Explain machine learning" (query 2, similar to query 1)
 //! - "Define ML" (query 3, similar to queries 1 and 2)
 //!
-//! Without query cache: Each query misses L1a, hits cold tier (slow)
+//! Without query cache: Each query hits hot/cold tier search
 //! With query cache: Query 2 and 3 hit L1b (fast, semantic match)
 //!
 //! # Performance
@@ -28,18 +28,23 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::hnsw_index::SearchResult;
+
 /// Cached query result
 ///
-/// Stores the result of a query (doc_id + embedding) indexed by query hash.
-/// When a similar query arrives, we can return this cached result without
-/// searching the cold tier.
+/// Stores the top‑k search results for a query, indexed by query hash.
+/// When a similar query arrives, we can return cached results without
+/// re-running vector search.
 #[derive(Clone, Debug)]
 pub struct CachedQueryResult {
-    /// Document ID that matches this query
-    pub doc_id: u64,
+    /// Top-k search results for this query
+    pub results: Vec<SearchResult>,
 
-    /// Document embedding
-    pub embedding: Vec<f32>,
+    /// The `k` value used when computing `results` (before truncation).
+    ///
+    /// This allows the cache to safely answer requests for smaller `k` values by slicing, while
+    /// forcing a miss for larger `k` values so callers can recompute accurate results.
+    pub requested_k: usize,
 
     /// Query hash (for exact match lookups)
     pub query_hash: u64,
@@ -81,7 +86,7 @@ pub struct QueryCacheStats {
 
 /// Query hash cache - L1b cache layer
 ///
-/// Caches query→document mappings based on semantic similarity.
+/// Caches query→top‑k search results based on semantic similarity.
 /// Uses two-level lookup:
 /// 1. Exact match: O(1) hash lookup
 /// 2. Similarity scan: O(k) cosine similarity (k = min(cache_size, scan_limit))
@@ -162,32 +167,41 @@ impl QueryHashCache {
     /// - Similarity scan: <1μs (2000 queries × 0.5ns per comparison)
     ///
     /// # Returns
-    /// - `Some(CachedQueryResult)` if exact or similarity match found
+    /// - `Some(Vec<SearchResult>)` if exact or similarity match found
     /// - `None` if no match
-    pub fn get(&self, query_embedding: &[f32]) -> Option<CachedQueryResult> {
+    pub fn get(&self, query_embedding: &[f32], k: usize) -> Option<Vec<SearchResult>> {
         let query_hash = Self::hash_embedding(query_embedding);
 
         // Step 1: Try exact match (fast path)
         {
             let cache = self.cache.read();
             if let Some(cached) = cache.get(&query_hash) {
-                // Exact match - update LRU and stats
+                // Exact match - update LRU.
                 self.update_lru(query_hash);
-                self.stats.write().exact_hits += 1;
-                return Some(cached.clone());
+
+                if cached.requested_k >= k {
+                    self.stats.write().exact_hits += 1;
+                    let take = k.min(cached.results.len());
+                    return Some(cached.results[..take].to_vec());
+                }
+
+                // Exact entry exists but was computed with a smaller k; do not fall through to
+                // similarity matching (would return unrelated results). Force a miss so the caller
+                // recomputes with the correct k.
+                self.stats.write().misses += 1;
+                return None;
             }
         }
 
         // Step 2: Try similarity match (slower path)
-        self.find_similar_query(query_embedding, query_hash)
+        self.find_similar_query(query_embedding, query_hash, k)
     }
 
-    /// Insert query→document mapping into cache
+    /// Insert query→search results into cache
     ///
     /// # Parameters
     /// - `query_embedding`: Query vector (will be hashed and stored)
-    /// - `doc_id`: Document ID that matches this query
-    /// - `embedding`: Document embedding
+    /// - `results`: Top-k search results for this query
     ///
     /// # Returns
     /// - `Some(query_hash)` if an eviction occurred
@@ -195,13 +209,20 @@ impl QueryHashCache {
     ///
     /// # Eviction Policy
     /// LRU eviction when cache is full (evicts least recently used query)
-    pub fn insert(
+    pub fn insert(&self, query_embedding: Vec<f32>, results: Vec<SearchResult>) -> Option<u64> {
+        let requested_k = results.len();
+        self.insert_with_k(query_embedding, results, requested_k)
+    }
+
+    pub fn insert_with_k(
         &self,
         query_embedding: Vec<f32>,
-        doc_id: u64,
-        embedding: Vec<f32>,
+        results: Vec<SearchResult>,
+        requested_k: usize,
     ) -> Option<u64> {
         let query_hash = Self::hash_embedding(&query_embedding);
+
+        let requested_k = requested_k.max(results.len());
 
         let mut cache = self.cache.write();
         let mut query_embs = self.query_embeddings.write();
@@ -209,14 +230,17 @@ impl QueryHashCache {
 
         // Check if already in cache (update case)
         if let std::collections::hash_map::Entry::Occupied(mut e) = cache.entry(query_hash) {
-            // Update existing entry
-            e.insert(CachedQueryResult {
-                doc_id,
-                embedding,
-                query_hash,
-                cached_at: Instant::now(),
-            });
-            query_embs.insert(query_hash, query_embedding);
+            let existing_k = e.get().requested_k;
+            if requested_k >= existing_k {
+                // Update existing entry (monotonic: keep the larger-k entry).
+                e.insert(CachedQueryResult {
+                    results,
+                    requested_k,
+                    query_hash,
+                    cached_at: Instant::now(),
+                });
+                query_embs.insert(query_hash, query_embedding);
+            }
 
             // Move to back of LRU queue
             if let Some(pos) = lru.iter().position(|&h| h == query_hash) {
@@ -248,8 +272,8 @@ impl QueryHashCache {
         cache.insert(
             query_hash,
             CachedQueryResult {
-                doc_id,
-                embedding,
+                results,
+                requested_k,
                 query_hash,
                 cached_at: Instant::now(),
             },
@@ -335,7 +359,7 @@ impl QueryHashCache {
 
         let mut removed_hashes = Vec::new();
         cache.retain(|&hash, entry| {
-            if entry.doc_id == doc_id {
+            if entry.results.iter().any(|r| r.doc_id == doc_id) {
                 removed_hashes.push(hash);
                 false
             } else {
@@ -400,7 +424,8 @@ impl QueryHashCache {
         &self,
         query_embedding: &[f32],
         query_hash: u64,
-    ) -> Option<CachedQueryResult> {
+        k: usize,
+    ) -> Option<Vec<SearchResult>> {
         let query_embs = self.query_embeddings.read();
         let cache = self.cache.read();
         let lru = self.lru_queue.read();
@@ -415,6 +440,15 @@ impl QueryHashCache {
         for &candidate_hash in candidates {
             if candidate_hash == query_hash {
                 continue; // Skip self (already checked in exact match)
+            }
+
+            let candidate = match cache.get(&candidate_hash) {
+                Some(candidate) => candidate,
+                None => continue,
+            };
+
+            if candidate.requested_k < k {
+                continue;
             }
 
             if let Some(candidate_emb) = query_embs.get(&candidate_hash) {
@@ -438,7 +472,10 @@ impl QueryHashCache {
             stats.similarity_hits += 1;
             stats.total_similarity_score += best_similarity as f64;
 
-            cache.get(&matched_hash).cloned()
+            cache.get(&matched_hash).map(|cached| {
+                let take = k.min(cached.results.len());
+                cached.results[..take].to_vec()
+            })
         } else {
             // No match - record miss
             drop(query_embs);
@@ -521,24 +558,29 @@ mod tests {
         similar
     }
 
+    fn make_results(doc_id: u64) -> Vec<SearchResult> {
+        vec![SearchResult {
+            doc_id,
+            distance: 0.0,
+        }]
+    }
+
     #[test]
     fn test_query_cache_basic() {
         let cache = QueryHashCache::new(10, 0.85);
 
         let query = create_test_embedding(1, 128);
-        let doc_emb = create_test_embedding(100, 128);
-
         // Cache miss
-        assert!(cache.get(&query).is_none());
+        assert!(cache.get(&query, 1).is_none());
         assert_eq!(cache.stats().misses, 1);
 
         // Insert
-        cache.insert(query.clone(), 42, doc_emb.clone());
+        cache.insert(query.clone(), make_results(42));
         assert_eq!(cache.len(), 1);
 
         // Cache hit (exact match)
-        let cached = cache.get(&query).unwrap();
-        assert_eq!(cached.doc_id, 42);
+        let cached = cache.get(&query, 1).unwrap();
+        assert_eq!(cached[0].doc_id, 42);
         assert_eq!(cache.stats().exact_hits, 1);
         assert_eq!(cache.stats().total_hits, 1);
     }
@@ -548,18 +590,16 @@ mod tests {
         let cache = QueryHashCache::new(10, 0.90);
 
         let base_query = create_test_embedding(1, 128);
-        let doc_emb = create_test_embedding(100, 128);
-
         // Insert base query
-        cache.insert(base_query.clone(), 42, doc_emb.clone());
+        cache.insert(base_query.clone(), make_results(42));
 
         // Create similar query (small noise)
         let similar_query = create_similar_embedding(&base_query, 0.01);
 
         // Should hit via similarity match
-        let cached = cache.get(&similar_query);
+        let cached = cache.get(&similar_query, 1);
         assert!(cached.is_some(), "Similar query should hit cache");
-        assert_eq!(cached.unwrap().doc_id, 42);
+        assert_eq!(cached.unwrap()[0].doc_id, 42);
 
         let stats = cache.stats();
         assert_eq!(stats.similarity_hits, 1);
@@ -571,39 +611,23 @@ mod tests {
         let cache = QueryHashCache::new(3, 0.85);
 
         // Fill cache
-        cache.insert(
-            create_test_embedding(1, 128),
-            1,
-            create_test_embedding(101, 128),
-        );
-        cache.insert(
-            create_test_embedding(2, 128),
-            2,
-            create_test_embedding(102, 128),
-        );
-        cache.insert(
-            create_test_embedding(3, 128),
-            3,
-            create_test_embedding(103, 128),
-        );
+        cache.insert(create_test_embedding(1, 128), make_results(1));
+        cache.insert(create_test_embedding(2, 128), make_results(2));
+        cache.insert(create_test_embedding(3, 128), make_results(3));
         assert_eq!(cache.len(), 3);
 
         // Insert 4th query, should evict query 1 (oldest)
-        cache.insert(
-            create_test_embedding(4, 128),
-            4,
-            create_test_embedding(104, 128),
-        );
+        cache.insert(create_test_embedding(4, 128), make_results(4));
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.stats().evictions, 1);
 
         // Query 1 should be evicted
-        assert!(cache.get(&create_test_embedding(1, 128)).is_none());
+        assert!(cache.get(&create_test_embedding(1, 128), 1).is_none());
 
         // Queries 2, 3, 4 should still be present
-        assert!(cache.get(&create_test_embedding(2, 128)).is_some());
-        assert!(cache.get(&create_test_embedding(3, 128)).is_some());
-        assert!(cache.get(&create_test_embedding(4, 128)).is_some());
+        assert!(cache.get(&create_test_embedding(2, 128), 1).is_some());
+        assert!(cache.get(&create_test_embedding(3, 128), 1).is_some());
+        assert!(cache.get(&create_test_embedding(4, 128), 1).is_some());
     }
 
     #[test]
@@ -616,25 +640,25 @@ mod tests {
         let q4 = create_test_embedding(4, 128);
 
         // Fill cache
-        cache.insert(q1.clone(), 1, create_test_embedding(101, 128));
-        cache.insert(q2.clone(), 2, create_test_embedding(102, 128));
-        cache.insert(q3.clone(), 3, create_test_embedding(103, 128));
+        cache.insert(q1.clone(), make_results(1));
+        cache.insert(q2.clone(), make_results(2));
+        cache.insert(q3.clone(), make_results(3));
 
         // Access query 1 (moves to back of LRU)
-        cache.get(&q1);
+        cache.get(&q1, 1);
 
         // Insert query 4, should evict query 2 (now oldest)
-        cache.insert(q4.clone(), 4, create_test_embedding(104, 128));
+        cache.insert(q4.clone(), make_results(4));
 
         // Query 1 should still be present (accessed recently)
-        assert!(cache.get(&q1).is_some());
+        assert!(cache.get(&q1, 1).is_some());
 
         // Query 2 should be evicted
-        assert!(cache.get(&q2).is_none());
+        assert!(cache.get(&q2, 1).is_none());
 
         // Queries 3, 4 should be present
-        assert!(cache.get(&q3).is_some());
-        assert!(cache.get(&q4).is_some());
+        assert!(cache.get(&q3, 1).is_some());
+        assert!(cache.get(&q4, 1).is_some());
     }
 
     #[test]
@@ -669,19 +693,11 @@ mod tests {
     fn test_query_cache_clear() {
         let cache = QueryHashCache::new(10, 0.85);
 
-        cache.insert(
-            create_test_embedding(1, 128),
-            1,
-            create_test_embedding(101, 128),
-        );
-        cache.insert(
-            create_test_embedding(2, 128),
-            2,
-            create_test_embedding(102, 128),
-        );
+        cache.insert(create_test_embedding(1, 128), make_results(1));
+        cache.insert(create_test_embedding(2, 128), make_results(2));
 
         assert_eq!(cache.len(), 2);
-        cache.get(&create_test_embedding(1, 128));
+        cache.get(&create_test_embedding(1, 128), 1);
 
         cache.clear();
 
@@ -697,14 +713,14 @@ mod tests {
         let q1 = create_test_embedding(1, 128);
         let q2 = create_test_embedding(2, 128);
 
-        cache.insert(q1.clone(), 1, create_test_embedding(101, 128));
-        cache.insert(q2.clone(), 2, create_test_embedding(102, 128));
+        cache.insert(q1.clone(), make_results(1));
+        cache.insert(q2.clone(), make_results(2));
 
         // 2 hits, 2 misses
-        cache.get(&q1); // Hit
-        cache.get(&q2); // Hit
-        cache.get(&create_test_embedding(3, 128)); // Miss
-        cache.get(&create_test_embedding(4, 128)); // Miss
+        cache.get(&q1, 1); // Hit
+        cache.get(&q2, 1); // Hit
+        cache.get(&create_test_embedding(3, 128), 1); // Miss
+        cache.get(&create_test_embedding(4, 128), 1); // Miss
 
         let stats = cache.stats();
         assert_eq!(stats.total_hits, 2);
@@ -717,14 +733,14 @@ mod tests {
         let cache = QueryHashCache::new(10, 0.95); // High threshold
 
         let base = create_test_embedding(1, 128);
-        cache.insert(base.clone(), 42, create_test_embedding(100, 128));
+        cache.insert(base.clone(), make_results(42));
 
         // Very similar query (small noise) - should hit
         let very_similar = create_similar_embedding(&base, 0.001);
-        assert!(cache.get(&very_similar).is_some());
+        assert!(cache.get(&very_similar, 1).is_some());
 
         // Somewhat similar query (medium noise) - should miss (below threshold)
         let somewhat_similar = create_similar_embedding(&base, 0.1);
-        assert!(cache.get(&somewhat_similar).is_none());
+        assert!(cache.get(&somewhat_similar, 1).is_none());
     }
 }

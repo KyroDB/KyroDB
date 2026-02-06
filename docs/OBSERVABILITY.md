@@ -35,8 +35,16 @@ scrape_configs:
 ```promql
 rate(kyrodb_queries_total[1m])
 kyrodb_query_latency_ns{percentile="99"} / 1000000
-rate(kyrodb_queries_failed[5m]) / rate(kyrodb_queries_total[5m]) * 100
 ```
+
+Error rate (safe against divide-by-zero when `kyrodb_queries_total` has no samples):
+
+```promql
+# Safe pattern: clamp_min prevents division by zero
+rate(kyrodb_queries_failed[5m]) / clamp_min(rate(kyrodb_queries_total[5m]), 1e-10) * 100
+```
+
+> **Note**: The raw `rate(kyrodb_queries_failed[5m]) / rate(kyrodb_queries_total[5m]) * 100` will return `NaN` when there are no query samples. The `clamp_min` wrapper ensures the denominator is never zero.
 
 ### Cache performance
 
@@ -108,6 +116,8 @@ curl http://localhost:51051/ready
 {"ready":true,"status":"ready"}
 ```
 
+> Both `ready` (boolean) and `status` (string) are intentionally present: `ready` is the canonical programmatic field for automated health checks (K8s probes, load balancers), while `status` provides a human-readable label useful in dashboards and logs. Consumers should key on the `ready` boolean for readiness decisions.
+
 K8s configuration:
 
 ```yaml
@@ -146,14 +156,14 @@ Example response:
     "max_error_rate": 0.001,
     "min_availability": 0.999,
     "min_cache_hit_rate": 0.7,
-    "p99_latency_ns": 1000000
+    "p99_latency_ns": 10000000
   }
 }
 ```
 
 SLO targets:
 
-- P99 latency: < 1ms
+- P99 latency: < 10ms
 - Cache hit rate: > 70%
 - Error rate: < 0.1%
 - Availability: > 99.9%
@@ -166,12 +176,12 @@ groups:
 - name: kyrodb_slo
   rules:
   - alert: KyroDBHighLatency
-    expr: kyrodb_query_latency_ns{percentile="99"} > 1000000
+    expr: kyrodb_query_latency_ns{percentile="99"} > 10000000
     for: 5m
     labels:
       severity: warning
     annotations:
-      summary: "P99 latency {{ $value | humanize }}ns exceeds 1ms SLO"
+      summary: "P99 latency {{ $value | humanizeDuration }} exceeds 10ms SLO"
 
   - alert: KyroDBLowCacheHit
     expr: kyrodb_cache_hit_rate < 0.70
@@ -227,6 +237,15 @@ groups:
 ## Logging
 
 Logging defaults to text format. Configure JSON output in the config file.
+
+KyroDB does not auto-discover config files. Point the server at the file explicitly with `--config <path>` or set `KYRODB_CONFIG`. Example:
+
+```bash
+./target/release/kyrodb_server --config ./config.yaml
+# or: KYRODB_CONFIG=./config.yaml ./target/release/kyrodb_server
+```
+
+Edit the `logging:` block in that file to switch formats (e.g., `format: json`).
 
 ```yaml
 logging:

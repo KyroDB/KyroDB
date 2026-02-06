@@ -202,6 +202,17 @@ impl SemanticAdapter {
 
         for (_, cached_embedding) in cache.iter().skip(scan_start) {
             if query_embedding.len() != cached_embedding.len() {
+                debug_assert!(
+                    false,
+                    "Embedding dimension mismatch: query={}, cached={}",
+                    query_embedding.len(),
+                    cached_embedding.len()
+                );
+                tracing::warn!(
+                    query_dim = query_embedding.len(),
+                    cached_dim = cached_embedding.len(),
+                    "Skipping embedding with dimension mismatch"
+                );
                 continue;
             }
             let similarity = cosine_similarity(query_embedding, cached_embedding);

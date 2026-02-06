@@ -15,14 +15,12 @@ KyroDB is a gRPC-first vector database with a two-level L1 cache, a hot tier, an
 ┌─────────────────────────────────────────────────────────┐
 │                     KyroDB Server                        │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │   Layer 1a: Document Cache                          │ │
+│  │   Layer 1a: Document Cache (Get)                    │ │
 │  └────────────────────────────────────────────────────┘ │
-│                         │ miss                           │
-│                         ▼                                │
 │  ┌────────────────────────────────────────────────────┐ │
-│  │   Layer 1b: Query Cache                             │ │
+│  │   Layer 1b: Semantic search‑result cache (k-NN)     │ │
 │  └────────────────────────────────────────────────────┘ │
-│                         │ miss                           │
+│                         │ miss (per path)                │
 │                         ▼                                │
 │  ┌────────────────────────────────────────────────────┐ │
 │  │   Layer 2: Hot Tier (recent writes)                 │ │
@@ -55,16 +53,23 @@ HTTP observability endpoints:
 
 1. Client sends a gRPC `Search` request.
 2. The server validates the request and passes it to `TieredEngine`.
-3. `TieredEngine` checks L1a (document cache), then L1b (query cache), then the hot tier, then HNSW.
+3. `TieredEngine` checks L1b (semantic search‑result cache), then the hot tier, then HNSW.
 4. Results are filtered by tenant metadata, namespace, and filters when applicable.
 5. The server returns a `SearchResponse`.
+
+## Read path (point lookup)
+
+1. Client sends a gRPC `Get` (by `doc_id`) request.
+2. The server validates the request and passes it to `TieredEngine`.
+3. `TieredEngine` checks L1a (document cache), then the hot tier, then HNSW.
+4. The server returns the embedding (and metadata if requested).
 
 ## Write path (insert)
 
 1. Client sends a gRPC `Insert` or `BulkInsert` request.
 2. The server validates and writes to the WAL and hot tier.
 3. Background flushes move hot-tier entries into the HNSW cold tier.
-4. Snapshots are created at the interval set by `persistence.snapshot_interval_secs`.
+4. Snapshots are created when the operation count reaches `persistence.snapshot_interval_mutations` (set to `0` to disable).
 
 ## Persistence
 
@@ -81,40 +86,34 @@ HTTP observability endpoints:
 - [API Reference](API_REFERENCE.md)
 - [Configuration Guide](CONFIGURATION_MANAGEMENT.md)
 - [Backup and Recovery](BACKUP_AND_RECOVERY.md)
-   │
-   ├─► Copy HNSW index files
-   ├─► Verify checksums
-   └─► Load index into memory
-   │
-4. Replay WAL (if exists)
-   │
-   ├─► Read WAL entries since snapshot
-   ├─► Apply inserts/updates
-   └─► Rebuild hot tier
-   │
-5. Start server
-   │
-   └─► Server ready, data restored
 
-Recovery time:
-• Snapshot load: ~10s for 10M vectors
-• WAL replay: ~1s per 10K ops
-• Total: < 1 minute for typical workload
+## Recovery flow (WAL + snapshots)
+
+On startup, KyroDB recovers state from disk using the MANIFEST, the newest valid snapshot, and WAL segments:
+
 ```
+1. Load MANIFEST (snapshot + WAL segment list)
+2. Load the newest valid snapshot (fallback to older snapshots if the newest is corrupt)
+3. Replay WAL entries newer than the snapshot
+4. Rebuild in-memory structures (HNSW + doc store + metadata index)
+```
+
+Recovery time depends on snapshot size, WAL tail length, and disk performance. Measure in staging on production-like hardware before relying on a restart-time SLO.
 
 ---
 
 ## Training Flow (L1a Document Cache)
 
-**How the RMI cache predictor learns:**
+**How the learned cache predictor learns:**
 
 ```
 Access Logger (continuous):
 │
 ├─► Every query logs: (doc_id, timestamp)
-└─► Ring buffer (bounded memory, 17.6ns overhead)
+└─► Ring buffer (bounded memory)
 
-Training Task (every 15 seconds in validation, 10 min in production):
+Training Task (periodic; controlled by `cache.training_interval_secs` and `cache.enable_training_task`):
+(see Configuration section below for schema: `cache.enable_training_task` is a boolean, default true)
 │
 1. Collect access logs from last window
    │
@@ -123,11 +122,10 @@ Training Task (every 15 seconds in validation, 10 min in production):
    ├─► Label "hot" if accessed in last 5 min
    └─► Label "cold" if not accessed
    │
-3. Train RMI model
+3. Train predictor
    │
    ├─► Two-stage linear regression
    ├─► Predicts cache hotness score (0-1)
-   └─► Training time: ~100ms for 100K samples
    │
 4. Deploy new model
    │
@@ -139,9 +137,7 @@ Training Task (every 15 seconds in validation, 10 min in production):
    ├─► Track L1a hit rate over next training cycle
    └─► Export metrics (L1a, L1b, combined)
 
-Validated L1a accuracy: 63.5% hit rate (12-hour validation)
-Validated L1b performance: 10.1% additional hit rate
-Combined L1 hit rate: 73.5%
+Example harness result: combined L1 hit rate ~73.5% (L1a ~63.5%, L1b ~10.1%)
 ```
 
 ---
@@ -176,7 +172,7 @@ Combined L1 hit rate: 73.5%
 │  ┌──────────────────────────────────────┐                    │
 │  │         TieredEngine                  │                   │
 │  │  ┌──────────────────────────────┐    │                   │
-│  │  │     LearnedCache (RMI)       │    │                   │
+│  │  │     Learned predictor        │    │                   │
 │  │  └──────────────────────────────┘    │                   │
 │  │  ┌──────────────────────────────┐    │                   │
 │  │  │     HotTier (BTree)          │    │                   │
@@ -197,10 +193,11 @@ Combined L1 hit rate: 73.5%
 │                    ▼                                          │
 │  ┌──────────────────────────────────────┐                    │
 │  │      Background Tasks                 │                   │
-│  │  • Hot tier flush (10 min)            │                   │
-│  │  • RMI training (10 min)              │                   │
-│  │  • WAL compaction (hourly)            │                   │
-│  │  • Snapshot creation (daily)          │                   │
+│  │  • Hot tier flush (periodic)          │                   │
+│  │  • Predictor retraining (optional)    │                   │
+│  │  • WAL rotation (size-based)          │                   │
+│  │  • Snapshotting (op-count based)      │                   │
+│  │  • WAL cleanup (post-snapshot)        │                   │
 │  └──────────────────────────────────────┘                    │
 │                                                               │
 └───────────────────────────────────────────────────────────────┘
@@ -210,20 +207,16 @@ Combined L1 hit rate: 73.5%
 
 ## Data Structures
 
-### Hybrid Semantic Cache (RMI)
+### Learned cache predictor (L1a)
 
 ```
-RMI (Recursive Model Index):
-├─► Stage 1: Root model (linear regression)
-│   • Maps doc_id → bucket (0-255)
-│
-└─► Stage 2: Leaf models (256 linear regressions)
-    • Each bucket has its own model
-    • Predicts hotness score (0.0-1.0)
-    • Threshold: > 0.5 = hot, else cold
-
-Memory: ~4KB (256 models × 16 bytes)
-Prediction: < 5ns (2 linear regressions)
+Learned cache predictor:
+├─► Input: access events (doc_id, timestamp)
+├─► Score: hotness = frequency × recency_weight
+│   • Recency weight = exp(-age / half_life)
+├─► Feedback: penalize/boost based on observed false +/- outcomes
+├─► Selection: keep top-N hot docs with diversity guardrails
+└─► Admission: admit if score >= threshold (optionally auto-tuned)
 ```
 
 ### HNSW Index
@@ -244,8 +237,7 @@ Parameters:
 • ef_construction = 200 (build quality)
 • ef_search = 50 (search quality)
 
-Memory: ~100 bytes per vector
-Search: < 1ms P99 @ 10M vectors
+Memory usage and search latency depend on dimension, `m`, `ef_search`, and dataset characteristics. Use `benchmarks/` to measure recall/QPS/latency for your workload.
 ```
 
 ### Hot Tier (BTree)
@@ -256,79 +248,54 @@ BTree:
 └─► Value: (embedding: Vec<f32>, timestamp: u64)
 
 Flush criteria:
-• Age > 10 minutes, OR
-• Size > 100MB, OR
+• Age > `hot_tier_max_age_secs`, OR
+• Size > configured soft/hard limits, OR
 • Manual flush via API
-
-Memory: ~4KB per vector
-Lookup: < 100ns (O(log n))
 ```
 
 ---
 
 ## Configuration
 
-**Key config parameters:**
+**Key config parameters (current schema):**
 
 ```yaml
 # config.yaml
 server:
-  grpc_port: 50051
-  http_port: 51051
-  
+    host: "127.0.0.1"
+    port: 50051
+    http_port: 51051
+
 cache:
-  strategy: "learned"  # or "lru"
-  max_size_mb: 1024
-  training_interval_secs: 600  # 10 minutes
-  
-hot_tier:
-  flush_interval_secs: 600  # 10 minutes
-  max_size_mb: 100
-  
+    capacity: 10000
+    strategy: learned # lru | learned | abtest
+    training_interval_secs: 600
+    enable_training_task: true # boolean; enables periodic learned predictor retraining
+    hot_tier_max_age_secs: 600
+    query_cache_capacity: 100
+    query_cache_similarity_threshold: 0.52
+
 hnsw:
-  dimension: 768
-  m: 16  # neighbors per node
-  ef_construction: 200
-  ef_search: 50
-  
+    dimension: 768
+    m: 16 # neighbors per node
+    ef_construction: 200
+    ef_search: 50
+
 persistence:
-  wal_path: "/var/lib/kyrodb/wal"
-  snapshot_path: "/var/lib/kyrodb/snapshots"
-  fsync_policy: "data"  # or "always", "never"
+    data_dir: "/var/lib/kyrodb"
+    wal_flush_interval_ms: 100
+    fsync_policy: data_only # data_only | full | none
+    snapshot_interval_mutations: 10000
 ```
 
 ---
 
-## Performance Characteristics
+## Performance
 
-**Latency by operation (12-hour validation on MS MARCO):**
+Performance is workload-dependent. Use the included harnesses and benchmark suite:
 
-| Operation | P50 | P99 | Notes |
-|-----------|-----|-----|-------|
-| Query (L1 cache hit) | 4μs | 9ms | 73% of queries |
-| Query (cache miss) | 4.3ms | 9.9ms | Falls through to HNSW |
-| Query (overall) | 12μs | 9.7ms | Blended with 73% hit rate |
-| Insert | 50μs | 100μs | To hot tier |
-| Search (k=10) | 500μs | 5ms | HNSW approximate search |
-| Flush | 5s | 10s | Hot tier to cold tier |
-| Backup (full) | 30s | 60s | Depends on data size |
-
-**Throughput:**
-
-| Operation | Target QPS |
-|-----------|-----------|
-| Insert | 10,000 |
-| Query | 100,000+ (with cache) |
-| Search | 10,000 |
-
-**Scalability:**
-
-| Vectors | Memory | Disk | Search P99 |
-|---------|--------|------|------------|
-| 10K | 100MB | 200MB | 5ms |
-| 100K | 500MB | 1GB | 5ms |
-| 1M | 2GB | 5GB | 10ms |
-| 10M | 15GB | 40GB | 20ms |
+- Cache validation + hit-rate/latency breakdown: [Two-Level Cache Architecture](TWO_LEVEL_CACHE_ARCHITECTURE.md)
+- ANN recall/QPS/latency: `benchmarks/README.md` and `benchmarks/results/`
 
 ---
 
@@ -337,27 +304,31 @@ persistence:
 ### What happens when...
 
 **Server crashes?**
-- WAL ensures no data loss (up to last fsync)
-- Recovery replays WAL on restart
-- Downtime: < 1 minute for 10M vectors
+
+- Durability depends on `persistence.fsync_policy` (e.g., `none` may lose recent writes on crash).
+- Recovery replays WAL on restart and may load a snapshot to speed up recovery.
+- Restart/recovery time depends on snapshot size, WAL tail length, and disk performance.
 
 **Disk full?**
+
 - Circuit breaker opens (stops WAL writes)
 - Queries still work (read-only mode)
 - Inserts fail with error
 - Alert fires: "WAL write failed"
 
 **HNSW index corrupted?**
+
 - Restore from snapshot
 - Replay WAL to rebuild
 - Or restore from backup
 
 **Cache predictor broken?**
-- Fallback to LRU cache automatically
-- Performance degrades but still works
-- Retrain predictor to fix
+
+- If the training task is disabled or crashes, the learned predictor stops updating and hit rate may degrade.
+- The server continues serving queries; re-enable/fix training and restart if needed.
 
 **Out of memory?**
+
 - OS kills process (OOM killer)
 - Restart and recover from WAL
 - Prevention: set cache size limits in config
@@ -367,15 +338,18 @@ persistence:
 ## Security
 
 **Authentication:**
+
 - API key-based (optional)
 - Configured in `api_keys.yaml`
 - Per-tenant isolation
 
 **Encryption:**
+
 - TLS for client connections (optional)
 - Data at rest NOT encrypted (use disk encryption)
 
 **Rate Limiting:**
+
 - Per-connection QPS limits
 - Global QPS limits
 - Configured in `config.yaml`
@@ -385,16 +359,19 @@ persistence:
 ## Future Enhancements
 
 **Phase 1 :**
+
 - Distributed architecture (multi-node)
 - Replication (primary + replicas)
 - Sharding (horizontal scaling)
 
 **Phase 2 :**
+
 - Hybrid queries (vector + metadata filters)
 - Multi-vector per document
 - Batch insert API
 
 **Phase 3 :**
+
 - Auto-scaling (cloud deployment)
 - Cost optimization (tiered storage)
 - Advanced analytics (query patterns)

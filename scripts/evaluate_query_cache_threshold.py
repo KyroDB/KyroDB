@@ -66,6 +66,8 @@ def main() -> None:
     all_docs = list(by_doc.keys())
     if not multi_docs:
         raise SystemExit("No documents with >=2 queries; cannot sample positive pairs")
+    if len(all_docs) < 2:
+        raise SystemExit("Need at least 2 documents to sample negative pairs; found 1")
 
     rng = random.Random(args.seed)
 
@@ -105,6 +107,16 @@ def main() -> None:
         tpr = float((pos >= t).mean())
         fpr = float((neg >= t).mean())
         print(f"t={t:.2f}  TPR={tpr:.3f}  FPR={fpr:.4f}")
+
+    chosen_t = 0.52
+    tpr = float((pos >= chosen_t).mean())
+    fpr = float((neg >= chosen_t).mean())
+    fnr = 1.0 - tpr
+    print(
+        "summary: t={:.2f}  TPR={:.3f}  FPR={:.4f}  FNR={:.3f} (balanced sample)".format(
+            chosen_t, tpr, fpr, fnr
+        )
+    )
 
 
 if __name__ == "__main__":

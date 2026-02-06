@@ -12,9 +12,11 @@ KyroDB provides:
 
 ## Quick Reference
 
-The backup CLI requires the `cli-tools` feature:
-
 ```bash
+# Build backup CLI (minimal: JSON output; no tables/progress bars)
+cargo build --bin kyrodb_backup --release
+
+# Optional: enable table output + progress bars
 cargo build --bin kyrodb_backup --release --features cli-tools
 ```
 
@@ -44,19 +46,18 @@ cargo build --bin kyrodb_backup --release --features cli-tools
   --backup-dir ./backups \
   --format json
 
-# Restore from backup
+# Restore from backup (DANGEROUS: may clear/overwrite --data-dir)
+export BACKUP_ALLOW_CLEAR=true
 ./target/release/kyrodb_backup restore \
   --data-dir ./data \
   --backup-dir ./backups \
   --backup-id <BACKUP_ID>
 
-# Restore to specific point in time
+# Restore to specific point in time (Unix timestamp)
 ./target/release/kyrodb_backup restore \
   --data-dir ./data \
   --backup-dir ./backups \
   --point-in-time <UNIX_TIMESTAMP>
-
-Restores clear the data directory. Set `BACKUP_ALLOW_CLEAR=true` before running a restore.
 
 # Verify backup integrity
 ./target/release/kyrodb_backup verify \
@@ -146,8 +147,13 @@ Run validation in a staging environment first.
 systemctl stop kyrodb
 ```
 
-2. Restore the backup / snapshot
-  - Use the same restore procedure as above.
+2. Restore the backup
+
+```bash
+export BACKUP_ALLOW_CLEAR=true
+./target/release/kyrodb_backup restore --backup-id <BACKUP_ID> --data-dir ./data --backup-dir ./backups
+```
+
 3. Start KyroDB
 
 ```bash
@@ -247,7 +253,7 @@ TARGET_TIME=$(date -d "2025-10-20 14:30:00 UTC" +%s)
 systemctl stop kyrodb
 
 # 3. Restore to that time
-./target/release/kyrodb_backup restore --point-in-time $TARGET_TIME
+BACKUP_ALLOW_CLEAR=true ./target/release/kyrodb_backup restore --point-in-time $TARGET_TIME
 
 # 4. Start server
 systemctl start kyrodb
@@ -267,7 +273,7 @@ Complete data center failure. Restore from offsite backup.
 aws s3 sync s3://kyrodb-backups ./backups
 
 # 2. Restore on new server
-./target/release/kyrodb_backup \
+BACKUP_ALLOW_CLEAR=true ./target/release/kyrodb_backup \
   --backup-dir ./backups \
   restore --backup-id <ID>
 
@@ -361,7 +367,7 @@ Add to crontab:
 TMP_DIR=$(mktemp -d)
 
 # 2. Restore to temporary location
-./target/release/kyrodb_backup \
+BACKUP_ALLOW_CLEAR=true ./target/release/kyrodb_backup \
   --backup-dir ./backups \
   --data-dir $TMP_DIR \
   restore --backup-id <BACKUP_ID>

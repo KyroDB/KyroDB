@@ -32,6 +32,7 @@ fn bench_insert_with_persistence(c: &mut Criterion) {
                     data_dir,
                     *policy,
                     16,
+                    100 * 1024 * 1024,
                 )
                 .unwrap();
 
@@ -76,6 +77,7 @@ fn bench_snapshot_creation(c: &mut Criterion) {
                 dir.path(),
                 FsyncPolicy::Never,
                 100,
+                100 * 1024 * 1024,
             )
             .unwrap();
 
@@ -113,6 +115,7 @@ fn bench_recovery(c: &mut Criterion) {
                 dir.path(),
                 FsyncPolicy::Never,
                 100,
+                100 * 1024 * 1024,
             )
             .unwrap();
 
@@ -131,6 +134,7 @@ fn bench_recovery(c: &mut Criterion) {
                         *size_val * 2,
                         FsyncPolicy::Never,
                         100,
+                        100 * 1024 * 1024,
                         kyrodb_engine::MetricsCollector::new(),
                     )
                     .unwrap();

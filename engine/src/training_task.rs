@@ -341,9 +341,15 @@ mod tests {
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let handle =
-            spawn_training_task(logger.clone(), strategy.clone(), config, None, None, shutdown_rx)
-                .await;
+        let handle = spawn_training_task(
+            logger.clone(),
+            strategy.clone(),
+            config,
+            None,
+            None,
+            shutdown_rx,
+        )
+        .await;
 
         // Wait for multiple training cycles
         sleep(Duration::from_secs(3)).await;
@@ -380,9 +386,15 @@ mod tests {
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let handle =
-            spawn_training_task(logger.clone(), strategy.clone(), config, None, None, shutdown_rx)
-                .await;
+        let handle = spawn_training_task(
+            logger.clone(),
+            strategy.clone(),
+            config,
+            None,
+            None,
+            shutdown_rx,
+        )
+        .await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;
@@ -418,9 +430,15 @@ mod tests {
         };
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let handle =
-            spawn_training_task(logger.clone(), strategy.clone(), config, None, None, shutdown_rx)
-                .await;
+        let handle = spawn_training_task(
+            logger.clone(),
+            strategy.clone(),
+            config,
+            None,
+            None,
+            shutdown_rx,
+        )
+        .await;
 
         // Wait for a few cycles
         sleep(Duration::from_millis(500)).await;

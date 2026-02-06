@@ -43,9 +43,15 @@ let mean_ndcg = calculate_mean_ndcg(&query_results_map, 10);
 
 ## Cache Quality Measurement (validation binary)
 
-In `validation_enterprise`, relevance is derived from access counts during the workload. Higher access counts are treated as higher relevance, and NDCG is computed on the ranked access-frequency list.
+In `validation_enterprise`, the goal is to validate that the learned predictor ranks the *right* documents as hot.
 
-This provides a coarse signal of whether frequently accessed documents rise to the top of the ranking. It does not directly measure cache admissions in `kyrodb_server`.
+- **Ground truth (relevance vector)**: observed access counts per document during the workload. Documents accessed more frequently receive higher relevance scores.
+- **Evaluated ranking**: documents ordered by the learned predictor's admission score (descending). This is the ranking the predictor *actually produces*.
+- **NDCG@10**: measures how closely the predictor's top-10 ranking matches the ideal ranking obtained by sorting documents by their access counts. An NDCG of 1.0 means the predictor places the most-accessed documents in exactly the same order as the ideal ranking; lower values indicate the predictor mis-ranks frequently accessed documents further from the top.
+
+The evaluated ranking is produced by the predictor, not by sorting access counts, which avoids the trivial case where both orderings are identical (which would yield NDCG=1.0 by construction and test nothing).
+
+**MRR and Recall@10** use **binary relevance**: the ground-truth top-10 most-accessed documents are treated as the relevant set (relevant=1), and all other documents are irrelevant (relevant=0). The predictor's ranking is evaluated against this binary set.
 
 ---
 
@@ -93,7 +99,7 @@ NDCG calculations are performed after the workload completes in `validation_ente
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| Validation workload | Implemented | Computes NDCG/MRR/Recall from access frequency ranking |
+| Validation workload | Implemented | Computes NDCG/MRR/Recall from predictor ranking vs access-frequency ground truth |
 | Production metrics | Not wired | No NDCG metrics exported by the server |
 
 ---

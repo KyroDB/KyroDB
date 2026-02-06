@@ -2,6 +2,20 @@
 
 Configure KyroDB via YAML/TOML files, environment variables, or command-line arguments.
 
+## Breaking changes / migration guide
+
+KyroDB config parsing is intentionally strict: unknown keys are rejected at startup. If you are upgrading from an older config, pay attention to these changes:
+
+- **Environment variables**: nested configuration now uses the `KYRODB__` (double underscore) prefix + separator.
+  - Example: `KYRODB_CACHE_CAPACITY=50000` → `KYRODB__CACHE__CAPACITY=50000`
+  - Example: `KYRODB_HNSW_DIMENSION=1536` → `KYRODB__HNSW__DIMENSION=1536`
+  - The server still supports CLI shortcut env vars for convenience: `KYRODB_CONFIG`, `KYRODB_PORT`, `KYRODB_DATA_DIR`.
+- **Persistence snapshot interval**: `persistence.snapshot_interval_secs` was renamed to `persistence.snapshot_interval_mutations` (operation-count based: counts all WAL mutations including inserts and deletes; `0` disables automatic snapshots). The legacy key `snapshot_interval_inserts` is still accepted as a backward-compatible alias during deserialization.
+- **Removed config keys (now rejected)**:
+  - `persistence.enable_wal`
+  - `auth.usage_stats_file`, `auth.usage_export_interval_secs`
+  - Cache flags that were previously documented but ignored: `cache.enable_ab_testing`, `cache.ab_test_split`, `cache.enable_query_clustering`, `cache.clustering_similarity_threshold`, `cache.enable_prefetching`, `cache.prefetch_threshold`, `cache.max_prefetch_per_doc`
+
 ## Configuration sources (priority order)
 
 1. Command-line arguments
@@ -38,33 +52,33 @@ server:
   shutdown_timeout_secs: 30
 ```
 
-### Cache (partially used)
+### Cache (used + partially wired)
 
 ```yaml
 cache:
   capacity: 10000
+  strategy: learned
+  enable_training_task: true
   training_interval_secs: 600
   training_window_secs: 3600
   recency_halflife_secs: 1800
   min_training_samples: 100
-  enable_ab_testing: false
-  ab_test_split: 0.5
   admission_threshold: 0.15
   auto_tune_threshold: true
   target_utilization: 0.85
-  enable_query_clustering: true
-  clustering_similarity_threshold: 0.85
-  enable_prefetching: true
-  prefetch_threshold: 0.1
-  max_prefetch_per_doc: 5
-  strategy: learned
+  predictor_capacity_multiplier: 4
+  logger_window_size: 1000000
+  query_cache_capacity: 100
+  query_cache_similarity_threshold: 0.52
+  hot_tier_max_age_secs: 600
 ```
 
 Notes:
 
 - `cache.capacity` is used to size the cache and hot tier.
-- `cache.training_interval_secs` is currently used as the hot tier max age.
-- `cache.strategy`, `enable_ab_testing`, `ab_test_split`, and the clustering/prefetching fields are currently not used by `kyrodb_server`.
+- `cache.hot_tier_max_age_secs` controls hot-tier max age; if omitted, the server falls back to `cache.training_interval_secs` for backward compatibility.
+- `cache.training_interval_secs` controls the training cadence for the learned predictor.
+- `cache.strategy` is used by `kyrodb_server` (lru/learned/abtest).
 
 ### HNSW (used)
 
@@ -79,15 +93,14 @@ hnsw:
   disable_normalization_check: false
 ```
 
-### Persistence (partially used)
+### Persistence (used)
 
 ```yaml
 persistence:
   data_dir: "./data"
-  enable_wal: true
   wal_flush_interval_ms: 100
   fsync_policy: data_only
-  snapshot_interval_secs: 3600
+  snapshot_interval_mutations: 10000
   max_wal_size_bytes: 104857600
   enable_recovery: true
   allow_fresh_start_on_recovery_failure: false
@@ -95,23 +108,26 @@ persistence:
 
 Notes:
 
-- `data_dir`, `wal_flush_interval_ms`, `fsync_policy`, `snapshot_interval_secs`, `max_wal_size_bytes`, `enable_recovery`, and `allow_fresh_start_on_recovery_failure` are used.
-- `enable_wal` is defined but not currently used by `kyrodb_server`.
+- `data_dir`, `wal_flush_interval_ms`, `fsync_policy`, `snapshot_interval_mutations`, `max_wal_size_bytes`, `enable_recovery`, and `allow_fresh_start_on_recovery_failure` are used.
+- `snapshot_interval_mutations` is **operation-count based** (WAL mutations, including inserts and deletes); set to `0` to disable automatic snapshots. The legacy key `snapshot_interval_inserts` is accepted as a backward-compatible alias.
 
-### SLO (defined, not wired)
+### SLO (used)
 
 ```yaml
 slo:
-  p99_latency_ms: 1.0
+  p99_latency_ms: 10.0
   cache_hit_rate: 0.70
   error_rate: 0.001
   availability: 0.999
   min_samples: 100
 ```
 
-`kyrodb_server` currently uses fixed SLO thresholds in the metrics module; these values are validated but not applied.
+SLO thresholds are validated on startup and used by the metrics/health system:
 
-### Rate limiting (defined, not wired)
+- `/slo` reports breach status using these thresholds.
+- `/health` and `/ready` incorporate SLO breach status after `slo.min_samples` queries (warmup protection).
+
+### Rate limiting (partially wired)
 
 ```yaml
 rate_limit:
@@ -122,6 +138,18 @@ rate_limit:
 ```
 
 Per-tenant rate limiting uses `max_qps` from the API keys file when authentication is enabled.
+
+`max_qps_per_connection` and `max_qps_global` are **global defaults** that apply when a tenant does not provide a per-tenant override (i.e., `max_qps` omitted or set to `0`). Per-tenant `max_qps` in `api_keys.yaml` overrides the global defaults for that tenant. When `rate_limit.enabled=true`, the server also enforces the global QPS cap (`max_qps_global`) across all tenants; when disabled, tenants without `max_qps` are effectively unlimited.
+
+Example:
+
+```yaml
+# data/api_keys.yaml
+api_keys:
+  - key: kyro_acme_corp_a3f9d8e2c1b4567890abcdef12345678
+    tenant_id: acme_corp
+    max_qps: 500
+```
 
 ### Logging (used)
 
@@ -135,20 +163,17 @@ logging:
   max_files: 10
 ```
 
-### Authentication (partially used)
+### Authentication (used)
 
 ```yaml
 auth:
   enabled: false
   api_keys_file: "data/api_keys.yaml"
-  usage_stats_file: "data/usage_stats.csv"
-  usage_export_interval_secs: 300
 ```
 
 Notes:
 
 - `enabled` and `api_keys_file` are used by `kyrodb_server`.
-- Usage export settings are defined but not currently used.
 
 ### Timeouts (used)
 
@@ -185,7 +210,7 @@ KYRODB__<section>__<key>=<value>
   --data-dir /var/lib/kyrodb
 ```
 
-Available arguments:
+Common arguments:
 
 - `--config <FILE>`
 - `--port <PORT>`

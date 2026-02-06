@@ -3,7 +3,7 @@
 //! Design goals:
 //! - Always safe to run: never executes unsupported instructions (no SIGILL).
 //! - One binary works across a wide range of CPUs.
-//! - Uses the best available ISA at runtime: AVX-512F → AVX2(+FMA) → SSE2 → scalar.
+//! - Uses the best available ISA at runtime: AVX-512F(+FMA) → AVX2(+FMA) → SSE2 → scalar.
 //! - Builds on non-x86 platforms: uses NEON on aarch64 when available; otherwise falls back to scalar.
 
 /// Returns the dot product $\sum_i a_i b_i$.
@@ -34,7 +34,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if std::is_x86_feature_detected!("avx512f") {
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
             return dot_f32_avx512(a, b, len);
         }
         // AVX2 does not strictly imply FMA; guard to avoid executing unsupported instructions.
@@ -72,7 +72,7 @@ pub fn sum_squares_f32(v: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if std::is_x86_feature_detected!("avx512f") {
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
             return sum_squares_f32_avx512(v);
         }
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -113,7 +113,7 @@ pub fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if std::is_x86_feature_detected!("avx512f") {
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
             return l2_distance_f32_avx512(a, b, len);
         }
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -148,14 +148,24 @@ pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
 
     // Fast path: compute dot and both norms in one pass where possible.
     let (dot, norm_a_sq, norm_b_sq) = dot_and_norms_f32(a, b, len);
+    if !dot.is_finite() {
+        return 0.0;
+    }
+    if !norm_a_sq.is_finite() || !norm_b_sq.is_finite() {
+        return 0.0;
+    }
     if norm_a_sq <= 0.0 || norm_b_sq <= 0.0 {
         return 0.0;
     }
     let denom = (norm_a_sq.sqrt()) * (norm_b_sq.sqrt());
-    if denom <= f32::EPSILON {
+    if !denom.is_finite() || denom <= f32::EPSILON {
         return 0.0;
     }
-    (dot / denom).clamp(-1.0, 1.0)
+    let result = dot / denom;
+    if !result.is_finite() {
+        return 0.0;
+    }
+    result.clamp(-1.0, 1.0)
 }
 
 #[inline]
@@ -197,7 +207,7 @@ fn dot_and_norms_f32(a: &[f32], b: &[f32], len: usize) -> (f32, f32, f32) {
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if std::is_x86_feature_detected!("avx512f") {
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
             return dot_and_norms_f32_avx512(a, b, len);
         }
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -249,6 +259,7 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[target_feature(enable = "fma")]
 unsafe fn dot_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
     let mut acc = _mm512_setzero_ps();
     let chunks = len / 16;
@@ -256,7 +267,7 @@ unsafe fn dot_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
         let off = i * 16;
         let va = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
         let vb = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
-        acc = _mm512_add_ps(acc, _mm512_mul_ps(va, vb));
+        acc = _mm512_fmadd_ps(va, vb, acc);
     }
     let mut tmp = [0.0f32; 16];
     _mm512_storeu_ps(tmp.as_mut_ptr() as *mut _, acc);
@@ -310,13 +321,14 @@ unsafe fn sum_squares_f32_avx2(v: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[target_feature(enable = "fma")]
 unsafe fn sum_squares_f32_avx512(v: &[f32]) -> f32 {
     let mut acc = _mm512_setzero_ps();
     let chunks = v.len() / 16;
     for i in 0..chunks {
         let off = i * 16;
         let x = _mm512_loadu_ps(v.as_ptr().add(off) as *const _);
-        acc = _mm512_add_ps(acc, _mm512_mul_ps(x, x));
+        acc = _mm512_fmadd_ps(x, x, acc);
     }
     let mut tmp = [0.0f32; 16];
     _mm512_storeu_ps(tmp.as_mut_ptr() as *mut _, acc);
@@ -373,6 +385,7 @@ unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[target_feature(enable = "fma")]
 unsafe fn l2_distance_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
     let mut acc = _mm512_setzero_ps();
     let chunks = len / 16;
@@ -381,7 +394,7 @@ unsafe fn l2_distance_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
         let va = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
         let vb = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
         let d = _mm512_sub_ps(va, vb);
-        acc = _mm512_add_ps(acc, _mm512_mul_ps(d, d));
+        acc = _mm512_fmadd_ps(d, d, acc);
     }
     let mut tmp = [0.0f32; 16];
     _mm512_storeu_ps(tmp.as_mut_ptr() as *mut _, acc);
@@ -452,6 +465,7 @@ unsafe fn dot_and_norms_f32_avx2(a: &[f32], b: &[f32], len: usize) -> (f32, f32,
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[target_feature(enable = "fma")]
 unsafe fn dot_and_norms_f32_avx512(a: &[f32], b: &[f32], len: usize) -> (f32, f32, f32) {
     let mut dot = _mm512_setzero_ps();
     let mut na = _mm512_setzero_ps();
@@ -461,9 +475,9 @@ unsafe fn dot_and_norms_f32_avx512(a: &[f32], b: &[f32], len: usize) -> (f32, f3
         let off = i * 16;
         let va = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
         let vb = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
-        dot = _mm512_add_ps(dot, _mm512_mul_ps(va, vb));
-        na = _mm512_add_ps(na, _mm512_mul_ps(va, va));
-        nb = _mm512_add_ps(nb, _mm512_mul_ps(vb, vb));
+        dot = _mm512_fmadd_ps(va, vb, dot);
+        na = _mm512_fmadd_ps(va, va, na);
+        nb = _mm512_fmadd_ps(vb, vb, nb);
     }
     let mut dot_tmp = [0.0f32; 16];
     let mut na_tmp = [0.0f32; 16];

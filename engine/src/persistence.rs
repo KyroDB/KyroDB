@@ -21,7 +21,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -48,6 +48,8 @@ pub struct WalEntry {
     pub doc_id: u64,
     pub embedding: Vec<f32>,
     pub metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub seq_no: u64,
     pub timestamp: u64,
 }
 
@@ -63,13 +65,11 @@ pub enum FsyncPolicy {
 }
 
 /// WAL writer: append-only log with checksums
-///
-/// Performance optimization: Uses async fsync for FsyncPolicy::Always to avoid
-/// blocking writes. The file is cloned and synced in a background task.
 pub struct WalWriter {
     file: BufWriter<File>,
     path: PathBuf,
     fsync_policy: FsyncPolicy,
+    last_fsync: Instant,
     entry_count: usize,
     bytes_written: u64,
     error_handler: Option<Arc<WalErrorHandler>>,
@@ -102,11 +102,14 @@ impl WalWriter {
         // Write magic header
         writer.write_all(&WAL_MAGIC.to_le_bytes())?;
         writer.flush()?;
+        // Ensure the file header is durable before we ever reference this WAL in the MANIFEST.
+        writer.get_ref().sync_data()?;
 
         Ok(Self {
             file: writer,
             path,
             fsync_policy,
+            last_fsync: Instant::now(),
             entry_count: 0,
             bytes_written: 4, // Magic header
             error_handler,
@@ -159,13 +162,24 @@ impl WalWriter {
         // Flush to OS buffer cache (fast, does not wait for disk)
         self.file.flush()?;
 
-        // fsync policy: Only FsyncPolicy::Always does immediate sync
+        // fsync policy:
+        // - Always: full durability (`sync_all`) on every append
+        // - Periodic: `sync_data` at an interval (or every write if interval=0)
+        // - Never: rely on OS buffering (data loss on crash)
         match self.fsync_policy {
             FsyncPolicy::Always => {
-                self.file.get_ref().sync_data()?;
+                self.file.get_ref().sync_all()?;
             }
-            FsyncPolicy::Never | FsyncPolicy::Periodic(_) => {
-                // No immediate sync
+            FsyncPolicy::Periodic(interval_ms) => {
+                if interval_ms == 0
+                    || self.last_fsync.elapsed() >= Duration::from_millis(interval_ms)
+                {
+                    self.file.get_ref().sync_data()?;
+                    self.last_fsync = Instant::now();
+                }
+            }
+            FsyncPolicy::Never => {
+                // No sync
             }
         }
         Ok(())
@@ -195,7 +209,7 @@ impl WalWriter {
     #[instrument(level = "trace", skip(self))]
     pub fn sync(&mut self) -> Result<()> {
         self.file.flush()?;
-        self.file.get_ref().sync_data()?;
+        self.file.get_ref().sync_all()?;
         Ok(())
     }
 
@@ -227,7 +241,7 @@ impl WalWriter {
 
         // Spawn blocking fsync on separate thread pool
         let handle =
-            tokio::task::spawn_blocking(move || file.sync_data().context("Async fsync failed"));
+            tokio::task::spawn_blocking(move || file.sync_all().context("Async fsync failed"));
 
         Ok(handle)
     }
@@ -556,7 +570,11 @@ pub struct Snapshot {
     ///
     /// `#[serde(default)]` keeps backward compatibility with older snapshots.
     #[serde(default)]
-    pub distance: crate::config::DistanceMetric,
+    pub distance: Option<crate::config::DistanceMetric>,
+    /// Last WAL sequence number included in this snapshot.
+    /// `#[serde(default)]` keeps backward compatibility with older snapshots.
+    #[serde(default)]
+    pub last_wal_seq: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -585,6 +603,7 @@ impl Snapshot {
         distance: crate::config::DistanceMetric,
         documents: Vec<(u64, Vec<f32>)>,
         metadata: Vec<(u64, HashMap<String, String>)>,
+        last_wal_seq: u64,
     ) -> Result<Self> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -592,13 +611,14 @@ impl Snapshot {
             .as_secs();
 
         let mut snapshot = Self {
-            version: 2, // Bump version for metadata support
+            version: 3, // WAL sequence tracking
             timestamp,
             doc_count: documents.len(),
             dimension,
-            distance,
+            distance: Some(distance),
             documents,
             metadata,
+            last_wal_seq,
         };
 
         snapshot.validate_and_normalize()?;
@@ -689,12 +709,7 @@ impl Snapshot {
         let mut snapshot = match bincode::deserialize::<Snapshot>(&snapshot_bytes) {
             Ok(snapshot) => snapshot,
             Err(primary_err) => match bincode::deserialize::<LegacySnapshotV2>(&snapshot_bytes) {
-                Ok(legacy) => {
-                    warn!(
-                        "Loaded legacy snapshot v2 without distance; upgrading in-memory representation"
-                    );
-                    Snapshot::from_legacy_v2(legacy)
-                }
+                Ok(legacy) => Snapshot::from_legacy_v2(legacy),
                 Err(_) => match bincode::deserialize::<LegacySnapshotV1>(&snapshot_bytes) {
                     Ok(legacy) => {
                         warn!(
@@ -710,6 +725,17 @@ impl Snapshot {
         };
 
         snapshot.validate_and_normalize()?;
+        if snapshot.distance.is_none() {
+            let assumed = crate::config::DistanceMetric::default();
+            warn!(
+                snapshot = %path.display(),
+                version = snapshot.version,
+                timestamp = snapshot.timestamp,
+                assumed_distance = ?assumed,
+                "Snapshot missing distance metric; assuming default. Verify metric to avoid incorrect search results."
+            );
+            snapshot.distance = Some(assumed);
+        }
 
         Ok(snapshot)
     }
@@ -749,7 +775,9 @@ impl Snapshot {
             }
         }
 
-        // Extract snapshot number from filename (e.g., "snapshot_123.snap" -> 123)
+        // Extract snapshot number from filename (e.g., "snapshot_1770322269.snap" -> 1770322269).
+        // Note: KyroDB snapshot filenames are timestamp-based, not sequential counters, so fallback
+        // discovery must scan the directory rather than decrementing by 1.
         let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let snapshot_number = filename
             .trim_start_matches("snapshot_")
@@ -757,16 +785,43 @@ impl Snapshot {
             .parse::<u64>()
             .ok();
 
-        if let Some(num) = snapshot_number {
-            // Try up to 5 previous snapshots
-            for fallback_idx in 1..=5 {
-                if num < fallback_idx {
-                    break;
+        if let Some(dir) = path.parent() {
+            let mut candidates: Vec<(u64, std::path::PathBuf)> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if !name.starts_with("snapshot_") || !name.ends_with(".snap") {
+                        continue;
+                    }
+                    let Some(n) = name
+                        .trim_start_matches("snapshot_")
+                        .trim_end_matches(".snap")
+                        .parse::<u64>()
+                        .ok()
+                    else {
+                        continue;
+                    };
+                    candidates.push((n, entry.path()));
                 }
+            }
 
-                let fallback_num = num - fallback_idx;
-                let fallback_path = path.with_file_name(format!("snapshot_{}.snap", fallback_num));
+            // Sort newest -> oldest and find the corrupted snapshot's position.
+            candidates.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+            let skip_count = snapshot_number
+                .and_then(|num| candidates.iter().position(|(n, _)| *n == num))
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
 
+            if skip_count == 0 && snapshot_number.is_some() {
+                warn!(
+                    snapshot = %path.display(),
+                    "primary snapshot missing from directory; trying newest available"
+                );
+            }
+
+            // Try up to 5 older snapshots (or newest first if primary missing).
+            for (_, fallback_path) in candidates.into_iter().skip(skip_count).take(5) {
                 if !fallback_path.exists() {
                     continue;
                 }
@@ -875,32 +930,27 @@ impl Snapshot {
             .collect();
 
         Self {
-            version: 2,
+            version: 3,
             timestamp: legacy.timestamp,
             doc_count: legacy.documents.len(),
             dimension: legacy.dimension,
             documents: legacy.documents,
             metadata,
-            distance: crate::config::DistanceMetric::default(),
+            distance: None,
+            last_wal_seq: 0,
         }
     }
 
     fn from_legacy_v2(legacy: LegacySnapshotV2) -> Self {
-        let assumed = crate::config::DistanceMetric::default();
-        warn!(
-            snapshot_timestamp = legacy.timestamp,
-            doc_count = legacy.documents.len(),
-            assumed_distance = ?assumed,
-            "LegacySnapshotV2 missing distance metric; assuming default. Verify metric to avoid incorrect search results."
-        );
         Self {
-            version: 2,
+            version: 3,
             timestamp: legacy.timestamp,
             doc_count: legacy.documents.len(),
             dimension: legacy.dimension,
             documents: legacy.documents,
             metadata: legacy.metadata,
-            distance: assumed,
+            distance: None,
+            last_wal_seq: 0,
         }
     }
 }
@@ -995,6 +1045,7 @@ mod tests {
             embedding: vec![0.1, 0.2, 0.3],
             timestamp: 1000,
             metadata: HashMap::new(),
+            seq_no: 1,
         };
 
         let entry2 = WalEntry {
@@ -1003,6 +1054,7 @@ mod tests {
             embedding: vec![],
             timestamp: 2000,
             metadata: HashMap::new(),
+            seq_no: 2,
         };
 
         writer.append(&entry1).unwrap();
@@ -1035,6 +1087,7 @@ mod tests {
             crate::config::DistanceMetric::Cosine,
             documents,
             metadata,
+            0,
         )
         .unwrap();
         snapshot.save(&snapshot_path).unwrap();
@@ -1200,6 +1253,7 @@ mod tests {
             embedding: vec![1.0, 2.0, 3.0],
             timestamp: 1234567890,
             metadata: HashMap::new(),
+            seq_no: 1,
         };
 
         // Should succeed
@@ -1261,6 +1315,7 @@ mod tests {
             crate::config::DistanceMetric::Cosine,
             documents.clone(),
             metadata,
+            0,
         )
         .unwrap();
         snapshot.save(&snapshot_path).unwrap();
@@ -1301,6 +1356,7 @@ mod tests {
             crate::config::DistanceMetric::Cosine,
             documents_100,
             metadata_100,
+            0,
         )
         .unwrap();
         snapshot_100.save(&snapshot_100_path).unwrap();
@@ -1317,6 +1373,7 @@ mod tests {
             crate::config::DistanceMetric::Cosine,
             documents_99,
             metadata_99,
+            0,
         )
         .unwrap();
         snapshot_99.save(&snapshot_99_path).unwrap();
@@ -1339,6 +1396,60 @@ mod tests {
         assert_eq!(recovered_snapshot.dimension, 2);
 
         // Metrics should show corruption and successful fallback
+        let corruption_count = metrics.get_hnsw_corruption_count();
+        let fallback_success = metrics.get_hnsw_fallback_success_count();
+        assert_eq!(corruption_count, 1);
+        assert_eq!(fallback_success, 1);
+    }
+
+    #[test]
+    fn test_snapshot_fallback_when_primary_missing() {
+        let dir = TempDir::new().unwrap();
+        let metrics = MetricsCollector::new();
+
+        // Create snapshot_100.snap (newest)
+        let snapshot_100_path = dir.path().join("snapshot_100.snap");
+        let documents_100 = vec![(1, vec![1.0, 2.0]), (2, vec![3.0, 4.0])];
+        let metadata_100 = documents_100
+            .iter()
+            .map(|(id, _)| (*id, HashMap::new()))
+            .collect();
+        let snapshot_100 = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            documents_100,
+            metadata_100,
+            0,
+        )
+        .unwrap();
+        snapshot_100.save(&snapshot_100_path).unwrap();
+
+        // Create snapshot_99.snap (older)
+        let snapshot_99_path = dir.path().join("snapshot_99.snap");
+        let documents_99 = vec![(1, vec![0.1, 0.2])];
+        let metadata_99 = documents_99
+            .iter()
+            .map(|(id, _)| (*id, HashMap::new()))
+            .collect();
+        let snapshot_99 = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            documents_99,
+            metadata_99,
+            0,
+        )
+        .unwrap();
+        snapshot_99.save(&snapshot_99_path).unwrap();
+
+        // Primary snapshot path is missing, should fall back to newest available (snapshot_100)
+        let missing_primary = dir.path().join("snapshot_101.snap");
+        let (recovered_snapshot, recovered_from_fallback) =
+            Snapshot::load_with_validation(&missing_primary, &metrics).unwrap();
+
+        assert!(recovered_from_fallback);
+        assert_eq!(recovered_snapshot.doc_count, 2);
+        assert_eq!(recovered_snapshot.dimension, 2);
+
         let corruption_count = metrics.get_hnsw_corruption_count();
         let fallback_success = metrics.get_hnsw_fallback_success_count();
         assert_eq!(corruption_count, 1);

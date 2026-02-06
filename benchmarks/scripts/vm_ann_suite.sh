@@ -117,10 +117,8 @@ http_port = 51051
 [cache]
 capacity = $((max_elements * 2))
 strategy = "lru"
-enable_ab_testing = false
-enable_query_clustering = false
-enable_prefetching = false
 auto_tune_threshold = false
+enable_training_task = false
 
 [hnsw]
 max_elements = $max_elements
@@ -132,9 +130,10 @@ distance = "$distance"
 
 [persistence]
 data_dir = "$data_dir"
-enable_wal = false
 fsync_policy = "none"
-snapshot_interval_secs = 0
+wal_flush_interval_ms = 100
+snapshot_interval_mutations = 0
+max_wal_size_bytes = 1073741824
 enable_recovery = true
 allow_fresh_start_on_recovery_failure = true
 
