@@ -1,16 +1,13 @@
 //!
-//! This file contains ONLY the essential RMI algorithm components needed for
+//! This file contains ONLY the essential learned predictor algorithm components needed for
 //! Hybrid Semantic Cache prediction.
 //!
 
 use std::sync::Arc;
 
-/// Maximum search window for bounded search guarantee
-const MAX_SEARCH_WINDOW: usize = 16;
-
 /// Local linear model for position prediction
 ///
-/// Core RMI component: predicts position in sorted array using linear regression.
+/// Core learned predictor component: predicts position in sorted array using linear regression.
 /// Reusable for Hybrid Semantic Cache: predicts doc_id → hotness_score lookup position.
 #[derive(Debug, Clone)]
 pub struct LocalLinearModel {
@@ -52,8 +49,13 @@ impl LocalLinearModel {
         let key_max = data[data_len - 1].0;
 
         // Linear regression: position = slope * key + intercept
-        let slope = (data_len - 1) as f64 / (key_max - key_min) as f64;
-        let intercept = -(key_min as f64) * slope;
+        // Degenerate case: all keys identical — flat model predicting the midpoint.
+        let (slope, intercept) = if key_max == key_min {
+            (0.0, (data_len - 1) as f64 / 2.0)
+        } else {
+            let s = (data_len - 1) as f64 / (key_max - key_min) as f64;
+            (s, -(key_min as f64) * s)
+        };
 
         // Calculate maximum prediction error
         let mut max_error = 0u32;
@@ -64,7 +66,9 @@ impl LocalLinearModel {
             max_error = max_error.max(error);
         }
 
-        let error_bound = max_error.max(1).min(MAX_SEARCH_WINDOW as u32 / 2);
+        // Use the true maximum error so bounded_search never misses a key.
+        // A large error_bound degrades to O(log n) binary search, but remains correct.
+        let error_bound = max_error.max(1);
 
         Self {
             slope,
@@ -101,14 +105,14 @@ impl LocalLinearModel {
 
 /// Segment of sorted data with local learned model
 ///
-/// Core RMI component: each segment learns a local linear model for its key range.
+/// Core learned predictor component: each segment learns a local linear model for its key range.
 /// Reusable for Hybrid Semantic Cache: segment stores (doc_id, hotness_score) pairs.
-pub struct RmiSegment {
+pub struct LearnedPredictorSegment {
     local_model: LocalLinearModel,
     data: Arc<Vec<(u64, u64)>>,
 }
 
-impl RmiSegment {
+impl LearnedPredictorSegment {
     /// Create segment from sorted data
     pub fn new(data: Vec<(u64, u64)>) -> Self {
         let local_model = LocalLinearModel::new(&data);
@@ -158,24 +162,26 @@ impl RmiSegment {
 
 /// Segment router: maps key → segment index
 ///
-/// Core RMI component: top-level model that routes keys to segments.
+/// Core learned predictor component: top-level model that routes keys to segments.
 /// Reusable for Hybrid Semantic Cache: routes doc_id to appropriate cache segment.
 pub struct SegmentRouter {
-    key_ranges: Vec<(u64, u64)>,
+    /// (key_min, key_max, original_segment_index) for each non-empty segment.
+    key_ranges: Vec<(u64, u64, usize)>,
     segment_count: usize,
 }
 
 impl SegmentRouter {
     /// Build router from segment key ranges
-    pub fn new(segments: &[RmiSegment]) -> Self {
+    pub fn new(segments: &[LearnedPredictorSegment]) -> Self {
         let key_ranges = segments
             .iter()
-            .filter_map(|seg| {
+            .enumerate()
+            .filter_map(|(idx, seg)| {
                 let data = seg.data();
                 if data.is_empty() {
                     None
                 } else {
-                    Some((data[0].0, data[data.len() - 1].0))
+                    Some((data[0].0, data[data.len() - 1].0, idx))
                 }
             })
             .collect();
@@ -186,11 +192,10 @@ impl SegmentRouter {
         }
     }
 
-    /// Find segment index for key
+    /// Find segment index for key (returns index into the original segments array)
     pub fn find_segment(&self, key: u64) -> Option<usize> {
-        // Binary search over key ranges
         self.key_ranges
-            .binary_search_by(|(min, max)| {
+            .binary_search_by(|(min, max, _)| {
                 if key < *min {
                     std::cmp::Ordering::Greater
                 } else if key > *max {
@@ -200,6 +205,7 @@ impl SegmentRouter {
                 }
             })
             .ok()
+            .map(|idx| self.key_ranges[idx].2)
     }
 
     pub fn segment_count(&self) -> usize {
@@ -207,17 +213,17 @@ impl SegmentRouter {
     }
 }
 
-/// Multi-segment RMI index
+/// Multi-segment learned predictor index
 ///
-/// Complete RMI with routing + segments.
-/// Learned index for cache predictor: Recursive Model Index (RMI).
-pub struct RmiIndex {
-    segments: Vec<RmiSegment>,
+/// Complete learned predictor with routing + segments.
+/// Learned index for cache predictor: Learned Frequency Predictor (learned predictor).
+pub struct LearnedPredictorIndex {
+    segments: Vec<LearnedPredictorSegment>,
     router: SegmentRouter,
 }
 
-impl RmiIndex {
-    /// Build RMI from sorted data
+impl LearnedPredictorIndex {
+    /// Build learned predictor from sorted data
     pub fn build(data: Vec<(u64, u64)>, target_segment_size: usize) -> Self {
         if data.is_empty() {
             return Self {
@@ -230,9 +236,9 @@ impl RmiIndex {
         }
 
         // Partition data into segments
-        let segments: Vec<RmiSegment> = data
+        let segments: Vec<LearnedPredictorSegment> = data
             .chunks(target_segment_size)
-            .map(|chunk| RmiSegment::new(chunk.to_vec()))
+            .map(|chunk| LearnedPredictorSegment::new(chunk.to_vec()))
             .collect();
 
         let router = SegmentRouter::new(&segments);
@@ -263,22 +269,37 @@ mod tests {
 
         assert_eq!(model.predict(10), 0);
         assert_eq!(model.predict(40), 3);
-        assert!(model.error_bound() <= 8);
+        assert!(model.error_bound() >= 1);
     }
 
     #[test]
-    fn test_rmi_segment() {
+    fn test_local_linear_model_identical_keys() {
+        // Degenerate case: all keys equal must not divide by zero
+        let data = vec![(5, 100), (5, 200), (5, 300)];
+        let model = LocalLinearModel::new(&data);
+
+        let predicted = model.predict(5);
+        assert!(
+            predicted < data.len(),
+            "predicted {} out of range",
+            predicted
+        );
+        assert!(model.error_bound() >= 1);
+    }
+
+    #[test]
+    fn test_learned_predictor_segment() {
         let data = vec![(1, 10), (2, 20), (3, 30), (4, 40)];
-        let segment = RmiSegment::new(data);
+        let segment = LearnedPredictorSegment::new(data);
 
         assert_eq!(segment.bounded_search(2), Some(20));
         assert_eq!(segment.bounded_search(99), None);
     }
 
     #[test]
-    fn test_rmi_index() {
+    fn test_learned_predictor_index() {
         let data: Vec<(u64, u64)> = (0..1000).map(|i| (i, i * 10)).collect();
-        let index = RmiIndex::build(data, 100);
+        let index = LearnedPredictorIndex::build(data, 100);
 
         assert_eq!(index.get(42), Some(420));
         assert_eq!(index.get(999), Some(9990));

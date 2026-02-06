@@ -131,7 +131,7 @@ fn test_ab_splitter_even_distribution() {
         let strategy = splitter.get_strategy(doc_id);
         if strategy.name() == "lru_baseline" {
             lru_count += 1;
-        } else if strategy.name() == "learned_rmi" {
+        } else if strategy.name() == "learned_predictor" {
             learned_count += 1;
         } else {
             panic!("Unknown strategy name: {}", strategy.name());
@@ -495,8 +495,8 @@ fn test_strategy_names_correct() {
     );
     assert_eq!(
         learned.name(),
-        "learned_rmi",
-        "Learned strategy name must be 'learned_rmi'"
+        "learned_predictor",
+        "Learned strategy name must be 'learned_predictor'"
     );
 }
 

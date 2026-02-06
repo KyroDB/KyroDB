@@ -1,4 +1,4 @@
-//! Background task: Periodic RMI retraining for cache predictor
+//! Background task: Periodic learned predictor retraining for cache predictor
 
 use crate::access_logger::AccessPatternLogger;
 use crate::cache_strategy::LearnedCacheStrategy;
@@ -29,8 +29,8 @@ pub struct TrainingConfig {
     /// Minimum events required before training (default: 100)
     pub min_events_for_training: usize,
 
-    /// RMI capacity (default: 10,000 documents)
-    pub rmi_capacity: usize,
+    /// learned predictor capacity (default: 10,000 documents)
+    pub predictor_capacity: usize,
 
     /// Admission threshold (default: 0.15)
     pub admission_threshold: f32,
@@ -49,7 +49,7 @@ impl Default for TrainingConfig {
             window_duration: Duration::from_secs(3600),
             recency_halflife: Duration::from_secs(1800),
             min_events_for_training: 100,
-            rmi_capacity: 10_000,
+            predictor_capacity: 10_000,
             admission_threshold: 0.15,
             auto_tune_enabled: true,
             target_utilization: 0.85,
@@ -57,7 +57,7 @@ impl Default for TrainingConfig {
     }
 }
 
-/// Spawns background task that periodically retrain RMI predictor
+/// Spawns background task that periodically retrain Learned predictor
 ///
 /// Runs every `config.interval`, fetches recent access events, trains new predictor,
 /// and updates the cache strategy.
@@ -86,14 +86,14 @@ pub async fn spawn_training_task(
                         continue;
                     }
 
-                    // Preserve target_hot_entries from current predictor to avoid resetting to RMI capacity
+                    // Preserve target_hot_entries from current predictor to avoid resetting to learned predictor capacity
                     let current_target = {
                         let predictor = learned_strategy.predictor.read();
                         predictor.target_hot_entries()
                     };
 
                     // Train new predictor
-                    match train_predictor(&events, config.rmi_capacity, &config, current_target) {
+                    match train_predictor(&events, config.predictor_capacity, &config, current_target) {
                         Ok(new_predictor) => {
                             // Update learned strategy atomically
                             learned_strategy.update_predictor(new_predictor);
@@ -122,7 +122,7 @@ pub async fn spawn_training_task(
     })
 }
 
-/// Trains a new RMI predictor from access events
+/// Trains a new Learned predictor from access events
 ///
 /// Internal helper function - builds predictor from scratch using access patterns
 fn train_predictor(
@@ -336,7 +336,7 @@ mod tests {
             interval: Duration::from_secs(1),
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100,
-            rmi_capacity: 100,
+            predictor_capacity: 100,
             ..TrainingConfig::default()
         };
 
@@ -381,7 +381,7 @@ mod tests {
             interval: Duration::from_millis(100),
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100, // More than we have
-            rmi_capacity: 100,
+            predictor_capacity: 100,
             ..TrainingConfig::default()
         };
 
@@ -425,7 +425,7 @@ mod tests {
             interval: Duration::from_millis(100),
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100,
-            rmi_capacity: 100,
+            predictor_capacity: 100,
             ..TrainingConfig::default()
         };
 
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(config.interval, Duration::from_secs(600));
         assert_eq!(config.window_duration, Duration::from_secs(3600));
         assert_eq!(config.min_events_for_training, 100);
-        assert_eq!(config.rmi_capacity, 10_000);
+        assert_eq!(config.predictor_capacity, 10_000);
         assert_eq!(config.recency_halflife, Duration::from_secs(1800));
         assert_eq!(config.admission_threshold, 0.15);
         assert!(config.auto_tune_enabled);
@@ -540,7 +540,7 @@ mod tests {
             interval: Duration::from_millis(100),
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100,
-            rmi_capacity: 100,
+            predictor_capacity: 100,
             ..TrainingConfig::default()
         };
 
@@ -584,7 +584,7 @@ mod tests {
             interval: Duration::from_secs(600),
             window_duration: Duration::from_secs(3600),
             min_events_for_training: 100,
-            rmi_capacity: 100,
+            predictor_capacity: 100,
             ..TrainingConfig::default()
         };
 

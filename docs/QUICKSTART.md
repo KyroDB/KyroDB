@@ -84,15 +84,19 @@ def main() -> None:
     embedding[0] = 0.1
     embedding[1] = 0.2
 
-    resp = stub.Insert(
-      kyrodb_pb2.InsertRequest(
-        doc_id=1,
-        embedding=embedding,
-        metadata={"source": "quickstart"},
-        namespace="default",
+    try:
+      resp = stub.Insert(
+        kyrodb_pb2.InsertRequest(
+          doc_id=1,
+          embedding=embedding,
+          metadata={"source": "quickstart"},
+          namespace="default",
+        )
       )
-    )
-    print(resp)
+      print(resp)
+    except grpc.RpcError as e:
+      print(f"gRPC error: code={e.code()} details={e.details()}")
+      raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -231,7 +231,7 @@ fn test_recovery_skips_legacy_wal_before_snapshot() {
         .iter()
         .map(|(id, _)| (*id, HashMap::new()))
         .collect();
-    let snapshot = Snapshot::new(2, DistanceMetric::Euclidean, documents, metadata, 0).unwrap();
+    let snapshot = Snapshot::new(2, DistanceMetric::Euclidean, documents, metadata, 100).unwrap();
     let snapshot_ts = snapshot.timestamp;
     snapshot.save(&snapshot_path).unwrap();
 

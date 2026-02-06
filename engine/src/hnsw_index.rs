@@ -9,6 +9,25 @@ use std::sync::Arc;
 
 use crate::config::DistanceMetric;
 
+/// Safe dot-product distance: `max(0, 1 - dot(a, b))`.
+///
+/// Replaces anndists `DistDot` which panics when FP imprecision makes
+/// `1 - dot > 0` fail for near-identical unit vectors (the scalar fallback
+/// in anndists 0.1.3 asserts `dot >= 0` without clamping).
+///
+/// Uses KyroDB's own SIMD-optimized `dot_f32()` which dispatches at runtime
+/// to AVX-512/AVX2/SSE2 on x86_64 or NEON on aarch64, so this is strictly
+/// faster than anndists's simdeez-based implementation on most platforms.
+#[derive(Default, Copy, Clone)]
+pub(crate) struct DistSafeDot;
+
+impl Distance<f32> for DistSafeDot {
+    fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+        let dot = crate::simd::dot_f32(va, vb);
+        (1.0 - dot).max(0.0)
+    }
+}
+
 /// Vector search result with document ID and distance
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
@@ -43,9 +62,10 @@ pub struct HnswVectorIndex {
 
 #[derive(Clone)]
 enum HnswIndexImpl {
-    Cosine(Arc<Hnsw<'static, f32, DistCosine>>),
+    /// Cosine metric: uses DistSafeDot internally (vectors are pre-normalized by KyroDB)
+    Cosine(Arc<Hnsw<'static, f32, DistSafeDot>>),
     Euclidean(Arc<Hnsw<'static, f32, DistL2>>),
-    InnerProduct(Arc<Hnsw<'static, f32, DistDot>>),
+    InnerProduct(Arc<Hnsw<'static, f32, DistSafeDot>>),
 }
 
 impl HnswVectorIndex {
@@ -118,26 +138,35 @@ impl HnswVectorIndex {
 
         let index = match distance {
             DistanceMetric::Cosine => {
-                HnswIndexImpl::Cosine(Arc::new(Hnsw::<f32, DistCosine>::new(
+                // KyroDB always L2-normalizes vectors before insertion/search (enforced by
+                // normalize_in_place_if_needed). For pre-normalized vectors, cosine distance
+                // is equivalent to 1 - dot_product. Using DistDot instead of DistCosine
+                // avoids redundant internal normalization in DistCosine, which:
+                //   1. Eliminates numerical noise from double-normalization
+                //   2. Improves recall (especially on angular benchmarks like GloVe)
+                //   3. Is faster (fewer FLOPs per distance computation)
+                // This matches hnsw_rs's own recommendation in ann-glove25-angular.rs:
+                //   "pre normalisation to use DistDot metric instead DistCosine to spare cpu"
+                HnswIndexImpl::Cosine(Arc::new(Hnsw::<f32, DistSafeDot>::new(
                     m,
                     max_elements,
                     max_layer,
                     ef_construction,
-                    DistCosine {},
+                    DistSafeDot {},
                 )))
             }
             DistanceMetric::Euclidean => HnswIndexImpl::Euclidean(Arc::new(
                 Hnsw::<f32, DistL2>::new(m, max_elements, max_layer, ef_construction, DistL2 {}),
             )),
             DistanceMetric::InnerProduct => {
-                // DistDot assumes vectors are L2-normalized by the caller.
+                // DistSafeDot assumes vectors are L2-normalized by the caller.
                 // We enforce no normalization here to keep the hot path allocation-free.
-                HnswIndexImpl::InnerProduct(Arc::new(Hnsw::<f32, DistDot>::new(
+                HnswIndexImpl::InnerProduct(Arc::new(Hnsw::<f32, DistSafeDot>::new(
                     m,
                     max_elements,
                     max_layer,
                     ef_construction,
-                    DistDot {},
+                    DistSafeDot {},
                 )))
             }
         };
@@ -198,6 +227,89 @@ impl HnswVectorIndex {
         }
 
         self.current_count += 1;
+        Ok(())
+    }
+
+    /// Parallel batch insert of pre-validated, pre-normalized vectors.
+    ///
+    /// Uses hnsw_rs's Rayon-backed `parallel_insert_slice` for concurrent graph
+    /// construction. This is the primary speedup path for recovery and compaction
+    /// where thousands of vectors need to be re-indexed.
+    ///
+    /// Callers MUST ensure:
+    /// - All embeddings have correct dimension (panics on mismatch inside hnsw_rs)
+    /// - All embeddings are L2-normalized when using Cosine/InnerProduct distance
+    /// - `origin_ids` are valid `usize`-representable u64 values
+    /// - `self.current_count + data.len() <= self.max_elements`
+    ///
+    /// For small batches (<100 vectors), falls through to sequential insert which
+    /// avoids Rayon thread-pool overhead.
+    pub fn parallel_insert_batch(&mut self, data: &[(&[f32], usize)]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let new_count = self.current_count + data.len();
+        if new_count > self.max_elements {
+            anyhow::bail!(
+                "HNSW batch insert would exceed capacity: {} + {} > {}",
+                self.current_count,
+                data.len(),
+                self.max_elements
+            );
+        }
+
+        // Validate dimensions upfront — cheaper than failing mid-insert
+        let needs_norm_check = matches!(
+            self.distance,
+            DistanceMetric::Cosine | DistanceMetric::InnerProduct
+        ) && !self.disable_normalization_check;
+
+        for (i, (embedding, _)) in data.iter().enumerate() {
+            if embedding.len() != self.dimension {
+                anyhow::bail!(
+                    "Batch insert: embedding[{}] dimension mismatch: expected {}, got {}",
+                    i,
+                    self.dimension,
+                    embedding.len()
+                );
+            }
+            if needs_norm_check {
+                let norm_sq: f32 = embedding.iter().map(|v| v * v).sum();
+                if !(0.98..=1.02).contains(&norm_sq) {
+                    anyhow::bail!(
+                        "Batch insert: embedding[{}] {:?} requires L2-normalized vectors; norm_sq={}",
+                        i,
+                        self.distance,
+                        norm_sq
+                    );
+                }
+            }
+        }
+
+        // For small batches, sequential insert avoids Rayon thread-pool overhead
+        const PARALLEL_THRESHOLD: usize = 100;
+        if data.len() < PARALLEL_THRESHOLD {
+            for &(embedding, origin_id) in data {
+                match &self.index {
+                    HnswIndexImpl::Cosine(h) => h.insert((embedding, origin_id)),
+                    HnswIndexImpl::Euclidean(h) => h.insert((embedding, origin_id)),
+                    HnswIndexImpl::InnerProduct(h) => h.insert((embedding, origin_id)),
+                }
+            }
+        } else {
+            // hnsw_rs parallel_insert_slice uses Rayon par_iter for concurrent graph building.
+            // The Hnsw struct uses interior mutability with fine-grained per-layer locking,
+            // so `parallel_insert_slice` takes `&self` — safe to call through Arc.
+            let batch: Vec<(&[f32], usize)> = data.to_vec();
+            match &self.index {
+                HnswIndexImpl::Cosine(h) => h.parallel_insert_slice(&batch),
+                HnswIndexImpl::Euclidean(h) => h.parallel_insert_slice(&batch),
+                HnswIndexImpl::InnerProduct(h) => h.parallel_insert_slice(&batch),
+            }
+        }
+
+        self.current_count = new_count;
         Ok(())
     }
 

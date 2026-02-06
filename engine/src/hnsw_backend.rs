@@ -18,7 +18,7 @@ use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -339,6 +339,11 @@ pub struct HnswBackend {
     metadata_index: Arc<RwLock<MetadataInvertedIndex>>,
     /// Persistence components (optional)
     persistence: Option<PersistenceState>,
+    /// Set to `true` when WAL rollback fails after a failed HNSW insert.
+    /// When set, further writes are rejected to prevent silent data loss.
+    /// Reads remain available (the in-memory index may still serve queries).
+    /// Operators must inspect the WAL, repair, and restart.
+    wal_inconsistent: Arc<AtomicBool>,
 }
 
 /// Persistence state for HnswBackend
@@ -465,7 +470,7 @@ impl HnswBackend {
             store.external_to_internal.insert(external_id, internal_id);
         }
 
-        // Rebuild HNSW index from compacted live docs.
+        // Rebuild HNSW index from compacted live docs using parallel insertion.
         let mut new_index = HnswVectorIndex::new_with_params(
             dimension,
             capacity,
@@ -474,9 +479,13 @@ impl HnswBackend {
             ef_construction,
             disable_norm_check,
         )?;
-        for (internal_id, embedding) in store.embeddings.iter().enumerate() {
-            new_index.add_vector(internal_id as u64, embedding)?;
-        }
+        let batch: Vec<(&[f32], usize)> = store
+            .embeddings
+            .iter()
+            .enumerate()
+            .map(|(internal_id, emb)| (emb.as_slice(), internal_id))
+            .collect();
+        new_index.parallel_insert_batch(&batch)?;
         *index = new_index;
 
         // Rebuild metadata inverted index to match compacted internal IDs.
@@ -561,6 +570,9 @@ impl HnswBackend {
             documents = embeddings.len(),
             dimension, "building HNSW index"
         );
+
+        // Phase 1: Validate and normalize all embeddings
+        let mut live_indices: Vec<usize> = Vec::with_capacity(embeddings.len());
         for (doc_id, embedding) in embeddings.iter_mut().enumerate() {
             if embedding.iter().all(|&x| x == 0.0) {
                 continue;
@@ -574,8 +586,15 @@ impl HnswBackend {
                 );
             }
             normalize_in_place_if_needed(distance, embedding)?;
-            index.add_vector(doc_id as u64, embedding)?;
+            live_indices.push(doc_id);
         }
+
+        // Phase 2: Parallel HNSW graph construction
+        let batch: Vec<(&[f32], usize)> = live_indices
+            .iter()
+            .map(|&doc_id| (embeddings[doc_id].as_slice(), doc_id))
+            .collect();
+        index.parallel_insert_batch(&batch)?;
         info!("HNSW index built");
 
         let mut doc_store = DocumentStore {
@@ -609,6 +628,7 @@ impl HnswBackend {
             doc_store: Arc::new(RwLock::new(doc_store)),
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: None,
+            wal_inconsistent: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -766,6 +786,7 @@ impl HnswBackend {
             doc_store: Arc::new(RwLock::new(doc_store)),
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: Some(persistence),
+            wal_inconsistent: Arc::new(AtomicBool::new(false)),
         };
 
         // Durability: initial state must be recoverable even if no user-triggered snapshot
@@ -1032,6 +1053,8 @@ impl HnswBackend {
         doc_store.metadata.reserve(docs_vec.len());
         doc_store.internal_to_external.reserve(docs_vec.len());
 
+        // Phase 1: Build the document store sequentially (cheap, deterministic internal IDs).
+        // Validate embeddings and normalize in-place before parallel HNSW insertion.
         for (doc_id, embedding, metadata) in docs_vec {
             if embedding.len() != dimension {
                 anyhow::bail!(
@@ -1044,12 +1067,21 @@ impl HnswBackend {
             let mut embedding = embedding;
             normalize_in_place_if_needed(distance, &mut embedding)?;
             let internal_id = doc_store.embeddings.len();
-            index.add_vector(internal_id as u64, &embedding)?;
             doc_store.embeddings.push(embedding);
             doc_store.metadata.push(metadata);
             doc_store.internal_to_external.push(Some(doc_id));
             doc_store.external_to_internal.insert(doc_id, internal_id);
         }
+
+        // Phase 2: Parallel HNSW graph construction from pre-validated embeddings.
+        // Uses hnsw_rs's Rayon-backed parallel_insert_slice for concurrent graph building.
+        let batch: Vec<(&[f32], usize)> = doc_store
+            .embeddings
+            .iter()
+            .enumerate()
+            .map(|(internal_id, emb)| (emb.as_slice(), internal_id))
+            .collect();
+        index.parallel_insert_batch(&batch)?;
         info!("HNSW index rebuilt");
 
         if doc_store.external_to_internal.is_empty() {
@@ -1096,6 +1128,7 @@ impl HnswBackend {
             doc_store: Arc::new(RwLock::new(doc_store)),
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: Some(persistence),
+            wal_inconsistent: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1128,6 +1161,12 @@ impl HnswBackend {
         self.len() == 0
     }
 
+    /// Returns `true` if the WAL is in an inconsistent state (writes are rejected).
+    /// This occurs when a WAL rollback fails after a failed HNSW insert.
+    pub fn is_wal_inconsistent(&self) -> bool {
+        self.wal_inconsistent.load(Ordering::SeqCst)
+    }
+
     /// Lightweight existence check that avoids cloning embeddings
     pub fn exists(&self, doc_id: u64) -> bool {
         self.doc_store
@@ -1153,6 +1192,14 @@ impl HnswBackend {
         embedding: Vec<f32>,
         metadata: HashMap<String, String>,
     ) -> Result<()> {
+        // Reject writes if WAL is in an inconsistent state (unrecoverable rollback failure).
+        if self.wal_inconsistent.load(Ordering::SeqCst) {
+            anyhow::bail!(
+                "Insert rejected: WAL is in an inconsistent state. \
+                 Manual inspection and restart required before writes can resume."
+            );
+        }
+
         // Check disk space before write (if persistence enabled)
         if let Some(ref persistence) = self.persistence {
             if !check_and_warn_disk_space(&persistence.data_dir)? {
@@ -1272,9 +1319,19 @@ impl HnswBackend {
                             error = %rollback_err,
                             doc_id,
                             rollback_seq_no,
-                            "failed to append WAL rollback after failed HNSW insert; aborting to avoid inconsistent state"
+                            "CRITICAL: WAL rollback failed after failed HNSW insert; \
+                             marking backend write-degraded to prevent silent data loss. \
+                             Manual WAL inspection and restart required."
                         );
-                        std::process::abort();
+                        self.wal_inconsistent.store(true, Ordering::SeqCst);
+                        return Err(anyhow::anyhow!(
+                            "CRITICAL: WAL inconsistency detected for doc_id {}. \
+                             WAL contains an insert with no matching rollback (rollback seq={}). \
+                             Backend is now write-degraded. Reads still available. \
+                             Repair WAL and restart.",
+                            doc_id,
+                            rollback_seq_no
+                        ));
                     }
                     if let Err(rotate_err) = persistence.rotate_wal_if_needed(&mut wal) {
                         error!(
@@ -1378,6 +1435,13 @@ impl HnswBackend {
 
         if documents.is_empty() {
             return Ok((0, 0));
+        }
+
+        if self.wal_inconsistent.load(Ordering::SeqCst) {
+            anyhow::bail!(
+                "Bulk insert rejected: WAL is in an inconsistent state. \
+                 Manual inspection and restart required."
+            );
         }
 
         if self.persistence.is_some() {
@@ -1694,6 +1758,10 @@ impl HnswBackend {
         metadata: HashMap<String, String>,
         merge: bool,
     ) -> Result<bool> {
+        if self.wal_inconsistent.load(Ordering::SeqCst) {
+            anyhow::bail!("Metadata update rejected: WAL is in an inconsistent state.");
+        }
+
         let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
 
         let mut store = self.doc_store.write();
@@ -1807,6 +1875,10 @@ impl HnswBackend {
     /// - Filtered out during search
     #[instrument(level = "debug", skip(self), fields(doc_id))]
     pub fn delete(&self, doc_id: u64) -> Result<bool> {
+        if self.wal_inconsistent.load(Ordering::SeqCst) {
+            anyhow::bail!("Delete rejected: WAL is in an inconsistent state.");
+        }
+
         // Check existence first to avoid logging unnecessary WAL entries
         let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
 

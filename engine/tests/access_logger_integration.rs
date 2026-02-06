@@ -214,7 +214,7 @@ fn test_periodic_retraining() {
     let score_2_phase2 = predictor.predict_hotness(2);
 
     // After retraining, doc 2 should be hotter (recent pattern dominates)
-    // Note: Actual behavior depends on RMI's sliding window
+    // Note: Actual behavior depends on Learned predictor's sliding window
     // This test validates that retraining updates predictions
 
     println!(
@@ -278,7 +278,7 @@ fn test_cache_admission_policy() {
     );
 
     // Cold document likely not admitted (depends on training)
-    // This is a softer assertion as it depends on RMI's learned function
+    // This is a softer assertion as it depends on Learned predictor's learned function
 }
 
 #[test]

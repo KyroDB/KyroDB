@@ -169,7 +169,7 @@ impl Default for Config {
 
             // Production-realistic cache: 1.8% of corpus (sized for 70%+ hit rate)
             // 180 slots for ~250 hot docs (Zipf 1.4 working set) = 72% coverage
-            // Provides sufficient headroom for RMI predictor to achieve 70%+ combined L1
+            // Provides sufficient headroom for Learned predictor to achieve 70%+ combined L1
             cache_capacity: 180,
 
             // Models real RAG query distribution (moderate skew)
@@ -334,7 +334,7 @@ struct ValidationResults {
     test_duration_secs: u64,
     total_queries: u64,
 
-    // Layer 1a (Document Cache) stats - RMI frequency-based
+    // Layer 1a (Document Cache) stats - Learned frequency-based
     l1a_cache_hits: u64,
     l1a_cache_misses: u64,
     l1a_hit_rate: f64,
@@ -1316,7 +1316,7 @@ async fn main() -> Result<()> {
     learned_predictor.set_miss_penalty_rate(0.8);
     learned_predictor.set_working_set_boost(Duration::from_secs(60), 0.02);
 
-    // Layer 1a: Document Cache (RMI frequency-based)
+    // Layer 1a: Document Cache (Learned frequency-based)
     // Create strategy for training task
     let learned_strategy_for_training = Arc::new(LearnedCacheStrategy::new(
         learned_cache_capacity,
@@ -1403,7 +1403,7 @@ async fn main() -> Result<()> {
     )
     .context("Failed to create TieredEngine")?;
 
-    // Connect access logger to TieredEngine for RMI training data collection
+    // Connect access logger to TieredEngine for learned predictor training data collection
     engine.set_access_logger(access_logger.clone());
 
     let engine = Arc::new(engine);
@@ -1510,7 +1510,7 @@ async fn main() -> Result<()> {
         interval: Duration::from_secs(config.training_interval_secs),
         window_duration: Duration::from_secs(1800),
         min_events_for_training: 100,
-        rmi_capacity: predictor_capacity,
+        predictor_capacity: predictor_capacity,
         recency_halflife: Duration::from_secs(600),
         admission_threshold: 0.08,
         auto_tune_enabled: true,
@@ -2051,7 +2051,7 @@ async fn main() -> Result<()> {
     println!();
     println!("Two-Level Cache Performance:");
     println!();
-    println!("  Layer 1a (Document Cache - RMI):");
+    println!("  Layer 1a (Document Cache - Learned Predictor):");
     println!("    Hits:          {}", final_stats.cache_hits);
     println!("    Misses:        {}", final_stats.cache_misses);
     println!(

@@ -1,6 +1,6 @@
 //! KyroDB - High-performance vector database for RAG workloads
 //!
-//! **Hybrid Semantic Cache**: Combines RMI-based frequency prediction with semantic similarity
+//! **Hybrid Semantic Cache**: Combines Learned frequency prediction with semantic similarity
 //! for intelligent cache admission decisions in RAG workloads.
 //!
 
@@ -24,7 +24,7 @@ pub fn init_deadlock_detection() {
         thread::sleep(Duration::from_secs(10));
         let deadlocks = deadlock::check_deadlock();
         if !deadlocks.is_empty() {
-            eprintln!("🚨 DEADLOCK DETECTED 🚨");
+            eprintln!("DEADLOCK DETECTED");
             eprintln!("{} deadlock(s) found:", deadlocks.len());
             for (i, threads) in deadlocks.iter().enumerate() {
                 eprintln!("Deadlock #{}", i);
@@ -66,8 +66,8 @@ pub mod hnsw_index;
 // HNSW backend: Integration layer for cache + HNSW
 pub mod hnsw_backend;
 
-// Learned index: RMI (Recursive Model Index) for cache prediction
-pub mod rmi_core;
+// Learned index: learned predictor (Learned Frequency Predictor) for cache prediction
+pub mod learned_predictor_core;
 
 // Cache prediction: Hybrid frequency + semantic similarity
 pub mod learned_cache;
@@ -79,7 +79,7 @@ pub mod access_logger;
 pub mod ab_stats; // Metrics persistence (CSV format)
 pub mod cache_strategy; // CacheStrategy trait + LRU/Learned implementations + A/B splitter
 pub mod query_hash_cache; // Query hash cache (L1b): Semantic similarity-based query caching
-pub mod training_task; // Background RMI training task (tokio::spawn, 60-second interval)
+pub mod training_task; // Background learned predictor training task (tokio::spawn, 60-second interval)
 pub mod vector_cache; // In-memory vector cache with LRU eviction
 
 // Semantic layer: Hybrid cache decisions (frequency + similarity)
@@ -132,8 +132,10 @@ pub use hnsw_index::{HnswVectorIndex, SearchResult};
 // HNSW backend (cache integration)
 pub use hnsw_backend::HnswBackend;
 
-// Learned index components (RMI for cache prediction)
-pub use rmi_core::{LocalLinearModel, RmiIndex, RmiSegment};
+// Learned index components (frequency predictor for cache prediction)
+pub use learned_predictor_core::{
+    LearnedPredictorIndex, LearnedPredictorSegment, LocalLinearModel,
+};
 
 // Cache predictor components
 pub use learned_cache::{AccessEvent, AccessType, CachePredictorStats, LearnedCachePredictor};

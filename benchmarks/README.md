@@ -84,7 +84,7 @@ Optional overrides:
 - `SOAK_MAX_TRAIN` to truncate the dataset for local iteration (recomputes ground truth).
 - `SOAK_CONFIG` to supply a custom server config instead of auto-generated defaults.
 
-### 1. Setup VM (Standard FX32ms v2)
+### 1. Setup VM (Standard_F32s_v2)
 
 ```bash
 # SSH to VM

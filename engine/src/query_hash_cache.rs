@@ -4,7 +4,7 @@
 //! Complements the document-level cache (L1a) by caching paraphrased queries.
 //!
 //! # Architecture
-//! - L1a (Document Cache): Frequency-based (RMI predictor) - caches hot documents
+//! - L1a (Document Cache): Frequency-based (Learned predictor) - caches hot documents
 //! - L1b (Query Cache): Similarity-based (this module) - caches similar queries
 //!
 //! # Use Case

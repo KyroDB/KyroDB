@@ -203,14 +203,20 @@ async fn test_stats_survive_restart() {
         let persister = AbStatsPersister::new(&stats_path).unwrap();
         persister.log_hit("lru_baseline", 1u64, 100).await.unwrap();
         persister.log_miss("lru_baseline", 2u64, 200).await.unwrap();
-        persister.log_hit("learned_rmi", 3u64, 150).await.unwrap();
+        persister
+            .log_hit("learned_predictor", 3u64, 150)
+            .await
+            .unwrap();
         persister.flush().await.unwrap();
     }
 
     // Second session: log more events
     {
         let persister = AbStatsPersister::new(&stats_path).unwrap();
-        persister.log_miss("learned_rmi", 4u64, 250).await.unwrap();
+        persister
+            .log_miss("learned_predictor", 4u64, 250)
+            .await
+            .unwrap();
         persister.flush().await.unwrap();
     }
 
@@ -248,7 +254,7 @@ async fn test_background_training_updates_predictor() {
         window_duration: Duration::from_secs(3600),
         recency_halflife: Duration::from_secs(1800),
         min_events_for_training: 100,
-        rmi_capacity: 100,
+        predictor_capacity: 100,
         admission_threshold: 0.15,
         auto_tune_enabled: true,
         target_utilization: 0.85,
@@ -392,10 +398,16 @@ async fn test_ab_stats_analysis() {
 
     // Log events: Learned has 7 hits, 3 misses (70% hit rate)
     for i in 0u64..7 {
-        persister.log_hit("learned_rmi", i, 150).await.unwrap();
+        persister
+            .log_hit("learned_predictor", i, 150)
+            .await
+            .unwrap();
     }
     for i in 7u64..10 {
-        persister.log_miss("learned_rmi", i, 250).await.unwrap();
+        persister
+            .log_miss("learned_predictor", i, 250)
+            .await
+            .unwrap();
     }
 
     persister.flush().await.unwrap();

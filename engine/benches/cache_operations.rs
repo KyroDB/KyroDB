@@ -2,7 +2,7 @@
 //! - Cache lookup: < 50ns (hash table O(1))
 //! - Cache insertion: < 100ns (with LRU update)
 //! - Cache eviction: < 200ns (VecDeque removal)
-//! - Learned prediction: < 50ns (RMI inference)
+//! - Learned prediction: < 50ns (Frequency predictor inference)
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kyrodb_engine::{

@@ -1,13 +1,13 @@
 //! Hybrid Semantic Cache Predictor (Frequency Component)
 //!
-//! **Purpose**: RMI-based frequency prediction for document-level hotness.
+//! **Purpose**: Learned frequency prediction for document-level hotness.
 //! Combined with semantic similarity adapter for hybrid cache admission decisions.
 //!
 //! This module predicts cache hotness: doc_id → P(hot | recent_accesses)
-//! RMI learns access patterns and predicts which documents should be cached.
+//! learned predictor learns access patterns and predicts which documents should be cached.
 //!
 //! Architecture:
-//! - RMI stores doc_id → hotness_score (O(log n) lookup)
+//! - learned predictor stores doc_id → hotness_score (O(log n) lookup)
 //! - Semantic adapter computes embedding similarity (optional hybrid layer)
 //! - Access logger feeds training data
 //!
@@ -31,7 +31,7 @@ pub struct AccessEvent {
     pub doc_id: u64,
     pub timestamp: SystemTime,
     pub access_type: AccessType,
-    // Embeddings are not used in RMI training (only doc_id matters).
+    // Embeddings are not used in learned predictor training (only doc_id matters).
     // Keeping this struct small (~32 bytes) is critical for memory efficiency.
 }
 
@@ -52,7 +52,7 @@ pub enum AccessType {
     Write,
 }
 
-/// Hybrid Semantic Cache predictor using RMI to predict document hotness (frequency component)
+/// Hybrid Semantic Cache predictor using learned predictor to predict document hotness (frequency component)
 ///
 /// Predicts P(hot | recent_accesses) for each document ID.
 /// Documents with high predicted hotness are kept in cache.
@@ -187,7 +187,7 @@ impl LearnedCachePredictor {
     /// - Training interval: 10 minutes
     /// - Auto-tune: ENABLED (target 80% utilization for learning headroom)
     pub fn new(capacity: usize) -> Result<Self> {
-        // Use RMI as WIDE NET (recall-focused), semantic adapter filters false positives.
+        // Use learned predictor as WIDE NET (recall-focused), semantic adapter filters false positives.
         // Threshold balances recall (don't reject hot docs) vs precision (don't admit cold docs).
         // Target: Predict 5-6x cache capacity as "potentially hot" for semantic filtering.
         let initial_threshold = if capacity < 100 {
@@ -695,7 +695,7 @@ impl LearnedCachePredictor {
     }
 
     /// FEEDBACK LOOP: Called when cache evicts a document that wasn't re-accessed
-    /// This indicates RMI predicted the doc as hot, but it turned out to be a false positive
+    /// This indicates learned predictor predicted the doc as hot, but it turned out to be a false positive
     pub fn record_eviction(&self, doc_id: u64) {
         let mut fps = self.false_positives.write();
         let entry = fps.entry(doc_id).or_insert(EvictionStats {
@@ -707,7 +707,7 @@ impl LearnedCachePredictor {
     }
 
     /// FEEDBACK LOOP: Called when cache misses a document (predicted cold but accessed)
-    /// This indicates RMI missed a hot document (false negative)
+    /// This indicates learned predictor missed a hot document (false negative)
     pub fn record_cache_miss(&self, doc_id: u64, predicted_hotness: f32) {
         if predicted_hotness < self.cache_threshold {
             *self.false_negatives.write().entry(doc_id).or_insert(0) += 1;
@@ -726,7 +726,7 @@ impl LearnedCachePredictor {
     }
 
     /// FEEDBACK LOOP: During training, penalize false positives and boost false negatives
-    /// This corrects RMI predictions based on actual cache behavior
+    /// This corrects Learned frequency predictions based on actual cache behavior
     /// - False positives (evicted without re-access): up to 30% multiplicative penalty
     /// - False negatives (accessed but not cached): +0.02 per miss (capped)
     pub fn apply_feedback_corrections(&self, hotness_scores: &mut HashMap<u64, f32>) {

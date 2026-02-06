@@ -8,7 +8,7 @@
 //!
 //! # Architecture Position
 //! **Layer 2 in three-tier architecture**:
-//! - Layer 1 (Cache): Hot documents predicted by RMI + semantic similarity
+//! - Layer 1 (Cache): Hot documents predicted by learned predictor + semantic similarity
 //! - Layer 2 (Hot Tier): Recent writes, not yet in HNSW
 //! - Layer 3 (Cold Tier): Full HNSW index for all documents
 
@@ -375,7 +375,7 @@ impl HotTier {
         // Compute query norm once for cosine/inner-product.
         let query_l2_norm = match distance_metric {
             DistanceMetric::Cosine | DistanceMetric::InnerProduct => Self::l2_norm(query),
-            _ => 0.0,
+            DistanceMetric::Euclidean => 0.0,
         };
 
         // Use a bounded list for top-k to avoid sorting all N documents.

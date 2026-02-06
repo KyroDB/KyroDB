@@ -2,13 +2,12 @@
 //!
 //! Access pattern logger: Ring buffer for training data collection
 //!
-//! Fixed-capacity lock-free ring buffer (ringbuf crate) - no memory leaks
+//! Fixed-capacity ring buffer (ringbuf crate) - no memory leaks
 //!
 //! Architecture:
-//! - Ring buffer: Lock-free ringbuf crate (SPSC, zero-copy)
+//! - Ring buffer: ringbuf crate (HeapRb), wrapped in RwLock for concurrent access
 //! - Single-writer, multiple-reader design via RwLock
 //! - Periodic training: Flush events every 10 minutes to cache predictor
-//! - Zero-copy reads: No allocation for recent window queries
 //!
 //! Performance targets:
 //! - Log overhead: <20ns per access (with lock)
@@ -16,7 +15,7 @@
 //! - Training window: Last 24 hours of accesses
 //!
 //! Memory Safety:
-//! - Uses ringbuf crate (lock-free ring buffer, no leaks)
+//! - Uses ringbuf crate (ring buffer, no leaks)
 //! - Fixed memory footprint (bounded buffer)
 //! - No unbounded growth under sustained load
 
@@ -29,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-/// Access pattern logger with lock-free ring buffer and periodic training
+/// Access pattern logger with ring buffer and periodic training
 ///
 /// # Memory Safety
 /// - Uses ringbuf crate (no memory leaks)
@@ -54,7 +53,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// predictor.train_from_accesses(&recent).unwrap();
 /// ```
 pub struct AccessPatternLogger {
-    /// Ring buffer for access events (lock-free, fixed capacity)
+    /// Ring buffer for access events (RwLock-protected, fixed capacity)
     /// Uses HeapRb for dynamic allocation with fixed size
     events: Arc<RwLock<HeapRb<AccessEvent>>>,
 
@@ -118,7 +117,7 @@ impl AccessPatternLogger {
     #[inline]
     pub fn log_access(&self, doc_id: u64, _query_embedding: &[f32]) {
         // Store doc_id only (embeddings removed to prevent memory leak)
-        // RMI training only needs doc_id and timestamp, not the full embedding
+        // learned predictor training only needs doc_id and timestamp, not the full embedding
         // This reduces AccessEvent from ~1568 bytes to ~32 bytes (48× reduction!)
         let event = AccessEvent {
             doc_id,

@@ -10,7 +10,7 @@ KyroDB config parsing is intentionally strict: unknown keys are rejected at star
   - Example: `KYRODB_CACHE_CAPACITY=50000` → `KYRODB__CACHE__CAPACITY=50000`
   - Example: `KYRODB_HNSW_DIMENSION=1536` → `KYRODB__HNSW__DIMENSION=1536`
   - The server still supports CLI shortcut env vars for convenience: `KYRODB_CONFIG`, `KYRODB_PORT`, `KYRODB_DATA_DIR`.
-- **Persistence snapshot interval**: `persistence.snapshot_interval_secs` was renamed to `persistence.snapshot_interval_mutations` (operation-count based: counts all WAL mutations including inserts and deletes; `0` disables automatic snapshots). The legacy key `snapshot_interval_inserts` is still accepted as a backward-compatible alias during deserialization.
+- **Persistence snapshot interval**: `persistence.snapshot_interval_secs` was renamed to `persistence.snapshot_interval_mutations` (operation-count based: counts all WAL mutations including inserts and deletes; `0` disables automatic snapshots). The legacy key `snapshot_interval_inserts` is still accepted as a backward-compatible alias during deserialization. **Migration**: replace `snapshot_interval_secs: N` with `snapshot_interval_mutations: N` in your config file; the semantics change from wall-clock seconds to mutation count, so choose a value appropriate for your write throughput (e.g., `1000` triggers a snapshot every 1 000 mutations).
 - **Removed config keys (now rejected)**:
   - `persistence.enable_wal`
   - `auth.usage_stats_file`, `auth.usage_export_interval_secs`
@@ -53,6 +53,10 @@ server:
 ```
 
 ### Cache (used + partially wired)
+
+> **Partially wired** means the config keys are parsed and stored, but not all of
+> them drive runtime behavior yet. Keys marked *used* below are fully functional;
+> the rest are reserved for upcoming features and will be wired in future releases.
 
 ```yaml
 cache:

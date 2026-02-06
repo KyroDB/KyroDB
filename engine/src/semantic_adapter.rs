@@ -11,8 +11,8 @@
 //! - Slow path (uncertain): 1-5ms (semantic similarity scan)
 //! - Memory overhead: ~38 MB for 100K embeddings (384-dim f32)
 
+use indexmap::IndexMap;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Semantic adapter configuration
@@ -69,7 +69,17 @@ pub struct SemanticStats {
     pub cached_embeddings: usize,
 }
 
-/// Lightweight semantic layer over frequency-based RMI predictor (forms Hybrid Semantic Cache)
+/// Embedding cache state consolidated under a single lock to prevent TOCTOU
+/// races between dimension validation and cache insertion.
+struct EmbeddingCacheState {
+    /// doc_id -> embedding, bounded at max capacity with FIFO eviction.
+    /// IndexMap guarantees insertion-order iteration.
+    entries: IndexMap<u64, Vec<f32>>,
+    /// Expected embedding dimension, set on first insert and validated thereafter.
+    expected_dim: Option<usize>,
+}
+
+/// Lightweight semantic layer over frequency-based Learned predictor (forms Hybrid Semantic Cache)
 ///
 /// Strategy:
 /// 1. Check frequency-based prediction (4-8ns)
@@ -78,16 +88,8 @@ pub struct SemanticStats {
 /// 4. If uncertain: check semantic similarity (slow path)
 /// 5. Hybrid decision: average frequency + semantic scores
 pub struct SemanticAdapter {
-    /// Embedding cache: doc_id -> embedding
-    /// Bounded at max_cached_embeddings with FIFO eviction
-    embedding_cache: Arc<RwLock<HashMap<u64, Vec<f32>>>>,
-
-    /// Expected embedding dimension for cached vectors.
-    ///
-    /// This is set on first successful cache insert and validated on every
-    /// subsequent insert to prevent dimension mismatches from panicking later
-    /// during cosine similarity computation.
-    expected_embedding_dim: Arc<RwLock<Option<usize>>>,
+    /// Embedding cache with dimension tracking under a single lock.
+    cache_state: Arc<RwLock<EmbeddingCacheState>>,
 
     /// Configuration
     config: SemanticConfig,
@@ -105,10 +107,10 @@ impl SemanticAdapter {
     /// Create new semantic adapter with custom config
     pub fn with_config(config: SemanticConfig) -> Self {
         Self {
-            embedding_cache: Arc::new(RwLock::new(HashMap::with_capacity(
-                config.max_cached_embeddings,
-            ))),
-            expected_embedding_dim: Arc::new(RwLock::new(None)),
+            cache_state: Arc::new(RwLock::new(EmbeddingCacheState {
+                entries: IndexMap::with_capacity(config.max_cached_embeddings),
+                expected_dim: None,
+            })),
             config,
             stats: Arc::new(RwLock::new(SemanticStats::default())),
         }
@@ -120,7 +122,7 @@ impl SemanticAdapter {
     /// During cold-start (empty semantic cache), falls back to frequency-only.
     ///
     /// # Parameters
-    /// - `freq_score`: Frequency-based hotness score from RMI (0.0-1.0)
+    /// - `freq_score`: Frequency-based hotness score from learned predictor (0.0-1.0)
     /// - `embedding`: Query embedding vector
     ///
     /// # Returns
@@ -186,21 +188,20 @@ impl SemanticAdapter {
     /// - Empty cache: <1μs
     /// - Scan 1000 embeddings (384-dim): 1-5ms
     fn compute_semantic_score(&self, query_embedding: &[f32]) -> f32 {
-        let cache = self.embedding_cache.read();
+        let state = self.cache_state.read();
 
-        // Cold start: no embeddings cached yet
-        if cache.is_empty() {
+        if state.entries.is_empty() {
             self.stats.write().semantic_misses += 1;
             return 0.0;
         }
 
-        // Scan recent embeddings (limit to avoid expensive full scan)
-        let scan_start = cache
+        let scan_start = state
+            .entries
             .len()
             .saturating_sub(self.config.similarity_scan_limit);
         let mut max_similarity = 0.0f32;
 
-        for (_, cached_embedding) in cache.iter().skip(scan_start) {
+        for (_, cached_embedding) in state.entries.iter().skip(scan_start) {
             if query_embedding.len() != cached_embedding.len() {
                 debug_assert!(
                     false,
@@ -257,38 +258,35 @@ impl SemanticAdapter {
         }
 
         let embedding_dim = embedding.len();
-        {
-            let mut expected_dim = self.expected_embedding_dim.write();
-            match *expected_dim {
-                None => {
-                    *expected_dim = Some(embedding_dim);
-                }
-                Some(expected) if expected != embedding_dim => {
-                    anyhow::bail!(
-                        "embedding dimension mismatch: expected {} found {}",
-                        expected,
-                        embedding_dim
-                    );
-                }
-                Some(_) => {}
+        let mut state = self.cache_state.write();
+
+        // Validate dimension under the same lock that guards insertion.
+        match state.expected_dim {
+            None => {
+                state.expected_dim = Some(embedding_dim);
             }
+            Some(expected) if expected != embedding_dim => {
+                anyhow::bail!(
+                    "embedding dimension mismatch: expected {} found {}",
+                    expected,
+                    embedding_dim
+                );
+            }
+            Some(_) => {}
         }
 
-        let mut cache = self.embedding_cache.write();
-
-        // Bounded eviction: remove oldest if at capacity
-        if cache.len() >= self.config.max_cached_embeddings {
-            // Simple FIFO: remove first entry (HashMap iteration order is insertion order in Rust 1.70+)
-            if let Some(&oldest_key) = cache.keys().next() {
-                cache.remove(&oldest_key);
-            }
+        // Bounded eviction: remove oldest if at capacity.
+        if state.entries.len() >= self.config.max_cached_embeddings {
+            state.entries.shift_remove_index(0);
         }
 
-        cache.insert(doc_id, embedding);
+        state.entries.insert(doc_id, embedding);
 
-        // Update stats
+        let cached_count = state.entries.len();
+        drop(state);
+
         let mut stats = self.stats.write();
-        stats.cached_embeddings = cache.len();
+        stats.cached_embeddings = cached_count;
 
         Ok(())
     }
@@ -306,11 +304,10 @@ impl SemanticAdapter {
     /// Clear embedding cache (for testing or memory pressure)
     pub fn clear_cache(&self) {
         {
-            let mut expected_dim = self.expected_embedding_dim.write();
-            *expected_dim = None;
+            let mut state = self.cache_state.write();
+            state.entries.clear();
+            state.expected_dim = None;
         }
-        let mut cache = self.embedding_cache.write();
-        cache.clear();
 
         let mut stats = self.stats.write();
         stats.cached_embeddings = 0;
@@ -318,7 +315,7 @@ impl SemanticAdapter {
 
     /// Get embedding cache size
     pub fn cache_size(&self) -> usize {
-        self.embedding_cache.read().len()
+        self.cache_state.read().entries.len()
     }
 }
 

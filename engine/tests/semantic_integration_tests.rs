@@ -163,7 +163,7 @@ fn test_frequency_only_strategy_without_semantic() {
     let strategy = LearnedCacheStrategy::new(10, predictor);
 
     assert!(!strategy.has_semantic());
-    assert_eq!(strategy.name(), "learned_rmi");
+    assert_eq!(strategy.name(), "learned_predictor");
 
     // Should work with frequency-only logic
     let embedding = vec![1.0; 384];

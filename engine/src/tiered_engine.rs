@@ -1,7 +1,7 @@
 //! Tiered Engine - Two-level cache architecture orchestrator
 //!
 //! Coordinates all tiers:
-//! - **Layer 1a (Document Cache)**: RMI frequency-based cache (hot documents)
+//! - **Layer 1a (Document Cache)**: Learned frequency-based cache (hot documents)
 //! - **Layer 1b (Query Cache)**: Semantic search-result cache (paraphrased queries)
 //! - **Layer 2 (Hot Tier)**: Recent writes buffer (fast writes, periodic flush)
 //! - **Layer 3 (Cold Tier)**: HNSW index (all documents, approximate k-NN search)
@@ -58,7 +58,7 @@ use tracing::{debug, error, info, instrument, warn};
 /// lock contention, which is unacceptable for a performance-critical database.
 #[derive(Debug, Clone, Default)]
 pub struct TieredEngineStats {
-    /// Layer 1a (Document Cache) statistics - RMI frequency-based
+    /// Layer 1a (Document Cache) statistics - Learned frequency-based
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_hit_rate: f64,
@@ -212,7 +212,7 @@ struct TieredEngineComponents {
 
 /// Tiered Engine - Two-level cache vector database
 pub struct TieredEngine {
-    /// Layer 1a: Document Cache (RMI frequency-based, hot documents)
+    /// Layer 1a: Document Cache (Learned frequency-based, hot documents)
     cache_strategy: Arc<RwLock<Box<dyn CacheStrategy>>>,
 
     /// Layer 1b: Query Cache (Semantic similarity-based, paraphrased queries)
@@ -437,7 +437,7 @@ impl TieredEngine {
     /// Query - unified three-tier path
     ///
     /// # Query Flow
-    /// 1. Check cache (L1) - RMI prediction + semantic similarity
+    /// 1. Check cache (L1) - Learned frequency prediction + semantic similarity
     /// 2. If miss, check hot tier (L2) - recent writes
     /// 3. If miss, search HNSW (L3) - full k-NN search
     /// 4. Cache admission decision (should we cache this result?)
@@ -946,8 +946,11 @@ impl TieredEngine {
 
         {
             let mut stats = self.stats.write();
-            stats.cold_tier_searches += 1;
             stats.total_queries += 1;
+
+            if cold_tier_has_docs {
+                stats.cold_tier_searches += 1;
+            }
 
             if !hot_results.is_empty() {
                 stats.hot_tier_hits += 1;
@@ -1086,8 +1089,9 @@ impl TieredEngine {
 
         let cold_results = if cold_tier_has_docs {
             let effective_ef_search = ef_search_override.unwrap_or(self.config.hnsw_ef_search);
-            let results = self.cold_tier
-                .knn_search_batch(&miss_queries, k * 2, Some(effective_ef_search))?;
+            let results =
+                self.cold_tier
+                    .knn_search_batch(&miss_queries, k * 2, Some(effective_ef_search))?;
             {
                 let mut stats = self.stats.write();
                 stats.cold_tier_searches += miss_indices.len() as u64;
@@ -1114,8 +1118,11 @@ impl TieredEngine {
                 .expect("cold results length mismatch for cache misses");
             let merged_results = Self::merge_knn_results(hot, cold, k);
             if cacheable && !merged_results.is_empty() {
-                self.query_cache
-                    .insert_with_k(normalized_queries[i].clone(), merged_results.clone(), k);
+                self.query_cache.insert_with_k(
+                    normalized_queries[i].clone(),
+                    merged_results.clone(),
+                    k,
+                );
             }
             merged.push(merged_results);
         }
@@ -1475,8 +1482,14 @@ impl TieredEngine {
         // Insert into hot tier (fast)
         self.hot_tier.insert(doc_id, embedding, metadata);
 
-        // L1b caches top‑k search results. Any insert can change k‑NN results, so
-        // clear the search cache to preserve read-your-writes semantics.
+        // L1b caches top-k search results. On a cache hit the search path returns
+        // immediately WITHOUT checking the hot tier, so any insert makes cached
+        // results potentially stale (the new vector may be closer to a cached query
+        // than its current top-k). We must clear the entire query cache here because
+        // we cannot know which cached queries are affected without re-running distance
+        // computations against all cached query vectors (too expensive for the write
+        // path). For deletes, targeted invalidate_doc() suffices because only queries
+        // whose result sets contain the deleted doc_id are affected.
         self.query_cache.clear();
 
         let mut stats = self.stats.write();
@@ -1547,6 +1560,11 @@ impl TieredEngine {
                     fail_count
                 );
             }
+        }
+
+        // Emergency flush moved documents to cold tier; clear L1b query cache.
+        if success_count > 0 {
+            self.query_cache.clear();
         }
 
         Ok(success_count)
@@ -1687,6 +1705,12 @@ impl TieredEngine {
                 );
             }
             // Partial success - return success count but log warning (already done above)
+        }
+
+        // Flush moved documents from hot tier to cold tier, which changes k-NN result
+        // sets for cold-tier searches. Clear L1b to prevent serving stale cached results.
+        if success_count > 0 {
+            self.query_cache.clear();
         }
 
         Ok(success_count)

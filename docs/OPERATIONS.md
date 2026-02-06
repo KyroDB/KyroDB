@@ -92,7 +92,10 @@ Free space or move the data directory to faster storage, then restart the server
 2. Create a backup (recommended) or copy the directory as a fallback.
 3. Move `persistence.data_dir` to the new location (fast SSD / local NVMe).
 4. Update your config (`persistence.data_dir`) or pass `--data-dir <PATH>` / `KYRODB_DATA_DIR`.
-5. Verify the move completed and permissions are correct (file counts/checksums as needed).
+5. Verify the move completed:
+   - Compare file counts: `find <OLD_DIR> -type f | wc -l` vs `find <NEW_DIR> -type f | wc -l`
+   - Check permissions: `ls -la <NEW_DIR>/` — the server process must have read/write access.
+   - Verify the MANIFEST file exists: `test -f <NEW_DIR>/MANIFEST && echo OK`
 6. Restart the server and verify `/health`, `/ready`, and logs. If validation fails, revert using the backup.
 
 #### WAL circuit breaker open
@@ -156,7 +159,11 @@ Use the backup tool to restore a known-good state. See the [backup guide](BACKUP
 > Only use `BACKUP_ALLOW_CLEAR=true` when data loss in the target directory is intentional.
 
 ```bash
+# List available backups. Use --format json to get machine-parseable output.
 kyrodb_backup list --backup-dir ./backups --format json
+
+# Restore a specific backup. Extract the backup ID from the list output above
+# (the "id" field in JSON output, e.g. "20250601T120000Z").
 export BACKUP_ALLOW_CLEAR=true
 kyrodb_backup restore --backup-id <BACKUP_ID> --data-dir ./data --backup-dir ./backups
 ```

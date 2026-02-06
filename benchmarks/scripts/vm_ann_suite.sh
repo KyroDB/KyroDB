@@ -86,6 +86,7 @@ PY
 
   echo "Server failed to become healthy" >&2
   kill "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
   return 1
 }
 

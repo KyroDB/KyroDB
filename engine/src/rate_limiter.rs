@@ -525,4 +525,72 @@ mod tests {
         }
         assert!(!bucket.try_consume());
     }
+
+    #[test]
+    fn test_global_limit_caps_total_throughput() {
+        // Global limit of 5 QPS, tenant limit of 10 QPS.
+        // The global bucket should reject after 5 requests regardless of tenant allowance.
+        let limiter = RateLimiter::new_with_global(Some(5));
+
+        let mut allowed = 0;
+        for _ in 0..10 {
+            if limiter.check_limit("tenant_a", 10) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 5, "global limit must cap total throughput at 5");
+    }
+
+    #[test]
+    fn test_global_limit_refunds_tenant_token_on_reject() {
+        // Global limit of 2. After 2 requests, global bucket is exhausted.
+        // Verify the tenant's tokens are refunded so they aren't leaked.
+        let limiter = RateLimiter::new_with_global(Some(2));
+
+        assert!(limiter.check_limit("tenant_a", 100));
+        assert!(limiter.check_limit("tenant_a", 100));
+
+        // 3rd request: tenant has tokens but global is exhausted → tenant token refunded.
+        assert!(!limiter.check_limit("tenant_a", 100));
+
+        let available = limiter.available_tokens("tenant_a").unwrap();
+        // 100 capacity - 2 consumed (third was refunded) = ~98
+        assert!(
+            available >= 97.0,
+            "tenant token should have been refunded, got {}",
+            available
+        );
+    }
+
+    #[test]
+    fn test_global_limit_shared_across_tenants() {
+        // Global limit of 3. Two tenants each with per-tenant limit of 10.
+        // Combined requests across both tenants must not exceed 3.
+        let limiter = RateLimiter::new_with_global(Some(3));
+
+        assert!(limiter.check_limit("tenant_a", 10));
+        assert!(limiter.check_limit("tenant_b", 10));
+        assert!(limiter.check_limit("tenant_a", 10));
+
+        // Global is now exhausted
+        assert!(!limiter.check_limit("tenant_a", 10));
+        assert!(!limiter.check_limit("tenant_b", 10));
+    }
+
+    #[test]
+    fn test_no_global_limit_unlimited() {
+        // Without global limit, only per-tenant limits apply.
+        let limiter = RateLimiter::new_with_global(None);
+
+        let mut allowed = 0;
+        for _ in 0..50 {
+            if limiter.check_limit("tenant_a", 50) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed, 50,
+            "without global limit, all 50 requests should pass"
+        );
+    }
 }

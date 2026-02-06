@@ -243,7 +243,7 @@ The L1a/L1b hit rates shown in **Validated Results** come from the validation ha
 
 **Diagnosis:**
 ```bash
-# Check hit rate breakdown
+# Check overall cache metrics
 curl localhost:51051/metrics | grep kyrodb_cache
 ```
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import os
 import re
@@ -207,14 +208,12 @@ def _run_benchmark(
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     if p.stdout is None:
         raise RuntimeError("benchmark stdout is not captured (expected stdout=PIPE)")
-    captured: List[str] = []
+    captured: collections.deque[str] = collections.deque(maxlen=5000)
     try:
         for line in p.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
-            # Keep a bounded capture for error context.
-            if len(captured) < 5000:
-                captured.append(line)
+            captured.append(line)
         rc = p.wait()
     except KeyboardInterrupt:
         try:

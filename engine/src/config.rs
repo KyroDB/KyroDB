@@ -237,7 +237,7 @@ impl Default for CacheConfig {
 pub enum CacheStrategy {
     /// LRU eviction (baseline)
     Lru,
-    /// Hybrid Semantic Cache with RMI predictor
+    /// Hybrid Semantic Cache with Learned predictor
     Learned,
     /// A/B test between LRU and Learned
     AbTest,

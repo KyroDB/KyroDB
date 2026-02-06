@@ -2553,7 +2553,7 @@ async fn main() -> anyhow::Result<()> {
             window_duration: Duration::from_secs(config.cache.training_window_secs),
             recency_halflife: Duration::from_secs(config.cache.recency_halflife_secs),
             min_events_for_training: config.cache.min_training_samples.max(1),
-            rmi_capacity: config
+            predictor_capacity: config
                 .cache
                 .capacity
                 .saturating_mul(config.cache.predictor_capacity_multiplier.max(1))

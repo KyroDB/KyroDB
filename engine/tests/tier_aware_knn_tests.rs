@@ -125,7 +125,7 @@ fn test_knn_searches_hot_tier() {
         );
     }
 
-    println!("✓ Hot tier documents correctly included in k-NN results");
+    println!("[OK] Hot tier documents correctly included in k-NN results");
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn test_knn_deduplication() {
     );
 
     println!(
-        "✓ Deduplication works correctly (doc 2 appeared {} time)",
+        "[OK] Deduplication works correctly (doc 2 appeared {} time)",
         doc_2_count
     );
 }
@@ -258,7 +258,7 @@ fn test_knn_result_merging_correctness() {
     }
 
     println!(
-        "✓ Merging produced {} unique, sorted results",
+        "[OK] Merging produced {} unique, sorted results",
         results.len()
     );
 }
@@ -328,7 +328,7 @@ fn test_knn_consistency() {
         );
     }
 
-    println!("✓ k-NN consistency validated");
+    println!("[OK] k-NN consistency validated");
 }
 
 #[test]
@@ -377,7 +377,7 @@ fn test_knn_empty_hot_tier() {
         "Distance should be near 0 for identical vectors"
     );
 
-    println!("✓ k-NN works correctly with empty hot tier");
+    println!("[OK] k-NN works correctly with empty hot tier");
 }
 
 #[test]
@@ -436,7 +436,7 @@ fn test_knn_only_hot_tier() {
         "All 5 hot tier documents should be in results"
     );
 
-    println!("✓ k-NN works correctly with primarily hot tier documents");
+    println!("[OK] k-NN works correctly with primarily hot tier documents");
 }
 
 #[test]
@@ -525,7 +525,7 @@ fn test_knn_latency_with_hot_tier() {
         p99_latency
     );
 
-    println!("✓ Latency validation passed");
+    println!("[OK] Latency validation passed");
 }
 
 #[test]
@@ -613,7 +613,7 @@ fn test_knn_correctness_vs_brute_force() {
         overlap
     );
 
-    println!("✓ k-NN correctness validated (recall: {}/5)", overlap);
+    println!("[OK] k-NN correctness validated (recall: {}/5)", overlap);
 }
 
 /// Helper: Compute cosine distance between two vectors
