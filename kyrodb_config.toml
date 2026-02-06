@@ -33,23 +33,16 @@ shutdown_timeout_secs = 30
 # Customer A might use 1000, Customer B might use 100,000
 capacity = 10000
 
-# Cache eviction strategy: "lru", "learned", or "abtest"
+# Cache eviction strategy: "lru" or "learned"
 # - lru: Simple LRU eviction (baseline)
-# - learned: Hybrid Semantic Cache with RMI predictor
-# - abtest: A/B test between LRU and Learned
+# - learned: Hybrid Semantic Cache with a learned hotness predictor
 strategy = "learned"
 
 # Training interval for Hybrid Semantic Cache (seconds)
 training_interval_secs = 600  # 10 minutes
 
-# Minimum access count before training RMI
+# Minimum access count before training the predictor
 min_training_samples = 100
-
-# Enable A/B testing (only applies when strategy = "abtest")
-enable_ab_testing = false
-
-# A/B test traffic split (0.0-1.0, fraction for treatment group)
-ab_test_split = 0.5
 
 # HNSW Configuration (Vector Search Backend)
 [hnsw]
@@ -82,9 +75,6 @@ distance = "cosine"
 # Override with KYRODB__PERSISTENCE__DATA_DIR environment variable
 data_dir = "/var/lib/kyrodb/data"
 
-# Enable write-ahead log (disable only for benchmarking)
-enable_wal = true
-
 # WAL flush interval (milliseconds, 0 = immediate fsync)
 # Lower = more durable, slower writes
 wal_flush_interval_ms = 100
@@ -95,8 +85,8 @@ wal_flush_interval_ms = 100
 # - full: fsync data + metadata (safest, slowest)
 fsync_policy = "data_only"
 
-# Snapshot interval (seconds, 0 = disabled)
-snapshot_interval_secs = 3600  # 1 hour
+# Snapshot interval (number of WAL mutations including inserts and deletes, 0 = disabled)
+snapshot_interval_mutations = 10000
 
 # Maximum WAL size before rotation (bytes)
 max_wal_size_bytes = 104857600  # 100 MB

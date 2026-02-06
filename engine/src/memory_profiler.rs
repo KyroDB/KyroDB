@@ -117,7 +117,7 @@ pub fn get_memory_stats() -> anyhow::Result<MemoryStats> {
 }
 
 /// Platform-native memory tracking (works everywhere without jemalloc)
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "jemalloc-profiling"), target_os = "linux"))]
 fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
     use std::fs;
 
@@ -152,7 +152,7 @@ fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(feature = "jemalloc-profiling"), target_os = "macos"))]
 fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
     use std::mem;
 
@@ -196,7 +196,10 @@ fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    not(feature = "jemalloc-profiling"),
+    not(any(target_os = "linux", target_os = "macos"))
+))]
 fn platform_memory_stats() -> anyhow::Result<MemoryStats> {
     // Unsupported platform - return error
     anyhow::bail!(

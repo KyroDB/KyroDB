@@ -1,12 +1,15 @@
 # KyroDB Backup CLI - Quick Reference
 
-Professional command-line tool for KyroDB backup and restore operations.
+Command-line tool for KyroDB backup and restore operations.
 
 ## Installation
 
 ```bash
-# Build from source
+# Build from source (minimal: JSON output; no tables/progress bars)
 cargo build --bin kyrodb_backup --release
+
+# Optional: enable table output + progress bars
+cargo build --bin kyrodb_backup --release --features cli-tools
 
 # Binary location
 ./target/release/kyrodb_backup
@@ -18,9 +21,9 @@ cargo build --bin kyrodb_backup --release
 kyrodb_backup [OPTIONS] <COMMAND>
 
 Global Options:
-  --data-dir <PATH>      Database data directory [default: ./data]
-  --backup-dir <PATH>    Backup storage directory [default: ./backups]
-  -h, --help            Print help
+  --data-dir <PATH>     Database data directory [default: ./data]
+  --backup-dir <PATH>   Backup storage directory [default: ./backups]
+  -h, --help           Print help
 ```
 
 ## Commands
@@ -71,10 +74,10 @@ Vectors: 10000
 
 ### 2. List Backups
 
-List all available backups in table or JSON format.
+List all available backups in table or JSON format. The default output format depends on whether the binary was built with `cli-tools`.
 
 ```bash
-# Table format (default)
+# Table format (available with `cli-tools`; default only when built with `cli-tools`)
 ./target/release/kyrodb_backup list \
   --data-dir ./data \
   --backup-dir ./backups
@@ -87,7 +90,7 @@ List all available backups in table or JSON format.
 ```
 
 **Options:**
-- `--format <table|json>`: Output format (default: table)
+- `--format <table|json>`: Output format. Default is `table` when built with `cli-tools`; otherwise `json`. For stable automation, pass `--format json`.
 
 **Table Output:**
 ```
@@ -122,6 +125,10 @@ List all available backups in table or JSON format.
 Restore database from a backup or to a specific point in time.
 
 ```bash
+# Restores may clear/overwrite the existing --data-dir.
+# Safety mechanism: restore will refuse to clear unless you explicitly confirm.
+export BACKUP_ALLOW_CLEAR=true
+
 # Restore from specific backup
 ./target/release/kyrodb_backup restore \
   --data-dir ./data \
@@ -154,6 +161,8 @@ Database restored from backup 550e8400-e29b-41d4-a716-446655440000
 ```
 
 **Warning:** Restore operation will overwrite existing data directory.
+
+If `BACKUP_ALLOW_CLEAR` is not set to `true`, the restore will abort/refuse to clear the data directory and print a warning/error.
 
 ---
 
@@ -271,6 +280,7 @@ LATEST=$(./target/release/kyrodb_backup list \
   --backup-dir ./backups \
   --format json | jq -r '.[0].id')
 
+export BACKUP_ALLOW_CLEAR=true
 ./target/release/kyrodb_backup restore \
   --data-dir ./data \
   --backup-dir ./backups \
@@ -304,6 +314,7 @@ if [ $? -ne 0 ]; then
     --format json | \
     jq -r '.[] | select(.description | contains("Pre-upgrade")) | .id' | \
     head -1)
+  export BACKUP_ALLOW_CLEAR=true
   ./target/release/kyrodb_backup restore \
     --data-dir ./data \
     --backup-dir ./backups \
@@ -322,7 +333,24 @@ The CLI provides clear error messages for common issues:
 $ kyrodb_backup verify
 error: the following required arguments were not provided:
   <backup-id>
+```
 
+### Restore Refuses to Clear Data Directory
+
+When running a restore without `BACKUP_ALLOW_CLEAR` set, the CLI emits:
+
+```
+Error: Cannot clear data directory. Set BACKUP_ALLOW_CLEAR=true environment variable to allow clearing the data directory during restore.
+```
+
+**Solution**: set the environment variable to acknowledge the destructive operation:
+
+```bash
+export BACKUP_ALLOW_CLEAR=true
+./target/release/kyrodb_backup restore --backup-id <backup-id>
+```
+
+```bash
 # Invalid backup ID format
 $ kyrodb_backup verify invalid-uuid
 Error: invalid UUID format
@@ -361,7 +389,6 @@ kyrodb_backup restore --backup-id UUID
 ## Performance Tips
 
 1. **Incremental Backups**: Use incremental backups for frequent snapshots (lower overhead)
-2. **Parallel Operations**: CLI automatically uses multiple threads for large backups
 
 ---
 
@@ -410,13 +437,7 @@ kyrodb_backup prune \
 
 ## Integration with Monitoring
 
-### Prometheus Metrics
-
-The backup operations expose metrics:
-- `kyrodb_backup_count_total`: Total number of backups
-- `kyrodb_backup_size_bytes`: Size of all backups
-- `kyrodb_backup_duration_seconds`: Backup creation duration
-- `kyrodb_restore_duration_seconds`: Restore operation duration
+The backup CLI does not emit Prometheus metrics. Use exit codes and periodic verification to monitor backup health.
 
 ### Health Checks
 
@@ -452,5 +473,4 @@ fi
 
 ---
 
-**Version**: 0.1.0  
-**Status**: Production Ready
+**Version**: 0.1.0

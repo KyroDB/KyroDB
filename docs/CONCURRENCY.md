@@ -222,7 +222,8 @@ cargo build --bin kyrodb_server
 ./target/debug/kyrodb_server --port 3030
 
 # Generate concurrent load (separate terminal)
-ab -n 10000 -c 50 http://localhost:3030/health
+# HTTP observability defaults to gRPC port + 1000
+ab -n 10000 -c 50 http://localhost:4030/health
 ```
 
 If deadlock occurs, server will panic with stack trace.

@@ -13,6 +13,14 @@ KyroDB provides:
 ## Quick Reference
 
 ```bash
+# Build backup CLI (minimal: JSON output; no tables/progress bars)
+cargo build --bin kyrodb_backup --release
+
+# Optional: enable table output + progress bars
+cargo build --bin kyrodb_backup --release --features cli-tools
+```
+
+```bash
 # Create full backup (default)
 ./target/release/kyrodb_backup create \
   --data-dir ./data \
@@ -38,13 +46,14 @@ KyroDB provides:
   --backup-dir ./backups \
   --format json
 
-# Restore from backup
+# Restore from backup (DANGEROUS: may clear/overwrite --data-dir)
+export BACKUP_ALLOW_CLEAR=true
 ./target/release/kyrodb_backup restore \
   --data-dir ./data \
   --backup-dir ./backups \
   --backup-id <BACKUP_ID>
 
-# Restore to specific point in time
+# Restore to specific point in time (Unix timestamp)
 ./target/release/kyrodb_backup restore \
   --data-dir ./data \
   --backup-dir ./backups \
@@ -103,6 +112,96 @@ PARENT_ID=$(./target/release/kyrodb_backup list --format json | jq -r '.[0].id')
 
 **When to use**: Hourly, between full backups, for continuous protection.
 
+## Migration Notes
+
+### Legacy Snapshots Without Distance Metric
+
+Legacy snapshot formats (LegacySnapshotV2) do not store the distance metric. During migration, KyroDB assumes the default metric (currently `DistanceMetric::Cosine`) and emits a warning with the snapshot timestamp and document count. If the original index used a different metric, search results may be incorrect after recovery.
+
+Do not resume production traffic until validation passes.
+
+#### Determine the original metric
+
+Use as many of these signals as you have (LegacySnapshotV2 cannot tell you by itself):
+
+1. Application configuration used at snapshot time
+  - Inspect the config file deployed at the time (TOML/YAML) and the effective runtime config.
+  - If you keep config in Git, use the commit/tag that produced the snapshot.
+2. Snapshot/backup metadata outside the snapshot file
+  - Some deployments store the metric in backup manifests or operational runbooks.
+3. Server logs
+  - KyroDB logs a warning when it loads a legacy snapshot and falls back to the default metric.
+  - Example:
+
+```bash
+grep -n "LegacySnapshotV2\|legacy snapshot\|DistanceMetric" /var/log/kyrodb/kyrodb.log | tail -n 50
+```
+
+#### Validation procedure after restore
+
+Run validation in a staging environment first.
+
+1. Stop KyroDB
+
+```bash
+systemctl stop kyrodb
+```
+
+2. Restore the backup
+
+```bash
+export BACKUP_ALLOW_CLEAR=true
+./target/release/kyrodb_backup restore --backup-id <BACKUP_ID> --data-dir ./data --backup-dir ./backups
+```
+
+3. Start KyroDB
+
+```bash
+systemctl start kyrodb
+```
+
+4. Validate correctness with known vectors/queries
+  - Run a fixed set of “golden” query vectors (and expected top-k IDs) against the recovered index.
+  - Also validate similarity/distance values by computing them offline using the intended metric.
+
+At minimum, confirm:
+- Top-1 / top-k IDs match expected results.
+- Score ordering is consistent with the metric (Cosine vs Euclidean vs InnerProduct).
+
+#### Remediation if the metric is wrong
+
+1. Stop KyroDB
+
+```bash
+systemctl stop kyrodb
+```
+
+2. Update the index configuration to the correct metric
+  - Edit the KyroDB config file used by the service (TOML/YAML).
+  - In KyroDB, the index configuration is under the `hnsw` section. Set `distance` to one of: `cosine`, `euclidean`, `innerproduct`.
+
+```toml
+[hnsw]
+distance = "euclidean"
+```
+
+3. Rebuild/reindex the dataset using the correct metric
+  - KyroDB does not provide a standalone `kyrodb_reindex` CLI.
+  - Rebuild by loading all vectors into a fresh data directory using the gRPC bulk insert API:
+    1) Stop KyroDB.
+    2) Move or clear the existing data directory (e.g., `/var/lib/kyrodb/data`).
+    3) Start KyroDB with the updated config.
+    4) Stream all vectors via `BulkInsert`, then call `FlushHotTier` and optionally `CreateSnapshot`.
+  - API details are in [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+
+4. Restart and re-run the validation procedure
+
+```bash
+systemctl start kyrodb
+```
+
+Do not resume production traffic until the validation procedure passes for LegacySnapshotV2 restores.
+
 ## Backup Schedule (Recommended)
 
 ```bash
@@ -125,17 +224,20 @@ PARENT_ID=$(./target/release/kyrodb_backup list --format json | jq -r '.[0].id')
 # 1. Stop server
 systemctl stop kyrodb
 
-# 2. List available backups
+# 2. Allow data directory clear for restore
+export BACKUP_ALLOW_CLEAR=true
+
+# 3. List available backups
 ./target/release/kyrodb_backup list
 
-# 3. Restore from backup ID
+# 4. Restore from backup ID
 ./target/release/kyrodb_backup restore --backup-id <BACKUP_ID>
 
-# 4. Start server
+# 5. Start server
 systemctl start kyrodb
 
-# 5. Verify data restored
-curl http://localhost:51051/metrics | grep kyrodb_hnsw_vector_count
+# 6. Verify data restored
+curl http://localhost:51051/health
 ```
 
 ### Scenario 2: Point-in-Time Recovery
@@ -151,7 +253,7 @@ TARGET_TIME=$(date -d "2025-10-20 14:30:00 UTC" +%s)
 systemctl stop kyrodb
 
 # 3. Restore to that time
-./target/release/kyrodb_backup restore --point-in-time $TARGET_TIME
+BACKUP_ALLOW_CLEAR=true ./target/release/kyrodb_backup restore --point-in-time $TARGET_TIME
 
 # 4. Start server
 systemctl start kyrodb
@@ -171,7 +273,7 @@ Complete data center failure. Restore from offsite backup.
 aws s3 sync s3://kyrodb-backups ./backups
 
 # 2. Restore on new server
-./target/release/kyrodb_backup \
+BACKUP_ALLOW_CLEAR=true ./target/release/kyrodb_backup \
   --backup-dir ./backups \
   restore --backup-id <ID>
 
@@ -265,7 +367,7 @@ Add to crontab:
 TMP_DIR=$(mktemp -d)
 
 # 2. Restore to temporary location
-./target/release/kyrodb_backup \
+BACKUP_ALLOW_CLEAR=true ./target/release/kyrodb_backup \
   --backup-dir ./backups \
   --data-dir $TMP_DIR \
   restore --backup-id <BACKUP_ID>
@@ -279,7 +381,6 @@ SERVER_PID=$!
 # 4. Run smoke tests
 sleep 2
 curl http://localhost:51099/health
-curl http://localhost:51099/metrics | grep kyrodb_hnsw_vector_count
 
 # 5. Clean up
 kill $SERVER_PID
@@ -296,17 +397,22 @@ KyroDB protects against accidental data loss.
 
 **Always stop the KyroDB server before performing a restore operation.**
 
+Restores clear the target data directory. Confirm this by setting `BACKUP_ALLOW_CLEAR=true` in the environment.
+
 ```bash
 # 1. Stop server
 systemctl stop kyrodb
 
-# 2. Perform restore
+# 2. Allow data directory clear for restore
+export BACKUP_ALLOW_CLEAR=true
+
+# 3. Perform restore
 ./target/release/kyrodb_backup restore \
   --data-dir ./data \
   --backup-dir ./backups \
   --backup-id <BACKUP_ID>
 
-# 3. Start the server
+# 4. Start the server
 systemctl start kyrodb
 ```
 
@@ -314,7 +420,7 @@ Restoring while the server is running may cause data corruption or inconsistent 
 
 ## Cloud Backup (S3)
 
-**Note**: S3 backup integration is planned for a future release. For now, use standard tools like `aws s3 sync` to copy backups to cloud storage:
+The CLI does not expose S3 operations directly. Use standard tools like `aws s3 sync` to copy backups to cloud storage:
 
 ```bash
 # Sync local backups to S3
@@ -332,19 +438,6 @@ aws s3 sync s3://your-bucket/kyrodb-backups/ ./backups
 
 ## Monitoring Backups
 
-### Backup Metrics
-
-```bash
-# View backup statistics
-curl http://localhost:51051/metrics | grep backup
-
-# Key metrics:
-# - kyrodb_backup_total: Total backups created
-# - kyrodb_backup_size_bytes: Last backup size
-# - kyrodb_backup_duration_seconds: Last backup duration
-# - kyrodb_restore_total: Total restores performed
-```
-
 ### Backup Health Check
 
 ```bash
@@ -355,7 +448,7 @@ BACKUP_DIR=/backups
 MAX_AGE_HOURS=26  # Alert if no backup in 26 hours
 
 # Get latest backup timestamp
-LATEST=$(kyrodb_backup list --backup-dir $BACKUP_DIR --json | \
+LATEST=$(kyrodb_backup list --backup-dir $BACKUP_DIR --format json | \
   jq -r '.[0].timestamp')
 
 NOW=$(date +%s)

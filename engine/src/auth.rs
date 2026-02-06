@@ -29,6 +29,8 @@ pub struct TenantInfo {
     pub tenant_name: String,
 
     /// Maximum queries per second allowed
+    /// Set to 0 or omit to use server defaults.
+    #[serde(default)]
     pub max_qps: u32,
 
     /// Maximum vectors this tenant can store
@@ -57,11 +59,9 @@ impl TenantInfo {
 
         anyhow::ensure!(!self.tenant_name.is_empty(), "tenant_name cannot be empty");
 
-        anyhow::ensure!(
-            self.max_qps > 0,
-            "max_qps must be > 0, got {}",
-            self.max_qps
-        );
+        if self.max_qps == 0 {
+            // Allow 0 or missing to indicate "use server defaults".
+        }
 
         anyhow::ensure!(
             self.max_vectors > 0,
@@ -182,7 +182,12 @@ impl AuthManager {
         );
 
         // Find the last underscore (separates tenant_id from secret)
-        let last_underscore_pos = key.rfind('_').unwrap(); // Safe: we know there's at least one '_' after "kyro"
+        let last_underscore_pos = key.rfind('_').ok_or_else(|| {
+            anyhow::anyhow!(
+                "API key must have format kyro_<tenant_id>_<secret>: {}",
+                key
+            )
+        })?;
 
         anyhow::ensure!(
             last_underscore_pos > 5, // Must be after "kyro_"
@@ -219,6 +224,16 @@ impl AuthManager {
         );
 
         Ok(())
+    }
+
+    /// Return all enabled tenants (deduplicated by tenant_id at caller if needed).
+    pub fn enabled_tenants(&self) -> Vec<TenantInfo> {
+        self.api_keys
+            .read()
+            .values()
+            .filter(|tenant_info| tenant_info.enabled)
+            .cloned()
+            .collect()
     }
 
     /// Validate API key and return tenant info
@@ -357,10 +372,10 @@ mod tests {
         invalid.tenant_name = "".to_string();
         assert!(invalid.validate().is_err());
 
-        // Invalid: zero max_qps
+        // Zero max_qps is allowed (falls back to server defaults)
         let mut invalid = valid.clone();
         invalid.max_qps = 0;
-        assert!(invalid.validate().is_err());
+        assert!(invalid.validate().is_ok());
 
         // Invalid: zero max_vectors
         let mut invalid = valid.clone();

@@ -2,9 +2,7 @@
 
 ## Overview
 
-NDCG (Normalized Discounted Cumulative Gain) measures ranking quality in KyroDB. It validates cache admission quality by determining whether the system caches documents that will actually be queried again.
-
-**Purpose**: Distinguish between a cache with high hit rate from lucky popularity and one with genuine predictive power.
+NDCG (Normalized Discounted Cumulative Gain) measures ranking quality in KyroDB validation runs. It is currently used in the `validation_enterprise` binary, not on the production server hot path.
 
 ---
 
@@ -43,46 +41,23 @@ let mean_ndcg = calculate_mean_ndcg(&query_results_map, 10);
 
 ---
 
-## Cache Quality Measurement
+## Cache Quality Measurement (validation binary)
 
-**Problem**: Hit rate alone does not indicate whether the correct documents are being cached.
+In `validation_enterprise`, the goal is to validate that the learned predictor ranks the *right* documents as hot.
 
-**Example**:
-- Cache A: 80% hit rate, caches random popular documents
-- Cache B: 80% hit rate, caches documents that will be queried soon
+- **Ground truth (relevance vector)**: observed access counts per document during the workload. Documents accessed more frequently receive higher relevance scores.
+- **Evaluated ranking**: documents ordered by the learned predictor's admission score (descending). This is the ranking the predictor *actually produces*.
+- **NDCG@10**: measures how closely the predictor's top-10 ranking matches the ideal ranking obtained by sorting documents by their access counts. An NDCG of 1.0 means the predictor places the most-accessed documents in exactly the same order as the ideal ranking; lower values indicate the predictor mis-ranks frequently accessed documents further from the top.
 
-Both have identical hit rates, but Cache B has superior **predictive quality**.
+The evaluated ranking is produced by the predictor, not by sorting access counts, which avoids the trivial case where both orderings are identical (which would yield NDCG=1.0 by construction and test nothing).
 
-**Measurement Approach**:
-1. **Track cache admissions**: Record when document X is admitted to cache
-2. **Record future accesses**: Determine if document X is queried again
-   - If queried: relevance = 1.0 (correct prediction)
-   - If not queried: relevance = 0.0 (incorrect prediction)
-3. **Calculate NDCG@10**: Measures ranking quality of admission decisions
-
-**Interpretation**:
-| NDCG@10 Score | Meaning |
-|---------------|---------|
-| 1.0 | Perfect cache admission (always caches documents that will be queried) |
-| 0.5-0.7 | Good predictive quality |
-| 0.3-0.5 | Moderate quality |
-| < 0.3 | Poor predictive power |
+**MRR and Recall@10** use **binary relevance**: the ground-truth top-10 most-accessed documents are treated as the relevant set (relevant=1), and all other documents are irrelevant (relevant=0). The predictor's ranking is evaluated against this binary set.
 
 ---
 
 ## Expected Performance
 
-**LRU Baseline**:
-- NDCG@10: 0.3-0.5
-- MRR: 0.4-0.6
-- Recall@10: 0.2-0.4
-
-**Hybrid Semantic Cache**:
-- NDCG@10: 0.6-0.8
-- MRR: 0.7-0.9
-- Recall@10: 0.5-0.7
-
-**Target**: 1.5-2x NDCG improvement over LRU baseline.
+Performance targets are workload-dependent. Use the validation run to establish baselines for your dataset and compare different cache strategies.
 
 ---
 
@@ -116,16 +91,7 @@ All 10 tests should pass:
 
 ## Performance Overhead
 
-| Metric | Cost |
-|--------|------|
-| Per-query tracking | O(1) |
-| End-of-test calculation | O(n log n) |
-| Memory usage | O(queries) |
-
-**For 70K queries**:
-- Memory: ~1.7 MB
-- Calculation time: <10ms
-- Impact: <0.01% of test duration
+NDCG calculations are performed after the workload completes in `validation_enterprise` and are not on the production hot path.
 
 ---
 
@@ -133,10 +99,8 @@ All 10 tests should pass:
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| Cache admission validation | Implemented | Measures if cached documents are queried again |
-| HNSW search result ranking | Planned | Measures semantic relevance of k-NN results |
-| RMI prediction quality | Planned | Validates RMI prediction accuracy |
-| Semantic adapter quality | Planned | Measures cluster grouping quality |
+| Validation workload | Implemented | Computes NDCG/MRR/Recall from predictor ranking vs access-frequency ground truth |
+| Production metrics | Not wired | No NDCG metrics exported by the server |
 
 ---
 

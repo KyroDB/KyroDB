@@ -47,10 +47,10 @@ DURATION=$((DURATION < 1 ? 1 : DURATION))
 echo ""
 echo "=== RESULTS ==="
 echo " All $TOTAL_OPS operations completed successfully"
-echo "⏱️  Duration: ${DURATION}s"
+echo "Duration: ${DURATION}s"
 THROUGHPUT=$((TOTAL_OPS / DURATION))
-echo "📊 Throughput: ${THROUGHPUT} ops/sec"
-echo "💾 Final memory check:"
+echo "Throughput: ${THROUGHPUT} ops/sec"
+echo "Final memory check:"
 ps aux | grep -E "cargo|rust" | grep -v grep | head -n 5
 echo ""
 echo "=== VALIDATION COMPLETE ==="

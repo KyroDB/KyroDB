@@ -4,6 +4,7 @@ use anyhow::Result;
 use kyrodb_engine::backup::{BackupManager, BackupType};
 use kyrodb_engine::hnsw_backend::HnswBackend;
 use kyrodb_engine::persistence::FsyncPolicy;
+use kyrodb_engine::DistanceMetric;
 use std::collections::HashMap;
 use std::process::Command;
 use tempfile::TempDir;
@@ -23,13 +24,12 @@ fn test_cli_backup_create_full() -> Result<()> {
         vec![0.0, 0.0, 1.0, 0.0],
     ];
 
-    let data_path = data_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
+    let data_path = data_dir.path();
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Euclidean,
         embeddings.clone(),
         metadata,
         100,
@@ -78,13 +78,12 @@ fn test_cli_backup_list() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
+    let data_path = data_dir.path();
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Euclidean,
         embeddings,
         metadata,
         100,
@@ -125,13 +124,12 @@ fn test_cli_backup_list_json() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
+    let data_path = data_dir.path();
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Euclidean,
         embeddings,
         metadata,
         100,
@@ -174,13 +172,12 @@ fn test_cli_restore_from_backup() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0, 7.0, 8.0]];
-    let data_path = data_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
+    let data_path = data_dir.path();
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Euclidean,
         embeddings.clone(),
         metadata,
         100,
@@ -242,13 +239,12 @@ fn test_cli_prune_backups() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
+    let data_path = data_dir.path();
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Euclidean,
         embeddings,
         metadata,
         100,
@@ -343,13 +339,12 @@ fn test_cli_verify_backup() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
+    let data_path = data_dir.path();
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Euclidean,
         embeddings,
         metadata,
         100,
@@ -395,13 +390,12 @@ fn test_cli_incremental_backup() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
+    let data_path = data_dir.path();
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Euclidean,
         embeddings,
         metadata,
         100,
@@ -470,13 +464,12 @@ fn test_cli_point_in_time_restore() -> Result<()> {
     let backup_dir = TempDir::new()?;
 
     let embeddings = vec![vec![1.0, 2.0, 3.0, 4.0]];
-    let data_path = data_dir
-        .path()
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in data directory path"))?;
+    let data_path = data_dir.path();
 
     let metadata = empty_metadata(embeddings.len());
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Euclidean,
         embeddings,
         metadata,
         100,

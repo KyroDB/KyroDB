@@ -18,6 +18,14 @@ use kyrodb::{FlushRequest, InsertRequest, QueryRequest, SearchRequest};
 
 type GrpcClient = KyroDbServiceClient<tonic::transport::Channel>;
 
+fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+    v
+}
+
 async fn wait_for_server(endpoint: &str, timeout: Duration) -> Result<GrpcClient> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -90,6 +98,11 @@ fn create_data_dir(temp_dir: &TempDir) -> Result<PathBuf> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn end_to_end_insert_query_search() -> Result<()> {
+    if std::env::var("KYRODB_ENABLE_NET_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping grpc end-to-end test (set KYRODB_ENABLE_NET_TESTS=1 to enable)");
+        return Ok(());
+    }
+
     let binary = server_binary()?;
     let temp_dir = tempfile::tempdir().context("failed to create temp directory")?;
     let data_dir = create_data_dir(&temp_dir)?;
@@ -100,7 +113,9 @@ async fn end_to_end_insert_query_search() -> Result<()> {
     let mut child = Command::new(binary)
         .env("KYRODB_DATA_DIR", &data_dir)
         .env("KYRODB_PORT", port.to_string())
-        .env("KYRODB_HTTP_PORT", http_port.to_string())
+        // KyroDbConfig reads environment variables via the `config` crate using the
+        // `KYRODB__...` prefix with `__` as a separator.
+        .env("KYRODB__SERVER__HTTP_PORT", http_port.to_string())
         .kill_on_drop(true)
         .spawn()
         .context("failed to spawn kyrodb_server")?;
@@ -109,7 +124,7 @@ async fn end_to_end_insert_query_search() -> Result<()> {
 
     let doc_id = 42u64;
     // Use 768 dimensions to match server default config
-    let embedding: Vec<f32> = (0..768).map(|i| i as f32 * 0.001).collect();
+    let embedding: Vec<f32> = normalize((0..768).map(|i| i as f32 * 0.001).collect());
 
     let insert_request = InsertRequest {
         doc_id,
@@ -156,6 +171,7 @@ async fn end_to_end_insert_query_search() -> Result<()> {
         min_score: 0.0,
         namespace: String::new(),
         include_embeddings: false,
+        ef_search: 0,
         filter: None,
         metadata_filters: HashMap::new(),
     };

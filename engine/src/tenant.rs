@@ -8,6 +8,7 @@
 //
 // Performance: ~10ns for namespace operations (string formatting)
 
+use anyhow::Result;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,8 +24,8 @@ use std::sync::Arc;
 /// # Example
 /// ```ignore
 /// let manager = TenantManager::new();
-/// let doc_id = manager.allocate_doc_id("acme_corp");
-/// let namespaced = manager.namespace_doc_id("acme_corp", doc_id);
+/// let doc_id = manager.allocate_doc_id("acme_corp").unwrap();
+/// let namespaced = manager.namespace_doc_id("acme_corp", doc_id).unwrap();
 /// // namespaced = "acme_corp:0"
 /// ```
 pub struct TenantManager {
@@ -44,15 +45,14 @@ impl TenantManager {
     ///
     /// Ensures tenant_id does not contain colon (used as namespace separator).
     ///
-    /// # Panics
-    /// Panics if tenant_id is empty or contains a colon.
-    fn validate_tenant_id(tenant_id: &str) {
-        assert!(!tenant_id.is_empty(), "tenant_id cannot be empty");
-        assert!(
+    fn validate_tenant_id(tenant_id: &str) -> Result<()> {
+        anyhow::ensure!(!tenant_id.is_empty(), "tenant_id cannot be empty");
+        anyhow::ensure!(
             !tenant_id.contains(':'),
             "tenant_id cannot contain colon (reserved as namespace separator): {}",
             tenant_id
         );
+        Ok(())
     }
 
     /// Allocate new document ID for tenant
@@ -63,15 +63,13 @@ impl TenantManager {
     /// # Performance
     /// O(1) with atomic fetch_add: ~10ns
     ///
-    /// # Panics
-    /// Panics if tenant_id is empty or contains a colon.
-    pub fn allocate_doc_id(&self, tenant_id: &str) -> u64 {
-        Self::validate_tenant_id(tenant_id);
+    pub fn allocate_doc_id(&self, tenant_id: &str) -> Result<u64> {
+        Self::validate_tenant_id(tenant_id)?;
         // Fast path: read lock for existing counter
         {
             let counters = self.next_doc_id.read();
             if let Some(counter) = counters.get(tenant_id) {
-                return counter.fetch_add(1, Ordering::Relaxed);
+                return Ok(counter.fetch_add(1, Ordering::Relaxed));
             }
         }
 
@@ -83,7 +81,7 @@ impl TenantManager {
             .entry(tenant_id.to_string())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)));
 
-        counter.fetch_add(1, Ordering::Relaxed)
+        Ok(counter.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Create tenant-namespaced document ID for storage
@@ -96,11 +94,9 @@ impl TenantManager {
     /// assert_eq!(namespaced, "acme_corp:12345");
     /// ```
     ///
-    /// # Panics
-    /// Panics if tenant_id is empty or contains a colon.
-    pub fn namespace_doc_id(&self, tenant_id: &str, doc_id: u64) -> String {
-        Self::validate_tenant_id(tenant_id);
-        format!("{}:{}", tenant_id, doc_id)
+    pub fn namespace_doc_id(&self, tenant_id: &str, doc_id: u64) -> Result<String> {
+        Self::validate_tenant_id(tenant_id)?;
+        Ok(format!("{}:{}", tenant_id, doc_id))
     }
 
     /// Parse tenant_id from namespaced document ID
@@ -229,26 +225,26 @@ mod tests {
         let manager = TenantManager::new();
 
         // Allocate IDs for tenant A
-        assert_eq!(manager.allocate_doc_id("tenant_a"), 0);
-        assert_eq!(manager.allocate_doc_id("tenant_a"), 1);
-        assert_eq!(manager.allocate_doc_id("tenant_a"), 2);
+        assert_eq!(manager.allocate_doc_id("tenant_a").unwrap(), 0);
+        assert_eq!(manager.allocate_doc_id("tenant_a").unwrap(), 1);
+        assert_eq!(manager.allocate_doc_id("tenant_a").unwrap(), 2);
 
         // Allocate IDs for tenant B (independent sequence)
-        assert_eq!(manager.allocate_doc_id("tenant_b"), 0);
-        assert_eq!(manager.allocate_doc_id("tenant_b"), 1);
+        assert_eq!(manager.allocate_doc_id("tenant_b").unwrap(), 0);
+        assert_eq!(manager.allocate_doc_id("tenant_b").unwrap(), 1);
 
         // Tenant A continues from 3
-        assert_eq!(manager.allocate_doc_id("tenant_a"), 3);
+        assert_eq!(manager.allocate_doc_id("tenant_a").unwrap(), 3);
     }
 
     #[test]
     fn test_namespace_doc_id() {
         let manager = TenantManager::new();
 
-        let namespaced = manager.namespace_doc_id("acme_corp", 12345);
+        let namespaced = manager.namespace_doc_id("acme_corp", 12345).unwrap();
         assert_eq!(namespaced, "acme_corp:12345");
 
-        let namespaced = manager.namespace_doc_id("startup_x", 0);
+        let namespaced = manager.namespace_doc_id("startup_x", 0).unwrap();
         assert_eq!(namespaced, "startup_x:0");
     }
 
@@ -309,9 +305,9 @@ mod tests {
         assert_eq!(manager.current_doc_id("tenant_a"), 0);
 
         // Allocate some IDs
-        manager.allocate_doc_id("tenant_a");
-        manager.allocate_doc_id("tenant_a");
-        manager.allocate_doc_id("tenant_a");
+        manager.allocate_doc_id("tenant_a").unwrap();
+        manager.allocate_doc_id("tenant_a").unwrap();
+        manager.allocate_doc_id("tenant_a").unwrap();
 
         // Counter is at 3 (next ID to allocate)
         assert_eq!(manager.current_doc_id("tenant_a"), 3);
@@ -323,14 +319,14 @@ mod tests {
 
         assert_eq!(manager.tenant_count(), 0);
 
-        manager.allocate_doc_id("tenant_a");
+        manager.allocate_doc_id("tenant_a").unwrap();
         assert_eq!(manager.tenant_count(), 1);
 
-        manager.allocate_doc_id("tenant_b");
+        manager.allocate_doc_id("tenant_b").unwrap();
         assert_eq!(manager.tenant_count(), 2);
 
         // Same tenant doesn't increase count
-        manager.allocate_doc_id("tenant_a");
+        manager.allocate_doc_id("tenant_a").unwrap();
         assert_eq!(manager.tenant_count(), 2);
     }
 
@@ -345,7 +341,7 @@ mod tests {
             let handle = thread::spawn(move || {
                 let mut ids = vec![];
                 for _ in 0..100 {
-                    ids.push(manager.allocate_doc_id("tenant_shared"));
+                    ids.push(manager.allocate_doc_id("tenant_shared").unwrap());
                 }
                 ids
             });
@@ -419,20 +415,20 @@ mod tests {
         let manager = TenantManager::new();
 
         // Tenant A inserts 3 documents
-        let doc_id_a1 = manager.allocate_doc_id("tenant_a");
-        let doc_id_a2 = manager.allocate_doc_id("tenant_a");
-        let doc_id_a3 = manager.allocate_doc_id("tenant_a");
+        let doc_id_a1 = manager.allocate_doc_id("tenant_a").unwrap();
+        let doc_id_a2 = manager.allocate_doc_id("tenant_a").unwrap();
+        let doc_id_a3 = manager.allocate_doc_id("tenant_a").unwrap();
 
-        let namespaced_a1 = manager.namespace_doc_id("tenant_a", doc_id_a1);
-        let namespaced_a2 = manager.namespace_doc_id("tenant_a", doc_id_a2);
-        let namespaced_a3 = manager.namespace_doc_id("tenant_a", doc_id_a3);
+        let namespaced_a1 = manager.namespace_doc_id("tenant_a", doc_id_a1).unwrap();
+        let namespaced_a2 = manager.namespace_doc_id("tenant_a", doc_id_a2).unwrap();
+        let namespaced_a3 = manager.namespace_doc_id("tenant_a", doc_id_a3).unwrap();
 
         // Tenant B inserts 2 documents
-        let doc_id_b1 = manager.allocate_doc_id("tenant_b");
-        let doc_id_b2 = manager.allocate_doc_id("tenant_b");
+        let doc_id_b1 = manager.allocate_doc_id("tenant_b").unwrap();
+        let doc_id_b2 = manager.allocate_doc_id("tenant_b").unwrap();
 
-        let namespaced_b1 = manager.namespace_doc_id("tenant_b", doc_id_b1);
-        let namespaced_b2 = manager.namespace_doc_id("tenant_b", doc_id_b2);
+        let namespaced_b1 = manager.namespace_doc_id("tenant_b", doc_id_b1).unwrap();
+        let namespaced_b2 = manager.namespace_doc_id("tenant_b", doc_id_b2).unwrap();
 
         // Simulate search results (mixed tenants)
         let search_results = vec![
@@ -461,36 +457,33 @@ mod tests {
     fn test_reset_tenant() {
         let manager = TenantManager::new();
 
-        manager.allocate_doc_id("tenant_a");
-        manager.allocate_doc_id("tenant_a");
+        manager.allocate_doc_id("tenant_a").unwrap();
+        manager.allocate_doc_id("tenant_a").unwrap();
         assert_eq!(manager.current_doc_id("tenant_a"), 2);
 
         manager.reset_tenant("tenant_a");
         assert_eq!(manager.current_doc_id("tenant_a"), 0);
 
         // Next allocation starts from 0 again
-        assert_eq!(manager.allocate_doc_id("tenant_a"), 0);
+        assert_eq!(manager.allocate_doc_id("tenant_a").unwrap(), 0);
     }
 
     #[test]
-    #[should_panic(expected = "tenant_id cannot be empty")]
-    fn test_empty_tenant_id_panics() {
+    fn test_empty_tenant_id_rejected() {
         let manager = TenantManager::new();
-        manager.allocate_doc_id("");
+        assert!(manager.allocate_doc_id("").is_err());
     }
 
     #[test]
-    #[should_panic(expected = "tenant_id cannot contain colon")]
-    fn test_tenant_id_with_colon_panics() {
+    fn test_tenant_id_with_colon_rejected() {
         let manager = TenantManager::new();
-        manager.allocate_doc_id("evil:corp");
+        assert!(manager.allocate_doc_id("evil:corp").is_err());
     }
 
     #[test]
-    #[should_panic(expected = "tenant_id cannot contain colon")]
-    fn test_namespace_doc_id_with_colon_panics() {
+    fn test_namespace_doc_id_with_colon_rejected() {
         let manager = TenantManager::new();
-        manager.namespace_doc_id("evil:corp", 123);
+        assert!(manager.namespace_doc_id("evil:corp", 123).is_err());
     }
 
     #[test]
@@ -498,11 +491,11 @@ mod tests {
         let manager = TenantManager::new();
 
         // Valid tenant IDs with underscores
-        assert_eq!(manager.allocate_doc_id("acme_corp"), 0);
-        assert_eq!(manager.allocate_doc_id("startup_x_2025"), 0);
+        assert_eq!(manager.allocate_doc_id("acme_corp").unwrap(), 0);
+        assert_eq!(manager.allocate_doc_id("startup_x_2025").unwrap(), 0);
 
         // Valid tenant IDs with numbers
-        assert_eq!(manager.allocate_doc_id("tenant123"), 0);
-        assert_eq!(manager.allocate_doc_id("org_456_test"), 0);
+        assert_eq!(manager.allocate_doc_id("tenant123").unwrap(), 0);
+        assert_eq!(manager.allocate_doc_id("org_456_test").unwrap(), 0);
     }
 }

@@ -4,10 +4,10 @@
 //!
 //! Provides pluggable cache strategies:
 //! - LRU baseline: Always cache, LRU eviction
-//! - Learned: RMI-predicted hotness-based admission
+//! - Learned: Learned frequency-predicted hotness-based admission
 //!
 //! Two-level cache architecture:
-//! - L1a (this module): Document-level cache with RMI frequency prediction
+//! - L1a (this module): Document-level cache with Learned frequency prediction
 //! - L1b (query_hash_cache): Query-level cache with semantic similarity
 
 use crate::learned_cache::LearnedCachePredictor;
@@ -27,7 +27,7 @@ pub trait CacheStrategy: Send + Sync {
     /// Decide if vector should be cached
     ///
     /// Returns `true` if the vector should be admitted to cache.
-    /// Strategy-specific logic (e.g., LRU always admits, learned uses RMI prediction).
+    /// Strategy-specific logic (e.g., LRU always admits, learned uses Learned frequency prediction).
     fn should_cache(&self, doc_id: u64, embedding: &[f32]) -> bool;
 
     /// Insert vector into cache
@@ -106,9 +106,9 @@ impl CacheStrategy for LruCacheStrategy {
     }
 }
 
-/// Learned Cache strategy (RMI frequency-based, optionally semantic-aware)
+/// Learned Cache strategy (Learned frequency-based, optionally semantic-aware)
 ///
-/// Uses RMI predictor to decide cache admission based on predicted hotness.
+/// Uses Learned predictor to decide cache admission based on predicted hotness.
 /// This is L1a (document-level cache) in the two-level architecture.
 ///
 /// When created with `new_with_semantic`, combines frequency prediction with
@@ -125,11 +125,11 @@ pub struct LearnedCacheStrategy {
 }
 
 impl LearnedCacheStrategy {
-    /// Create new Learned Cache strategy (RMI frequency-based)
+    /// Create new Learned Cache strategy (Learned frequency-based)
     ///
     /// # Parameters
     /// - `capacity`: Cache capacity
-    /// - `predictor`: Trained RMI frequency predictor
+    /// - `predictor`: Trained Learned frequency predictor
     pub fn new(capacity: usize, mut predictor: LearnedCachePredictor) -> Self {
         Self::configure_predictor_defaults(&mut predictor, capacity);
 
@@ -137,19 +137,19 @@ impl LearnedCacheStrategy {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
             semantic_adapter: None,
-            name: "learned_rmi".to_string(),
+            name: "learned_predictor".to_string(),
         }
     }
 
     /// Create new Learned Cache strategy with semantic adapter (hybrid frequency+semantic)
     ///
-    /// Combines RMI frequency prediction with semantic similarity for cache admission.
+    /// Combines Learned frequency prediction with semantic similarity for cache admission.
     /// When frequency score is uncertain (between low and high confidence thresholds),
     /// semantic similarity is used as a tiebreaker.
     ///
     /// # Parameters
     /// - `capacity`: Cache capacity
-    /// - `predictor`: Trained RMI frequency predictor
+    /// - `predictor`: Trained Learned frequency predictor
     /// - `semantic_adapter`: Semantic adapter for similarity-based boosting
     pub fn new_with_semantic(
         capacity: usize,
@@ -198,7 +198,7 @@ impl LearnedCacheStrategy {
         let predictor_cap = predictor.capacity_limit().max(1);
         let desired = cache_capacity
             .saturating_mul(8)
-            .clamp(cache_capacity.max(1), predictor_cap);
+            .clamp(cache_capacity.max(1).min(predictor_cap), predictor_cap);
         let diversity_pow2 = desired.checked_next_power_of_two().unwrap_or(desired);
         let diversity = diversity_pow2.clamp(32, 1024);
         predictor.set_diversity_buckets(diversity);
@@ -237,12 +237,14 @@ impl CacheStrategy for LearnedCacheStrategy {
             trace!(doc_id, strategy = %self.name, "bootstrap admit (untrained predictor)");
             // During bootstrap, also cache embedding in semantic adapter if present
             if let Some(ref adapter) = self.semantic_adapter {
-                adapter.cache_embedding(doc_id, embedding.to_vec());
+                if let Err(e) = adapter.cache_embedding(doc_id, embedding.to_vec()) {
+                    tracing::warn!(doc_id, error = %e, "SemanticAdapter: cache_embedding rejected");
+                }
             }
             return true;
         }
 
-        // Get frequency-based prediction (RMI)
+        // Get frequency-based prediction (learned predictor)
         let freq_score = predictor.lookup_hotness(doc_id).unwrap_or(0.0);
         let threshold = predictor.cache_threshold().max(predictor.admission_floor());
 
@@ -258,7 +260,9 @@ impl CacheStrategy for LearnedCacheStrategy {
                     "admit (hybrid semantic+freq)"
                 );
                 // Cache embedding for future semantic lookups
-                adapter.cache_embedding(doc_id, embedding.to_vec());
+                if let Err(e) = adapter.cache_embedding(doc_id, embedding.to_vec()) {
+                    tracing::warn!(doc_id, error = %e, "SemanticAdapter: cache_embedding rejected");
+                }
             } else {
                 trace!(
                     doc_id,
@@ -271,7 +275,7 @@ impl CacheStrategy for LearnedCacheStrategy {
             return should_admit;
         }
 
-        // Pure frequency-based admission (RMI only)
+        // Pure frequency-based admission (frequency predictor only)
         let should_admit = freq_score >= threshold;
 
         if should_admit {
@@ -358,7 +362,7 @@ impl AbTestSplitter {
 
     /// Get strategy for doc_id based on deterministic 50/50 split
     pub fn get_strategy(&self, doc_id: u64) -> Arc<dyn CacheStrategy> {
-        if doc_id.is_multiple_of(2) {
+        if doc_id % 2 == 0 {
             Arc::clone(&self.lru_strategy)
         } else {
             Arc::clone(&self.learned_strategy)
@@ -530,7 +534,7 @@ mod tests {
         let _should_cache_cold = strategy.should_cache(2, &vec![0.5; 128]);
 
         // At minimum, hot doc should have higher admission probability
-        // (exact behavior depends on RMI training and threshold)
+        // (exact behavior depends on learned predictor training and threshold)
         assert!(should_cache_hot); // Hot doc should be cached
     }
 

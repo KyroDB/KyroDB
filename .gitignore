@@ -116,6 +116,16 @@ bench/*.svg
 bench/*.csv
 bench_server.log
 
+# Benchmark data (large files - DO NOT COMMIT)
+benchmarks/data/
+benchmarks/_generated/
+benchmarks/results/*
+!benchmarks/results/.gitkeep
+benchmark_data/
+*.hdf5
+*.wal
+*.npy
+
 # Docker
 .dockerignore
 
@@ -134,7 +144,6 @@ docs/ENGINEERING_STATUS.md
 docs/VISION.md
 .venv/       
 simulation.html
-KyroQL
-
-
-                                                                                                                                                                                                                                                                                                                                                                        
+benchmarks/scripts/analyze_vm_suite.py
+docs/BENCHMARK_REPORT_vm_suite_20260124_175225.md
+AGENTS.md

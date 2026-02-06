@@ -1,11 +1,12 @@
 # Build stage
-FROM rust:1.75-bookworm AS builder
+ARG RUST_IMAGE_TAG=1.86-bookworm
+FROM rust:${RUST_IMAGE_TAG} AS builder
 
 WORKDIR /usr/src/kyrodb
 COPY Cargo.toml Cargo.lock ./
 COPY engine ./engine
 
-RUN cd engine && cargo build --release --features cli-tools
+RUN cd engine && cargo build --release --locked --features cli-tools
 
 # Runtime stage
 FROM debian:bookworm-slim

@@ -153,7 +153,7 @@ impl AbStatsPersister {
                     "miss" => lru_misses += 1,
                     _ => {}
                 },
-                "learned_rmi" => match metric.event_type.as_str() {
+                "learned_predictor" => match metric.event_type.as_str() {
                     "hit" => {
                         learned_hits += 1;
                         learned_latencies.push(metric.latency_ns);
@@ -258,7 +258,7 @@ mod tests {
         // Log some events
         persister.log_hit("lru_baseline", 1, 100).await.unwrap();
         persister.log_miss("lru_baseline", 2, 200).await.unwrap();
-        persister.log_hit("learned_rmi", 3, 50).await.unwrap();
+        persister.log_hit("learned_predictor", 3, 50).await.unwrap();
 
         persister.flush().await.unwrap();
 
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(metrics.len(), 3);
         assert_eq!(metrics[0].strategy, "lru_baseline");
         assert_eq!(metrics[0].event_type, "hit");
-        assert_eq!(metrics[2].strategy, "learned_rmi");
+        assert_eq!(metrics[2].strategy, "learned_predictor");
     }
 
     #[tokio::test]
@@ -288,7 +288,7 @@ mod tests {
         // Second session (simulates restart)
         {
             let persister = AbStatsPersister::new(&stats_path).unwrap();
-            persister.log_hit("learned_rmi", 2, 50).await.unwrap();
+            persister.log_hit("learned_predictor", 2, 50).await.unwrap();
             persister.flush().await.unwrap();
         }
 
@@ -318,14 +318,14 @@ mod tests {
             },
             AbTestMetric {
                 timestamp_ms: 1002,
-                strategy: "learned_rmi".to_string(),
+                strategy: "learned_predictor".to_string(),
                 event_type: "hit".to_string(),
                 doc_id: 3,
                 latency_ns: 50,
             },
             AbTestMetric {
                 timestamp_ms: 1003,
-                strategy: "learned_rmi".to_string(),
+                strategy: "learned_predictor".to_string(),
                 event_type: "hit".to_string(),
                 doc_id: 4,
                 latency_ns: 50,

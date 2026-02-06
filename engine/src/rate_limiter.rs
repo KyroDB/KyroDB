@@ -3,13 +3,14 @@
 // Design:
 // - Token bucket algorithm: Fixed refill rate, burst capacity
 // - Per-tenant buckets: HashMap<tenant_id, TokenBucket>
+// - Optional global bucket for total QPS cap
 // - Smooth refill: Fractional tokens for consistent rate
 // - Lock per bucket: Minimize contention (not global lock)
 //
 // Performance: ~100ns per check (HashMap lookup + bucket update)
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -70,6 +71,14 @@ impl TokenBucket {
         }
     }
 
+    /// Refund one consumed token (best-effort).
+    ///
+    /// Used to maintain fairness when a downstream/global limit rejects after a tenant token
+    /// was already consumed.
+    pub fn refund_one(&mut self) {
+        self.tokens = (self.tokens + 1.0).min(self.capacity as f64);
+    }
+
     /// Refill tokens based on elapsed time
     ///
     /// Tokens = min(capacity, current_tokens + (elapsed_seconds * refill_rate))
@@ -121,13 +130,25 @@ impl TokenBucket {
 pub struct RateLimiter {
     /// Per-tenant token buckets (lazy initialized)
     buckets: Arc<parking_lot::RwLock<HashMap<String, Arc<Mutex<TokenBucket>>>>>,
+    /// Tenants already warned about capacity mismatch (avoid log spam)
+    #[allow(dead_code)]
+    warned_tenants: Arc<parking_lot::RwLock<HashSet<String>>>,
+    /// Optional global token bucket (shared across all tenants)
+    global_bucket: Option<Mutex<TokenBucket>>,
 }
 
 impl RateLimiter {
     /// Create new empty rate limiter
     pub fn new() -> Self {
+        Self::new_with_global(None)
+    }
+
+    /// Create rate limiter with optional global QPS cap.
+    pub fn new_with_global(max_qps_global: Option<u32>) -> Self {
         Self {
             buckets: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            warned_tenants: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            global_bucket: max_qps_global.map(TokenBucket::new).map(Mutex::new),
         }
     }
 
@@ -137,15 +158,13 @@ impl RateLimiter {
     /// Returns false if rate limit exceeded (should reject with 429).
     ///
     /// Token bucket is created on first request for tenant with the provided max_qps.
-    /// Subsequent calls must use the same max_qps value (validated via assertion).
+    /// Subsequent calls should use the same max_qps value.
     ///
     /// # Performance
     /// - O(1) HashMap lookup: ~50ns
     /// - Token bucket update: ~50ns
     /// - Total: ~100ns per request
     ///
-    /// # Panics
-    /// Panics if max_qps differs from the bucket's existing capacity.
     pub fn check_limit(&self, tenant_id: &str, max_qps: u32) -> bool {
         // Fast path: read lock for existing bucket
         {
@@ -153,15 +172,47 @@ impl RateLimiter {
             if let Some(bucket) = buckets.get(tenant_id) {
                 // Validate that max_qps matches existing bucket capacity
                 let bucket_capacity = bucket.lock().capacity();
-                assert_eq!(
-                    bucket_capacity, max_qps,
-                    "Rate limit mismatch for tenant {}: existing capacity {}, requested {}",
-                    tenant_id, bucket_capacity, max_qps
-                );
+                if bucket_capacity != max_qps {
+                    // Defensive: never panic on a misconfiguration; continue using the existing bucket.
+                    // This mismatch should be impossible in normal operation.
+                    #[cfg(debug_assertions)]
+                    debug_assert_eq!(
+                        bucket_capacity, max_qps,
+                        "Rate limit mismatch for tenant {}: existing capacity {}, requested {}",
+                        tenant_id, bucket_capacity, max_qps
+                    );
+                    #[cfg(not(debug_assertions))]
+                    {
+                        let mut warned = self.warned_tenants.write();
+                        if !warned.contains(tenant_id) {
+                            tracing::warn!(
+                                tenant_id = %tenant_id,
+                                existing_capacity = bucket_capacity,
+                                requested_qps = max_qps,
+                                "Rate limit mismatch: using existing bucket capacity"
+                            );
+                            warned.insert(tenant_id.to_string());
+                        }
+                    }
+                }
 
                 let bucket = Arc::clone(bucket);
                 drop(buckets); // Release read lock before acquiring mutex
-                return bucket.lock().try_consume();
+
+                // Consume tenant token first.
+                if !bucket.lock().try_consume() {
+                    return false;
+                }
+
+                // Consume global token only after tenant passes.
+                if let Some(global) = &self.global_bucket {
+                    if !global.lock().try_consume() {
+                        bucket.lock().refund_one();
+                        return false;
+                    }
+                }
+
+                return true;
             }
         }
 
@@ -177,9 +228,20 @@ impl RateLimiter {
             )
         };
 
-        // Consume token after releasing write lock
-        let result = bucket.lock().try_consume();
-        result
+        // Consume tenant token after releasing write lock.
+        if !bucket.lock().try_consume() {
+            return false;
+        }
+
+        // Consume global token only after tenant passes.
+        if let Some(global) = &self.global_bucket {
+            if !global.lock().try_consume() {
+                bucket.lock().refund_one();
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Get current available tokens for tenant (for observability)
@@ -197,12 +259,14 @@ impl RateLimiter {
         if let Some(bucket) = buckets.get(tenant_id) {
             bucket.lock().reset();
         }
+        self.warned_tenants.write().remove(tenant_id);
     }
 
     /// Clear all rate limit state (for testing)
     #[cfg(test)]
     pub fn clear(&self) {
         self.buckets.write().clear();
+        self.warned_tenants.write().clear();
     }
 
     /// Get count of tracked tenants
@@ -460,5 +524,73 @@ mod tests {
             assert!(bucket.try_consume());
         }
         assert!(!bucket.try_consume());
+    }
+
+    #[test]
+    fn test_global_limit_caps_total_throughput() {
+        // Global limit of 5 QPS, tenant limit of 10 QPS.
+        // The global bucket should reject after 5 requests regardless of tenant allowance.
+        let limiter = RateLimiter::new_with_global(Some(5));
+
+        let mut allowed = 0;
+        for _ in 0..10 {
+            if limiter.check_limit("tenant_a", 10) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 5, "global limit must cap total throughput at 5");
+    }
+
+    #[test]
+    fn test_global_limit_refunds_tenant_token_on_reject() {
+        // Global limit of 2. After 2 requests, global bucket is exhausted.
+        // Verify the tenant's tokens are refunded so they aren't leaked.
+        let limiter = RateLimiter::new_with_global(Some(2));
+
+        assert!(limiter.check_limit("tenant_a", 100));
+        assert!(limiter.check_limit("tenant_a", 100));
+
+        // 3rd request: tenant has tokens but global is exhausted → tenant token refunded.
+        assert!(!limiter.check_limit("tenant_a", 100));
+
+        let available = limiter.available_tokens("tenant_a").unwrap();
+        // 100 capacity - 2 consumed (third was refunded) = ~98
+        assert!(
+            available >= 97.0,
+            "tenant token should have been refunded, got {}",
+            available
+        );
+    }
+
+    #[test]
+    fn test_global_limit_shared_across_tenants() {
+        // Global limit of 3. Two tenants each with per-tenant limit of 10.
+        // Combined requests across both tenants must not exceed 3.
+        let limiter = RateLimiter::new_with_global(Some(3));
+
+        assert!(limiter.check_limit("tenant_a", 10));
+        assert!(limiter.check_limit("tenant_b", 10));
+        assert!(limiter.check_limit("tenant_a", 10));
+
+        // Global is now exhausted
+        assert!(!limiter.check_limit("tenant_a", 10));
+        assert!(!limiter.check_limit("tenant_b", 10));
+    }
+
+    #[test]
+    fn test_no_global_limit_unlimited() {
+        // Without global limit, only per-tenant limits apply.
+        let limiter = RateLimiter::new_with_global(None);
+
+        let mut allowed = 0;
+        for _ in 0..50 {
+            if limiter.check_limit("tenant_a", 50) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed, 50,
+            "without global limit, all 50 requests should pass"
+        );
     }
 }

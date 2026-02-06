@@ -169,7 +169,7 @@ impl Default for Config {
 
             // Production-realistic cache: 1.8% of corpus (sized for 70%+ hit rate)
             // 180 slots for ~250 hot docs (Zipf 1.4 working set) = 72% coverage
-            // Provides sufficient headroom for RMI predictor to achieve 70%+ combined L1
+            // Provides sufficient headroom for Learned predictor to achieve 70%+ combined L1
             cache_capacity: 180,
 
             // Models real RAG query distribution (moderate skew)
@@ -334,12 +334,12 @@ struct ValidationResults {
     test_duration_secs: u64,
     total_queries: u64,
 
-    // Layer 1a (Document Cache) stats - RMI frequency-based
+    // Layer 1a (Document Cache) stats - Learned frequency-based
     l1a_cache_hits: u64,
     l1a_cache_misses: u64,
     l1a_hit_rate: f64,
 
-    // Layer 1b (Query Cache) stats - Semantic similarity-based
+    // Layer 1b (Query Search Cache) stats - Semantic similarity-based
     l1b_cache_hits: u64,
     l1b_cache_misses: u64,
     l1b_hit_rate: f64,
@@ -757,6 +757,7 @@ struct SemanticWorkloadGenerator {
 }
 
 impl SemanticWorkloadGenerator {
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         corpus_embeddings: Arc<Vec<Vec<f32>>>,
         query_embeddings: Arc<Vec<Vec<f32>>>,
@@ -820,7 +821,7 @@ impl SemanticWorkloadGenerator {
         }
 
         let doc_sampler = ZipfSampler::new(corpus_size, zipf_exponent, 0x5EEDFACE)?;
-        let cold_ratio = cold_traffic_ratio.max(0.0).min(1.0);
+        let cold_ratio = cold_traffic_ratio.clamp(0.0, 1.0);
         let sticky_query_map = Arc::new(RwLock::new(HashMap::new()));
         {
             let mut guard = sticky_query_map.write().await;
@@ -858,9 +859,9 @@ impl SemanticWorkloadGenerator {
         {
             let mut rng = self.rng.write().await;
             if rng.gen::<f64>() < self.cold_traffic_ratio {
-                let doc_id = rng.gen_range(0..self.corpus_size) as u64;
+                let doc_id = rng.gen_range(0..self.corpus_size);
                 // For cold traffic, return a random query index (still seeds sticky map)
-                let query_idx = rng.gen_range(0..self.query_space_size.max(1)) as usize;
+                let query_idx = rng.gen_range(0..self.query_space_size.max(1));
                 drop(rng);
                 self.cold_query_count.fetch_add(1, Ordering::Relaxed);
                 self.new_query_samples.fetch_add(1, Ordering::Relaxed);
@@ -890,9 +891,11 @@ impl SemanticWorkloadGenerator {
                 let should_reuse = rng.gen::<f64>() < self.query_reuse_probability;
                 drop(rng);
 
-                if should_reuse && existing_query.is_some() {
-                    self.sticky_reuse_hits.fetch_add(1, Ordering::Relaxed);
-                    return (existing_query.unwrap(), doc_id);
+                if should_reuse {
+                    if let Some(existing_query) = existing_query {
+                        self.sticky_reuse_hits.fetch_add(1, Ordering::Relaxed);
+                        return (existing_query, doc_id);
+                    }
                 }
 
                 // Pick new query from pool (simulates paraphrase variation)
@@ -979,24 +982,13 @@ fn build_paraphrase_pools(
     let mut pools: HashMap<u64, Vec<usize>> = HashMap::with_capacity(corpus_size as usize);
 
     for doc_id in 0..corpus_size {
-        if let Some(indices) = doc_to_queries.get(&(doc_id as u64)) {
+        if let Some(indices) = doc_to_queries.get(&doc_id) {
             // Store query indices directly (no hashing needed)
-            pools.insert(doc_id as u64, indices.clone());
+            pools.insert(doc_id, indices.clone());
         }
     }
 
     pools
-}
-
-fn synthetic_query_hash(doc_id: u64, slot: u64) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    doc_id.hash(&mut hasher);
-    slot.hash(&mut hasher);
-    0x9E3779B97F4A7C15u64.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Hash embedding vector to u64 for cache key
@@ -1307,8 +1299,7 @@ async fn main() -> Result<()> {
     let diversity = predictor_capacity
         .checked_next_power_of_two()
         .unwrap_or(predictor_capacity)
-        .max(128)
-        .min(2048);
+        .clamp(128, 2048);
     learned_predictor.set_diversity_buckets(diversity);
     // Target 2.5× cache capacity (~175 docs) for Zipf 1.4 distribution
     let hot_target = (learned_cache_capacity as f32 * 2.5) as usize;
@@ -1325,14 +1316,14 @@ async fn main() -> Result<()> {
     learned_predictor.set_miss_penalty_rate(0.8);
     learned_predictor.set_working_set_boost(Duration::from_secs(60), 0.02);
 
-    // Layer 1a: Document Cache (RMI frequency-based)
+    // Layer 1a: Document Cache (Learned frequency-based)
     // Create strategy for training task
     let learned_strategy_for_training = Arc::new(LearnedCacheStrategy::new(
         learned_cache_capacity,
         learned_predictor,
     ));
 
-    // Layer 1b: Query Cache (Semantic similarity-based)
+    // Layer 1b: Query Search Cache (Semantic similarity-based)
     // Capacity: 300 queries, threshold: 0.25 (MS MARCO median paraphrase similarity)
     // MS MARCO queries for same doc have median similarity ~0.28, so 0.25 captures most variants
     let query_cache = Arc::new(QueryHashCache::new(300, 0.25));
@@ -1378,9 +1369,16 @@ async fn main() -> Result<()> {
         hot_tier_hard_limit: 2000,
         hot_tier_max_age: Duration::from_secs(300), // 5 minutes
         hnsw_max_elements: config.corpus_size * 2,
+        embedding_dimension: corpus_embeddings.first().map(|v| v.len()).unwrap_or(768),
+        hnsw_distance: kyrodb_engine::config::DistanceMetric::Cosine,
+        hnsw_m: kyrodb_engine::hnsw_index::HnswVectorIndex::DEFAULT_M,
+        hnsw_ef_construction: kyrodb_engine::hnsw_index::HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
+        hnsw_ef_search: 50,
+        hnsw_disable_normalization_check: false,
         data_dir: None, // No persistence for validation
         fsync_policy: kyrodb_engine::FsyncPolicy::Never,
         snapshot_interval: 10000,
+        max_wal_size_bytes: 0,
         flush_interval: Duration::from_secs(60),
         cache_timeout_ms: 10,
         hot_tier_timeout_ms: 50,
@@ -1405,11 +1403,13 @@ async fn main() -> Result<()> {
     )
     .context("Failed to create TieredEngine")?;
 
-    // Connect access logger to TieredEngine for RMI training data collection
+    // Connect access logger to TieredEngine for learned predictor training data collection
     engine.set_access_logger(access_logger.clone());
 
     let engine = Arc::new(engine);
-    println!("TieredEngine ready with two-level cache (L1a: Document Cache, L1b: Query Cache)");
+    println!(
+        "TieredEngine ready with two-level cache (L1a: Document Cache, L1b: Query Search Cache)"
+    );
     println!("  -> Shared strategy: Training updates will be visible to query path");
 
     let (query_embeddings, query_to_doc) = match (
@@ -1510,7 +1510,7 @@ async fn main() -> Result<()> {
         interval: Duration::from_secs(config.training_interval_secs),
         window_duration: Duration::from_secs(1800),
         min_events_for_training: 100,
-        rmi_capacity: predictor_capacity,
+        predictor_capacity: predictor_capacity,
         recency_halflife: Duration::from_secs(600),
         admission_threshold: 0.08,
         auto_tune_enabled: true,
@@ -1527,6 +1527,7 @@ async fn main() -> Result<()> {
         learned_strategy_for_training.clone(),
         training_config,
         Some(training_cycles.clone()),
+        None,
         shutdown_rx,
     )
     .await;
@@ -1671,9 +1672,9 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Get query embedding for L1b query cache
+        // Get query embedding for access logging / training
         // For semantic workload: use actual query embedding from index
-        // For temporal workload: use None (L1b won't be used, only L1a)
+        // For temporal workload: use None (no semantic embedding)
         let query_embedding_for_cache = match &workload_gen {
             WorkloadGenerator::Semantic(_) if query_embeddings.is_some() => {
                 // Use actual query embedding from the sampled index
@@ -1683,7 +1684,7 @@ async fn main() -> Result<()> {
                     .map(|emb| emb.as_slice())
             }
             _ => {
-                // Temporal workload: use None (L1b won't be used, only L1a)
+                // Temporal workload: use None (no semantic embedding)
                 None
             }
         };
@@ -1691,7 +1692,7 @@ async fn main() -> Result<()> {
         // Capture stats before query to track cache behavior
         let stats_before = engine.stats();
 
-        // Query through TieredEngine (all tiers: L1a, L1b, L2, L3)
+        // Query through TieredEngine (L1a + hot/cold tiers; L1b is search-only)
         let embedding_opt = engine.query(doc_id, query_embedding_for_cache);
 
         if let Some(_embedding) = embedding_opt {
@@ -1701,7 +1702,7 @@ async fn main() -> Result<()> {
             // Capture stats after query to determine if it was a cache hit
             let stats_after = engine.stats();
 
-            // Check if L1 cache (L1a or L1b) served this query
+            // Check if L1 cache (L1a) served this query
             let was_l1_cache_hit = stats_after.l1_combined_hits > stats_before.l1_combined_hits;
 
             // Log actual cache behavior to CSV (not document existence)
@@ -1749,7 +1750,7 @@ async fn main() -> Result<()> {
                 total_queries,
                 current_qps,
                 stats.cache_hit_rate * 100.0,          // L1a (Document Cache)
-                stats.query_cache_hit_rate * 100.0,    // L1b (Query Cache)
+                stats.query_cache_hit_rate * 100.0,    // L1b (Query Search Cache)
                 stats.l1_combined_hit_rate * 100.0,    // Combined L1
                 mode,
                 cycles
@@ -1797,7 +1798,7 @@ async fn main() -> Result<()> {
 
         // Calculate actual memory usage estimates
         let query_emb_mb = if let Some(ref qe) = query_embeddings {
-            (qe.len() * qe.get(0).map_or(384, |v| v.len()) * 4) as f64 / 1_048_576.0
+            (qe.len() * qe.first().map_or(384, |v| v.len()) * 4) as f64 / 1_048_576.0
         } else {
             0.0
         };
@@ -1812,7 +1813,7 @@ async fn main() -> Result<()> {
             "  L1a (Doc Cache): {:.1} MB ({} vectors × 384-dim × 4 bytes)",
             l1a_cache_mb, l1a_cache_len
         );
-        println!("  L1b (Query Cache): tracked in TieredEngine stats");
+        println!("  L1b (Query Search Cache): tracked in TieredEngine stats");
         println!("  L2 (Hot Tier):   {} documents", final_stats.hot_tier_size);
         println!(
             "  L3 (Cold Tier):  {} documents",
@@ -1853,17 +1854,40 @@ async fn main() -> Result<()> {
 
     println!("\nCalculating NDCG quality metrics...");
 
-    // Convert doc_accesses HashMap to ranked RankingResults (sorted by access count DESC)
-    let mut ranking: Vec<(u64, usize)> = doc_accesses.into_iter().collect();
-    ranking.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by access count DESC
+    // Ground truth: relevance derived from observed access frequency (more accesses = more relevant).
+    let mut ground_truth: Vec<(u64, usize)> = doc_accesses.into_iter().collect();
+    ground_truth.sort_by(|a, b| b.1.cmp(&a.1)); // access_count DESC
 
-    let cache_ranking_results: Vec<RankingResult> = ranking
+    // Evaluated ranking: order documents by learned predictor admission score (descending).
+    // This measures whether the predictor ranks the most-accessed docs near the top.
+    let predictor_scores: Vec<(u64, usize, f32)> = {
+        let predictor_guard = learned_strategy_for_training.predictor.read();
+        let mut scored: Vec<(u64, usize, f32)> = ground_truth
+            .iter()
+            .map(|(doc_id, access_count)| {
+                (
+                    *doc_id,
+                    *access_count,
+                    predictor_guard.admission_score(*doc_id),
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        scored
+    };
+
+    let cache_ranking_results: Vec<RankingResult> = predictor_scores
         .iter()
         .enumerate()
-        .map(|(position, &(doc_id, access_count))| RankingResult {
-            doc_id,
+        .map(|(position, (doc_id, access_count, _score))| RankingResult {
+            doc_id: *doc_id,
             position,
-            relevance: access_count as f64, // More accesses = more relevant
+            relevance: *access_count as f64,
         })
         .collect();
 
@@ -1878,16 +1902,38 @@ async fn main() -> Result<()> {
         0.0
     };
 
-    let mrr = if !cache_ranking_results.is_empty() {
-        calculate_mrr(&cache_ranking_results)
+    // For MRR/Recall, treat only the ground-truth top-10 accessed docs as "relevant" (binary).
+    let ground_truth_top_k: std::collections::HashSet<u64> = ground_truth
+        .iter()
+        .take(10)
+        .map(|(doc_id, _)| *doc_id)
+        .collect();
+    let total_relevant = ground_truth_top_k.len();
+
+    let binary_ranking: Vec<RankingResult> = predictor_scores
+        .iter()
+        .enumerate()
+        .map(
+            |(position, (doc_id, _access_count, _score))| RankingResult {
+                doc_id: *doc_id,
+                position,
+                relevance: if ground_truth_top_k.contains(doc_id) {
+                    1.0
+                } else {
+                    0.0
+                },
+            },
+        )
+        .collect();
+
+    let mrr = if !binary_ranking.is_empty() {
+        calculate_mrr(&binary_ranking)
     } else {
         0.0
     };
 
-    // Recall@10: Top-10 docs by access count vs all cached docs
-    let total_relevant = cache_ranking_results.len();
     let recall_at_10 = if total_relevant > 0 {
-        calculate_recall_at_k(&cache_ranking_results, 10, total_relevant)
+        calculate_recall_at_k(&binary_ranking, 10, total_relevant)
     } else {
         0.0
     };
@@ -1925,7 +1971,7 @@ async fn main() -> Result<()> {
         l1a_cache_misses: final_stats.cache_misses,
         l1a_hit_rate: final_stats.cache_hit_rate,
 
-        // Layer 1b (Query Cache) stats
+        // Layer 1b (Query Search Cache) stats
         l1b_cache_hits: final_stats.query_cache_hits,
         l1b_cache_misses: final_stats.query_cache_misses,
         l1b_hit_rate: final_stats.query_cache_hit_rate,
@@ -2005,7 +2051,7 @@ async fn main() -> Result<()> {
     println!();
     println!("Two-Level Cache Performance:");
     println!();
-    println!("  Layer 1a (Document Cache - RMI):");
+    println!("  Layer 1a (Document Cache - Learned Predictor):");
     println!("    Hits:          {}", final_stats.cache_hits);
     println!("    Misses:        {}", final_stats.cache_misses);
     println!(
@@ -2013,7 +2059,7 @@ async fn main() -> Result<()> {
         final_stats.cache_hit_rate * 100.0
     );
     println!();
-    println!("  Layer 1b (Query Cache - Semantic):");
+    println!("  Layer 1b (Query Search Cache - Semantic):");
     println!("    Hits:          {}", final_stats.query_cache_hits);
     println!("    Misses:        {}", final_stats.query_cache_misses);
     println!(

@@ -13,7 +13,7 @@
 //!
 //! 1. **Cache Quality**: Do cached docs match future queries?
 //! 2. **Search Quality**: Are k-NN results relevant?
-//! 3. **Prediction Quality**: Does RMI predict relevant docs?
+//! 3. **Prediction Quality**: Does learned predictor predict relevant docs?
 
 use std::collections::HashMap;
 

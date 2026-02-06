@@ -15,7 +15,6 @@ use std::collections::HashMap;
 // Simple cache model for loom testing (simplified version of actual cache)
 #[derive(Clone)]
 struct SimpleCacheEntry {
-    doc_id: u64,
     data: Vec<f32>,
 }
 
@@ -40,7 +39,7 @@ impl SimpleCache {
                 storage.remove(&first_key);
             }
         }
-        storage.insert(doc_id, SimpleCacheEntry { doc_id, data });
+        storage.insert(doc_id, SimpleCacheEntry { data });
     }
 
     fn get(&self, doc_id: u64) -> Option<Vec<f32>> {

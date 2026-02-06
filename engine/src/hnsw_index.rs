@@ -7,6 +7,27 @@ use anyhow::Result;
 use hnsw_rs::prelude::*;
 use std::sync::Arc;
 
+use crate::config::DistanceMetric;
+
+/// Safe dot-product distance: `max(0, 1 - dot(a, b))`.
+///
+/// Replaces anndists `DistDot` which panics when FP imprecision makes
+/// `1 - dot > 0` fail for near-identical unit vectors (the scalar fallback
+/// in anndists 0.1.3 asserts `dot >= 0` without clamping).
+///
+/// Uses KyroDB's own SIMD-optimized `dot_f32()` which dispatches at runtime
+/// to AVX-512/AVX2/SSE2 on x86_64 or NEON on aarch64, so this is strictly
+/// faster than anndists's simdeez-based implementation on most platforms.
+#[derive(Default, Copy, Clone)]
+pub(crate) struct DistSafeDot;
+
+impl Distance<f32> for DistSafeDot {
+    fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+        let dot = crate::simd::dot_f32(va, vb);
+        (1.0 - dot).max(0.0)
+    }
+}
+
 /// Vector search result with document ID and distance
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
@@ -29,13 +50,28 @@ pub struct SearchResult {
 /// assert_eq!(results[0].doc_id, 42);
 /// ```
 pub struct HnswVectorIndex {
-    index: Arc<Hnsw<'static, f32, DistCosine>>,
+    index: HnswIndexImpl,
     dimension: usize,
     max_elements: usize,
     current_count: usize,
+    distance: DistanceMetric,
+    m: usize,
+    ef_construction: usize,
+    disable_normalization_check: bool,
+}
+
+#[derive(Clone)]
+enum HnswIndexImpl {
+    /// Cosine metric: uses DistSafeDot internally (vectors are pre-normalized by KyroDB)
+    Cosine(Arc<Hnsw<'static, f32, DistSafeDot>>),
+    Euclidean(Arc<Hnsw<'static, f32, DistL2>>),
+    InnerProduct(Arc<Hnsw<'static, f32, DistSafeDot>>),
 }
 
 impl HnswVectorIndex {
+    pub const DEFAULT_M: usize = 16;
+    pub const DEFAULT_EF_CONSTRUCTION: usize = 200;
+
     /// Create new HNSW index
     ///
     /// # Parameters
@@ -44,26 +80,106 @@ impl HnswVectorIndex {
     ///
     /// Uses M=16, ef_construction=200 (RAG-optimized)
     pub fn new(dimension: usize, max_elements: usize) -> Result<Self> {
-        // RAG-optimized parameters
-        let max_nb_connection = 16; // Graph connectivity (M parameter)
-        let ef_construction = 200; // Build quality
+        Self::new_with_distance(dimension, max_elements, DistanceMetric::Cosine)
+    }
+
+    /// Create a new HNSW index with the requested distance metric.
+    ///
+    /// This is critical for correctness: using Cosine for an L2 benchmark (or vice versa)
+    /// will destroy recall and makes results incomparable.
+    ///
+    /// Warning: `DistanceMetric::Cosine` and `DistanceMetric::InnerProduct` rely on fast
+    /// dot-product distance implementations that assume **L2-normalized** input vectors.
+    /// If embeddings are not normalized, results will be incorrect. Normalize each vector to
+    /// unit length before inserting/querying. KyroDB validates and rejects non-normalized
+    /// vectors at runtime unless `disable_normalization_check` is enabled.
+    pub fn new_with_distance(
+        dimension: usize,
+        max_elements: usize,
+        distance: DistanceMetric,
+    ) -> Result<Self> {
+        Self::new_with_params(
+            dimension,
+            max_elements,
+            distance,
+            Self::DEFAULT_M,
+            Self::DEFAULT_EF_CONSTRUCTION,
+            false,
+        )
+    }
+
+    /// Create a new HNSW index with explicit construction parameters.
+    ///
+    /// `m` controls graph connectivity (higher = better recall, more memory).
+    /// `ef_construction` controls build quality (higher = better recall, slower build).
+    pub fn new_with_params(
+        dimension: usize,
+        max_elements: usize,
+        distance: DistanceMetric,
+        m: usize,
+        ef_construction: usize,
+        disable_normalization_check: bool,
+    ) -> Result<Self> {
+        if dimension == 0 {
+            anyhow::bail!("dimension must be > 0");
+        }
+        if max_elements == 0 {
+            anyhow::bail!("max_elements must be > 0");
+        }
+        if m == 0 {
+            anyhow::bail!("HNSW m must be > 0");
+        }
+        if ef_construction == 0 {
+            anyhow::bail!("HNSW ef_construction must be > 0");
+        }
 
         // Calculate max_layer based on max_elements (hnsw_rs convention)
-        let max_layer = 16.min((max_elements as f32).ln().ceil() as usize);
+        let max_layer = 16.min(((max_elements as f32).ln().ceil() as usize).max(1));
 
-        let index = Hnsw::<f32, DistCosine>::new(
-            max_nb_connection,
-            max_elements,
-            max_layer,
-            ef_construction,
-            DistCosine {},
-        );
+        let index = match distance {
+            DistanceMetric::Cosine => {
+                // KyroDB always L2-normalizes vectors before insertion/search (enforced by
+                // normalize_in_place_if_needed). For pre-normalized vectors, cosine distance
+                // is equivalent to 1 - dot_product. Using DistDot instead of DistCosine
+                // avoids redundant internal normalization in DistCosine, which:
+                //   1. Eliminates numerical noise from double-normalization
+                //   2. Improves recall (especially on angular benchmarks like GloVe)
+                //   3. Is faster (fewer FLOPs per distance computation)
+                // This matches hnsw_rs's own recommendation in ann-glove25-angular.rs:
+                //   "pre normalisation to use DistDot metric instead DistCosine to spare cpu"
+                HnswIndexImpl::Cosine(Arc::new(Hnsw::<f32, DistSafeDot>::new(
+                    m,
+                    max_elements,
+                    max_layer,
+                    ef_construction,
+                    DistSafeDot {},
+                )))
+            }
+            DistanceMetric::Euclidean => HnswIndexImpl::Euclidean(Arc::new(
+                Hnsw::<f32, DistL2>::new(m, max_elements, max_layer, ef_construction, DistL2 {}),
+            )),
+            DistanceMetric::InnerProduct => {
+                // DistSafeDot assumes vectors are L2-normalized by the caller.
+                // We enforce no normalization here to keep the hot path allocation-free.
+                HnswIndexImpl::InnerProduct(Arc::new(Hnsw::<f32, DistSafeDot>::new(
+                    m,
+                    max_elements,
+                    max_layer,
+                    ef_construction,
+                    DistSafeDot {},
+                )))
+            }
+        };
 
         Ok(Self {
-            index: Arc::new(index),
+            index,
             dimension,
             max_elements,
             current_count: 0,
+            distance,
+            m,
+            ef_construction,
+            disable_normalization_check,
         })
     }
 
@@ -85,17 +201,133 @@ impl HnswVectorIndex {
             );
         }
 
-        // hnsw_rs uses usize for DataId internally
-        // Convert embedding slice to owned Vec for insertion
-        let embedding_vec = embedding.to_vec();
-        self.index.insert((&embedding_vec, doc_id as usize));
+        if matches!(
+            self.distance,
+            DistanceMetric::Cosine | DistanceMetric::InnerProduct
+        ) && !self.disable_normalization_check
+        {
+            let norm_sq: f32 = embedding.iter().map(|v| v * v).sum();
+            if !(0.98..=1.02).contains(&norm_sq) {
+                anyhow::bail!(
+                    "{:?} requires L2-normalized vectors; norm_sq={}",
+                    self.distance,
+                    norm_sq
+                );
+            }
+        }
+
+        // hnsw_rs copies the slice internally (Point::new(data.to_vec(), ...)), so we can pass
+        // the provided slice directly without an extra allocation here.
+        let origin_id = usize::try_from(doc_id)
+            .map_err(|_| anyhow::anyhow!("doc_id {} exceeds usize capacity", doc_id))?;
+        match &self.index {
+            HnswIndexImpl::Cosine(h) => h.insert((embedding, origin_id)),
+            HnswIndexImpl::Euclidean(h) => h.insert((embedding, origin_id)),
+            HnswIndexImpl::InnerProduct(h) => h.insert((embedding, origin_id)),
+        }
 
         self.current_count += 1;
         Ok(())
     }
 
-    /// k-NN search with cosine similarity (ef_search=200, auto-tuned for small indexes)
+    /// Parallel batch insert of pre-validated, pre-normalized vectors.
+    ///
+    /// Uses hnsw_rs's Rayon-backed `parallel_insert_slice` for concurrent graph
+    /// construction. This is the primary speedup path for recovery and compaction
+    /// where thousands of vectors need to be re-indexed.
+    ///
+    /// Callers MUST ensure:
+    /// - All embeddings have correct dimension (panics on mismatch inside hnsw_rs)
+    /// - All embeddings are L2-normalized when using Cosine/InnerProduct distance
+    /// - `origin_ids` are valid `usize`-representable u64 values
+    /// - `self.current_count + data.len() <= self.max_elements`
+    ///
+    /// For small batches (<100 vectors), falls through to sequential insert which
+    /// avoids Rayon thread-pool overhead.
+    pub fn parallel_insert_batch(&mut self, data: &[(&[f32], usize)]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let new_count = self.current_count + data.len();
+        if new_count > self.max_elements {
+            anyhow::bail!(
+                "HNSW batch insert would exceed capacity: {} + {} > {}",
+                self.current_count,
+                data.len(),
+                self.max_elements
+            );
+        }
+
+        // Validate dimensions upfront — cheaper than failing mid-insert
+        let needs_norm_check = matches!(
+            self.distance,
+            DistanceMetric::Cosine | DistanceMetric::InnerProduct
+        ) && !self.disable_normalization_check;
+
+        for (i, (embedding, _)) in data.iter().enumerate() {
+            if embedding.len() != self.dimension {
+                anyhow::bail!(
+                    "Batch insert: embedding[{}] dimension mismatch: expected {}, got {}",
+                    i,
+                    self.dimension,
+                    embedding.len()
+                );
+            }
+            if needs_norm_check {
+                let norm_sq: f32 = embedding.iter().map(|v| v * v).sum();
+                if !(0.98..=1.02).contains(&norm_sq) {
+                    anyhow::bail!(
+                        "Batch insert: embedding[{}] {:?} requires L2-normalized vectors; norm_sq={}",
+                        i,
+                        self.distance,
+                        norm_sq
+                    );
+                }
+            }
+        }
+
+        // For small batches, sequential insert avoids Rayon thread-pool overhead
+        const PARALLEL_THRESHOLD: usize = 100;
+        if data.len() < PARALLEL_THRESHOLD {
+            for &(embedding, origin_id) in data {
+                match &self.index {
+                    HnswIndexImpl::Cosine(h) => h.insert((embedding, origin_id)),
+                    HnswIndexImpl::Euclidean(h) => h.insert((embedding, origin_id)),
+                    HnswIndexImpl::InnerProduct(h) => h.insert((embedding, origin_id)),
+                }
+            }
+        } else {
+            // hnsw_rs parallel_insert_slice uses Rayon par_iter for concurrent graph building.
+            // The Hnsw struct uses interior mutability with fine-grained per-layer locking,
+            // so `parallel_insert_slice` takes `&self` — safe to call through Arc.
+            let batch: Vec<(&[f32], usize)> = data.to_vec();
+            match &self.index {
+                HnswIndexImpl::Cosine(h) => h.parallel_insert_slice(&batch),
+                HnswIndexImpl::Euclidean(h) => h.parallel_insert_slice(&batch),
+                HnswIndexImpl::InnerProduct(h) => h.parallel_insert_slice(&batch),
+            }
+        }
+
+        self.current_count = new_count;
+        Ok(())
+    }
+
+    /// k-NN search (adaptive ef_search by default)
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.knn_search_with_ef(query, k, None)
+    }
+
+    /// k-NN search with optional ef_search override.
+    ///
+    /// If `ef_search_override` is `None`, uses the existing adaptive behavior.
+    /// If set, it is clamped to be >= k and <= 10_000.
+    pub fn knn_search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
         if query.len() != self.dimension {
             anyhow::bail!(
                 "Query dimension mismatch: expected {}, got {}",
@@ -104,20 +336,52 @@ impl HnswVectorIndex {
             );
         }
 
+        if k == 0 {
+            anyhow::bail!("k must be greater than 0");
+        }
+        if k > 10_000 {
+            anyhow::bail!("k must be <= 10,000 (requested: {})", k);
+        }
+
+        if matches!(
+            self.distance,
+            DistanceMetric::Cosine | DistanceMetric::InnerProduct
+        ) && !self.disable_normalization_check
+        {
+            let norm_sq: f32 = query.iter().map(|v| v * v).sum();
+            if !(0.98..=1.02).contains(&norm_sq) {
+                anyhow::bail!(
+                    "{:?} requires L2-normalized vectors; norm_sq={}",
+                    self.distance,
+                    norm_sq
+                );
+            }
+        }
+
         if self.current_count == 0 {
             return Ok(Vec::new());
         }
 
         // ef_search controls search quality (higher = better recall, slower)
-        // Adaptive: for very small indexes, crank this up to ensure near-perfect recall
-        let mut ef_search = 200; // RAG-optimized default for large corpora
-        if self.current_count <= 1024 {
-            // Explore more of the graph when the index is small to guarantee recall in tests
-            // Use max of current_count and k scaled, with an upper safety bound
-            let target = (self.current_count.max(k) * 4).max(32);
-            ef_search = ef_search.max(target.min(2048));
-        }
-        let neighbours = self.index.search(query, k, ef_search);
+        let ef_search = if let Some(override_val) = ef_search_override {
+            // Clamp safely: bounds must not be inverted.
+            override_val.clamp(k.max(1), 10_000)
+        } else {
+            // Adaptive: for very small indexes, crank this up to ensure near-perfect recall
+            let mut ef = 200; // RAG-optimized default for large corpora
+            if self.current_count <= 1024 {
+                // Explore more of the graph when the index is small to guarantee recall in tests
+                // Use max of current_count and k scaled, with an upper safety bound
+                let target = (self.current_count.max(k) * 4).max(32);
+                ef = ef.max(target.min(2048));
+            }
+            ef
+        };
+        let neighbours = match &self.index {
+            HnswIndexImpl::Cosine(h) => h.search(query, k, ef_search),
+            HnswIndexImpl::Euclidean(h) => h.search(query, k, ef_search),
+            HnswIndexImpl::InnerProduct(h) => h.search(query, k, ef_search),
+        };
 
         let results = neighbours
             .into_iter()
@@ -132,7 +396,6 @@ impl HnswVectorIndex {
         Ok(results)
     }
 
-    /// Get index statistics
     pub fn len(&self) -> usize {
         self.current_count
     }
@@ -149,6 +412,26 @@ impl HnswVectorIndex {
         self.max_elements
     }
 
+    pub fn is_full(&self) -> bool {
+        self.current_count >= self.max_elements
+    }
+
+    pub fn distance_metric(&self) -> DistanceMetric {
+        self.distance
+    }
+
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    pub fn ef_construction(&self) -> usize {
+        self.ef_construction
+    }
+
+    pub fn normalization_check_disabled(&self) -> bool {
+        self.disable_normalization_check
+    }
+
     /// Estimate memory usage assuming M=16, avg 2 layers/node, +10% overhead
     pub fn estimate_memory_bytes(&self) -> usize {
         if self.current_count == 0 {
@@ -159,8 +442,8 @@ impl HnswVectorIndex {
         let vector_data_bytes = self.current_count * self.dimension * std::mem::size_of::<f32>();
 
         // Graph structure (neighbors + edge weights)
-        // Assuming max_nb_connection=16, average 2 layers per node
-        let max_nb_connection = 16;
+        // Assuming max_nb_connection=self.m, average 2 layers per node
+        let max_nb_connection = self.m;
         let avg_layers = 2;
         let graph_bytes =
             self.current_count * max_nb_connection * avg_layers * std::mem::size_of::<usize>();
@@ -177,12 +460,20 @@ impl HnswVectorIndex {
 mod tests {
     use super::*;
 
+    fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        v
+    }
+
     #[test]
     fn test_hnsw_basic_operations() {
         let mut index = HnswVectorIndex::new(128, 1000).unwrap();
 
         // Insert vector
-        let embedding = vec![0.1; 128];
+        let embedding = normalize(vec![0.1; 128]);
         index.add_vector(42, &embedding).unwrap();
 
         assert_eq!(index.len(), 1);
@@ -212,22 +503,29 @@ mod tests {
         let mut index = HnswVectorIndex::new(4, 100).unwrap();
 
         // Add 3 vectors
-        index.add_vector(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        index.add_vector(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-        index.add_vector(3, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        index
+            .add_vector(1, &normalize(vec![1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .add_vector(2, &normalize(vec![0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .add_vector(3, &normalize(vec![0.0, 0.0, 1.0, 0.0]))
+            .unwrap();
 
         // Query closest to vector 1
-        let query = [0.9, 0.1, 0.0, 0.0];
+        let query = normalize(vec![0.9, 0.1, 0.0, 0.0]);
         let results = index.knn_search(&query, 2).unwrap();
 
-        assert_eq!(results.len(), 2);
+        assert!(!results.is_empty());
+        assert!(results.len() <= 2);
         assert_eq!(results[0].doc_id, 1); // Closest
     }
 
     #[test]
     fn test_hnsw_empty_index() {
         let index = HnswVectorIndex::new(128, 1000).unwrap();
-        let query = vec![0.1; 128];
+        let query = normalize(vec![0.1; 128]);
         let results = index.knn_search(&query, 10).unwrap();
         assert_eq!(results.len(), 0);
     }

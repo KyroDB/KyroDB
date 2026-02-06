@@ -1,8 +1,10 @@
-//! RMI Core Tests
+//! learned predictor Core Tests
 //!
-//! Tests for Hybrid Semantic Cache RMI components
+//! Tests for Hybrid Semantic Cache learned predictor components
 
-use kyrodb_engine::rmi_core::{LocalLinearModel, RmiIndex, RmiSegment};
+use kyrodb_engine::learned_predictor_core::{
+    LearnedPredictorIndex, LearnedPredictorSegment, LocalLinearModel,
+};
 
 #[test]
 fn test_local_linear_model_basic() {
@@ -25,7 +27,7 @@ fn test_local_linear_model_basic() {
 #[test]
 fn test_rmi_segment_bounded_search() {
     let data = vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)];
-    let segment = RmiSegment::new(data);
+    let segment = LearnedPredictorSegment::new(data);
 
     // Exact matches
     assert_eq!(segment.bounded_search(1), Some(10));
@@ -43,7 +45,7 @@ fn test_rmi_index_multi_segment() {
     let data: Vec<(u64, u64)> = (0..1000).map(|i| (i, i * 10)).collect();
 
     // Build index with 100 entries per segment
-    let index = RmiIndex::build(data, 100);
+    let index = LearnedPredictorIndex::build(data, 100);
 
     // Should have ~10 segments
     assert!(index.segment_count() >= 9 && index.segment_count() <= 11);
@@ -56,7 +58,7 @@ fn test_rmi_index_multi_segment() {
 
 #[test]
 fn test_rmi_index_empty() {
-    let index = RmiIndex::build(vec![], 100);
+    let index = LearnedPredictorIndex::build(vec![], 100);
     assert_eq!(index.segment_count(), 0);
     assert_eq!(index.get(0), None);
 }
@@ -64,7 +66,7 @@ fn test_rmi_index_empty() {
 #[test]
 fn test_rmi_index_single_element() {
     let data = vec![(42, 100)];
-    let index = RmiIndex::build(data, 100);
+    let index = LearnedPredictorIndex::build(data, 100);
 
     assert_eq!(index.get(42), Some(100));
     assert_eq!(index.get(0), None);
@@ -87,7 +89,7 @@ fn test_rmi_with_zipfian_like_data() {
         data.push((i, i % 20)); // Hotness 0-20
     }
 
-    let index = RmiIndex::build(data, 100);
+    let index = LearnedPredictorIndex::build(data, 100);
 
     // Verify hot docs
     let hot_score = index.get(50).unwrap();

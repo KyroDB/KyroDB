@@ -20,13 +20,15 @@ training_interval_secs = 600
 
 [persistence]
 data_dir = "./data/kyrodb_images"
-enable_wal = true
 fsync_policy = "data_only"
-snapshot_interval_secs = 300
+wal_flush_interval_ms = 100
+snapshot_interval_mutations = 10000
+max_wal_size_bytes = 104857600  # 100 MB
 
 [slo]
 p99_latency_ms = 50.0
 cache_hit_rate = 0.70
 
-[log]
+[logging]
 level = "info"
+format = "text"

@@ -20,11 +20,17 @@
 //! RUST_LOG=kyrodb_engine=debug kyrodb_server
 //! ```
 
+use anyhow::Context;
 use clap::Parser;
+use kyrodb_engine::training_task::{spawn_training_task, TrainingConfig};
 use kyrodb_engine::{
-    cache_strategy::{AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy},
-    ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
-    TieredEngine, TieredEngineConfig,
+    access_logger::AccessPatternLogger,
+    cache_strategy::{
+        AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy, SharedLearnedCacheStrategy,
+    },
+    config::ObservabilityAuthMode,
+    AuthManager, ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
+    RateLimiter, SloThresholds, TenantInfo, TieredEngine, TieredEngineConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,10 +42,12 @@ use tracing::{error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // HTTP server for observability endpoints
+use axum::middleware::Next;
 use axum::{
     body::Body,
     extract::State as AxumState,
-    http::{Response as HttpResponse, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderValue, Response as HttpResponse, StatusCode},
+    middleware,
     routing::get,
     Router,
 };
@@ -65,11 +73,198 @@ const MAX_EMBEDDING_DIM: usize = 4096;
 /// Maximum batch size for bulk operations to prevent memory exhaustion
 const MAX_BATCH_SIZE: usize = 10000;
 
+/// BulkSearch micro-batch size to amortize per-request overhead
+const BULK_SEARCH_BATCH_SIZE: usize = 128;
+
+/// Maximum time to wait for a BulkSearch micro-batch (milliseconds)
+const BULK_SEARCH_MAX_WAIT_MS: u64 = 2;
+
 /// Minimum valid document ID (0 is reserved)
 const MIN_DOC_ID: u64 = 1;
 
+/// Maximum total documents for a single bulk_load_hnsw stream to prevent
+/// runaway CPU/disk usage. Configurable via max_total_documents if needed.
+const MAX_TOTAL_BULK_LOAD_DOCUMENTS: u64 = 10_000_000;
+
 /// Maximum k value for k-NN search to prevent excessive computation
 const MAX_KNN_K: u32 = 1000;
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ============================================================================
+// AUTH / TENANCY
+// ============================================================================
+
+const API_KEY_HEADER: &str = "x-api-key";
+const AUTHORIZATION_HEADER: &str = "authorization";
+
+#[derive(Debug, Clone)]
+struct TenantContext {
+    tenant_id: String,
+    tenant_index: u32,
+    max_qps: u32,
+}
+
+/// Stable tenant-local → global doc_id mapping.
+///
+/// global_doc_id layout:
+/// - high 32 bits: tenant_index
+/// - low  32 bits: tenant-local doc_id
+#[derive(Debug)]
+struct TenantIdMapper {
+    path: std::path::PathBuf,
+    map: parking_lot::RwLock<std::collections::HashMap<String, u32>>,
+}
+
+impl TenantIdMapper {
+    fn load_or_create(path: std::path::PathBuf, tenants: &[TenantInfo]) -> anyhow::Result<Self> {
+        if path.exists() {
+            let bytes = std::fs::read(&path).map_err(|e| {
+                anyhow::anyhow!("Failed to read tenant map {}: {}", path.display(), e)
+            })?;
+            let map: std::collections::HashMap<String, u32> = serde_json::from_slice(&bytes)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to parse tenant map {}: {}", path.display(), e)
+                })?;
+            return Ok(Self {
+                path,
+                map: parking_lot::RwLock::new(map),
+            });
+        }
+
+        let mut tenant_ids = tenants
+            .iter()
+            .map(|t| t.tenant_id.clone())
+            .collect::<Vec<_>>();
+        tenant_ids.sort();
+        tenant_ids.dedup();
+
+        let mut map = std::collections::HashMap::with_capacity(tenant_ids.len());
+        for (idx, tenant_id) in tenant_ids.into_iter().enumerate() {
+            let idx_u32: u32 = idx
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Too many tenants for u32 tenant_index"))?;
+            map.insert(tenant_id, idx_u32);
+        }
+
+        Self::persist_map_atomic(&path, &map)?;
+
+        Ok(Self {
+            path,
+            map: parking_lot::RwLock::new(map),
+        })
+    }
+
+    fn ensure_tenant(&self, tenant_id: &str) -> anyhow::Result<u32> {
+        if let Some(idx) = self.map.read().get(tenant_id).copied() {
+            return Ok(idx);
+        }
+
+        let mut map = self.map.write();
+        if let Some(idx) = map.get(tenant_id).copied() {
+            return Ok(idx);
+        }
+
+        let next_idx = map
+            .len()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("tenant_index overflow"))?;
+        map.insert(tenant_id.to_string(), next_idx);
+
+        let map_snapshot = map.clone();
+        let path = self.path.clone();
+        match Self::persist_map_atomic(&path, &map_snapshot) {
+            Ok(()) => Ok(next_idx),
+            Err(e) => {
+                map.remove(tenant_id);
+                Err(e)
+            }
+        }
+    }
+
+    fn persist_map_atomic(
+        path: &std::path::Path,
+        map: &std::collections::HashMap<String, u32>,
+    ) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(map)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize tenant map: {}", e))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create tenant map dir {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+        }
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Tenant map path has no parent"))?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Tenant map path has no file name"))?;
+        let tmp_name = format!(
+            ".{}.tmp.{}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        );
+        let tmp_path = parent.join(tmp_name);
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create temp tenant map: {}", e))?;
+
+        if path.exists() {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let _ = std::fs::set_permissions(&tmp_path, metadata.permissions());
+            }
+        }
+
+        use std::io::Write;
+        file.write_all(&bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to write tenant map: {}", e))?;
+        file.sync_all()
+            .map_err(|e| anyhow::anyhow!("Failed to fsync tenant map: {}", e))?;
+        drop(file);
+
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| anyhow::anyhow!("Failed to rename tenant map: {}", e))?;
+
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to open tenant map dir: {}", e))?;
+        dir.sync_all()
+            .map_err(|e| anyhow::anyhow!("Failed to fsync tenant map dir: {}", e))?;
+
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn to_global_doc_id(tenant_index: u32, local_doc_id: u64) -> Result<u64, Status> {
+        if local_doc_id > u32::MAX as u64 {
+            return Err(Status::invalid_argument(
+                "DOC_ID_OUT_OF_RANGE: doc_id exceeds tenant-local max (u32)",
+            ));
+        }
+        Ok(((tenant_index as u64) << 32) | local_doc_id)
+    }
+
+    fn is_tenant_doc_id(tenant_index: u32, global_doc_id: u64) -> bool {
+        (global_doc_id >> 32) as u32 == tenant_index
+    }
+
+    fn to_local_doc_id(global_doc_id: u64) -> u64 {
+        global_doc_id & 0xFFFF_FFFF
+    }
+}
 
 // ============================================================================
 // SERVER STATE
@@ -84,11 +279,361 @@ struct ServerState {
     #[allow(dead_code)] // Used in shutdown sequence, not via field access
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     metrics: MetricsCollector,
+
+    auth: Option<AuthManager>,
+    rate_limiter: Option<RateLimiter>,
+    tenant_id_mapper: Option<TenantIdMapper>,
 }
 
 /// gRPC service implementation
 struct KyroDBServiceImpl {
     state: Arc<ServerState>,
+}
+
+struct SearchPlan {
+    search_k: usize,
+    ef_search_override: Option<usize>,
+}
+
+impl KyroDBServiceImpl {
+    #[allow(clippy::result_large_err)]
+    fn tenant_context<T>(&self, request: &Request<T>) -> Result<Option<TenantContext>, Status> {
+        if !self.state.app_config.auth.enabled {
+            return Ok(None);
+        }
+
+        request
+            .extensions()
+            .get::<TenantContext>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("missing tenant context"))
+            .map(Some)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn enforce_rate_limit(&self, tenant: Option<&TenantContext>) -> Result<(), Status> {
+        let Some(tenant) = tenant else {
+            return Ok(());
+        };
+        let limiter = self
+            .state
+            .rate_limiter
+            .as_ref()
+            .ok_or_else(|| Status::internal("rate limiter not initialized"))?;
+        if limiter.check_limit(&tenant.tenant_id, tenant.max_qps) {
+            Ok(())
+        } else {
+            Err(Status::resource_exhausted("rate limit exceeded"))
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn map_doc_id(&self, tenant: Option<&TenantContext>, local_doc_id: u64) -> Result<u64, Status> {
+        if let Some(tenant) = tenant {
+            Ok(TenantIdMapper::to_global_doc_id(
+                tenant.tenant_index,
+                local_doc_id,
+            )?)
+        } else {
+            Ok(local_doc_id)
+        }
+    }
+
+    fn unmap_doc_id(&self, tenant: Option<&TenantContext>, global_doc_id: u64) -> u64 {
+        if let Some(tenant) = tenant {
+            if TenantIdMapper::is_tenant_doc_id(tenant.tenant_index, global_doc_id) {
+                TenantIdMapper::to_local_doc_id(global_doc_id)
+            } else {
+                0
+            }
+        } else {
+            global_doc_id
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate_search_request(
+        &self,
+        tenant: Option<&TenantContext>,
+        req: &SearchRequest,
+    ) -> Result<SearchPlan, Status> {
+        self.enforce_rate_limit(tenant)?;
+
+        if req.query_embedding.is_empty() {
+            self.state.metrics.record_error(ErrorCategory::Validation);
+            return Err(Status::invalid_argument("query_embedding cannot be empty"));
+        }
+        if req.query_embedding.len() > MAX_EMBEDDING_DIM {
+            self.state.metrics.record_error(ErrorCategory::Validation);
+            return Err(Status::invalid_argument(format!(
+                "query_embedding dimension {} exceeds maximum {}",
+                req.query_embedding.len(),
+                MAX_EMBEDDING_DIM
+            )));
+        }
+        if req.k == 0 {
+            self.state.metrics.record_error(ErrorCategory::Validation);
+            return Err(Status::invalid_argument("k must be greater than 0"));
+        }
+        if req.k > MAX_KNN_K {
+            self.state.metrics.record_error(ErrorCategory::Validation);
+            return Err(Status::invalid_argument(format!(
+                "k must be <= {}",
+                MAX_KNN_K
+            )));
+        }
+        if req.ef_search > 10_000 {
+            self.state.metrics.record_error(ErrorCategory::Validation);
+            return Err(Status::invalid_argument(
+                "ef_search must be <= 10000 (0 = server default)",
+            ));
+        }
+
+        let has_namespace = !req.namespace.is_empty();
+        let base_oversampling = if let Some(ref filter) = req.filter {
+            kyrodb_engine::adaptive_oversampling::calculate_oversampling_factor(filter)
+        } else {
+            1
+        };
+        let oversampling_factor = if has_namespace {
+            base_oversampling.saturating_mul(4).min(10)
+        } else {
+            base_oversampling
+        };
+        let search_k = (req.k as usize)
+            .saturating_mul(oversampling_factor)
+            .min(10_000);
+
+        let ef_search_override = if req.ef_search == 0 {
+            None
+        } else {
+            Some(req.ef_search as usize)
+        };
+
+        Ok(SearchPlan {
+            search_k,
+            ef_search_override,
+        })
+    }
+
+    fn convert_distance_to_score(&self, dist: f32) -> f32 {
+        use kyrodb_engine::config::DistanceMetric;
+
+        match self.state.app_config.hnsw.distance {
+            DistanceMetric::Cosine => 1.0 - dist,
+            DistanceMetric::Euclidean | DistanceMetric::InnerProduct => -dist,
+        }
+    }
+
+    fn build_search_response(
+        &self,
+        tenant: Option<&TenantContext>,
+        req: &SearchRequest,
+        results: Vec<kyrodb_engine::SearchResult>,
+        engine: &TieredEngine,
+        latency_ns: u64,
+    ) -> SearchResponse {
+        let mut final_results = Vec::with_capacity(req.k as usize);
+        let mut candidates = results.into_iter();
+
+        let has_namespace = !req.namespace.is_empty();
+        let needs_metadata = tenant.is_some() || has_namespace || req.filter.is_some();
+
+        while final_results.len() < req.k as usize {
+            let candidate = match candidates.next() {
+                Some(c) => c,
+                None => break,
+            };
+
+            if let Some(tenant) = tenant {
+                if !TenantIdMapper::is_tenant_doc_id(tenant.tenant_index, candidate.doc_id) {
+                    continue;
+                }
+            }
+
+            let score = self.convert_distance_to_score(candidate.distance);
+            if req.min_score > 0.0 && score < req.min_score {
+                continue;
+            }
+
+            let metadata = if needs_metadata {
+                let metadata = engine.get_metadata(candidate.doc_id).unwrap_or_default();
+
+                if let Some(tenant) = tenant {
+                    let expected = tenant.tenant_index.to_string();
+                    if metadata.get("__tenant_idx__") != Some(&expected) {
+                        continue;
+                    }
+                }
+
+                if has_namespace {
+                    let doc_namespace = metadata
+                        .get("__namespace__")
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    if doc_namespace != req.namespace {
+                        continue;
+                    }
+                }
+
+                if let Some(filter) = &req.filter {
+                    if !kyrodb_engine::metadata_filter::matches(filter, &metadata) {
+                        continue;
+                    }
+                }
+
+                metadata
+            } else {
+                HashMap::new()
+            };
+
+            let embedding = if req.include_embeddings {
+                engine.query(candidate.doc_id, None).unwrap_or_default()
+            } else {
+                vec![]
+            };
+
+            let local_doc_id = self.unmap_doc_id(tenant, candidate.doc_id);
+            if tenant.is_some() && local_doc_id < MIN_DOC_ID {
+                continue;
+            }
+
+            final_results.push(kyrodb::SearchResult {
+                doc_id: local_doc_id,
+                score,
+                embedding,
+                metadata,
+            });
+        }
+
+        let latency_ms = latency_ns as f64 / 1_000_000.0;
+
+        let total_found = final_results.len() as u32;
+        SearchResponse {
+            results: final_results,
+            total_found,
+            search_latency_ms: latency_ms as f32,
+            search_path: search_response::SearchPath::Unknown as i32,
+            error: String::new(),
+        }
+    }
+
+    async fn handle_search_request(
+        &self,
+        tenant: Option<&TenantContext>,
+        req: SearchRequest,
+    ) -> Result<SearchResponse, Status> {
+        let start = Instant::now();
+        let plan = self.validate_search_request(tenant, &req)?;
+
+        let engine = self.state.engine.read().await;
+
+        let results = engine
+            .knn_search_with_ef(&req.query_embedding, plan.search_k, plan.ef_search_override)
+            .map_err(|e| {
+                self.state.metrics.record_query_failure();
+                self.state.metrics.record_error(ErrorCategory::Internal);
+                Status::internal(format!("Search failed: {}", e))
+            })?;
+
+        let latency_ns = start.elapsed().as_nanos() as u64;
+        self.state.metrics.record_query_latency(latency_ns);
+        self.state.metrics.record_hnsw_search(latency_ns);
+
+        Ok(self.build_search_response(tenant, &req, results, &engine, latency_ns))
+    }
+
+    async fn handle_search_requests_batch(
+        &self,
+        tenant: Option<&TenantContext>,
+        requests: Vec<SearchRequest>,
+    ) -> Vec<Result<SearchResponse, Status>> {
+        if requests.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results: Vec<Option<Result<SearchResponse, Status>>> = vec![None; requests.len()];
+        let mut groups: HashMap<Option<usize>, Vec<(usize, SearchRequest, SearchPlan)>> =
+            HashMap::new();
+
+        for (idx, req) in requests.into_iter().enumerate() {
+            match self.validate_search_request(tenant, &req) {
+                Ok(plan) => {
+                    groups
+                        .entry(plan.ef_search_override)
+                        .or_default()
+                        .push((idx, req, plan));
+                }
+                Err(e) => {
+                    results[idx] = Some(Err(e));
+                }
+            }
+        }
+
+        let engine = self.state.engine.read().await;
+
+        for (ef_search_override, group) in groups {
+            let max_search_k = group
+                .iter()
+                .map(|(_, _, plan)| plan.search_k)
+                .max()
+                .unwrap_or(0);
+
+            let queries: Vec<Vec<f32>> = group
+                .iter()
+                .map(|(_, req, _)| req.query_embedding.clone())
+                .collect();
+
+            let batch_start = Instant::now();
+
+            let batch_results = engine
+                .knn_search_batch_with_ef(&queries, max_search_k, ef_search_override)
+                .map_err(|e| {
+                    self.state.metrics.record_error(ErrorCategory::Internal);
+                    Status::internal(format!("Search failed: {}", e))
+                });
+
+            match batch_results {
+                Ok(batch_results) => {
+                    let latency_ns = batch_start.elapsed().as_nanos() as u64;
+                    let batch_len = group.len().max(1) as u64;
+                    let per_request_latency_ns = latency_ns / batch_len;
+                    for ((idx, req, _plan), candidates) in
+                        group.into_iter().zip(batch_results.into_iter())
+                    {
+                        self.state
+                            .metrics
+                            .record_query_latency(per_request_latency_ns);
+                        self.state
+                            .metrics
+                            .record_hnsw_search(per_request_latency_ns);
+                        let response = self.build_search_response(
+                            tenant,
+                            &req,
+                            candidates,
+                            &engine,
+                            per_request_latency_ns,
+                        );
+                        results[idx] = Some(Ok(response));
+                    }
+                }
+                Err(status) => {
+                    let status_code = status.code();
+                    let status_message = status.message().to_string();
+                    for (idx, _req, _plan) in group {
+                        self.state.metrics.record_query_failure();
+                        self.state.metrics.record_error(ErrorCategory::Internal);
+                        results[idx] = Some(Err(Status::new(status_code, status_message.clone())));
+                    }
+                }
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(Status::internal("missing batch result"))))
+            .collect()
+    }
 }
 
 // KyroDBServiceImpl is constructed directly in main() with existing engine Arc
@@ -117,6 +662,8 @@ impl KyroDbService for KyroDBServiceImpl {
         request: Request<InsertRequest>,
     ) -> Result<Response<InsertResponse>, Status> {
         let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let req = request.into_inner();
 
         // Track connection
@@ -148,16 +695,28 @@ impl KyroDbService for KyroDBServiceImpl {
 
         tracing::Span::current().record("doc_id", req.doc_id);
 
+        let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
+
         let engine = self.state.engine.write().await;
 
         // Store namespace in metadata for filtering during search
         // Namespace is stored as reserved key "__namespace__" to avoid conflicts with user metadata
         let mut metadata = req.metadata;
+        metadata.remove("__tenant_id__");
+        metadata.remove("__tenant_idx__");
+        metadata.remove("__namespace__");
+        if let Some(tenant) = &tenant {
+            metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
+            metadata.insert(
+                "__tenant_idx__".to_string(),
+                tenant.tenant_index.to_string(),
+            );
+        }
         if !req.namespace.is_empty() {
             metadata.insert("__namespace__".to_string(), req.namespace.clone());
         }
 
-        match engine.insert(req.doc_id, req.embedding, metadata) {
+        match engine.insert(global_doc_id, req.embedding, metadata) {
             Ok(_) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 self.state.metrics.record_insert(true);
@@ -174,10 +733,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 Ok(Response::new(InsertResponse {
                     success: true,
                     error: String::new(),
-                    inserted_at: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
+                    inserted_at: unix_timestamp_secs(),
                     tier: insert_response::Tier::HotTier as i32,
                     total_inserted: 1,
                     total_failed: 0,
@@ -202,6 +758,8 @@ impl KyroDbService for KyroDBServiceImpl {
         request: Request<tonic::Streaming<InsertRequest>>,
     ) -> Result<Response<InsertResponse>, Status> {
         let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let mut stream = request.into_inner();
 
         let mut total_inserted = 0u64;
@@ -212,6 +770,7 @@ impl KyroDbService for KyroDBServiceImpl {
         // Acquire lock per-operation to prevent deadlock
         // Holding write lock across stream.message().await causes deadlock
         while let Some(req) = stream.message().await? {
+            self.enforce_rate_limit(tenant.as_ref())?;
             batch_count += 1;
 
             // Check batch size limit to prevent memory exhaustion
@@ -244,8 +803,32 @@ impl KyroDbService for KyroDBServiceImpl {
 
             // Short-lived lock per insert operation
             {
+                let global_doc_id = match self.map_doc_id(tenant.as_ref(), req.doc_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        total_failed += 1;
+                        last_error = e.message().to_string();
+                        continue;
+                    }
+                };
+
+                let mut metadata = req.metadata;
+                metadata.remove("__tenant_id__");
+                metadata.remove("__tenant_idx__");
+                metadata.remove("__namespace__");
+                if let Some(tenant) = &tenant {
+                    metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
+                    metadata.insert(
+                        "__tenant_idx__".to_string(),
+                        tenant.tenant_index.to_string(),
+                    );
+                }
+                if !req.namespace.is_empty() {
+                    metadata.insert("__namespace__".to_string(), req.namespace.clone());
+                }
+
                 let engine = self.state.engine.write().await;
-                match engine.insert(req.doc_id, req.embedding, req.metadata) {
+                match engine.insert(global_doc_id, req.embedding, metadata) {
                     Ok(_) => total_inserted += 1,
                     Err(e) => {
                         total_failed += 1;
@@ -270,13 +853,182 @@ impl KyroDbService for KyroDBServiceImpl {
         Ok(Response::new(InsertResponse {
             success: total_failed == 0,
             error: last_error,
-            inserted_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            inserted_at: unix_timestamp_secs(),
             tier: insert_response::Tier::HotTier as i32,
             total_inserted,
             total_failed,
+        }))
+    }
+
+    /// Bulk load directly to HNSW index (bypasses hot tier)
+    ///
+    /// This provides maximum indexing speed for benchmarks and data migrations.
+    /// Warning: Data is NOT persisted to WAL during load.
+    #[instrument(skip(self, request))]
+    async fn bulk_load_hnsw(
+        &self,
+        request: Request<tonic::Streaming<InsertRequest>>,
+    ) -> Result<Response<BulkLoadResponse>, Status> {
+        let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
+        let mut stream = request.into_inner();
+
+        // Stream ingestion in bounded chunks.
+        // We cannot hold the engine write lock across `.await` on the request stream.
+        // Instead, we batch up to MAX_BATCH_SIZE docs, ingest synchronously, then continue.
+        let mut documents: Vec<(u64, Vec<f32>, std::collections::HashMap<String, String>)> =
+            Vec::with_capacity(MAX_BATCH_SIZE);
+        let mut validation_errors = 0u64;
+        let mut last_error = String::new();
+
+        let mut total_loaded = 0u64;
+        let mut total_failed_insertion = 0u64;
+        let mut total_received = 0u64;
+
+        info!("BulkLoadHnsw: starting streaming load");
+
+        while let Some(req) = stream.message().await? {
+            // Re-check rate limit per batch boundary to prevent long-running
+            // streams from bypassing per-tenant limits.
+            self.enforce_rate_limit(tenant.as_ref())?;
+
+            total_received += 1;
+
+            // Enforce total document cap to prevent runaway resource consumption
+            if total_received > MAX_TOTAL_BULK_LOAD_DOCUMENTS {
+                last_error = format!(
+                    "Total document limit exceeded: received {} documents, max is {}",
+                    total_received, MAX_TOTAL_BULK_LOAD_DOCUMENTS
+                );
+                return Err(Status::resource_exhausted(&last_error));
+            }
+            // Validate doc_id
+            if req.doc_id < MIN_DOC_ID {
+                validation_errors += 1;
+                last_error = format!("Invalid doc_id: {} (must be >= {})", req.doc_id, MIN_DOC_ID);
+                continue;
+            }
+
+            // Validate embedding
+            if req.embedding.is_empty() {
+                validation_errors += 1;
+                last_error = format!("Empty embedding for doc_id {}", req.doc_id);
+                continue;
+            }
+
+            if req.embedding.len() > MAX_EMBEDDING_DIM {
+                validation_errors += 1;
+                last_error = format!(
+                    "Embedding dimension {} exceeds maximum {}",
+                    req.embedding.len(),
+                    MAX_EMBEDDING_DIM
+                );
+                continue;
+            }
+
+            // Map doc_id for multi-tenancy
+            let global_doc_id = match self.map_doc_id(tenant.as_ref(), req.doc_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    validation_errors += 1;
+                    last_error = e.message().to_string();
+                    continue;
+                }
+            };
+
+            // Build metadata with tenant info
+            let mut metadata = req.metadata;
+            metadata.remove("__tenant_id__");
+            metadata.remove("__tenant_idx__");
+            metadata.remove("__namespace__");
+            if let Some(tenant) = &tenant {
+                metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
+                metadata.insert(
+                    "__tenant_idx__".to_string(),
+                    tenant.tenant_index.to_string(),
+                );
+            }
+            if !req.namespace.is_empty() {
+                metadata.insert("__namespace__".to_string(), req.namespace.clone());
+            }
+
+            documents.push((global_doc_id, req.embedding, metadata));
+
+            if documents.len() >= MAX_BATCH_SIZE {
+                // Re-check rate limit before each batch ingestion
+                self.enforce_rate_limit(tenant.as_ref())?;
+                let batch = std::mem::take(&mut documents);
+                let batch_len = batch.len() as u64;
+                let engine = self.state.engine.write().await;
+                match engine.bulk_load_cold_tier(batch) {
+                    Ok((loaded, failed, _duration_ms, _rate)) => {
+                        total_loaded += loaded;
+                        total_failed_insertion += failed;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "BulkLoadHnsw: batch load failed");
+                        last_error = format!("Bulk load failed: {}", e);
+                        total_failed_insertion += batch_len;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !documents.is_empty() {
+            let batch = std::mem::take(&mut documents);
+            let batch_len = batch.len() as u64;
+            let engine = self.state.engine.write().await;
+            match engine.bulk_load_cold_tier(batch) {
+                Ok((loaded, failed, _duration_ms, _rate)) => {
+                    total_loaded += loaded;
+                    total_failed_insertion += failed;
+                }
+                Err(e) => {
+                    error!(error = %e, "BulkLoadHnsw: final batch load failed");
+                    last_error = format!("Bulk load failed: {}", e);
+                    total_failed_insertion += batch_len;
+                }
+            }
+        }
+
+        let total_time = start.elapsed();
+        let total_seconds = total_time.as_secs_f64().max(1e-9);
+        let rate = (total_loaded as f64) / total_seconds;
+        let total_failed = total_failed_insertion + validation_errors;
+
+        info!(
+            loaded = total_loaded,
+            failed_insertion = total_failed_insertion,
+            validation_errors,
+            rate_per_sec = rate,
+            total_ms = total_time.as_millis() as u64,
+            "BulkLoadHnsw: complete"
+        );
+
+        Ok(Response::new(BulkLoadResponse {
+            success: total_failed == 0,
+            error: if total_failed > 0 {
+                format!(
+                    "Loaded {} docs; {} failed validation, {} failed insertion{}",
+                    total_loaded,
+                    validation_errors,
+                    total_failed_insertion,
+                    if last_error.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; last_error={}", last_error)
+                    }
+                )
+            } else {
+                String::new()
+            },
+            total_loaded,
+            total_failed,
+            load_duration_ms: (total_seconds * 1000.0) as f32,
+            avg_insert_rate: rate as f32,
+            peak_memory_bytes: 0,
         }))
     }
 
@@ -286,17 +1038,60 @@ impl KyroDbService for KyroDBServiceImpl {
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
         let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let req = request.into_inner();
 
-        if req.doc_id == 0 {
-            return Err(Status::invalid_argument("doc_id must be non-zero"));
+        if req.doc_id < MIN_DOC_ID {
+            return Err(Status::invalid_argument(format!(
+                "doc_id must be >= {}",
+                MIN_DOC_ID
+            )));
         }
 
         tracing::Span::current().record("doc_id", req.doc_id);
 
+        let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
+
         let engine = self.state.engine.write().await;
 
-        match engine.delete(req.doc_id) {
+        let metadata = match engine.get_metadata(global_doc_id) {
+            Some(m) => m,
+            None => {
+                return Ok(Response::new(DeleteResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        };
+
+        if let Some(tenant) = &tenant {
+            if metadata.get("__tenant_idx__") != Some(&tenant.tenant_index.to_string()) {
+                return Ok(Response::new(DeleteResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        }
+
+        // Enforce namespace boundary (treat mismatch as not-found to avoid leakage).
+        if !req.namespace.is_empty() {
+            let doc_namespace = metadata
+                .get("__namespace__")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if doc_namespace != req.namespace {
+                return Ok(Response::new(DeleteResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        }
+
+        match engine.delete(global_doc_id) {
             Ok(existed) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
 
@@ -338,6 +1133,8 @@ impl KyroDbService for KyroDBServiceImpl {
         request: Request<kyrodb::UpdateMetadataRequest>,
     ) -> Result<Response<kyrodb::UpdateMetadataResponse>, Status> {
         let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let req = request.into_inner();
 
         if req.doc_id == 0 {
@@ -347,9 +1144,63 @@ impl KyroDbService for KyroDBServiceImpl {
         tracing::Span::current().record("doc_id", req.doc_id);
         tracing::Span::current().record("merge", req.merge);
 
+        let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
+
         let engine = self.state.engine.write().await;
 
-        match engine.update_metadata(req.doc_id, req.metadata, req.merge) {
+        let existing_metadata = match engine.get_metadata(global_doc_id) {
+            Some(m) => m,
+            None => {
+                return Ok(Response::new(kyrodb::UpdateMetadataResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        };
+
+        if let Some(tenant) = &tenant {
+            let tenant_idx = tenant.tenant_index.to_string();
+            if existing_metadata.get("__tenant_idx__") != Some(&tenant_idx) {
+                return Ok(Response::new(kyrodb::UpdateMetadataResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        }
+
+        // Enforce namespace boundary (treat mismatch as not-found to avoid leakage).
+        if !req.namespace.is_empty() {
+            let doc_namespace = existing_metadata
+                .get("__namespace__")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if doc_namespace != req.namespace {
+                return Ok(Response::new(kyrodb::UpdateMetadataResponse {
+                    success: true,
+                    error: String::new(),
+                    existed: false,
+                }));
+            }
+        }
+
+        let mut metadata = req.metadata;
+        metadata.remove("__tenant_id__");
+        metadata.remove("__tenant_idx__");
+        metadata.remove("__namespace__");
+        if let Some(tenant) = &tenant {
+            metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
+            metadata.insert(
+                "__tenant_idx__".to_string(),
+                tenant.tenant_index.to_string(),
+            );
+        }
+        if !req.namespace.is_empty() {
+            metadata.insert("__namespace__".to_string(), req.namespace.clone());
+        }
+
+        match engine.update_metadata(global_doc_id, metadata, req.merge) {
             Ok(existed) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 // Record as query operation (generic operation metric)
@@ -397,7 +1248,8 @@ impl KyroDbService for KyroDBServiceImpl {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let req = request.into_inner();
 
         if req.doc_id == 0 {
@@ -406,14 +1258,51 @@ impl KyroDbService for KyroDBServiceImpl {
 
         tracing::Span::current().record("doc_id", req.doc_id);
 
+        let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
+
         let engine = self.state.engine.read().await;
 
-        match engine.query(req.doc_id, None) {
+        // Fetch metadata first to enforce tenant/namespace checks without
+        // revealing existence via embedding lookup timing.
+        let metadata = engine.get_metadata(global_doc_id).unwrap_or_default();
+
+        if let Some(tenant) = &tenant {
+            let expected = tenant.tenant_index.to_string();
+            if metadata.get("__tenant_idx__") != Some(&expected) {
+                // Hide cross-tenant existence.
+                return Ok(Response::new(QueryResponse {
+                    found: false,
+                    doc_id: req.doc_id,
+                    embedding: vec![],
+                    metadata: HashMap::new(),
+                    served_from: query_response::Tier::Unknown as i32,
+                    error: String::new(),
+                }));
+            }
+        }
+
+        if !req.namespace.is_empty() {
+            let doc_namespace = metadata
+                .get("__namespace__")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if doc_namespace != req.namespace {
+                // Hide cross-namespace existence.
+                return Ok(Response::new(QueryResponse {
+                    found: false,
+                    doc_id: req.doc_id,
+                    embedding: vec![],
+                    metadata: HashMap::new(),
+                    served_from: query_response::Tier::Unknown as i32,
+                    error: String::new(),
+                }));
+            }
+        }
+
+        let start = Instant::now();
+        match engine.query(global_doc_id, None) {
             Some(embedding) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-                // Fetch metadata for the document
-                let metadata = engine.get_metadata(req.doc_id).unwrap_or_default();
 
                 info!(
                     doc_id = req.doc_id,
@@ -462,7 +1351,7 @@ impl KyroDbService for KyroDBServiceImpl {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
         let req = request.into_inner();
 
         // Track connection
@@ -471,162 +1360,146 @@ impl KyroDbService for KyroDBServiceImpl {
             metrics: self.state.metrics.clone(),
         };
 
-        // Validate input
-        if req.query_embedding.is_empty() {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument("query_embedding cannot be empty"));
-        }
-        if req.query_embedding.len() > MAX_EMBEDDING_DIM {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument(format!(
-                "query_embedding dimension {} exceeds maximum {}",
-                req.query_embedding.len(),
-                MAX_EMBEDDING_DIM
-            )));
-        }
-        if req.k == 0 {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument("k must be greater than 0"));
-        }
-        if req.k > MAX_KNN_K {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument(format!(
-                "k must be <= {}",
-                MAX_KNN_K
-            )));
-        }
-
         tracing::Span::current().record("k", req.k);
         tracing::Span::current().record("query_dim", req.query_embedding.len());
 
-        let engine = self.state.engine.read().await;
-
-        // Adaptive oversampling based on filter complexity
-        // Namespace filtering also requires oversampling since we filter post-fetch
-        let has_filter = req.filter.is_some();
-        let has_namespace = !req.namespace.is_empty();
-        let base_oversampling = if let Some(ref filter) = req.filter {
-            kyrodb_engine::adaptive_oversampling::calculate_oversampling_factor(filter)
-        } else {
-            1
-        };
-        // Apply additional oversampling when namespace filtering is active
-        // This ensures we have enough candidates after namespace filtering
-        let oversampling_factor = if has_namespace {
-            base_oversampling.saturating_mul(4).min(10)
-        } else {
-            base_oversampling
-        };
-        let search_k = (req.k as usize)
-            .saturating_mul(oversampling_factor)
-            .min(10_000);
-
-        match engine.knn_search(&req.query_embedding, search_k) {
-            Ok(results) => {
-                let latency_ns = start.elapsed().as_nanos() as u64;
-
-                // Record metrics
-                self.state.metrics.record_query_latency(latency_ns);
-                self.state.metrics.record_hnsw_search(latency_ns);
-
-                // Convert distance to similarity score
-                let convert_distance_to_score =
-                    |dist: f32| -> f32 { (1.0 - dist).clamp(-1.0, 1.0) };
-
-                let mut final_results = Vec::new();
-                let mut candidates = results.into_iter();
-
-                // Iterate candidates until we fill k results or run out
-                while final_results.len() < req.k as usize {
-                    let candidate = match candidates.next() {
-                        Some(c) => c,
-                        None => break, // No more candidates
-                    };
-
-                    // Check min_score first (cheap)
-                    let score = convert_distance_to_score(candidate.distance);
-                    if req.min_score > 0.0 && score < req.min_score {
-                        continue;
-                    }
-
-                    // Fetch metadata (needed for filtering and/or response)
-                    let metadata = engine.get_metadata(candidate.doc_id).unwrap_or_default();
-
-                    // Filter by namespace if specified
-                    // Namespace is stored as "__namespace__" in metadata during insert
-                    if has_namespace {
-                        let doc_namespace = metadata
-                            .get("__namespace__")
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        if doc_namespace != req.namespace {
-                            continue;
-                        }
-                    }
-
-                    // Apply metadata filter if present
-                    if let Some(filter) = &req.filter {
-                        if !kyrodb_engine::metadata_filter::matches(filter, &metadata) {
-                            continue;
-                        }
-                    }
-
-                    // Fetch embedding if requested (expensive, do only for final results)
-                    let embedding = if req.include_embeddings {
-                        engine.query(candidate.doc_id, None).unwrap_or_default()
-                    } else {
-                        vec![]
-                    };
-
-                    final_results.push(kyrodb::SearchResult {
-                        doc_id: candidate.doc_id,
-                        score,
-                        embedding,
-                        metadata,
-                    });
-                }
-
-                let latency_ms = latency_ns as f64 / 1_000_000.0;
-
-                info!(
-                    k = req.k,
-                    requested_k = search_k,
-                    results_found = final_results.len(),
-                    latency_ns = latency_ns,
-                    min_score = req.min_score,
-                    has_filter = has_filter,
-                    has_namespace = has_namespace,
-                    "Search completed successfully"
-                );
-
-                Ok(Response::new(SearchResponse {
-                    results: final_results.clone(),
-                    total_found: final_results.len() as u32,
-                    search_latency_ms: latency_ms as f32,
-                    search_path: search_response::SearchPath::Unknown as i32,
-                    error: String::new(),
-                }))
-            }
-            Err(e) => {
-                self.state.metrics.record_query_failure();
-                self.state.metrics.record_error(ErrorCategory::Internal);
-                error!(
-                    error = %e,
-                    k = req.k,
-                    "Search failed"
-                );
-                Err(Status::internal(format!("Search failed: {}", e)))
-            }
-        }
+        let response = self.handle_search_request(tenant.as_ref(), req).await?;
+        Ok(Response::new(response))
     }
 
-    #[instrument(skip(self, _request))]
+    #[instrument(skip(self, request))]
     async fn bulk_search(
         &self,
-        _request: Request<Streaming<SearchRequest>>,
+        request: Request<Streaming<SearchRequest>>,
     ) -> Result<Response<Self::BulkSearchStream>, Status> {
-        // Bulk search with batching is not yet implemented
-        Err(Status::unimplemented("bulk_search not yet implemented"))
+        let tenant = self.tenant_context(&request)?;
+        let mut stream = request.into_inner();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<SearchResponse, Status>>(16);
+        let service = KyroDBServiceImpl {
+            state: Arc::clone(&self.state),
+        };
+
+        tokio::spawn(async move {
+            let mut total_count: usize = 0;
+            let mut pending: Vec<SearchRequest> = Vec::with_capacity(BULK_SEARCH_BATCH_SIZE);
+
+            loop {
+                if tx.is_closed() {
+                    return;
+                }
+
+                if pending.is_empty() {
+                    tokio::select! {
+                        _ = tx.closed() => {
+                            return;
+                        }
+                        next = stream.message() => {
+                            let req = match next {
+                                Ok(Some(r)) => r,
+                                Ok(None) => return,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(Status::internal(format!("stream error: {}", e))))
+                                        .await;
+                                    return;
+                                }
+                            };
+
+                            if let Err(status) = service.enforce_rate_limit(tenant.as_ref()) {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
+
+                            total_count += 1;
+                            if total_count > MAX_BATCH_SIZE {
+                                let _ = tx
+                                    .send(Err(Status::resource_exhausted(format!(
+                                        "bulk_search batch size exceeds maximum {}",
+                                        MAX_BATCH_SIZE
+                                    ))))
+                                    .await;
+                                return;
+                            }
+
+                            pending.push(req);
+                        }
+                    }
+                } else {
+                    let next = tokio::time::timeout(
+                        Duration::from_millis(BULK_SEARCH_MAX_WAIT_MS),
+                        stream.message(),
+                    )
+                    .await;
+
+                    match next {
+                        Ok(Ok(Some(req))) => {
+                            if let Err(status) = service.enforce_rate_limit(tenant.as_ref()) {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
+                            total_count += 1;
+                            if total_count > MAX_BATCH_SIZE {
+                                let _ = tx
+                                    .send(Err(Status::resource_exhausted(format!(
+                                        "bulk_search batch size exceeds maximum {}",
+                                        MAX_BATCH_SIZE
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                            pending.push(req);
+                        }
+                        Ok(Ok(None)) => {
+                            if !pending.is_empty() {
+                                let batch = std::mem::take(&mut pending);
+                                let responses = service
+                                    .handle_search_requests_batch(tenant.as_ref(), batch)
+                                    .await;
+                                for resp in responses {
+                                    if tx.send(resp).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        Ok(Err(e)) => {
+                            let _ = tx
+                                .send(Err(Status::internal(format!("stream error: {}", e))))
+                                .await;
+                            return;
+                        }
+                        Err(_) => {
+                            let batch = std::mem::take(&mut pending);
+                            let responses = service
+                                .handle_search_requests_batch(tenant.as_ref(), batch)
+                                .await;
+                            for resp in responses {
+                                if tx.send(resp).await.is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                if pending.len() >= BULK_SEARCH_BATCH_SIZE {
+                    let batch = std::mem::take(&mut pending);
+                    let responses = service
+                        .handle_search_requests_batch(tenant.as_ref(), batch)
+                        .await;
+                    for resp in responses {
+                        if tx.send(resp).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     #[instrument(skip(self, request))]
@@ -635,6 +1508,8 @@ impl KyroDbService for KyroDBServiceImpl {
         request: Request<BulkQueryRequest>,
     ) -> Result<Response<BulkQueryResponse>, Status> {
         let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let req = request.into_inner();
 
         let total_requested = req.doc_ids.len() as u32;
@@ -648,9 +1523,19 @@ impl KyroDbService for KyroDBServiceImpl {
         let engine = self.state.engine.read().await;
 
         // Use the new bulk_query which returns metadata too
-        let results_vec = engine.bulk_query(&req.doc_ids, req.include_embeddings);
+        let mapped_doc_ids = if let Some(tenant) = &tenant {
+            let mut mapped = Vec::with_capacity(req.doc_ids.len());
+            for id in &req.doc_ids {
+                mapped.push(self.map_doc_id(Some(tenant), *id)?);
+            }
+            mapped
+        } else {
+            req.doc_ids.clone()
+        };
 
-        if results_vec.len() != req.doc_ids.len() {
+        let results_vec = engine.bulk_query(&mapped_doc_ids, req.include_embeddings);
+
+        if results_vec.len() != mapped_doc_ids.len() {
             self.state.metrics.record_query_failure();
             self.state.metrics.record_error(ErrorCategory::Internal);
             error!(
@@ -668,12 +1553,35 @@ impl KyroDbService for KyroDBServiceImpl {
 
         for (i, result) in results_vec.into_iter().enumerate() {
             let doc_id = req.doc_ids[i];
-            let found = result.is_some();
+            let mut found = result.is_some();
+            let (mut embedding, mut metadata) = result.unwrap_or_default();
+
+            if found && !req.namespace.is_empty() {
+                let doc_namespace = metadata
+                    .get("__namespace__")
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                if doc_namespace != req.namespace {
+                    found = false;
+                    embedding.clear();
+                    metadata.clear();
+                }
+            }
+
+            if found {
+                if let Some(tenant) = &tenant {
+                    let tenant_idx = tenant.tenant_index.to_string();
+                    if metadata.get("__tenant_idx__") != Some(&tenant_idx) {
+                        found = false;
+                        embedding.clear();
+                        metadata.clear();
+                    }
+                }
+            }
+
             if found {
                 total_found += 1;
             }
-
-            let (embedding, metadata) = result.unwrap_or_default();
 
             query_responses.push(QueryResponse {
                 found,
@@ -707,6 +1615,8 @@ impl KyroDbService for KyroDBServiceImpl {
         request: Request<BatchDeleteRequest>,
     ) -> Result<Response<BatchDeleteResponse>, Status> {
         let start = Instant::now();
+        let tenant = self.tenant_context(&request)?;
+        self.enforce_rate_limit(tenant.as_ref())?;
         let req = request.into_inner();
 
         let engine = self.state.engine.write().await;
@@ -720,13 +1630,96 @@ impl KyroDbService for KyroDBServiceImpl {
                         MAX_BATCH_SIZE
                     )));
                 }
-                engine.batch_delete(&id_list.doc_ids)
+
+                if let Some(tenant) = &tenant {
+                    let mut mapped = Vec::with_capacity(id_list.doc_ids.len());
+                    for id in &id_list.doc_ids {
+                        mapped.push(self.map_doc_id(Some(tenant), *id)?);
+                    }
+
+                    if req.namespace.is_empty() {
+                        let tenant_idx = tenant.tenant_index.to_string();
+                        let mut filtered = Vec::with_capacity(mapped.len());
+                        for global_id in mapped {
+                            if let Some(meta) = engine.get_metadata(global_id) {
+                                if meta.get("__tenant_idx__") == Some(&tenant_idx) {
+                                    filtered.push(global_id);
+                                }
+                            }
+                        }
+                        engine.batch_delete(&filtered)
+                    } else {
+                        let namespace = req.namespace.as_str();
+                        let tenant_idx = tenant.tenant_index.to_string();
+                        let mut filtered = Vec::with_capacity(mapped.len());
+                        for global_id in mapped {
+                            if let Some(meta) = engine.get_metadata(global_id) {
+                                if meta.get("__tenant_idx__") != Some(&tenant_idx) {
+                                    continue;
+                                }
+                                let doc_namespace =
+                                    meta.get("__namespace__").map(|s| s.as_str()).unwrap_or("");
+                                if doc_namespace == namespace {
+                                    filtered.push(global_id);
+                                }
+                            }
+                        }
+                        engine.batch_delete(&filtered)
+                    }
+                } else if req.namespace.is_empty() {
+                    engine.batch_delete(&id_list.doc_ids)
+                } else {
+                    let namespace = req.namespace.as_str();
+                    let mut filtered = Vec::with_capacity(id_list.doc_ids.len());
+                    for global_id in id_list.doc_ids {
+                        if let Some(meta) = engine.get_metadata(global_id) {
+                            let doc_namespace =
+                                meta.get("__namespace__").map(|s| s.as_str()).unwrap_or("");
+                            if doc_namespace == namespace {
+                                filtered.push(global_id);
+                            }
+                        }
+                    }
+                    engine.batch_delete(&filtered)
+                }
             }
             Some(batch_delete_request::DeleteCriteria::Filter(filter)) => {
-                // Use the existing metadata filter logic
-                engine.batch_delete_by_filter(|meta| {
-                    kyrodb_engine::metadata_filter::matches(&filter, meta)
-                })
+                // Combine tenant/namespace constraints into a structured AND filter so the
+                // cold-tier inverted index can accelerate common cases.
+                use kyrodb_engine::proto::metadata_filter::FilterType;
+                use kyrodb_engine::proto::{AndFilter, ExactMatch, MetadataFilter};
+
+                let mut filters = Vec::new();
+
+                if let Some(tenant) = &tenant {
+                    filters.push(MetadataFilter {
+                        filter_type: Some(FilterType::Exact(ExactMatch {
+                            key: "__tenant_idx__".to_string(),
+                            value: tenant.tenant_index.to_string(),
+                        })),
+                    });
+                }
+
+                if !req.namespace.is_empty() {
+                    filters.push(MetadataFilter {
+                        filter_type: Some(FilterType::Exact(ExactMatch {
+                            key: "__namespace__".to_string(),
+                            value: req.namespace.clone(),
+                        })),
+                    });
+                }
+
+                filters.push(filter);
+
+                let combined = if filters.len() == 1 {
+                    filters.pop().unwrap()
+                } else {
+                    MetadataFilter {
+                        filter_type: Some(FilterType::AndFilter(AndFilter { filters })),
+                    }
+                };
+
+                engine.batch_delete_by_metadata_filter(&combined)
             }
             None => {
                 return Err(Status::invalid_argument("No delete criteria provided"));
@@ -872,10 +1865,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
             // Overall metrics
             overall_hit_rate: stats.overall_hit_rate * 100.0,
-            collected_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            collected_at: unix_timestamp_secs(),
         }))
     }
 
@@ -895,7 +1885,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.write().await;
 
-        match engine.flush_hot_tier() {
+        match engine.flush_hot_tier(req.force) {
             Ok(docs_flushed) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -946,6 +1936,11 @@ impl KyroDbService for KyroDBServiceImpl {
             flush_interval_seconds: engine_config.flush_interval.as_secs(),
             embedding_dimension: app_config.hnsw.dimension as u64,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            hnsw_m: engine_config.hnsw_m as u64,
+            hnsw_ef_construction: engine_config.hnsw_ef_construction as u64,
+            hnsw_ef_search: engine_config.hnsw_ef_search as u64,
+            hnsw_distance: format!("{:?}", engine_config.hnsw_distance),
+            hnsw_disable_normalization_check: engine_config.hnsw_disable_normalization_check,
         }))
     }
 }
@@ -958,11 +1953,13 @@ impl KyroDbService for KyroDBServiceImpl {
 async fn metrics_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let prometheus_text = state.metrics.export_prometheus();
 
-    HttpResponse::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/plain; version=0.0.4")
-        .body(Body::from(prometheus_text))
-        .unwrap()
+    let mut resp = HttpResponse::new(Body::from(prometheus_text));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    resp
 }
 
 /// Health check /health endpoint (liveness probe)
@@ -1004,9 +2001,15 @@ async fn health_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRe
 
     HttpResponse::builder()
         .status(status_code)
-        .header("Content-Type", "application/json")
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
         .body(Body::from(body.to_string()))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            let mut resp = HttpResponse::new(Body::from("{\"status\":\"internal_error\"}"));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            resp.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            resp
+        })
 }
 
 /// Readiness check /ready endpoint (readiness probe)
@@ -1032,14 +2035,21 @@ async fn ready_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRes
 
     HttpResponse::builder()
         .status(status_code)
-        .header("Content-Type", "application/json")
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
         .body(Body::from(body.to_string()))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            let mut resp = HttpResponse::new(Body::from("{\"ready\":false}"));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            resp.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            resp
+        })
 }
 
 /// SLO status endpoint for alerting systems
 async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let slo = state.metrics.slo_status();
+    let thresholds = state.metrics.slo_thresholds();
 
     // Always return 200 OK for SLO status (breaches reported in body)
     let status_code = StatusCode::OK;
@@ -1058,18 +2068,78 @@ async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRespo
             "availability": slo.current_availability,
         },
         "slo_thresholds": {
-            "p99_latency_ns": 1_000_000, // 1ms
-            "min_cache_hit_rate": 0.70,
-            "max_error_rate": 0.001,
-            "min_availability": 0.999,
+            "p99_latency_ns": thresholds.p99_latency_ns,
+            "min_cache_hit_rate": thresholds.min_cache_hit_rate,
+            "max_error_rate": thresholds.max_error_rate,
+            "min_availability": thresholds.min_availability,
+            "min_samples": thresholds.min_samples,
         },
     });
 
     HttpResponse::builder()
         .status(status_code)
-        .header("Content-Type", "application/json")
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
         .body(Body::from(body.to_string()))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            let mut resp = HttpResponse::new(Body::from("{\"slo_breaches\":{}}"));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            resp.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            resp
+        })
+}
+
+async fn observability_auth_middleware(
+    AxumState(state): AxumState<Arc<ServerState>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> HttpResponse<Body> {
+    let mode = state.app_config.server.observability_auth;
+    if mode == ObservabilityAuthMode::Disabled {
+        return next.run(req).await;
+    }
+
+    let path = req.uri().path();
+    let requires_auth = match mode {
+        ObservabilityAuthMode::Disabled => false,
+        ObservabilityAuthMode::MetricsAndSlo => matches!(path, "/metrics" | "/slo"),
+        ObservabilityAuthMode::All => true,
+    };
+
+    if !requires_auth {
+        return next.run(req).await;
+    }
+
+    let auth = match state.auth.as_ref() {
+        Some(auth) => auth,
+        None => {
+            let mut resp = HttpResponse::new(Body::from("auth not initialized"));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return resp;
+        }
+    };
+
+    let api_key = req
+        .headers()
+        .get(API_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            req.headers()
+                .get(AUTHORIZATION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::to_string)
+        });
+
+    match api_key.and_then(|k| auth.validate(&k)) {
+        Some(_tenant) => next.run(req).await,
+        None => {
+            let mut resp = HttpResponse::new(Body::from("unauthorized"));
+            *resp.status_mut() = StatusCode::UNAUTHORIZED;
+            resp
+        }
+    }
 }
 
 // ============================================================================
@@ -1102,7 +2172,7 @@ struct CliArgs {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     // Initialize deadlock detection in debug builds
     kyrodb_engine::init_deadlock_detection();
 
@@ -1140,6 +2210,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validate final configuration
     config.validate()?;
+
+    info!(
+        p99_latency_ms = config.slo.p99_latency_ms,
+        cache_hit_rate = config.slo.cache_hit_rate,
+        error_rate = config.slo.error_rate,
+        availability = config.slo.availability,
+        min_samples = config.slo.min_samples,
+        "SLO thresholds configured"
+    );
+
+    // Initialize auth/tenancy (must be ready before serving)
+    let (auth, tenant_id_mapper, rate_limiter) = if config.auth.enabled {
+        let api_keys_file = config
+            .auth
+            .api_keys_file
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("auth.enabled=true requires auth.api_keys_file"))?;
+
+        let auth = AuthManager::new();
+        auth.load_from_file(&api_keys_file)?;
+
+        let tenants = auth.enabled_tenants();
+        let tenant_map_path = config.persistence.data_dir.join("tenants.json");
+        let tenant_id_mapper = TenantIdMapper::load_or_create(tenant_map_path, &tenants)?;
+
+        let global_limit = if config.rate_limit.enabled {
+            Some(config.rate_limit.max_qps_global as u32)
+        } else {
+            None
+        };
+        (
+            Some(auth),
+            Some(tenant_id_mapper),
+            Some(RateLimiter::new_with_global(global_limit)),
+        )
+    } else {
+        (None, None, None)
+    };
 
     // Initialize structured logging based on config
     let (non_blocking, _guard) = if let Some(log_file) = &config.logging.file {
@@ -1223,11 +2331,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_config = TieredEngineConfig {
         hot_tier_max_size: config.cache.capacity,
         hot_tier_hard_limit: config.cache.capacity * 2, // 2x soft limit for emergency eviction
-        hot_tier_max_age: Duration::from_secs(config.cache.training_interval_secs),
+        hot_tier_max_age: Duration::from_secs(
+            config
+                .cache
+                .hot_tier_max_age_secs
+                .unwrap_or(config.cache.training_interval_secs),
+        ),
         hnsw_max_elements: config.hnsw.max_elements,
+        embedding_dimension: config.hnsw.dimension,
+        hnsw_distance: config.hnsw.distance,
+        hnsw_m: config.hnsw.m,
+        hnsw_ef_construction: config.hnsw.ef_construction,
+        hnsw_ef_search: config.hnsw.ef_search,
+        hnsw_disable_normalization_check: config.hnsw.disable_normalization_check,
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
         fsync_policy,
-        snapshot_interval: config.persistence.snapshot_interval_secs as usize,
+        snapshot_interval: config.snapshot_interval_mutations(),
+        max_wal_size_bytes: config.persistence.max_wal_size_bytes,
         flush_interval: config.wal_flush_interval(),
         cache_timeout_ms: config.timeouts.cache_ms,
         hot_tier_timeout_ms: config.timeouts.hot_tier_ms,
@@ -1239,51 +2359,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(16);
 
     // Initialize or recover engine
-    info!("Initializing TieredEngine with A/B testing (LRU vs learned strategy)...");
+    info!("Initializing TieredEngine with configured cache strategy...");
 
-    // Helper to create cache strategy (Two-level cache architecture)
+    // Helper to create cache strategy (L1a) and expose learned strategy for training.
     let create_cache_strategy = || {
         let lru_strategy = Arc::new(LruCacheStrategy::new(config.cache.capacity));
 
-        let learned_predictor = LearnedCachePredictor::new(config.cache.capacity)
-            .expect("Failed to create Hybrid Semantic Cache predictor");
+        let predictor_capacity = config
+            .cache
+            .capacity
+            .saturating_mul(config.cache.predictor_capacity_multiplier.max(1))
+            .min(config.hnsw.max_elements.max(1));
 
-        // NOTE: Semantic logic moved to QueryHashCache (L1b) in two-level architecture
+        let learned_predictor = LearnedCachePredictor::with_config(
+            predictor_capacity,
+            config.cache.admission_threshold,
+            Duration::from_secs(config.cache.training_window_secs),
+            Duration::from_secs(config.cache.recency_halflife_secs),
+            Duration::from_secs(config.cache.training_interval_secs),
+        )
+        .context("Failed to create Hybrid Semantic Cache predictor")?;
+        let mut learned_predictor = learned_predictor;
+        learned_predictor.set_auto_tune(config.cache.auto_tune_threshold);
+        learned_predictor.set_target_utilization(config.cache.target_utilization);
+
+        // NOTE: L1b query cache handles semantic search‑result reuse.
         let learned_strategy = Arc::new(LearnedCacheStrategy::new(
             config.cache.capacity,
             learned_predictor,
         ));
 
-        // NOTE: Query clustering and prefetching moved to separate layers in two-level architecture
-        // Prefetching will be re-enabled as a separate service layer in future updates
+        let (strategy_box, learned_for_training): (
+            Box<dyn kyrodb_engine::CacheStrategy>,
+            Option<Arc<LearnedCacheStrategy>>,
+        ) = match config.cache.strategy {
+            kyrodb_engine::config::CacheStrategy::Lru => {
+                (Box::new(LruCacheStrategy::new(config.cache.capacity)), None)
+            }
+            kyrodb_engine::config::CacheStrategy::Learned => (
+                Box::new(SharedLearnedCacheStrategy::new(learned_strategy.clone())),
+                Some(learned_strategy.clone()),
+            ),
+            kyrodb_engine::config::CacheStrategy::AbTest => (
+                Box::new(AbTestSplitter::new(
+                    lru_strategy.clone(),
+                    learned_strategy.clone(),
+                )),
+                Some(learned_strategy.clone()),
+            ),
+        };
 
-        Box::new(AbTestSplitter::new(
-            lru_strategy.clone(),
-            learned_strategy.clone(),
-        ))
+        Ok::<
+            (
+                Box<dyn kyrodb_engine::CacheStrategy>,
+                Option<Arc<LearnedCacheStrategy>>,
+            ),
+            anyhow::Error,
+        >((strategy_box, learned_for_training))
     };
 
-    info!(
-        "Features: clustering={}, prefetching={}",
-        config.cache.enable_query_clustering, config.cache.enable_prefetching
-    );
+    let (cache_strategy, mut learned_strategy_for_training) = create_cache_strategy()?;
 
-    let cache_strategy = create_cache_strategy();
-
-    // Create query cache (L1b) - semantic similarity-based
+    // Create query cache (L1b) - semantic search‑result cache
     let query_cache = Arc::new(kyrodb_engine::QueryHashCache::new(
-        100,  // capacity: 100 query hashes
-        0.82, // similarity threshold from SemanticConfig default
+        config.cache.query_cache_capacity,
+        config.cache.query_cache_similarity_threshold,
     ));
 
     let data_dir_path = config.persistence.data_dir.clone();
-    let engine = if data_dir_path.exists() {
-        info!("Data directory exists, attempting recovery...");
+    let manifest_path = data_dir_path.join("MANIFEST");
+    let should_attempt_recovery = config.persistence.enable_recovery && manifest_path.exists();
 
+    let create_empty_engine =
+        |cache_strategy: Box<dyn kyrodb_engine::CacheStrategy>,
+         query_cache: Arc<kyrodb_engine::QueryHashCache>| {
+            TieredEngine::new(
+                cache_strategy,
+                query_cache,
+                Vec::new(),
+                Vec::new(),
+                engine_config.clone(),
+            )
+        };
+
+    let mut engine = if should_attempt_recovery {
+        info!("MANIFEST found, attempting recovery...");
+
+        let data_dir_for_recover = data_dir_path.to_string_lossy().to_string();
         match TieredEngine::recover(
             cache_strategy,
             query_cache.clone(),
-            data_dir_path.to_str().unwrap(),
+            data_dir_for_recover.as_str(),
             engine_config.clone(),
         ) {
             Ok(engine) => {
@@ -1291,38 +2457,136 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 engine
             }
             Err(e) => {
-                warn!(error = %e, "Recovery failed, creating new engine");
-                let fallback_cache_strategy = create_cache_strategy();
-                let query_cache_fallback = Arc::new(kyrodb_engine::QueryHashCache::new(100, 0.82));
-                let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]];
-                TieredEngine::new(
-                    fallback_cache_strategy,
-                    query_cache_fallback,
-                    dummy_embedding,
-                    vec![HashMap::new()],
-                    engine_config.clone(),
-                )?
+                error!(error = %e, "Recovery failed");
+                if !config.persistence.allow_fresh_start_on_recovery_failure {
+                    return Err(e).context(
+                        "Recovery failed and allow_fresh_start_on_recovery_failure=false (fail-fast)",
+                    );
+                }
+
+                // Operator explicitly allowed a fresh start. Quarantine the old on-disk state first.
+                let ts = unix_timestamp_secs();
+                let quarantine_path = data_dir_path.with_file_name(format!(
+                    "{}_corrupt_{}",
+                    data_dir_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("kyrodb_data"),
+                    ts
+                ));
+
+                if data_dir_path.exists() {
+                    std::fs::rename(&data_dir_path, &quarantine_path).with_context(|| {
+                        format!(
+                            "Failed to quarantine corrupted data dir ({} -> {})",
+                            data_dir_path.display(),
+                            quarantine_path.display()
+                        )
+                    })?;
+                    warn!(
+                        old = %data_dir_path.display(),
+                        quarantined = %quarantine_path.display(),
+                        "Quarantined data directory after recovery failure"
+                    );
+                }
+
+                let (fallback_cache_strategy, fallback_learned_strategy_for_training) =
+                    create_cache_strategy()?;
+                learned_strategy_for_training = fallback_learned_strategy_for_training;
+                let query_cache_fallback = Arc::new(kyrodb_engine::QueryHashCache::new(
+                    config.cache.query_cache_capacity,
+                    config.cache.query_cache_similarity_threshold,
+                ));
+                create_empty_engine(fallback_cache_strategy, query_cache_fallback)?
             }
         }
     } else {
-        info!("Creating new TieredEngine...");
-        let dummy_embedding = vec![vec![0.0; config.hnsw.dimension]];
-        TieredEngine::new(
-            cache_strategy,
-            query_cache.clone(),
-            dummy_embedding,
-            vec![HashMap::new()],
-            engine_config.clone(),
-        )?
+        if config.persistence.enable_recovery {
+            info!(
+                data_dir = %data_dir_path.display(),
+                "No MANIFEST found; initializing a new empty database"
+            );
+        } else {
+            info!(
+                data_dir = %data_dir_path.display(),
+                "Recovery disabled; initializing a new empty database"
+            );
+        }
+        create_empty_engine(cache_strategy, query_cache.clone())?
     };
 
     info!("TieredEngine initialized successfully with configured cache optimizations");
 
+    // Enable learned-cache training end-to-end:
+    // - attach access logger so queries generate training events
+    // - spawn periodic retraining task to update predictor
+    let should_run_training = config.cache.enable_training_task
+        && learned_strategy_for_training.is_some()
+        && config.cache.training_interval_secs > 0;
+
+    let access_logger = if should_run_training {
+        Some(Arc::new(parking_lot::RwLock::new(
+            AccessPatternLogger::new(config.cache.logger_window_size.max(1)),
+        )))
+    } else {
+        None
+    };
+
+    if let Some(logger) = &access_logger {
+        engine.set_access_logger(logger.clone());
+    }
+
     // Wrap engine in Arc<RwLock> for concurrent access
     let engine_arc = Arc::new(RwLock::new(engine));
 
-    // Create metrics collector
-    let metrics = MetricsCollector::new();
+    // Create metrics collector with configured SLO thresholds.
+    let metrics =
+        MetricsCollector::new_with_slo_thresholds(SloThresholds::from_config(&config.slo));
+
+    if should_run_training {
+        let learned_strategy = learned_strategy_for_training
+            .expect("should_run_training implies learned strategy exists");
+        let logger = access_logger.expect("should_run_training implies access logger exists");
+
+        let training_config = TrainingConfig {
+            interval: Duration::from_secs(config.cache.training_interval_secs),
+            window_duration: Duration::from_secs(config.cache.training_window_secs),
+            recency_halflife: Duration::from_secs(config.cache.recency_halflife_secs),
+            min_events_for_training: config.cache.min_training_samples.max(1),
+            predictor_capacity: config
+                .cache
+                .capacity
+                .saturating_mul(config.cache.predictor_capacity_multiplier.max(1))
+                .min(config.hnsw.max_elements.max(1)),
+            admission_threshold: config.cache.admission_threshold,
+            auto_tune_enabled: config.cache.auto_tune_threshold,
+            target_utilization: config.cache.target_utilization,
+        };
+
+        let training_shutdown_rx = shutdown_tx.subscribe();
+        let _training_handle = spawn_training_task(
+            logger,
+            learned_strategy,
+            training_config,
+            None,
+            Some(metrics.clone()),
+            training_shutdown_rx,
+        )
+        .await;
+
+        info!(
+            interval_secs = config.cache.training_interval_secs,
+            window_secs = config.cache.training_window_secs,
+            logger_window_size = config.cache.logger_window_size,
+            "Learned cache background retraining enabled"
+        );
+    } else {
+        info!(
+            enabled = config.cache.enable_training_task,
+            strategy = ?config.cache.strategy,
+            "Learned cache background retraining disabled"
+        );
+    }
 
     // Spawn background flush task with graceful shutdown
     let mut flush_shutdown_rx = shutdown_tx.subscribe();
@@ -1336,7 +2600,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! {
                 _ = interval.tick() => {
                     let engine = engine_for_flush.write().await;
-                    match engine.flush_hot_tier() {
+                    match engine.flush_hot_tier(false) {
                         Ok(count) if count > 0 => {
                             info!(docs_flushed = count, "Background flush completed");
                         }
@@ -1349,7 +2613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = flush_shutdown_rx.recv() => {
                     info!("Background flush task shutting down gracefully");
                     let engine = engine_for_flush.write().await;
-                    if let Ok(count) = engine.flush_hot_tier() {
+                    if let Ok(count) = engine.flush_hot_tier(true) { // Pass true for shutdown flush
                         if count > 0 {
                             info!(docs_flushed = count, "Final flush completed on shutdown");
                         }
@@ -1368,6 +2632,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine_config: engine_config.clone(),
         shutdown_tx: shutdown_tx.clone(),
         metrics: metrics.clone(),
+        auth,
+        rate_limiter,
+        tenant_id_mapper,
     });
 
     // Create gRPC service with engine Arc reference
@@ -1376,7 +2643,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build HTTP router for observability endpoints
-    let http_app = Router::new()
+    let mut http_app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
@@ -1384,10 +2651,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
+    if config.server.observability_auth != ObservabilityAuthMode::Disabled {
+        http_app = http_app.layer(middleware::from_fn_with_state(
+            state.clone(),
+            observability_auth_middleware,
+        ));
+    }
+
     // HTTP port for observability (from config)
     let http_port = config.http_port();
     let http_addr =
-        format!("{}:{}", config.server.host, http_port).parse::<std::net::SocketAddr>()?;
+        format!("{}:{}", config.http_host(), http_port).parse::<std::net::SocketAddr>()?;
 
     info!(
         "HTTP observability server listening on http://{}",
@@ -1435,17 +2709,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup signal handling for graceful shutdown
     let shutdown_signal = async {
         let ctrl_c = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to install Ctrl+C handler");
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                error!(error = %e, "Ctrl+C handler failed");
+            }
         };
 
         #[cfg(unix)]
         let terminate = async {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler")
-                .recv()
-                .await;
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sig) => {
+                    sig.recv().await;
+                }
+                Err(e) => {
+                    error!(error = %e, "SIGTERM handler failed");
+                    std::future::pending::<()>().await;
+                }
+            }
         };
 
         #[cfg(not(unix))]
@@ -1461,9 +2740,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Build gRPC service with auth interceptor when enabled
+    let auth_enabled = state.app_config.auth.enabled;
+    let state_for_interceptor = state.clone();
+    let service =
+        KyroDbServiceServer::with_interceptor(grpc_service, move |mut req: Request<()>| {
+            if !auth_enabled {
+                return Ok(req);
+            }
+
+            let auth = state_for_interceptor
+                .auth
+                .as_ref()
+                .ok_or_else(|| Status::internal("auth manager not initialized"))?;
+            let tenant_id_mapper = state_for_interceptor
+                .tenant_id_mapper
+                .as_ref()
+                .ok_or_else(|| Status::internal("tenant mapper not initialized"))?;
+
+            let api_key = req
+                .metadata()
+                .get(API_KEY_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .or_else(|| {
+                    req.metadata()
+                        .get(AUTHORIZATION_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| Status::unauthenticated("missing api key"))?;
+
+            let tenant = auth
+                .validate(&api_key)
+                .ok_or_else(|| Status::unauthenticated("invalid api key"))?;
+
+            let tenant_index = tenant_id_mapper
+                .ensure_tenant(&tenant.tenant_id)
+                .map_err(|e| Status::internal(format!("tenant mapping error: {}", e)))?;
+
+            let rate_limit_enabled = state_for_interceptor.app_config.rate_limit.enabled;
+            let default_max_qps = state_for_interceptor
+                .app_config
+                .rate_limit
+                .max_qps_per_connection as u32;
+            let effective_max_qps = if tenant.max_qps == 0 {
+                if rate_limit_enabled {
+                    default_max_qps.max(1)
+                } else {
+                    u32::MAX
+                }
+            } else {
+                tenant.max_qps
+            };
+
+            req.extensions_mut().insert(TenantContext {
+                tenant_id: tenant.tenant_id,
+                tenant_index,
+                max_qps: effective_max_qps,
+            });
+
+            Ok(req)
+        });
+
     // Start gRPC server with graceful shutdown
-    let grpc_server = Server::builder()
-        .add_service(KyroDbServiceServer::new(grpc_service))
+    let mut grpc_builder = Server::builder();
+    if config.server.tls.enabled {
+        let tls = &config.server.tls;
+        let cert_path = tls.cert_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("server.tls.enabled=true requires server.tls.cert_path")
+        })?;
+        let key_path = tls.key_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("server.tls.enabled=true requires server.tls.key_path")
+        })?;
+
+        let cert = std::fs::read(cert_path)?;
+        let key = std::fs::read(key_path)?;
+        let identity = tonic::transport::Identity::from_pem(cert, key);
+
+        let mut tls_cfg = tonic::transport::ServerTlsConfig::new().identity(identity);
+        if tls.require_client_cert {
+            let ca_path = tls.ca_cert_path.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "server.tls.require_client_cert=true requires server.tls.ca_cert_path"
+                )
+            })?;
+            let ca = std::fs::read(ca_path)?;
+            let ca = tonic::transport::Certificate::from_pem(ca);
+            tls_cfg = tls_cfg.client_ca_root(ca);
+        }
+
+        grpc_builder = grpc_builder.tls_config(tls_cfg)?;
+    }
+
+    let grpc_server = grpc_builder
+        .add_service(service)
         .serve_with_shutdown(grpc_addr, shutdown_signal);
 
     // Wait for shutdown

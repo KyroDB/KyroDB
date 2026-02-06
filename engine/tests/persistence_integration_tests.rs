@@ -7,10 +7,19 @@
 //! - Durability guarantees with different fsync policies
 
 use kyrodb_engine::{
-    FsyncPolicy, HnswBackend, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter,
+    metrics::MetricsCollector, DistanceMetric, FsyncPolicy, HnswBackend, Manifest, Snapshot,
+    WalEntry, WalOp, WalReader, WalWriter,
 };
 use std::collections::HashMap;
 use tempfile::TempDir;
+
+fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+    v
+}
 
 #[test]
 fn test_wal_basic_operations() {
@@ -26,6 +35,7 @@ fn test_wal_basic_operations() {
         embedding: vec![0.1, 0.2, 0.3, 0.4],
         timestamp: 1000,
         metadata: HashMap::new(),
+        seq_no: 1,
     };
 
     let entry2 = WalEntry {
@@ -34,6 +44,7 @@ fn test_wal_basic_operations() {
         embedding: vec![0.5, 0.6, 0.7, 0.8],
         timestamp: 2000,
         metadata: HashMap::new(),
+        seq_no: 2,
     };
 
     writer.append(&entry1).unwrap();
@@ -71,7 +82,7 @@ fn test_snapshot_save_load() {
         .iter()
         .map(|(id, _)| (*id, HashMap::new()))
         .collect();
-    let snapshot = Snapshot::new(4, documents, metadata).unwrap();
+    let snapshot = Snapshot::new(4, DistanceMetric::Cosine, documents, metadata, 0).unwrap();
     snapshot.save(&snapshot_path).unwrap();
 
     // Load snapshot
@@ -95,12 +106,15 @@ fn test_hnsw_backend_persistence() {
     let initial_embeddings = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
 
     let backend = HnswBackend::with_persistence(
+        4,
+        DistanceMetric::Cosine,
         initial_embeddings.clone(),
         vec![HashMap::new(); 2],
         100,
         dir.path(),
         FsyncPolicy::Always,
         10, // Snapshot every 10 inserts
+        1024 * 1024,
     )
     .unwrap();
 
@@ -123,8 +137,17 @@ fn test_hnsw_backend_persistence() {
 
     // Recover from persistence with metrics
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
-    let recovered =
-        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 10, metrics.clone()).unwrap();
+    let recovered = HnswBackend::recover(
+        4,
+        DistanceMetric::Cosine,
+        dir.path(),
+        100,
+        FsyncPolicy::Always,
+        10,
+        1024 * 1024,
+        metrics.clone(),
+    )
+    .unwrap();
 
     // Verify all documents recovered
     assert_eq!(recovered.len(), 4);
@@ -156,30 +179,110 @@ fn test_crash_recovery_wal_only() {
 
     {
         let backend = HnswBackend::with_persistence(
+            2,
+            DistanceMetric::Cosine,
             initial_embeddings.clone(),
             vec![HashMap::new(); 2],
             100,
             dir.path(),
             FsyncPolicy::Always,
             1000, // High threshold to avoid snapshot
+            1024 * 1024,
         )
         .unwrap();
 
         // Insert without snapshot
-        backend.insert(2, vec![0.5, 0.5], HashMap::new()).unwrap();
+        backend
+            .insert(2, normalize(vec![0.5, 0.5]), HashMap::new())
+            .unwrap();
 
         // Simulate crash (drop without clean shutdown)
     }
 
     // Recover from WAL
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
-    let recovered =
-        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 1000, metrics).unwrap();
+    let recovered = HnswBackend::recover(
+        2,
+        DistanceMetric::Cosine,
+        dir.path(),
+        100,
+        FsyncPolicy::Always,
+        1000,
+        1024 * 1024,
+        metrics,
+    )
+    .unwrap();
 
     // Verify data recovered from WAL
     assert_eq!(recovered.len(), 3);
     let doc2 = recovered.fetch_document(2).unwrap();
-    assert_eq!(doc2, vec![0.5, 0.5]);
+    assert_eq!(doc2, normalize(vec![0.5, 0.5]));
+}
+
+#[test]
+fn test_recovery_skips_legacy_wal_before_snapshot() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path();
+
+    let snapshot_name = "snapshot_100.snap";
+    let snapshot_path = data_dir.join(snapshot_name);
+    let documents = vec![(1, vec![1.0, 0.0])];
+    let metadata = documents
+        .iter()
+        .map(|(id, _)| (*id, HashMap::new()))
+        .collect();
+    let snapshot = Snapshot::new(2, DistanceMetric::Euclidean, documents, metadata, 100).unwrap();
+    let snapshot_ts = snapshot.timestamp;
+    snapshot.save(&snapshot_path).unwrap();
+
+    let wal_name = "wal_legacy.wal";
+    let wal_path = data_dir.join(wal_name);
+    let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Never).unwrap();
+    let legacy_before = WalEntry {
+        op: WalOp::Insert,
+        doc_id: 2,
+        embedding: vec![0.0, 1.0],
+        metadata: HashMap::new(),
+        seq_no: 0,
+        timestamp: snapshot_ts.saturating_sub(10),
+    };
+    let legacy_after = WalEntry {
+        op: WalOp::Insert,
+        doc_id: 3,
+        embedding: vec![0.5, 0.5],
+        metadata: HashMap::new(),
+        seq_no: 0,
+        timestamp: snapshot_ts + 10,
+    };
+    writer.append(&legacy_before).unwrap();
+    writer.append(&legacy_after).unwrap();
+    drop(writer);
+
+    let manifest_path = data_dir.join("MANIFEST");
+    let manifest = Manifest {
+        version: 1,
+        latest_snapshot: Some(snapshot_name.to_string()),
+        wal_segments: vec![wal_name.to_string()],
+        last_updated: snapshot_ts,
+    };
+    manifest.save(&manifest_path).unwrap();
+
+    let metrics = MetricsCollector::new();
+    let recovered = HnswBackend::recover(
+        2,
+        DistanceMetric::Euclidean,
+        data_dir,
+        100,
+        FsyncPolicy::Never,
+        10,
+        1024 * 1024,
+        metrics,
+    )
+    .unwrap();
+
+    assert!(recovered.fetch_document(1).is_some());
+    assert!(recovered.fetch_document(2).is_none());
+    assert!(recovered.fetch_document(3).is_some());
 }
 
 #[test]
@@ -189,19 +292,28 @@ fn test_automatic_snapshot_creation() {
     let initial_embeddings = vec![vec![1.0, 0.0]];
 
     let backend = HnswBackend::with_persistence(
+        2,
+        DistanceMetric::Cosine,
         initial_embeddings,
         vec![HashMap::new(); 1],
         100,
         dir.path(),
         FsyncPolicy::Always,
         3, // Snapshot every 3 inserts
+        1024 * 1024,
     )
     .unwrap();
 
     // Insert 3 documents (should trigger snapshot)
-    backend.insert(1, vec![0.9, 0.1], HashMap::new()).unwrap();
-    backend.insert(2, vec![0.8, 0.2], HashMap::new()).unwrap();
-    backend.insert(3, vec![0.7, 0.3], HashMap::new()).unwrap();
+    backend
+        .insert(1, normalize(vec![0.9, 0.1]), HashMap::new())
+        .unwrap();
+    backend
+        .insert(2, normalize(vec![0.8, 0.2]), HashMap::new())
+        .unwrap();
+    backend
+        .insert(3, normalize(vec![0.7, 0.3]), HashMap::new())
+        .unwrap();
 
     // Check that snapshot was created
     let manifest_path = dir.path().join("MANIFEST");
@@ -221,17 +333,20 @@ fn test_knn_search_after_recovery() {
     {
         let initial_embeddings = vec![
             vec![1.0, 0.0, 0.0, 0.0],
-            vec![0.9, 0.1, 0.0, 0.0],
+            normalize(vec![0.9, 0.1, 0.0, 0.0]),
             vec![0.0, 0.0, 1.0, 0.0],
         ];
 
         let backend = HnswBackend::with_persistence(
+            4,
+            DistanceMetric::Cosine,
             initial_embeddings,
             vec![HashMap::new(); 3],
             100,
             dir.path(),
             FsyncPolicy::Always,
             10,
+            1024 * 1024,
         )
         .unwrap();
 
@@ -240,8 +355,17 @@ fn test_knn_search_after_recovery() {
 
     // Recover and test k-NN search
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
-    let recovered =
-        HnswBackend::recover(dir.path(), 100, FsyncPolicy::Always, 10, metrics).unwrap();
+    let recovered = HnswBackend::recover(
+        4,
+        DistanceMetric::Cosine,
+        dir.path(),
+        100,
+        FsyncPolicy::Always,
+        10,
+        1024 * 1024,
+        metrics,
+    )
+    .unwrap();
 
     // Query closest to doc 0
     let query = vec![1.0, 0.0, 0.0, 0.0];
@@ -260,23 +384,38 @@ fn test_fsync_policy_never() {
     let initial_embeddings = vec![vec![1.0, 0.0]];
 
     let backend = HnswBackend::with_persistence(
+        2,
+        DistanceMetric::Cosine,
         initial_embeddings,
         vec![HashMap::new(); 1],
         100,
         dir.path(),
         FsyncPolicy::Never,
         5,
+        1024 * 1024,
     )
     .unwrap();
 
-    backend.insert(1, vec![0.9, 0.1], HashMap::new()).unwrap();
+    backend
+        .insert(1, normalize(vec![0.9, 0.1]), HashMap::new())
+        .unwrap();
     backend.create_snapshot().unwrap();
 
     // Recovery should still work
     drop(backend);
 
     let metrics = kyrodb_engine::metrics::MetricsCollector::new();
-    let recovered = HnswBackend::recover(dir.path(), 100, FsyncPolicy::Never, 5, metrics).unwrap();
+    let recovered = HnswBackend::recover(
+        2,
+        DistanceMetric::Cosine,
+        dir.path(),
+        100,
+        FsyncPolicy::Never,
+        5,
+        1024 * 1024,
+        metrics,
+    )
+    .unwrap();
 
     assert_eq!(recovered.len(), 2);
 }

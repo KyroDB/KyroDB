@@ -11,6 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
+fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+    v
+}
+
 /// Test full A/B test flow: query → cache check → HNSW search → cache admission → stats
 #[tokio::test]
 async fn test_full_ab_test_flow() {
@@ -23,6 +31,7 @@ async fn test_full_ab_test_flow() {
         let embedding: Vec<f32> = (0..dim)
             .map(|j| (i * dim as u64 + j as u64) as f32 * 0.01)
             .collect();
+        let embedding = normalize(embedding);
         hnsw.add_vector(i, &embedding).unwrap();
     }
 
@@ -42,6 +51,7 @@ async fn test_full_ab_test_flow() {
         let query: Vec<f32> = (0..dim)
             .map(|j| (i * dim as u64 + j as u64) as f32 * 0.01)
             .collect();
+        let query = normalize(query);
         let doc_id = i % 100;
 
         // Get strategy for this query
@@ -129,6 +139,7 @@ async fn test_cache_hit_rate_improves() {
         let embedding: Vec<f32> = (0..dim)
             .map(|j| (i * dim as u64 + j as u64) as f32 * 0.01)
             .collect();
+        let embedding = normalize(embedding);
         hnsw.add_vector(i, &embedding).unwrap();
     }
 
@@ -141,6 +152,7 @@ async fn test_cache_hit_rate_improves() {
         let query: Vec<f32> = (0..dim)
             .map(|j| (i * dim as u64 + j as u64) as f32 * 0.01)
             .collect();
+        let query = normalize(query);
         let doc_id = i % 100;
 
         if strategy.get_cached(doc_id).is_some() {
@@ -191,14 +203,20 @@ async fn test_stats_survive_restart() {
         let persister = AbStatsPersister::new(&stats_path).unwrap();
         persister.log_hit("lru_baseline", 1u64, 100).await.unwrap();
         persister.log_miss("lru_baseline", 2u64, 200).await.unwrap();
-        persister.log_hit("learned_rmi", 3u64, 150).await.unwrap();
+        persister
+            .log_hit("learned_predictor", 3u64, 150)
+            .await
+            .unwrap();
         persister.flush().await.unwrap();
     }
 
     // Second session: log more events
     {
         let persister = AbStatsPersister::new(&stats_path).unwrap();
-        persister.log_miss("learned_rmi", 4u64, 250).await.unwrap();
+        persister
+            .log_miss("learned_predictor", 4u64, 250)
+            .await
+            .unwrap();
         persister.flush().await.unwrap();
     }
 
@@ -236,15 +254,22 @@ async fn test_background_training_updates_predictor() {
         window_duration: Duration::from_secs(3600),
         recency_halflife: Duration::from_secs(1800),
         min_events_for_training: 100,
-        rmi_capacity: 100,
+        predictor_capacity: 100,
         admission_threshold: 0.15,
         auto_tune_enabled: true,
         target_utilization: 0.85,
     };
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-    let handle =
-        spawn_training_task(logger.clone(), strategy.clone(), config, None, shutdown_rx).await;
+    let handle = spawn_training_task(
+        logger.clone(),
+        strategy.clone(),
+        config,
+        None,
+        None,
+        shutdown_rx,
+    )
+    .await;
 
     // Wait for training cycle
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -373,10 +398,16 @@ async fn test_ab_stats_analysis() {
 
     // Log events: Learned has 7 hits, 3 misses (70% hit rate)
     for i in 0u64..7 {
-        persister.log_hit("learned_rmi", i, 150).await.unwrap();
+        persister
+            .log_hit("learned_predictor", i, 150)
+            .await
+            .unwrap();
     }
     for i in 7u64..10 {
-        persister.log_miss("learned_rmi", i, 250).await.unwrap();
+        persister
+            .log_miss("learned_predictor", i, 250)
+            .await
+            .unwrap();
     }
 
     persister.flush().await.unwrap();

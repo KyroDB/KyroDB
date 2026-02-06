@@ -84,12 +84,15 @@ fn test_hnsw_corruption_recovery() {
 
     // Create backend with persistence
     let backend = HnswBackend::with_persistence(
+        4,
+        kyrodb_engine::config::DistanceMetric::Cosine,
         embeddings.clone(),
         metadata.clone(),
         100,
-        data_dir.to_str().unwrap(),
+        data_dir,
         FsyncPolicy::Always,
         10,
+        1024 * 1024,
     )
     .unwrap();
 
@@ -136,10 +139,13 @@ fn test_hnsw_corruption_recovery() {
     // Try to recover - should fallback to previous snapshot
     let metrics = MetricsCollector::new();
     let recovered = HnswBackend::recover(
-        data_dir.to_str().unwrap(),
+        4,
+        kyrodb_engine::config::DistanceMetric::Cosine,
+        data_dir,
         100,
         FsyncPolicy::Always,
         10,
+        1024 * 1024,
         metrics.clone(),
     );
 
@@ -198,12 +204,15 @@ fn test_wal_normal_operation() {
 
     // Create backend with persistence (includes WAL)
     let backend = HnswBackend::with_persistence(
+        4,
+        kyrodb_engine::config::DistanceMetric::Cosine,
         vec![vec![1.0, 0.0, 0.0, 0.0]],
         vec![HashMap::new()],
         100,
-        temp_dir.path().to_str().unwrap(),
+        temp_dir.path(),
         FsyncPolicy::Always,
         10,
+        1024 * 1024,
     )
     .unwrap();
 
@@ -230,12 +239,15 @@ fn test_circuit_breaker_with_backend_operations() {
         if breaker.is_closed() {
             // Create backend
             let backend = HnswBackend::with_persistence(
+                4,
+                kyrodb_engine::config::DistanceMetric::Cosine,
                 vec![vec![1.0, 0.0, 0.0, 0.0]],
                 vec![HashMap::new()],
                 100,
-                temp_dir.path().to_str().unwrap(),
+                temp_dir.path(),
                 FsyncPolicy::Always,
                 10,
+                1024 * 1024,
             );
 
             if backend.is_ok() {
@@ -265,11 +277,18 @@ fn test_snapshot_corruption_metrics() {
     // Create a valid snapshot
     let documents = vec![(0, vec![1.0, 0.0, 0.0, 0.0]), (1, vec![0.0, 1.0, 0.0, 0.0])];
 
-    let metadata = documents
+    let metadata: Vec<(u64, std::collections::HashMap<String, String>)> = documents
         .iter()
         .map(|(id, _)| (*id, std::collections::HashMap::new()))
         .collect();
-    let snapshot = Snapshot::new(4, documents.clone(), metadata).unwrap();
+    let snapshot = Snapshot::new(
+        4,
+        kyrodb_engine::config::DistanceMetric::Cosine,
+        documents.clone(),
+        metadata,
+        0,
+    )
+    .unwrap();
 
     snapshot.save(&snapshot_path).unwrap();
 
@@ -298,6 +317,14 @@ fn test_snapshot_corruption_metrics() {
 async fn test_tiered_query_normal_operation() {
     use kyrodb_engine::{LruCacheStrategy, TieredEngine, TieredEngineConfig};
 
+    fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            v.iter_mut().for_each(|x| *x /= norm);
+        }
+        v
+    }
+
     let cache = LruCacheStrategy::new(100);
     let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
     let embeddings = vec![
@@ -310,6 +337,7 @@ async fn test_tiered_query_normal_operation() {
     let config = TieredEngineConfig {
         hot_tier_max_size: 10,
         hnsw_max_elements: 100,
+        embedding_dimension: 4,
         data_dir: None,
         cache_timeout_ms: 10,
         hot_tier_timeout_ms: 50,
@@ -321,7 +349,7 @@ async fn test_tiered_query_normal_operation() {
         TieredEngine::new(Box::new(cache), query_cache, embeddings, metadata, config).unwrap();
 
     // Query should succeed through normal tier access
-    let query = vec![0.5, 0.5, 0.0, 0.0];
+    let query = normalize(vec![0.5, 0.5, 0.0, 0.0]);
     let results = engine.knn_search_with_timeouts(&query, 2).await;
 
     assert!(results.is_ok(), "Should get results from cold tier");

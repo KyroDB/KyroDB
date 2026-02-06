@@ -17,6 +17,17 @@ server:
   
   # HTTP observability port (auto-calculated as gRPC port + 1000 if omitted)
   # http_port: 51051
+
+  # HTTP observability host (defaults to server.host if omitted)
+  # Use this to bind observability endpoints to a restricted interface.
+  # http_host: "127.0.0.1"
+
+  # Authentication policy for HTTP observability endpoints:
+  # - disabled: no auth on /metrics,/health,/ready,/slo
+  # - metrics_and_slo: require auth for /metrics and /slo
+  # - all: require auth for all observability endpoints
+  # Note: any non-disabled value requires auth.enabled=true.
+  # observability_auth: metrics_and_slo
   
   # Maximum concurrent connections
   max_connections: 10000
@@ -27,6 +38,14 @@ server:
   # Graceful shutdown timeout (seconds)
   shutdown_timeout_secs: 30
 
+# Authentication (API keys for gRPC and optionally observability)
+auth:
+  # Enable API key auth
+  enabled: false
+
+  # Path to API keys file (YAML)
+  # api_keys_file: "data/api_keys.yaml"
+
 # Cache Configuration (Hybrid Semantic Cache)
 cache:
   # Maximum number of vectors to cache
@@ -35,21 +54,53 @@ cache:
   
   # Cache eviction strategy: lru, learned, or abtest
   # - lru: Simple LRU eviction (baseline)
-  # - learned: Hybrid Semantic Cache with RMI predictor
+  # - learned: Hybrid Semantic Cache with a learned hotness predictor
   # - abtest: A/B test between LRU and Learned
   strategy: learned
   
   # Training interval for Hybrid Semantic Cache (seconds)
   training_interval_secs: 600  # 10 minutes
+
+  # Training window (how far back to consider accesses, in seconds)
+  training_window_secs: 3600
+
+  # Recency decay half-life (seconds)
+  recency_halflife_secs: 1800
+
+  # Enable the background retraining task in the server.
+  # If disabled, the learned predictor will remain in bootstrap mode.
+  enable_training_task: true
+
+  # Access logger window size (number of recent access events retained for training).
+  # Larger values can improve training stability at the cost of memory.
+  logger_window_size: 1000000
+
+  # Predictor capacity multiplier relative to cache capacity.
+  # The predictor stores hotness metadata; keeping this larger than cache capacity
+  # reduces churn for workloads with a large working set.
+  predictor_capacity_multiplier: 4
+
+  # Query search cache (L1b) settings
+  query_cache_capacity: 100
+  # Cosine similarity threshold for semantic query matches (top‑k reuse).
+  # Tune per embedding model and workload.
+  query_cache_similarity_threshold: 0.52
+
+  # Optional override for hot-tier max age (seconds).
+  # If omitted, the server uses training_interval_secs.
+  # hot_tier_max_age_secs: 600
   
-  # Minimum access count before training RMI
+  # Minimum access count before training the predictor
   min_training_samples: 100
-  
-  # Enable A/B testing (only applies when strategy: abtest)
-  enable_ab_testing: false
-  
-  # A/B test traffic split (0.0-1.0, fraction for treatment group)
-  ab_test_split: 0.5
+
+  # Admission threshold (0.0-1.0) for the learned strategy.
+  admission_threshold: 0.15
+
+  # Auto-tune admission threshold based on cache utilization.
+  auto_tune_threshold: true
+
+  # Target cache utilization (0.0-1.0) used by auto-tuning.
+  target_utilization: 0.85
 
 # HNSW Configuration (Vector Search Backend)
 hnsw:
@@ -75,15 +126,15 @@ hnsw:
   # Distance metric: cosine, euclidean, or innerproduct
   distance: cosine
 
+  # Disable L2-normalization checks for inner-product vectors (performance opt-out)
+  disable_normalization_check: false
+
 # Persistence Configuration (WAL + Snapshots)
 persistence:
   # Data directory for WAL and snapshots
   data_dir: "./data"
   
-  # Enable write-ahead log (disable only for benchmarking)
-  enable_wal: true
-  
-  # WAL flush interval (milliseconds, 0 = immediate fsync)
+  # WAL fsync interval (milliseconds, 0 = sync on every write when fsync_policy=data_only)
   # Lower = more durable, slower writes
   wal_flush_interval_ms: 100
   
@@ -93,8 +144,9 @@ persistence:
   # - full: fsync data + metadata (safest, slowest)
   fsync_policy: data_only
   
-  # Snapshot interval (seconds, 0 = disabled)
-  snapshot_interval_secs: 3600  # 1 hour
+  # Snapshot interval (number of WAL mutations including inserts and deletes, 0 = disabled)
+  # Legacy key "snapshot_interval_inserts" is still accepted as an alias.
+  snapshot_interval_mutations: 10000
   
   # Maximum WAL size before rotation (bytes)
   max_wal_size_bytes: 104857600  # 100 MB
@@ -102,11 +154,15 @@ persistence:
   # Enable automatic crash recovery on startup
   enable_recovery: true
 
+  # If true, allows starting with a fresh empty DB when recovery fails.
+  # WARNING: This can discard access to existing data if the on-disk state is corrupted.
+  allow_fresh_start_on_recovery_failure: false
+
 # SLO Configuration (Service Level Objectives)
 slo:
   # P99 latency threshold (milliseconds)
   # Breach alert if P99 > this value
-  p99_latency_ms: 1.0
+  p99_latency_ms: 10.0
   
   # Cache hit rate threshold (0.0-1.0)
   # Breach alert if hit rate < this value

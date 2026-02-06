@@ -120,7 +120,7 @@ impl Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StrategyId {
     LruBaseline,
-    LearnedRmi,
+    LearnedPredictor,
 }
 
 /// Final validation results
@@ -354,7 +354,7 @@ async fn main() -> Result<()> {
         window_duration: Duration::from_secs(24 * 3600),
         recency_halflife: Duration::from_secs(1800), // 30 min
         min_events_for_training: 100,
-        rmi_capacity: config.cache_capacity,
+        predictor_capacity: config.cache_capacity,
         admission_threshold: 0.15,
         auto_tune_enabled: true,
         target_utilization: 0.85,
@@ -367,6 +367,7 @@ async fn main() -> Result<()> {
         access_logger.clone(),
         learned_strategy.clone(),
         training_config,
+        None,
         None,
         shutdown_rx,
     )
@@ -416,7 +417,7 @@ async fn main() -> Result<()> {
             bail!("Zipf distribution validation failed: top 20 docs should capture 8-50% of accesses, got {:.1}%", top_20_pct * 100.0);
         }
 
-        println!("  ✓ Zipf distribution validated");
+        println!("  [OK] Zipf distribution validated");
     }
     println!();
 
@@ -466,8 +467,8 @@ async fn main() -> Result<()> {
         // Determine strategy ID (type-safe)
         let strategy_id = if strategy_name == "lru_baseline" {
             StrategyId::LruBaseline
-        } else if strategy_name == "learned_rmi" {
-            StrategyId::LearnedRmi
+        } else if strategy_name == "learned_predictor" {
+            StrategyId::LearnedPredictor
         } else {
             eprintln!(
                 "ERROR: Unknown strategy '{}', skipping query",
@@ -494,8 +495,8 @@ async fn main() -> Result<()> {
                     // LRU: Always cache (permissive admission)
                     true
                 }
-                StrategyId::LearnedRmi => {
-                    // Learned: Only cache if RMI predictor says hot
+                StrategyId::LearnedPredictor => {
+                    // Learned: Only cache if Learned predictor says hot
                     strategy.should_cache(doc_id, &embedding)
                 }
             };
@@ -521,7 +522,7 @@ async fn main() -> Result<()> {
                     lru_hits += 1;
                 }
             }
-            StrategyId::LearnedRmi => {
+            StrategyId::LearnedPredictor => {
                 learned_queries += 1;
                 if cache_hit {
                     learned_hits += 1;
@@ -711,7 +712,7 @@ async fn main() -> Result<()> {
     println!("  Cache misses:    {}", lru_queries - lru_hits);
     println!("  Hit rate:        {:.1}%", lru_hit_rate * 100.0);
     println!();
-    println!("Hybrid Semantic Cache (RMI):");
+    println!("Hybrid Semantic Cache (learned predictor):");
     println!("  Queries:         {}", learned_queries);
     println!("  Cache hits:      {}", learned_hits);
     println!("  Cache misses:    {}", learned_queries - learned_hits);
@@ -781,19 +782,19 @@ async fn main() -> Result<()> {
     println!();
     println!("Criteria:");
     println!(
-        "  ✓ Hybrid Semantic Cache hit rate 70-90%:       {}",
+        "  [OK] Hybrid Semantic Cache hit rate 70-90%:       {}",
         if hit_rate_pass { "PASS" } else { "FAIL" }
     );
     println!(
-        "  ✓ Improvement 2.0-3.0× over LRU:       {}",
+        "  [OK] Improvement 2.0-3.0x over LRU:       {}",
         if improvement_pass { "PASS" } else { "FAIL" }
     );
     println!(
-        "  ✓ Memory growth < 5%:                  {}",
+        "  [OK] Memory growth < 5%:                  {}",
         if memory_pass { "PASS" } else { "FAIL" }
     );
     println!(
-        "  ✓ Training task stable:                {}",
+        "  [OK] Training task stable:                {}",
         if training_pass { "PASS" } else { "FAIL" }
     );
     println!();
