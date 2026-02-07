@@ -1,13 +1,10 @@
 # Authentication and multi-tenancy
 
-## Known Limitations
+## Quota Enforcement
 
-**`max_vectors` is not enforced on inserts.** The `max_vectors` field in `api_keys.yaml` is validated at load time (must be > 0), but the server **will not reject inserts** after a tenant exceeds this value. Operators must not rely on `max_vectors` for quota enforcement.
+`max_vectors` is enforced on write paths. If a tenant attempts to insert beyond its configured quota, the server rejects the request with `RESOURCE_EXHAUSTED`.
 
-**Recommendations until enforcement is implemented:**
-- Use Prometheus metrics (e.g., per-tenant vector count) with alerting to detect when tenants approach or exceed their configured `max_vectors`.
-- Apply external enforcement at the proxy or infrastructure level (e.g., disk quotas, rate-limiting gateways).
-- When insert-time enforcement is added in a future release, it will **not be retroactive**: tenants that already exceed their `max_vectors` limit will not have existing vectors removed, but new inserts will be rejected once enforcement is active.
+The quota is forward-enforced: existing vectors are not removed automatically.
 
 ---
 
@@ -28,6 +25,8 @@ auth:
   enabled: true
   api_keys_file: "data/api_keys.yaml"
 ```
+
+For external pilots, prefer `config.pilot.toml` / `config.pilot.yaml` and keep `environment.type=pilot`.
 
 ## API keys file
 
@@ -54,8 +53,7 @@ Notes:
 
 - `created_at` is optional but must be ISO 8601 if present.
 - `max_qps` is optional; if omitted or set to `0`, the server falls back to the global defaults in `rate_limit` (see Configuration Guide). If `rate_limit.enabled=false`, tenants without `max_qps` are effectively unlimited.
-- `max_vectors` is validated when loading `api_keys.yaml` (must be > 0), but it is **not** enforced as a hard quota on inserts yet. See the **Known Limitations** section at the top of this document for details and recommended mitigations.
-  Enforcement is planned after Phase 0 hardening.
+- `max_vectors` is validated when loading `api_keys.yaml` (must be > 0) and enforced as a hard tenant write quota.
 
 ## Observability endpoint protection
 

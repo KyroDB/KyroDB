@@ -133,6 +133,12 @@ See the Hybrid Semantic Cache in action with the MS MARCO dataset:
 # - HTTP observability: port 51051
 ```
 
+For external pilots, start from the secure baseline profile:
+
+```bash
+./target/release/kyrodb_server --config config.pilot.toml
+```
+
 ---
 
 ## Configuration
@@ -265,6 +271,8 @@ KyroDB is optimized for:
 - [Observability](docs/OBSERVABILITY.md) - Metrics, monitoring, alerts
 - [Configuration Management](docs/CONFIGURATION_MANAGEMENT.md) - All config options
 - [Backup & Recovery](docs/BACKUP_AND_RECOVERY.md) - Disaster recovery procedures
+- [Pilot Launch Checklist](docs/PILOT_LAUNCH_CHECKLIST.md) - Go/no-go gates for startup pilots
+- [Benchmark Evidence Package](docs/BENCHMARK_EVIDENCE_PACKAGE.md) - Immutable benchmark claim workflow
 
 ### API & Development
 - [API Reference](docs/API_REFERENCE.md) - Complete API documentation

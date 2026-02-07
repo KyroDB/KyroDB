@@ -29,10 +29,11 @@ use kyrodb_engine::{
         AbTestSplitter, LearnedCacheStrategy, LruCacheStrategy, SharedLearnedCacheStrategy,
     },
     config::ObservabilityAuthMode,
-    AuthManager, ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, MetricsCollector,
-    RateLimiter, SloThresholds, TenantInfo, TieredEngine, TieredEngineConfig,
+    AuthManager, ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, Manifest,
+    MetricsCollector, PointQueryTier, RateLimiter, SearchExecutionPath, SloThresholds, TenantInfo,
+    TieredEngine, TieredEngineConfig,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -108,6 +109,7 @@ struct TenantContext {
     tenant_id: String,
     tenant_index: u32,
     max_qps: u32,
+    max_vectors: usize,
 }
 
 /// Stable tenant-local → global doc_id mapping.
@@ -283,6 +285,7 @@ struct ServerState {
     auth: Option<AuthManager>,
     rate_limiter: Option<RateLimiter>,
     tenant_id_mapper: Option<TenantIdMapper>,
+    tenant_vector_counts: Option<parking_lot::RwLock<HashMap<String, usize>>>,
 }
 
 /// gRPC service implementation
@@ -351,14 +354,90 @@ impl KyroDBServiceImpl {
         }
     }
 
+    fn map_query_tier(tier: PointQueryTier) -> i32 {
+        match tier {
+            PointQueryTier::Cache => query_response::Tier::Cache as i32,
+            PointQueryTier::HotTier => query_response::Tier::HotTier as i32,
+            PointQueryTier::ColdTier => query_response::Tier::ColdTier as i32,
+        }
+    }
+
+    fn map_search_path(path: SearchExecutionPath) -> i32 {
+        match path {
+            SearchExecutionPath::CacheHit => search_response::SearchPath::CacheHit as i32,
+            SearchExecutionPath::HotTierOnly => search_response::SearchPath::HotTierOnly as i32,
+            SearchExecutionPath::ColdTierOnly => search_response::SearchPath::ColdTierOnly as i32,
+            SearchExecutionPath::HotAndCold => search_response::SearchPath::HotAndCold as i32,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn enforce_vector_quota(
+        &self,
+        tenant: Option<&TenantContext>,
+        engine: &TieredEngine,
+        global_doc_id: u64,
+    ) -> Result<bool, Status> {
+        let Some(tenant) = tenant else {
+            return Ok(false);
+        };
+
+        let already_exists = engine.exists(global_doc_id);
+        if already_exists {
+            return Ok(true);
+        }
+
+        let counts = self
+            .state
+            .tenant_vector_counts
+            .as_ref()
+            .ok_or_else(|| Status::internal("tenant vector quota state not initialized"))?;
+        let current = counts.read().get(&tenant.tenant_id).copied().unwrap_or(0);
+        if current >= tenant.max_vectors {
+            return Err(Status::resource_exhausted(format!(
+                "max_vectors quota exceeded: tenant={} limit={}",
+                tenant.tenant_id, tenant.max_vectors
+            )));
+        }
+
+        Ok(false)
+    }
+
+    fn increment_tenant_vectors(&self, tenant: Option<&TenantContext>, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let Some(tenant) = tenant else {
+            return;
+        };
+        if let Some(counts) = &self.state.tenant_vector_counts {
+            let mut guard = counts.write();
+            let entry = guard.entry(tenant.tenant_id.clone()).or_insert(0);
+            *entry = entry.saturating_add(count);
+        }
+    }
+
+    fn decrement_tenant_vectors(&self, tenant: Option<&TenantContext>, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let Some(tenant) = tenant else {
+            return;
+        };
+        if let Some(counts) = &self.state.tenant_vector_counts {
+            let mut guard = counts.write();
+            if let Some(entry) = guard.get_mut(&tenant.tenant_id) {
+                *entry = entry.saturating_sub(count);
+            }
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     fn validate_search_request(
         &self,
-        tenant: Option<&TenantContext>,
+        _tenant: Option<&TenantContext>,
         req: &SearchRequest,
     ) -> Result<SearchPlan, Status> {
-        self.enforce_rate_limit(tenant)?;
-
         if req.query_embedding.is_empty() {
             self.state.metrics.record_error(ErrorCategory::Validation);
             return Err(Status::invalid_argument("query_embedding cannot be empty"));
@@ -421,7 +500,8 @@ impl KyroDBServiceImpl {
 
         match self.state.app_config.hnsw.distance {
             DistanceMetric::Cosine => 1.0 - dist,
-            DistanceMetric::Euclidean | DistanceMetric::InnerProduct => -dist,
+            DistanceMetric::InnerProduct => 1.0 - dist,
+            DistanceMetric::Euclidean => 1.0 / (1.0 + dist.max(0.0)),
         }
     }
 
@@ -432,7 +512,9 @@ impl KyroDBServiceImpl {
         results: Vec<kyrodb_engine::SearchResult>,
         engine: &TieredEngine,
         latency_ns: u64,
+        search_path: SearchExecutionPath,
     ) -> SearchResponse {
+        let total_found = results.len() as u32;
         let mut final_results = Vec::with_capacity(req.k as usize);
         let mut candidates = results.into_iter();
 
@@ -456,8 +538,17 @@ impl KyroDBServiceImpl {
                 continue;
             }
 
+            let fetched_doc = if needs_metadata || req.include_embeddings {
+                engine.get_document_with_metadata(candidate.doc_id)
+            } else {
+                None
+            };
+
             let metadata = if needs_metadata {
-                let metadata = engine.get_metadata(candidate.doc_id).unwrap_or_default();
+                let metadata = match fetched_doc.as_ref() {
+                    Some((_, metadata)) => metadata.clone(),
+                    None => continue,
+                };
 
                 if let Some(tenant) = tenant {
                     let expected = tenant.tenant_index.to_string();
@@ -488,7 +579,9 @@ impl KyroDBServiceImpl {
             };
 
             let embedding = if req.include_embeddings {
-                engine.query(candidate.doc_id, None).unwrap_or_default()
+                fetched_doc
+                    .map(|(embedding, _)| embedding)
+                    .unwrap_or_default()
             } else {
                 vec![]
             };
@@ -508,12 +601,11 @@ impl KyroDBServiceImpl {
 
         let latency_ms = latency_ns as f64 / 1_000_000.0;
 
-        let total_found = final_results.len() as u32;
         SearchResponse {
             results: final_results,
             total_found,
             search_latency_ms: latency_ms as f32,
-            search_path: search_response::SearchPath::Unknown as i32,
+            search_path: Self::map_search_path(search_path),
             error: String::new(),
         }
     }
@@ -524,12 +616,18 @@ impl KyroDBServiceImpl {
         req: SearchRequest,
     ) -> Result<SearchResponse, Status> {
         let start = Instant::now();
+        self.enforce_rate_limit(tenant)?;
         let plan = self.validate_search_request(tenant, &req)?;
 
         let engine = self.state.engine.read().await;
 
-        let results = engine
-            .knn_search_with_ef(&req.query_embedding, plan.search_k, plan.ef_search_override)
+        let (results, search_path) = engine
+            .knn_search_with_timeouts_with_ef(
+                &req.query_embedding,
+                plan.search_k,
+                plan.ef_search_override,
+            )
+            .await
             .map_err(|e| {
                 self.state.metrics.record_query_failure();
                 self.state.metrics.record_error(ErrorCategory::Internal);
@@ -540,7 +638,7 @@ impl KyroDBServiceImpl {
         self.state.metrics.record_query_latency(latency_ns);
         self.state.metrics.record_hnsw_search(latency_ns);
 
-        Ok(self.build_search_response(tenant, &req, results, &engine, latency_ns))
+        Ok(self.build_search_response(tenant, &req, results, &engine, latency_ns, search_path))
     }
 
     async fn handle_search_requests_batch(
@@ -587,7 +685,7 @@ impl KyroDBServiceImpl {
             let batch_start = Instant::now();
 
             let batch_results = engine
-                .knn_search_batch_with_ef(&queries, max_search_k, ef_search_override)
+                .knn_search_batch_with_ef_detailed(&queries, max_search_k, ef_search_override)
                 .map_err(|e| {
                     self.state.metrics.record_error(ErrorCategory::Internal);
                     Status::internal(format!("Search failed: {}", e))
@@ -598,7 +696,7 @@ impl KyroDBServiceImpl {
                     let latency_ns = batch_start.elapsed().as_nanos() as u64;
                     let batch_len = group.len().max(1) as u64;
                     let per_request_latency_ns = latency_ns / batch_len;
-                    for ((idx, req, _plan), candidates) in
+                    for ((idx, req, _plan), (candidates, search_path)) in
                         group.into_iter().zip(batch_results.into_iter())
                     {
                         self.state
@@ -613,6 +711,7 @@ impl KyroDBServiceImpl {
                             candidates,
                             &engine,
                             per_request_latency_ns,
+                            search_path,
                         );
                         results[idx] = Some(Ok(response));
                     }
@@ -698,6 +797,7 @@ impl KyroDbService for KyroDBServiceImpl {
         let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
 
         let engine = self.state.engine.write().await;
+        let already_exists = self.enforce_vector_quota(tenant.as_ref(), &engine, global_doc_id)?;
 
         // Store namespace in metadata for filtering during search
         // Namespace is stored as reserved key "__namespace__" to avoid conflicts with user metadata
@@ -720,6 +820,9 @@ impl KyroDbService for KyroDBServiceImpl {
             Ok(_) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 self.state.metrics.record_insert(true);
+                if !already_exists {
+                    self.increment_tenant_vectors(tenant.as_ref(), 1);
+                }
 
                 info!(
                     doc_id = req.doc_id,
@@ -727,14 +830,11 @@ impl KyroDbService for KyroDBServiceImpl {
                     "Document inserted successfully"
                 );
 
-                // Note: Tier reporting is currently hardcoded as HotTier.
-                // TieredEngine.insert() will be updated to return which tier was used in future iterations.
-                // Currently, all inserts go to hot tier by design.
                 Ok(Response::new(InsertResponse {
                     success: true,
                     error: String::new(),
                     inserted_at: unix_timestamp_secs(),
-                    tier: insert_response::Tier::HotTier as i32,
+                    tier: insert_response::Tier::ColdTier as i32,
                     total_inserted: 1,
                     total_failed: 0,
                 }))
@@ -766,6 +866,7 @@ impl KyroDbService for KyroDBServiceImpl {
         let mut total_failed = 0u64;
         let mut last_error = String::new();
         let mut batch_count = 0u64;
+        let mut newly_inserted = 0usize;
 
         // Acquire lock per-operation to prevent deadlock
         // Holding write lock across stream.message().await causes deadlock
@@ -811,6 +912,16 @@ impl KyroDbService for KyroDBServiceImpl {
                         continue;
                     }
                 };
+                let engine = self.state.engine.write().await;
+                let already_exists =
+                    match self.enforce_vector_quota(tenant.as_ref(), &engine, global_doc_id) {
+                        Ok(exists) => exists,
+                        Err(status) => {
+                            total_failed += 1;
+                            last_error = status.message().to_string();
+                            continue;
+                        }
+                    };
 
                 let mut metadata = req.metadata;
                 metadata.remove("__tenant_id__");
@@ -827,9 +938,13 @@ impl KyroDbService for KyroDBServiceImpl {
                     metadata.insert("__namespace__".to_string(), req.namespace.clone());
                 }
 
-                let engine = self.state.engine.write().await;
                 match engine.insert(global_doc_id, req.embedding, metadata) {
-                    Ok(_) => total_inserted += 1,
+                    Ok(_) => {
+                        total_inserted += 1;
+                        if !already_exists {
+                            newly_inserted = newly_inserted.saturating_add(1);
+                        }
+                    }
                     Err(e) => {
                         total_failed += 1;
                         last_error = format!("{}", e);
@@ -848,22 +963,22 @@ impl KyroDbService for KyroDBServiceImpl {
             throughput_docs_per_sec = (total_inserted as f64 / start.elapsed().as_secs_f64()),
             "Bulk insert completed"
         );
+        self.increment_tenant_vectors(tenant.as_ref(), newly_inserted);
 
-        // Note: Tier reporting hardcoded (see insert() method comment)
         Ok(Response::new(InsertResponse {
             success: total_failed == 0,
             error: last_error,
             inserted_at: unix_timestamp_secs(),
-            tier: insert_response::Tier::HotTier as i32,
+            tier: insert_response::Tier::ColdTier as i32,
             total_inserted,
             total_failed,
         }))
     }
 
-    /// Bulk load directly to HNSW index (bypasses hot tier)
+    /// Bulk load directly to HNSW index (bypasses hot tier).
     ///
-    /// This provides maximum indexing speed for benchmarks and data migrations.
-    /// Warning: Data is NOT persisted to WAL during load.
+    /// This path is durable: documents are ingested through the cold-tier write path
+    /// (WAL + HNSW), so successful loads survive crashes.
     #[instrument(skip(self, request))]
     async fn bulk_load_hnsw(
         &self,
@@ -961,10 +1076,41 @@ impl KyroDbService for KyroDBServiceImpl {
                 let batch = std::mem::take(&mut documents);
                 let batch_len = batch.len() as u64;
                 let engine = self.state.engine.write().await;
+                let mut new_doc_ids = HashSet::new();
+                if let Some(tenant_ctx) = tenant.as_ref() {
+                    for (doc_id, _, _) in &batch {
+                        if !engine.exists(*doc_id) {
+                            new_doc_ids.insert(*doc_id);
+                        }
+                    }
+                    if !new_doc_ids.is_empty() {
+                        let counts = self.state.tenant_vector_counts.as_ref().ok_or_else(|| {
+                            Status::internal("tenant vector quota state not initialized")
+                        })?;
+                        let current = counts
+                            .read()
+                            .get(&tenant_ctx.tenant_id)
+                            .copied()
+                            .unwrap_or(0);
+                        if current.saturating_add(new_doc_ids.len()) > tenant_ctx.max_vectors {
+                            return Err(Status::resource_exhausted(format!(
+                                "max_vectors quota exceeded: tenant={} limit={}",
+                                tenant_ctx.tenant_id, tenant_ctx.max_vectors
+                            )));
+                        }
+                    }
+                }
                 match engine.bulk_load_cold_tier(batch) {
                     Ok((loaded, failed, _duration_ms, _rate)) => {
                         total_loaded += loaded;
                         total_failed_insertion += failed;
+                        if !new_doc_ids.is_empty() {
+                            let inserted_now = new_doc_ids
+                                .iter()
+                                .filter(|doc_id| engine.exists(**doc_id))
+                                .count();
+                            self.increment_tenant_vectors(tenant.as_ref(), inserted_now);
+                        }
                     }
                     Err(e) => {
                         error!(error = %e, "BulkLoadHnsw: batch load failed");
@@ -980,10 +1126,41 @@ impl KyroDbService for KyroDBServiceImpl {
             let batch = std::mem::take(&mut documents);
             let batch_len = batch.len() as u64;
             let engine = self.state.engine.write().await;
+            let mut new_doc_ids = HashSet::new();
+            if let Some(tenant_ctx) = tenant.as_ref() {
+                for (doc_id, _, _) in &batch {
+                    if !engine.exists(*doc_id) {
+                        new_doc_ids.insert(*doc_id);
+                    }
+                }
+                if !new_doc_ids.is_empty() {
+                    let counts = self.state.tenant_vector_counts.as_ref().ok_or_else(|| {
+                        Status::internal("tenant vector quota state not initialized")
+                    })?;
+                    let current = counts
+                        .read()
+                        .get(&tenant_ctx.tenant_id)
+                        .copied()
+                        .unwrap_or(0);
+                    if current.saturating_add(new_doc_ids.len()) > tenant_ctx.max_vectors {
+                        return Err(Status::resource_exhausted(format!(
+                            "max_vectors quota exceeded: tenant={} limit={}",
+                            tenant_ctx.tenant_id, tenant_ctx.max_vectors
+                        )));
+                    }
+                }
+            }
             match engine.bulk_load_cold_tier(batch) {
                 Ok((loaded, failed, _duration_ms, _rate)) => {
                     total_loaded += loaded;
                     total_failed_insertion += failed;
+                    if !new_doc_ids.is_empty() {
+                        let inserted_now = new_doc_ids
+                            .iter()
+                            .filter(|doc_id| engine.exists(**doc_id))
+                            .count();
+                        self.increment_tenant_vectors(tenant.as_ref(), inserted_now);
+                    }
                 }
                 Err(e) => {
                     error!(error = %e, "BulkLoadHnsw: final batch load failed");
@@ -1094,6 +1271,9 @@ impl KyroDbService for KyroDBServiceImpl {
         match engine.delete(global_doc_id) {
             Ok(existed) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
+                if existed {
+                    self.decrement_tenant_vectors(tenant.as_ref(), 1);
+                }
 
                 if existed {
                     info!(
@@ -1300,8 +1480,8 @@ impl KyroDbService for KyroDBServiceImpl {
         }
 
         let start = Instant::now();
-        match engine.query(global_doc_id, None) {
-            Some(embedding) => {
+        match engine.query_with_source(global_doc_id, None) {
+            Some((embedding, served_from)) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                 info!(
@@ -1321,7 +1501,7 @@ impl KyroDbService for KyroDBServiceImpl {
                         vec![]
                     },
                     metadata,
-                    served_from: query_response::Tier::Unknown as i32,
+                    served_from: Self::map_query_tier(served_from),
                     error: String::new(),
                 }))
             }
@@ -1522,7 +1702,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let engine = self.state.engine.read().await;
 
-        // Use the new bulk_query which returns metadata too
+        // Use bulk query with source tier metadata.
         let mapped_doc_ids = if let Some(tenant) = &tenant {
             let mut mapped = Vec::with_capacity(req.doc_ids.len());
             for id in &req.doc_ids {
@@ -1533,7 +1713,7 @@ impl KyroDbService for KyroDBServiceImpl {
             req.doc_ids.clone()
         };
 
-        let results_vec = engine.bulk_query(&mapped_doc_ids, req.include_embeddings);
+        let results_vec = engine.bulk_query_with_source(&mapped_doc_ids, req.include_embeddings);
 
         if results_vec.len() != mapped_doc_ids.len() {
             self.state.metrics.record_query_failure();
@@ -1554,7 +1734,8 @@ impl KyroDbService for KyroDBServiceImpl {
         for (i, result) in results_vec.into_iter().enumerate() {
             let doc_id = req.doc_ids[i];
             let mut found = result.is_some();
-            let (mut embedding, mut metadata) = result.unwrap_or_default();
+            let (mut embedding, mut metadata, served_from) =
+                result.unwrap_or((vec![], HashMap::new(), PointQueryTier::ColdTier));
 
             if found && !req.namespace.is_empty() {
                 let doc_namespace = metadata
@@ -1588,7 +1769,11 @@ impl KyroDbService for KyroDBServiceImpl {
                 doc_id,
                 embedding,
                 metadata,
-                served_from: query_response::Tier::Unknown as i32,
+                served_from: if found {
+                    Self::map_query_tier(served_from)
+                } else {
+                    query_response::Tier::Unknown as i32
+                },
                 error: String::new(),
             });
         }
@@ -1731,6 +1916,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 // Record metrics for observability
                 self.state.metrics.record_query_latency(latency_ns);
+                self.decrement_tenant_vectors(tenant.as_ref(), count as usize);
 
                 info!(
                     deleted = count,
@@ -1767,17 +1953,30 @@ impl KyroDbService for KyroDBServiceImpl {
         let engine = self.state.engine.read().await;
         let stats = engine.stats();
 
-        // Determine overall health
-        let status = if stats.total_queries > 0 {
-            health_response::Status::Healthy
-        } else {
-            health_response::Status::Degraded
+        let overall_health = self.state.metrics.health_status();
+        let status = match overall_health {
+            HealthStatus::Healthy => health_response::Status::Healthy,
+            HealthStatus::Degraded { .. } => health_response::Status::Degraded,
+            HealthStatus::Starting => health_response::Status::Degraded,
+            HealthStatus::Unhealthy { .. } => health_response::Status::Unhealthy,
         };
 
-        // Component-level health
+        // Component-level health.
+        let component_filter = req.component.trim();
+        if !component_filter.is_empty()
+            && component_filter != "cache"
+            && component_filter != "hot_tier"
+            && component_filter != "cold_tier"
+            && component_filter != "wal"
+        {
+            return Err(Status::invalid_argument(
+                "component must be one of: cache, hot_tier, cold_tier, wal",
+            ));
+        }
+
         let mut components = HashMap::new();
 
-        if req.component.is_empty() || req.component == "cache" {
+        if component_filter.is_empty() || component_filter == "cache" {
             components.insert(
                 "cache".to_string(),
                 format!(
@@ -1787,18 +1986,36 @@ impl KyroDbService for KyroDBServiceImpl {
             );
         }
 
-        if req.component.is_empty() || req.component == "hot_tier" {
-            components.insert(
-                "hot_tier".to_string(),
-                format!("healthy ({} docs)", stats.hot_tier_size),
-            );
+        if component_filter.is_empty() || component_filter == "hot_tier" {
+            let hot_status = if stats.hot_tier_flush_failures > 0 {
+                format!(
+                    "degraded ({} docs, {} flush failures)",
+                    stats.hot_tier_size, stats.hot_tier_flush_failures
+                )
+            } else {
+                format!("healthy ({} docs)", stats.hot_tier_size)
+            };
+            components.insert("hot_tier".to_string(), hot_status);
         }
 
-        if req.component.is_empty() || req.component == "cold_tier" {
+        if component_filter.is_empty() || component_filter == "cold_tier" {
             components.insert(
                 "cold_tier".to_string(),
                 format!("healthy ({} docs)", stats.cold_tier_size),
             );
+        }
+
+        if component_filter.is_empty() || component_filter == "wal" {
+            let wal_inconsistent = engine.cold_tier().is_wal_inconsistent();
+            let wal_failed = self.state.metrics.get_wal_writes_failed();
+            let wal_status = if wal_inconsistent {
+                "unhealthy (WAL inconsistent; writes disabled)".to_string()
+            } else if wal_failed > 0 {
+                format!("degraded ({} failed WAL writes)", wal_failed)
+            } else {
+                "healthy".to_string()
+            };
+            components.insert("wal".to_string(), wal_status);
         }
 
         info!(
@@ -1823,6 +2040,13 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<MetricsResponse>, Status> {
         let engine = self.state.engine.read().await;
         let stats = engine.stats();
+        let cache_size = engine.cache_size() as u64;
+        self.state.metrics.set_cache_size(cache_size as usize);
+
+        let (p50_ns, p95_ns, p99_ns) = self.state.metrics.latency_percentiles_ns();
+        let uptime_secs = self.state.metrics.uptime().as_secs_f64().max(1e-9);
+        let metrics_total_queries = self.state.metrics.get_total_queries();
+        let metrics_total_inserts = self.state.metrics.get_inserts_total();
 
         info!(
             cache_hit_rate = stats.cache_hit_rate,
@@ -1836,7 +2060,7 @@ impl KyroDbService for KyroDBServiceImpl {
             cache_hits: stats.cache_hits,
             cache_misses: stats.cache_misses,
             cache_hit_rate: stats.cache_hit_rate * 100.0,
-            cache_size: 0,
+            cache_size,
 
             // Hot tier metrics
             hot_tier_hits: stats.hot_tier_hits,
@@ -1850,17 +2074,17 @@ impl KyroDbService for KyroDBServiceImpl {
             cold_tier_size: stats.cold_tier_size as u64,
 
             // Performance metrics
-            p50_latency_ms: 0.0,
-            p95_latency_ms: 0.0,
-            p99_latency_ms: 0.0,
+            p50_latency_ms: p50_ns as f64 / 1_000_000.0,
+            p95_latency_ms: p95_ns as f64 / 1_000_000.0,
+            p99_latency_ms: p99_ns as f64 / 1_000_000.0,
             total_queries: stats.total_queries,
             total_inserts: stats.total_inserts,
-            queries_per_second: 0.0,
-            inserts_per_second: 0.0,
+            queries_per_second: metrics_total_queries as f64 / uptime_secs,
+            inserts_per_second: metrics_total_inserts as f64 / uptime_secs,
 
             // System metrics
-            memory_usage_bytes: 0,
-            disk_usage_bytes: 0,
+            memory_usage_bytes: self.state.metrics.get_memory_used_bytes(),
+            disk_usage_bytes: self.state.metrics.get_disk_used_bytes(),
             cpu_usage_percent: 0.0,
 
             // Overall metrics
@@ -1909,13 +2133,49 @@ impl KyroDbService for KyroDBServiceImpl {
         }
     }
 
-    #[instrument(skip(self, _request))]
+    #[instrument(skip(self, request))]
     async fn create_snapshot(
         &self,
-        _request: Request<SnapshotRequest>,
+        request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
-        // Manual snapshot triggering is not yet implemented
-        Err(Status::unimplemented("create_snapshot not yet implemented"))
+        let req = request.into_inner();
+        if !req.path.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "custom snapshot path is not supported; leave path empty to use configured data_dir",
+            ));
+        }
+
+        let engine = self.state.engine.read().await;
+        engine
+            .cold_tier()
+            .create_snapshot()
+            .map_err(|e| Status::internal(format!("snapshot creation failed: {}", e)))?;
+
+        let data_dir = self
+            .state
+            .engine_config
+            .data_dir
+            .clone()
+            .ok_or_else(|| Status::internal("data_dir not configured"))?;
+        let manifest_path = std::path::Path::new(&data_dir).join("MANIFEST");
+        let manifest = Manifest::load(&manifest_path)
+            .map_err(|e| Status::internal(format!("failed to load MANIFEST: {}", e)))?;
+        let snapshot_name = manifest.latest_snapshot.ok_or_else(|| {
+            Status::internal("snapshot created but MANIFEST has no latest_snapshot")
+        })?;
+        let snapshot_path = std::path::Path::new(&data_dir).join(&snapshot_name);
+        let snapshot_size_bytes = std::fs::metadata(&snapshot_path)
+            .map(|m| m.len())
+            .map_err(|e| Status::internal(format!("failed to stat snapshot: {}", e)))?;
+        let documents_snapshotted = engine.cold_tier().len() as u64;
+
+        Ok(Response::new(SnapshotResponse {
+            success: true,
+            error: String::new(),
+            snapshot_path: snapshot_path.to_string_lossy().to_string(),
+            documents_snapshotted,
+            snapshot_size_bytes,
+        }))
     }
 
     #[instrument(skip(self, _request))]
@@ -2591,10 +2851,18 @@ async fn main() -> anyhow::Result<()> {
     // Spawn background flush task with graceful shutdown
     let mut flush_shutdown_rx = shutdown_tx.subscribe();
     let engine_for_flush = engine_arc.clone();
+    let flush_interval = if engine_config.flush_interval.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        engine_config.flush_interval
+    };
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        info!("Background flush task started (60s interval)");
+        let mut interval = tokio::time::interval(flush_interval);
+        info!(
+            interval_ms = flush_interval.as_millis() as u64,
+            "Background flush task started"
+        );
 
         loop {
             tokio::select! {
@@ -2624,6 +2892,43 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let tenant_vector_counts = if config.auth.enabled {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        if let (Some(auth_mgr), Some(mapper)) = (&auth, &tenant_id_mapper) {
+            let tenants = auth_mgr.enabled_tenants();
+            let engine = engine_arc.read().await;
+            for tenant in tenants {
+                let tenant_index = mapper
+                    .ensure_tenant(&tenant.tenant_id)
+                    .map_err(|e| anyhow::anyhow!("tenant mapping error: {}", e))?;
+                let tenant_idx_str = tenant_index.to_string();
+                let cold_filter = kyrodb::MetadataFilter {
+                    filter_type: Some(kyrodb::metadata_filter::FilterType::Exact(
+                        kyrodb::ExactMatch {
+                            key: "__tenant_idx__".to_string(),
+                            value: tenant_idx_str.clone(),
+                        },
+                    )),
+                };
+                let cold_count = engine
+                    .cold_tier()
+                    .ids_for_metadata_filter(&cold_filter)
+                    .len();
+                let hot_count = engine
+                    .hot_tier()
+                    .scan(|meta| meta.get("__tenant_idx__") == Some(&tenant_idx_str))
+                    .len();
+                counts.insert(
+                    tenant.tenant_id.clone(),
+                    cold_count.saturating_add(hot_count),
+                );
+            }
+        }
+        Some(parking_lot::RwLock::new(counts))
+    } else {
+        None
+    };
+
     // Create shared server state
     let state = Arc::new(ServerState {
         engine: engine_arc,
@@ -2635,6 +2940,7 @@ async fn main() -> anyhow::Result<()> {
         auth,
         rate_limiter,
         tenant_id_mapper,
+        tenant_vector_counts,
     });
 
     // Create gRPC service with engine Arc reference
@@ -2799,6 +3105,7 @@ async fn main() -> anyhow::Result<()> {
                 tenant_id: tenant.tenant_id,
                 tenant_index,
                 max_qps: effective_max_qps,
+                max_vectors: tenant.max_vectors,
             });
 
             Ok(req)

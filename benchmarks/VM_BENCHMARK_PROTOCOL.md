@@ -73,6 +73,7 @@ For each dataset + configuration:
 - Mean QPS and latency percentiles (P50/P99)
 - Hardware + OS + KyroDB git commit
 
+
 ## Known limitations (current state)
 
 - The local harness uses Python + gRPC; measured numbers include RPC and serialization overhead.

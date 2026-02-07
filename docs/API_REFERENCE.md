@@ -288,7 +288,7 @@ api_keys:
     enabled: true
 ```
 
-> **Note on `max_vectors`**: The `max_vectors` field is validated at load time (must be > 0), but **enforcement on inserts is not yet implemented**. The server will not reject inserts after a tenant exceeds this value. Insert-time quota enforcement is planned for a future release. Until then, operators should use external monitoring (e.g., Prometheus metrics, disk quotas, or proxy-level checks) to track and limit per-tenant vector counts. `max_qps` is enforced as described above.
+> **`max_vectors` enforcement**: `max_vectors` is validated at API-key load time (must be > 0) and enforced on write paths. Inserts that would exceed the tenant quota are rejected with `RESOURCE_EXHAUSTED`.
 
 For details (including observability endpoint auth), see [Authentication](AUTHENTICATION.md).
 

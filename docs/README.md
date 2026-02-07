@@ -18,6 +18,7 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 4. [**Observability**](OBSERVABILITY.md) - Prometheus metrics, Grafana dashboards, alerting
 5. [**Operations Guide**](OPERATIONS.md) - Troubleshooting common issues
 
+
 ## For Developers
 
 **Advanced topics:**

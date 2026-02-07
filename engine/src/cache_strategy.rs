@@ -43,6 +43,9 @@ pub trait CacheStrategy: Send + Sync {
 
     /// Get cache statistics
     fn stats(&self) -> String;
+
+    /// Current number of entries in L1a cache.
+    fn size(&self) -> usize;
 }
 
 /// LRU baseline strategy
@@ -103,6 +106,10 @@ impl CacheStrategy for LruCacheStrategy {
             stats.hit_rate * 100.0,
             stats.evictions
         )
+    }
+
+    fn size(&self) -> usize {
+        self.cache.len()
     }
 }
 
@@ -337,6 +344,10 @@ impl CacheStrategy for LearnedCacheStrategy {
             base_stats
         }
     }
+
+    fn size(&self) -> usize {
+        self.cache.len()
+    }
 }
 
 /// A/B test traffic splitter
@@ -412,6 +423,10 @@ impl CacheStrategy for AbTestSplitter {
     fn stats(&self) -> String {
         self.combined_stats()
     }
+
+    fn size(&self) -> usize {
+        self.lru_strategy.size() + self.learned_strategy.size()
+    }
 }
 
 /// Wrapper for shared LearnedCacheStrategy
@@ -471,6 +486,10 @@ impl CacheStrategy for SharedLearnedCacheStrategy {
 
     fn stats(&self) -> String {
         self.inner.stats()
+    }
+
+    fn size(&self) -> usize {
+        self.inner.size()
     }
 }
 

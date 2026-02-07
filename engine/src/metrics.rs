@@ -731,6 +731,51 @@ impl MetricsCollector {
         self.inner.wal_disk_full_errors.load(Ordering::Relaxed)
     }
 
+    /// Get query latency percentiles in nanoseconds (p50, p95, p99).
+    pub fn latency_percentiles_ns(&self) -> (u64, u64, u64) {
+        let mut latencies = self.inner.query_latencies.write();
+        (
+            latencies.percentile(50.0),
+            latencies.percentile(95.0),
+            latencies.percentile(99.0),
+        )
+    }
+
+    /// Get total query count tracked by metrics collector.
+    pub fn get_total_queries(&self) -> u64 {
+        self.inner.total_queries.load(Ordering::Relaxed)
+    }
+
+    /// Get total insert operations.
+    pub fn get_inserts_total(&self) -> u64 {
+        self.inner.inserts_total.load(Ordering::Relaxed)
+    }
+
+    /// Get failed insert operations.
+    pub fn get_inserts_failed(&self) -> u64 {
+        self.inner.inserts_failed.load(Ordering::Relaxed)
+    }
+
+    /// Get cache size gauge value.
+    pub fn get_cache_size(&self) -> usize {
+        self.inner.cache_size.load(Ordering::Relaxed)
+    }
+
+    /// Get memory usage gauge value.
+    pub fn get_memory_used_bytes(&self) -> u64 {
+        self.inner.memory_used_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Get disk usage gauge value.
+    pub fn get_disk_used_bytes(&self) -> u64 {
+        self.inner.disk_used_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Get active connection count.
+    pub fn get_active_connections(&self) -> usize {
+        self.inner.active_connections.load(Ordering::Relaxed)
+    }
+
     // ========================================================================
     // PROMETHEUS EXPORT
     // ========================================================================

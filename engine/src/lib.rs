@@ -181,7 +181,9 @@ pub use backup::{
 pub use hot_tier::{HotTier, HotTierStats};
 
 // Tiered engine components (three-layer architecture)
-pub use tiered_engine::{TieredEngine, TieredEngineConfig, TieredEngineStats};
+pub use tiered_engine::{
+    PointQueryTier, SearchExecutionPath, TieredEngine, TieredEngineConfig, TieredEngineStats,
+};
 
 // Circuit breaker components (error recovery)
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats};

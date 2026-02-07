@@ -546,14 +546,18 @@ impl Default for TimeoutConfig {
 
 /// Declares the intended deployment context for this configuration.
 ///
+/// - `production` (default): standard safety checks.
+/// - `pilot`: stricter launch checks (auth/rate-limit/observability guardrails).
+/// - `benchmark`: permits unsafe persistence settings for performance experiments.
+///
 /// When `type` is not `"benchmark"`, the server validates that persistence
 /// settings are safe for production (fsync_policy != none, snapshots enabled).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentConfig {
-    /// Environment type: `"production"` (default) or `"benchmark"`.
-    /// Benchmark mode permits unsafe persistence settings; any other value
-    /// triggers safety validation on startup.
+    /// Environment type: `"production"` (default), `"pilot"`, or `"benchmark"`.
+    /// Benchmark mode permits unsafe persistence settings; non-benchmark modes
+    /// trigger persistence safety validation on startup.
     #[serde(rename = "type")]
     pub environment_type: String,
 }
@@ -632,6 +636,16 @@ impl KyroDbConfig {
 
     /// Validate configuration parameters
     pub fn validate(&self) -> Result<()> {
+        let environment_type = self
+            .environment
+            .environment_type
+            .trim()
+            .to_ascii_lowercase();
+        anyhow::ensure!(
+            !environment_type.is_empty(),
+            "environment.type cannot be empty"
+        );
+
         // Server validation
         anyhow::ensure!(
             self.server.port > 0,
@@ -814,7 +828,7 @@ impl KyroDbConfig {
         // Environment-aware persistence safety check.
         // If the environment type is not "benchmark", reject configurations
         // that disable durability guarantees (these are only safe for benchmarks).
-        if self.environment.environment_type != "benchmark" {
+        if environment_type != "benchmark" {
             if matches!(self.persistence.fsync_policy, FsyncPolicy::None) {
                 anyhow::bail!(
                     "Unsafe persistence configuration: fsync_policy=\"none\" is only permitted \
@@ -833,6 +847,26 @@ impl KyroDbConfig {
                     self.environment.environment_type
                 );
             }
+        }
+
+        if environment_type == "pilot" {
+            anyhow::ensure!(self.auth.enabled, "Pilot mode requires auth.enabled=true");
+            anyhow::ensure!(
+                self.rate_limit.enabled,
+                "Pilot mode requires rate_limit.enabled=true"
+            );
+            anyhow::ensure!(
+                self.server.observability_auth != ObservabilityAuthMode::Disabled,
+                "Pilot mode requires server.observability_auth to protect HTTP observability endpoints"
+            );
+            anyhow::ensure!(
+                !self.persistence.allow_fresh_start_on_recovery_failure,
+                "Pilot mode requires allow_fresh_start_on_recovery_failure=false"
+            );
+            anyhow::ensure!(
+                self.server.tls.enabled || matches!(self.server.host.as_str(), "127.0.0.1" | "::1"),
+                "Pilot mode requires TLS for non-loopback gRPC bind addresses"
+            );
         }
 
         // Authentication validation
@@ -1067,6 +1101,66 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "ef_construction < M should fail"
+        );
+    }
+
+    #[test]
+    fn test_pilot_mode_requires_auth() {
+        let mut config = KyroDbConfig::default();
+        config.environment.environment_type = "pilot".to_string();
+        config.rate_limit.enabled = true;
+        config.server.observability_auth = ObservabilityAuthMode::All;
+        config.server.tls.enabled = true;
+        config.server.tls.cert_path = Some(PathBuf::from("cert.pem"));
+        config.server.tls.key_path = Some(PathBuf::from("key.pem"));
+        assert!(config.validate().is_err(), "pilot mode must require auth");
+    }
+
+    #[test]
+    fn test_pilot_mode_requires_rate_limit_and_observability_auth() {
+        let mut config = KyroDbConfig::default();
+        config.environment.environment_type = "pilot".to_string();
+        config.auth.enabled = true;
+        config.auth.api_keys_file = Some(PathBuf::from("api_keys.yaml"));
+        config.server.tls.enabled = true;
+        config.server.tls.cert_path = Some(PathBuf::from("cert.pem"));
+        config.server.tls.key_path = Some(PathBuf::from("key.pem"));
+        assert!(
+            config.validate().is_err(),
+            "pilot mode must require rate limiting and observability auth"
+        );
+    }
+
+    #[test]
+    fn test_pilot_mode_requires_tls_for_non_loopback() {
+        let mut config = KyroDbConfig::default();
+        config.environment.environment_type = "pilot".to_string();
+        config.auth.enabled = true;
+        config.auth.api_keys_file = Some(PathBuf::from("api_keys.yaml"));
+        config.rate_limit.enabled = true;
+        config.server.observability_auth = ObservabilityAuthMode::All;
+        config.server.host = "0.0.0.0".to_string();
+        assert!(
+            config.validate().is_err(),
+            "pilot mode requires TLS on non-loopback host"
+        );
+    }
+
+    #[test]
+    fn test_pilot_mode_valid_profile_passes() {
+        let mut config = KyroDbConfig::default();
+        config.environment.environment_type = "pilot".to_string();
+        config.auth.enabled = true;
+        config.auth.api_keys_file = Some(PathBuf::from("api_keys.yaml"));
+        config.rate_limit.enabled = true;
+        config.server.observability_auth = ObservabilityAuthMode::All;
+        config.server.tls.enabled = true;
+        config.server.tls.cert_path = Some(PathBuf::from("cert.pem"));
+        config.server.tls.key_path = Some(PathBuf::from("key.pem"));
+        config.persistence.allow_fresh_start_on_recovery_failure = false;
+        assert!(
+            config.validate().is_ok(),
+            "pilot mode config should pass with required guardrails"
         );
     }
 

@@ -38,6 +38,12 @@ Run with a config file:
 ./kyrodb_server --config config.yaml
 ```
 
+Run with the secure-by-default pilot profile:
+
+```bash
+./kyrodb_server --config config.pilot.toml
+```
+
 ## Configuration reference
 
 ### Server (used)
@@ -188,6 +194,21 @@ timeouts:
   cold_tier_ms: 1000
 ```
 
+### Environment mode (used)
+
+```yaml
+environment:
+  type: production # production | pilot | benchmark
+```
+
+Modes:
+
+- `production` (default): standard runtime validation and production-safe persistence checks.
+- `pilot`: stricter launch guardrails for external pilots.
+- `benchmark`: allows unsafe persistence settings for benchmark throughput experiments.
+
+`environment.type=pilot` enables additional startup validation to prevent insecure pilot configs.
+
 ## Environment variables
 
 Override any config value with `KYRODB__` and double-underscore separators:
@@ -229,6 +250,12 @@ Configuration is validated on startup. Common errors include:
 - HNSW dimension must be > 0
 - SLO rates must be in [0.0, 1.0]
 - Paths must be readable/writable
+- `environment.type=pilot` requires:
+  - `auth.enabled=true`
+  - `rate_limit.enabled=true`
+  - `server.observability_auth != disabled`
+  - `allow_fresh_start_on_recovery_failure=false`
+  - TLS enabled for non-loopback gRPC hosts
 
 ## Troubleshooting
 
@@ -247,5 +274,7 @@ Priority order is: CLI > env vars > config file > defaults.
 ```bash
 KYRODB__CACHE__CAPACITY=200000 ./kyrodb_server
 KYRODB__HNSW__EF_SEARCH=30 ./kyrodb_server
-KYRODB__PERSISTENCE__FSYNC_POLICY=none ./kyrodb_server
+KYRODB__PERSISTENCE__FSYNC_POLICY=data_only ./kyrodb_server
 ```
+
+`fsync_policy=none` is benchmark-only and is rejected when `environment.type` is `production` or `pilot`.
