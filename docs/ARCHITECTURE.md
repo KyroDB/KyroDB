@@ -292,10 +292,10 @@ persistence:
 
 ## Performance
 
-Performance is workload-dependent. Use the included harnesses and benchmark suite:
+Performance is workload-dependent. Use the included validation and ANN benchmark kit:
 
 - Cache validation + hit-rate/latency breakdown: [Two-Level Cache Architecture](TWO_LEVEL_CACHE_ARCHITECTURE.md)
-- ANN recall/QPS/latency: `benchmarks/README.md` and `benchmarks/results/`
+- ANN recall/QPS/latency workflow: `benchmarks/README.md`
 
 ---
 

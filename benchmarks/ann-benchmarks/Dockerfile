@@ -15,7 +15,7 @@ FROM rust:1.86-bookworm AS builder
 
 # Default to the public KyroDB repo so ann-benchmarks runs do not depend on
 # caller environment variables being set correctly.
-ARG KYRODB_GIT=https://github.com/KyroDB/KyroDB.git
+ARG KYRODB_GIT=https://github.com/vatskishan03/KyroDB.git
 # Optional git ref (branch/tag/commit SHA). If unset, uses the repo default branch.
 ARG KYRODB_REF=
 

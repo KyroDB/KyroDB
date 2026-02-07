@@ -200,7 +200,7 @@ Cache validation (see [Two-Level Cache Architecture](docs/TWO_LEVEL_CACHE_ARCHIT
 - Bimodal latency: cache hits in microseconds; cold-tier misses in milliseconds
 
 ANN benchmarking:
-- See `benchmarks/README.md` and `benchmarks/results/` for dataset-specific recall/QPS/latency.
+- See `benchmarks/README.md` for ANN-Benchmarks submission workflow and dataset runs.
 
 ### Latency Distribution (12-Hour Test)
 

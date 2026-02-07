@@ -68,6 +68,25 @@ class KyroDB(BaseANN):
 
         self._logger = logging.getLogger(__name__)
 
+    def _needs_unit_norm(self) -> bool:
+        metric = self.metric.lower()
+        return metric in ("angular", "cosine")
+
+    @staticmethod
+    def _normalize_rows(arr: np.ndarray) -> np.ndarray:
+        out = np.asarray(arr, dtype=np.float32)
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        return out / norms
+
+    @staticmethod
+    def _normalize_vector(vec: np.ndarray) -> np.ndarray:
+        out = np.asarray(vec, dtype=np.float32)
+        norm = float(np.linalg.norm(out))
+        if norm <= 1e-12:
+            return out
+        return out / norm
+
     def _connect(self) -> None:
         if self._channel is None:
             options = [
@@ -108,8 +127,18 @@ class KyroDB(BaseANN):
         env["KYRODB__HNSW__MAX_ELEMENTS"] = str(int(max_elements))
 
         # Bench runs should measure ANN performance, not durability.
+        env.setdefault("KYRODB__ENVIRONMENT__TYPE", "benchmark")
         env.setdefault("KYRODB__PERSISTENCE__SNAPSHOT_INTERVAL_MUTATIONS", "0")
         env.setdefault("KYRODB__PERSISTENCE__FSYNC_POLICY", "none")
+        env.setdefault("KYRODB__PERSISTENCE__ALLOW_FRESH_START_ON_RECOVERY_FAILURE", "true")
+
+        # Minimize non-ANN behavior (predictor training/query cache effects).
+        env.setdefault("KYRODB__CACHE__STRATEGY", "lru")
+        env.setdefault("KYRODB__CACHE__CAPACITY", "1")
+        env.setdefault("KYRODB__CACHE__MIN_TRAINING_SAMPLES", "1")
+        env.setdefault("KYRODB__CACHE__QUERY_CACHE_CAPACITY", "1")
+        env.setdefault("KYRODB__CACHE__ENABLE_TRAINING_TASK", "false")
+        env.setdefault("KYRODB__CACHE__AUTO_TUNE_THRESHOLD", "false")
 
         # Keep thread counts bounded and explicit for reproducibility.
         # Allow overrides via KYRODB_BENCH_THREADS.
@@ -122,7 +151,8 @@ class KyroDB(BaseANN):
         env["KYRODB__SERVER__HTTP_PORT"] = str(self.port + 1000)
 
         # Keep logs small but visible in container logs if needed.
-        env.setdefault("RUST_LOG", "info")
+        env.setdefault("RUST_LOG", "warn")
+        env.setdefault("KYRODB__LOGGING__LEVEL", "warn")
 
         self._logger.info(
             "Starting kyrodb_server (port=%s http_port=%s dim=%s metric=%s)",
@@ -187,21 +217,25 @@ class KyroDB(BaseANN):
         if len(X.shape) != 2:
             raise ValueError(f"expected 2D array, got shape={X.shape}")
 
-        self._start_server_if_needed(int(X.shape[1]), int(len(X)))
+        index_vectors = np.asarray(X, dtype=np.float32)
+        if self._needs_unit_norm():
+            index_vectors = self._normalize_rows(index_vectors)
+
+        self._start_server_if_needed(int(index_vectors.shape[1]), int(len(index_vectors)))
         self._connect()
         assert self._stub is not None
 
         # Prefer BulkLoadHnsw for benchmark ingestion (bypasses hot tier, avoids flush).
         start = time.time()
         try:
-            resp = self._stub.BulkLoadHnsw(self._generate_insert_requests(X))
+            resp = self._stub.BulkLoadHnsw(self._generate_insert_requests(index_vectors))
             if not resp.success:
                 raise RuntimeError(resp.error)
             elapsed = time.time() - start
             self._logger.info(
                 "BulkLoadHnsw complete: n=%d dim=%d seconds=%.2f rate=%.0f vec/s",
-                len(X),
-                X.shape[1],
+                len(index_vectors),
+                index_vectors.shape[1],
                 elapsed,
                 float(getattr(resp, "avg_insert_rate", 0.0) or 0.0),
             )
@@ -212,12 +246,17 @@ class KyroDB(BaseANN):
             self._logger.info("BulkLoadHnsw failed (%s); falling back to BulkInsert+Flush", e)
 
         start_insert = time.time()
-        response = self._stub.BulkInsert(self._generate_insert_requests(X))
+        response = self._stub.BulkInsert(self._generate_insert_requests(index_vectors))
         if not response.success:
             raise RuntimeError(f"BulkInsert failed: {response.error}")
 
         elapsed = time.time() - start_insert
-        self._logger.info("BulkInsert complete: n=%d dim=%d seconds=%.2f", len(X), X.shape[1], elapsed)
+        self._logger.info(
+            "BulkInsert complete: n=%d dim=%d seconds=%.2f",
+            len(index_vectors),
+            index_vectors.shape[1],
+            elapsed,
+        )
 
         flush = self._stub.FlushHotTier(kyrodb_pb2.FlushRequest(force=True))
         if not flush.success:
@@ -235,15 +274,23 @@ class KyroDB(BaseANN):
         if metric in ("angular", "cosine"):
             return 1.0 - score
         if metric in ("euclidean", "l2"):
-            return -score
+            if score <= 0.0:
+                return float("inf")
+            return (1.0 / score) - 1.0
+        if metric in ("inner_product", "inner-product", "innerproduct"):
+            return 1.0 - score
         return 1.0 - score
 
     def query(self, q: np.ndarray, k: int) -> List[Tuple[int, float]]:
         self._connect()
         assert self._stub is not None
 
+        query_vec = np.asarray(q, dtype=np.float32)
+        if self._needs_unit_norm():
+            query_vec = self._normalize_vector(query_vec)
+
         req = kyrodb_pb2.SearchRequest(
-            query_embedding=list(map(float, q)),
+            query_embedding=list(map(float, query_vec)),
             k=int(k),
             ef_search=int(self.ef_search),
         )
@@ -256,8 +303,12 @@ class KyroDB(BaseANN):
         self._connect()
         assert self._stub is not None
 
+        query_vectors = np.asarray(X, dtype=np.float32)
+        if self._needs_unit_norm():
+            query_vectors = self._normalize_rows(query_vectors)
+
         def gen():
-            for q in X:
+            for q in query_vectors:
                 yield kyrodb_pb2.SearchRequest(
                     query_embedding=list(map(float, q)),
                     k=int(k),

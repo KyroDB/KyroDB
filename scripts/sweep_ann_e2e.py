@@ -273,6 +273,13 @@ def _best_by_recall(rows: List[Dict[str, Any]], *, min_recall: float) -> Optiona
 
 
 def main() -> int:
+    if not Path("benchmarks/run_benchmark.py").exists():
+        raise SystemExit(
+            "This E2E sweep script depends on benchmarks/run_benchmark.py, which was removed "
+            "when benchmarking was streamlined for ANN-Benchmarks submission only. "
+            "Use benchmarks/README.md (ann-benchmarks workflow) instead."
+        )
+
     parser = argparse.ArgumentParser(description="End-to-end KyroDB ANN sweep (server + benchmark runner)")
     parser.add_argument("--dataset", default="sift-128-euclidean")
     parser.add_argument("--k", type=int, default=10)
