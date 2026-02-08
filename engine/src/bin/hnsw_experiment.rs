@@ -294,8 +294,7 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn inner_product_distance(a: &[f32], b: &[f32]) -> f32 {
-    // DistDot is implemented as a distance in hnsw_rs; for recall comparison here we use
-    // -dot so that "smaller is better".
+    // For recall comparison we use -dot so that "smaller is better".
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     -dot
 }

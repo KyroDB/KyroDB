@@ -112,6 +112,13 @@ struct BackupRow {
     description: String,
 }
 
+#[cfg(feature = "cli-tools")]
+fn spinner_style() -> Result<ProgressStyle> {
+    ProgressStyle::default_spinner()
+        .template("{spinner:.green} {msg}")
+        .map_err(|e| anyhow::anyhow!("failed to build progress bar style: {e}"))
+}
+
 fn main() -> Result<()> {
     #[cfg(feature = "cli-tools")]
     env_logger::init();
@@ -132,11 +139,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "cli-tools")]
             let progress = {
                 let p = ProgressBar::new_spinner();
-                p.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.green} {msg}")
-                        .unwrap(),
-                );
+                p.set_style(spinner_style()?);
                 p
             };
 
@@ -240,11 +243,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "cli-tools")]
             let progress = {
                 let p = ProgressBar::new_spinner();
-                p.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.green} {msg}")
-                        .unwrap(),
-                );
+                p.set_style(spinner_style()?);
                 p
             };
 
@@ -297,11 +296,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "cli-tools")]
             let progress = {
                 let p = ProgressBar::new_spinner();
-                p.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.green} {msg}")
-                        .unwrap(),
-                );
+                p.set_style(spinner_style()?);
                 p.set_message("Evaluating backups for pruning...");
                 p
             };
@@ -328,11 +323,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "cli-tools")]
             let progress = {
                 let p = ProgressBar::new_spinner();
-                p.set_style(
-                    ProgressStyle::default_spinner()
-                        .template("{spinner:.green} {msg}")
-                        .unwrap(),
-                );
+                p.set_style(spinner_style()?);
                 p.set_message("Verifying backup integrity...");
                 p
             };

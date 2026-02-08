@@ -15,6 +15,7 @@
 //! 2. **Search Quality**: Are k-NN results relevant?
 //! 3. **Prediction Quality**: Does learned predictor predict relevant docs?
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// Single ranking result with position and relevance
@@ -58,7 +59,7 @@ pub fn calculate_dcg(results: &[RankingResult], k: usize) -> f64 {
 /// IDCG score (maximum possible DCG)
 pub fn calculate_idcg(relevance_scores: &[f64], k: usize) -> f64 {
     let mut sorted_relevance = relevance_scores.to_vec();
-    sorted_relevance.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    sorted_relevance.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
 
     sorted_relevance
         .iter()

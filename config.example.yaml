@@ -41,6 +41,8 @@ server:
 # Authentication (API keys for gRPC and optionally observability)
 auth:
   # Enable API key auth
+  # NOTE: Keeping this false is only valid for loopback/local deployments.
+  # Production with non-loopback gRPC bind requires auth.enabled=true.
   enabled: false
 
   # Path to API keys file (YAML)

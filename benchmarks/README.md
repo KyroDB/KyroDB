@@ -75,6 +75,11 @@ Build the runner:
 cargo build --release -p kyrodb-engine --bin ann_inproc_bench
 ```
 
+Backend note (2026-02-08):
+
+- `ann_inproc_bench` exercises `HnswVectorIndex` with backend `kyro_single_graph`.
+- The backend keeps a single mutable/readable graph representation for both inserts and queries.
+
 Download datasets (example: SIFT):
 
 ```bash
@@ -111,6 +116,16 @@ Run the same flow for:
 - `gist-960-euclidean`
 - `mnist-784-euclidean`
 
+### Metric Semantics (`ann_inproc_bench`)
+
+`ann_inproc_bench` now emits two throughput metrics per sweep:
+
+- `qps_mean` (primary): **search-only** throughput (recall computation excluded).
+- `end_to_end_qps_mean`: throughput including benchmark-side recall/evaluation work.
+- `config.ann_backend`: backend identifier used for the run (currently `kyro_single_graph`).
+
+Use `qps_mean` for ANN core performance claims. Keep `end_to_end_qps_mean` for harness cost visibility.
+
 ## Azure Multi-Dataset In-Process Suite (Recommended)
 
 Use the suite runner to execute a reproducible matrix across:
@@ -142,6 +157,8 @@ Outputs are written under:
 - `target/ann_inproc/<run_id>/summary/inproc_summary.json` machine-readable ranked summary
 - `target/ann_inproc/<run_id>/summary/inproc_summary.md` publication-ready markdown
 - `target/ann_inproc/<run_id>/summary/inproc_candidates.csv` flattened candidate table
+
+Summary artifacts expose both `qps_search` (primary) and `qps_e2e` columns.
 
 Manual summary generation (if needed):
 

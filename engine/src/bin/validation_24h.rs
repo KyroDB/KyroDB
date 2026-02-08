@@ -231,9 +231,10 @@ impl MockDocumentStore {
         debug_assert_eq!(embedding.len(), self.embedding_dim);
 
         let mut rng = ChaCha8Rng::seed_from_u64(doc_id);
-        let noise = Normal::new(0.0, self.noise_stddev as f64).expect("valid noise distribution");
-        for value in embedding.iter_mut() {
-            *value += noise.sample(&mut rng) as f32;
+        if let Ok(noise) = Normal::new(0.0, self.noise_stddev as f64) {
+            for value in embedding.iter_mut() {
+                *value += noise.sample(&mut rng) as f32;
+            }
         }
 
         normalize_embedding(&mut embedding);

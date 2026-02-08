@@ -9,7 +9,9 @@ use crate::config::DistanceMetric;
 use crate::hnsw_index::{HnswVectorIndex, SearchResult};
 use crate::metadata_filter;
 use crate::metrics::MetricsCollector;
-use crate::persistence::{FsyncPolicy, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter};
+use crate::persistence::{
+    FsyncPolicy, Manifest, Snapshot, WalEntry, WalErrorHandler, WalOp, WalReader, WalWriter,
+};
 use crate::proto::MetadataFilter;
 use anyhow::{Context, Result};
 use parking_lot::{Mutex, RwLock};
@@ -22,6 +24,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, instrument, trace, warn};
+
+/// Process-unique base for WAL file IDs when the system clock is invalid.
+/// Initialized lazily on first use with (PID << 32 | random_u32) to prevent
+/// collisions with WAL files from a previous process that also had a bad clock.
+static FALLBACK_WAL_FILE_ID: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_WAL_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Returns a process-unique monotonic WAL file ID for the clock-failure path.
+/// First call seeds the counter with (pid << 32 | random_u32); subsequent calls
+/// increment atomically.  The 32-bit PID prefix partitions the namespace across
+/// processes and the random suffix handles PID recycling.
+fn next_fallback_wal_file_id() -> u64 {
+    FALLBACK_WAL_INIT.call_once(|| {
+        use rand::Rng;
+        let pid = u64::from(std::process::id());
+        let random_suffix: u32 = rand::thread_rng().gen();
+        let base = (pid << 32) | u64::from(random_suffix);
+        FALLBACK_WAL_FILE_ID.store(base, Ordering::Relaxed);
+    });
+    FALLBACK_WAL_FILE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Default)]
 struct MetadataInvertedIndex {
@@ -350,6 +373,8 @@ pub struct HnswBackend {
 struct PersistenceState {
     data_dir: PathBuf,
     wal: Arc<RwLock<WalWriter>>,
+    wal_error_handler: Arc<WalErrorHandler>,
+    wal_metrics: MetricsCollector,
     inserts_since_snapshot: Arc<RwLock<usize>>,
     snapshot_interval: usize,
     next_wal_seq: Arc<AtomicU64>,
@@ -377,7 +402,11 @@ impl PersistenceState {
             .to_string();
 
         // Create the file first, but do not start writing to it until the MANIFEST references it.
-        let new_writer = WalWriter::create(&new_wal_path, self.fsync_policy)?;
+        let new_writer = WalWriter::create_with_error_handler(
+            &new_wal_path,
+            self.fsync_policy,
+            Some(Arc::clone(&self.wal_error_handler)),
+        )?;
 
         let _manifest_guard = self.manifest_lock.lock();
         let manifest_path = self.data_dir.join("MANIFEST");
@@ -404,7 +433,8 @@ impl PersistenceState {
 impl HnswBackend {
     /// Compact tombstones by rebuilding the in-memory HNSW index and document store.
     ///
-    /// KyroDB uses soft deletes (tombstones) because `hnsw_rs` does not support deletions.
+    /// KyroDB uses soft deletes (tombstones) because graph edge rewiring delete is
+    /// intentionally deferred to compaction/rebuild paths.
     /// Over time, tombstones can consume HNSW capacity (`max_elements`). This compaction:
     /// - Drops tombstones from the document store (compacts internal IDs)
     /// - Rebuilds the HNSW graph from live documents only
@@ -715,6 +745,8 @@ impl HnswBackend {
             documents = embeddings.len(),
             dimension, "building HNSW index (persistence)"
         );
+
+        let mut live_indices: Vec<usize> = Vec::with_capacity(embeddings.len());
         for (doc_id, embedding) in embeddings.iter_mut().enumerate() {
             if embedding.iter().all(|&x| x == 0.0) {
                 continue;
@@ -728,24 +760,37 @@ impl HnswBackend {
                 );
             }
             normalize_in_place_if_needed(distance, embedding)?;
-            index.add_vector(doc_id as u64, embedding)?;
+            live_indices.push(doc_id);
         }
+        let batch: Vec<(&[f32], usize)> = live_indices
+            .iter()
+            .map(|&doc_id| (embeddings[doc_id].as_slice(), doc_id))
+            .collect();
+        index.parallel_insert_batch(&batch)?;
         info!("HNSW index built (persistence)");
 
         // Create initial WAL
         let wal_path = data_dir.join(format!("wal_{}.wal", Self::file_id()));
-        let wal = WalWriter::create(&wal_path, fsync_policy)?;
+        let wal_metrics = MetricsCollector::new();
+        let wal_error_handler = Arc::new(WalErrorHandler::with_metrics(wal_metrics.clone()));
+        let wal = WalWriter::create_with_error_handler(
+            &wal_path,
+            fsync_policy,
+            Some(Arc::clone(&wal_error_handler)),
+        )?;
 
         // Update manifest
         let mut manifest = Manifest::load_or_create(data_dir.join("MANIFEST"))?;
         manifest
             .wal_segments
-            .push(wal_path.file_name().unwrap().to_string_lossy().to_string());
+            .push(Self::wal_segment_name(&wal_path)?);
         manifest.save(data_dir.join("MANIFEST"))?;
 
         let persistence = PersistenceState {
             data_dir,
             wal: Arc::new(RwLock::new(wal)),
+            wal_error_handler,
+            wal_metrics,
             inserts_since_snapshot: Arc::new(RwLock::new(0)),
             snapshot_interval,
             next_wal_seq: Arc::new(AtomicU64::new(1)),
@@ -1074,7 +1119,7 @@ impl HnswBackend {
         }
 
         // Phase 2: Parallel HNSW graph construction from pre-validated embeddings.
-        // Uses hnsw_rs's Rayon-backed parallel_insert_slice for concurrent graph building.
+        // Uses backend batch insertion for concurrent graph building where supported.
         let batch: Vec<(&[f32], usize)> = doc_store
             .embeddings
             .iter()
@@ -1092,18 +1137,25 @@ impl HnswBackend {
 
         // Create new active WAL
         let wal_path = data_dir.join(format!("wal_{}.wal", Self::file_id()));
-        let wal = WalWriter::create(&wal_path, fsync_policy)?;
+        let wal_error_handler = Arc::new(WalErrorHandler::with_metrics(metrics.clone()));
+        let wal = WalWriter::create_with_error_handler(
+            &wal_path,
+            fsync_policy,
+            Some(Arc::clone(&wal_error_handler)),
+        )?;
 
         // Update manifest
         let mut manifest = manifest;
         manifest
             .wal_segments
-            .push(wal_path.file_name().unwrap().to_string_lossy().to_string());
+            .push(Self::wal_segment_name(&wal_path)?);
         manifest.save(&manifest_path)?;
 
         let persistence = PersistenceState {
             data_dir,
             wal: Arc::new(RwLock::new(wal)),
+            wal_error_handler,
+            wal_metrics: metrics.clone(),
             inserts_since_snapshot: Arc::new(RwLock::new(0)),
             snapshot_interval,
             next_wal_seq: Arc::new(AtomicU64::new(max_wal_seq.saturating_add(1))),
@@ -1132,18 +1184,44 @@ impl HnswBackend {
         })
     }
 
+    fn wal_segment_name(wal_path: &Path) -> Result<String> {
+        wal_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to derive WAL segment name from path: {}",
+                    wal_path.display()
+                )
+            })
+    }
+
     fn timestamp() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is set before Unix epoch (1970-01-01) - this should never happen on a properly configured system")
-            .as_secs()
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "system clock is before UNIX epoch; using timestamp=0"
+                );
+                0
+            }
+        }
     }
 
     fn file_id() -> u64 {
-        let dur = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is set before Unix epoch (1970-01-01) - this should never happen on a properly configured system");
-        u64::try_from(dur.as_micros()).unwrap_or(u64::MAX)
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            Err(error) => {
+                let fallback = next_fallback_wal_file_id();
+                warn!(
+                    error = %error,
+                    fallback_file_id = fallback,
+                    "system clock is before UNIX epoch; using process-unique fallback WAL file id"
+                );
+                fallback
+            }
+        }
     }
 
     /// Get vector dimension
@@ -1165,6 +1243,13 @@ impl HnswBackend {
     /// This occurs when a WAL rollback fails after a failed HNSW insert.
     pub fn is_wal_inconsistent(&self) -> bool {
         self.wal_inconsistent.load(Ordering::SeqCst)
+    }
+
+    pub fn wal_writes_failed(&self) -> u64 {
+        self.persistence
+            .as_ref()
+            .map(|p| p.wal_metrics.get_wal_writes_failed())
+            .unwrap_or(0)
     }
 
     /// Lightweight existence check that avoids cloning embeddings
@@ -1221,28 +1306,25 @@ impl HnswBackend {
         }
 
         let mut embedding = embedding;
+        let distance = self.index.read().distance_metric();
+        normalize_in_place_if_needed(distance, &mut embedding)?;
+
         let mut attempted_compaction = false;
         loop {
             let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
 
-            // Update in-memory index and document store
+            // Serialize WAL append and in-memory mutation in one write critical section.
+            // This guarantees WAL replay order matches acknowledged commit order.
             let mut index = self.index.write();
             let mut store = self.doc_store.write();
-
-            let old_internal_id = store.external_to_internal.get(&doc_id).copied();
-            let old_metadata = old_internal_id.map(|id| store.metadata[id].clone());
-
-            let distance = index.distance_metric();
-            normalize_in_place_if_needed(distance, &mut embedding)?;
-
             if index.is_full() {
                 let tombstones = store
                     .internal_to_external
                     .iter()
                     .filter(|v| v.is_none())
                     .count();
-                drop(store);
                 drop(index);
+                drop(store);
                 drop(snapshot_guard);
 
                 if !attempted_compaction && tombstones > 0 {
@@ -1253,14 +1335,13 @@ impl HnswBackend {
                     }
                 }
 
+                let index = self.index.read();
                 anyhow::bail!(
                     "HNSW index full: {} elements (max {})",
-                    self.index.read().len(),
-                    self.index.read().capacity()
+                    index.len(),
+                    index.capacity()
                 );
             }
-
-            let internal_id = store.embeddings.len();
 
             let embedding_for_wal = embedding.clone();
             let metadata_for_wal = metadata.clone();
@@ -1297,6 +1378,10 @@ impl HnswBackend {
                     );
                 }
             }
+
+            let old_internal_id = store.external_to_internal.get(&doc_id).copied();
+            let old_metadata = old_internal_id.map(|id| store.metadata[id].clone());
+            let internal_id = store.embeddings.len();
 
             if let Err(e) = index.add_vector(internal_id as u64, &embedding) {
                 // WAL already contains the insert, but the in-memory index update failed.
@@ -1346,6 +1431,9 @@ impl HnswBackend {
                 return Err(e).context("HNSW insert failed after WAL append");
             }
 
+            // Ensure read-optimized backend state stays active for sequential insert flows.
+            index.complete_sequential_inserts();
+
             store.embeddings.push(std::mem::take(&mut embedding));
             store.metadata.push(metadata);
             store.internal_to_external.push(Some(doc_id));
@@ -1389,7 +1477,6 @@ impl HnswBackend {
             // performing disk I/O while holding write locks would block writers.
             drop(index);
             drop(store);
-
             drop(snapshot_guard);
 
             if should_create_snapshot {
@@ -1555,6 +1642,10 @@ impl HnswBackend {
                     "bulk_insert progress"
                 );
             }
+        }
+
+        if loaded > 0 {
+            index.complete_sequential_inserts();
         }
 
         drop(store);
@@ -1975,6 +2066,10 @@ impl HnswBackend {
     /// Efficiently deletes multiple documents with a single lock acquisition and batched WAL write.
     #[instrument(skip(self, doc_ids), fields(count = doc_ids.len()))]
     pub fn batch_delete(&self, doc_ids: &[u64]) -> Result<u64> {
+        if self.wal_inconsistent.load(Ordering::SeqCst) {
+            anyhow::bail!("Batch delete rejected: WAL is in an inconsistent state.");
+        }
+
         // Acquire write lock for document store
         let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
 
@@ -2244,59 +2339,46 @@ impl HnswBackend {
         }
 
         let search_k = std::cmp::min(k * 2, 10_000);
-        let distance = self.index.read().distance_metric();
+        let index = self.index.read();
+        let distance = index.distance_metric();
 
-        // Process queries in parallel
-        let results: Vec<Result<Vec<SearchResult>>> = queries
+        // Process query ANN traversals in parallel while holding only the index read lock.
+        let raw_results: Vec<Result<Vec<SearchResult>>> = queries
             .par_iter()
             .map(|query| {
-                // Acquire read locks inside the Rayon closure so we don't capture non-Send guards.
-                let index = self.index.read();
                 let normalized_query = normalize_query_if_needed(distance, query)?;
-                let mut results = index.knn_search_with_ef(
-                    normalized_query.as_ref(),
-                    search_k,
-                    ef_search_override,
-                )?;
-                drop(index);
-
-                let store = self.doc_store.read();
-
-                // Filter out tombstones and map internal IDs to external IDs
-                results.retain(|r| {
-                    let internal_id = r.doc_id as usize;
-                    store
-                        .internal_to_external
-                        .get(internal_id)
-                        .and_then(|v| *v)
-                        .is_some()
-                });
-
-                results.sort_by(|a, b| {
-                    a.distance
-                        .partial_cmp(&b.distance)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                results.truncate(k);
-
-                let mut mapped = Vec::with_capacity(results.len());
-                for r in results {
-                    let internal_id = r.doc_id as usize;
-                    if let Some(external_id) =
-                        store.internal_to_external.get(internal_id).and_then(|v| *v)
-                    {
-                        mapped.push(SearchResult {
-                            doc_id: external_id,
-                            distance: r.distance,
-                        });
-                    }
-                }
-                Ok(mapped)
+                index.knn_search_with_ef(normalized_query.as_ref(), search_k, ef_search_override)
             })
             .collect();
+        let raw_results: Vec<Vec<SearchResult>> = raw_results.into_iter().collect::<Result<_>>()?;
+        drop(index);
 
-        // Convert Vec<Result<T>> to Result<Vec<T>>
-        results.into_iter().collect()
+        // Map internal IDs to external IDs in a single doc_store read pass (no O(N) clone).
+        let store = self.doc_store.read();
+        let mapped = raw_results
+            .into_iter()
+            .map(|mut results| {
+                // Results are already sorted by ascending distance from the index backend;
+                // preserve that order while filtering tombstones.
+                let mut out = Vec::with_capacity(k.min(results.len()));
+                for r in results.drain(..) {
+                    let internal_id = r.doc_id as usize;
+                    let external_id = match store.internal_to_external.get(internal_id) {
+                        Some(Some(doc_id)) => *doc_id,
+                        _ => continue,
+                    };
+                    out.push(SearchResult {
+                        doc_id: external_id,
+                        distance: r.distance,
+                    });
+                    if out.len() >= k {
+                        break;
+                    }
+                }
+                out
+            })
+            .collect();
+        Ok(mapped)
     }
 
     /// Return document IDs matching a structured metadata filter.
@@ -2690,11 +2772,58 @@ mod tests {
 
         // Query closest to doc 0
         let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
-        let results = backend.knn_search(&query, 2).unwrap();
+        // Pin ef_search for deterministic high-recall behavior in this tiny synthetic graph.
+        let results = backend.knn_search_with_ef(&query, 2, Some(128)).unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].doc_id, 0); // Exact match
         assert_eq!(results[1].doc_id, 1); // Similar
+    }
+
+    #[test]
+    fn test_hnsw_backend_knn_search_batch_matches_single_query_path() {
+        let embeddings = vec![
+            normalize(vec![1.0, 0.0, 0.0, 0.0]),
+            normalize(vec![0.9, 0.1, 0.0, 0.0]),
+            normalize(vec![0.0, 1.0, 0.0, 0.0]),
+            normalize(vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+
+        let metadata = vec![HashMap::new(); embeddings.len()];
+        let backend =
+            HnswBackend::new(4, DistanceMetric::Cosine, embeddings, metadata, 100).unwrap();
+
+        // Tombstone one entry to verify filtering logic in the batch mapping path.
+        assert!(backend.delete(1).unwrap());
+
+        let queries = vec![
+            normalize(vec![1.0, 0.0, 0.0, 0.0]),
+            normalize(vec![0.0, 1.0, 0.0, 0.0]),
+        ];
+        let batch = backend.knn_search_batch(&queries, 3, Some(128)).unwrap();
+        assert_eq!(batch.len(), queries.len());
+
+        for results in &batch {
+            assert!(results.len() <= 3);
+            assert!(
+                results.windows(2).all(|w| w[0].distance <= w[1].distance),
+                "batch results must stay distance-sorted"
+            );
+            assert!(
+                results.iter().all(|r| r.doc_id != 1),
+                "tombstoned document must not appear in batch results"
+            );
+        }
+
+        // Batch behavior must match per-query path for correctness.
+        let single0 = backend
+            .knn_search_with_ef(&queries[0], 3, Some(128))
+            .unwrap();
+        let single1 = backend
+            .knn_search_with_ef(&queries[1], 3, Some(128))
+            .unwrap();
+        assert_eq!(batch[0], single0);
+        assert_eq!(batch[1], single1);
     }
 
     #[test]
@@ -2706,6 +2835,28 @@ mod tests {
         assert!(!backend.is_empty());
         assert_eq!(backend.len(), 1);
         assert_eq!(backend.dimension(), 2);
+    }
+
+    #[test]
+    fn test_batch_delete_rejected_when_wal_inconsistent() {
+        let backend = HnswBackend::new(
+            2,
+            DistanceMetric::Cosine,
+            vec![normalize(vec![1.0, 0.0])],
+            vec![HashMap::new()],
+            100,
+        )
+        .unwrap();
+
+        backend.wal_inconsistent.store(true, Ordering::SeqCst);
+        let err = backend
+            .batch_delete(&[0])
+            .expect_err("batch_delete must be rejected when WAL is inconsistent");
+        assert!(
+            err.to_string().contains("WAL is in an inconsistent state"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use rand::Rng;
 
 /// Calculate cosine distance between two vectors
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    // Match the `anndists::dist::distances::DistCosine` implementation used by `hnsw_rs`:
+    // Match KyroDB's cosine-distance semantics: clamp at 0 for FP stability.
     // - accumulate in f64
     // - clamp negative distances to 0 (numerical noise)
     // - return 0 for degenerate vectors
@@ -277,8 +277,8 @@ proptest! {
 
     #[test]
     fn prop_hnsw_no_crash_on_edge_cases(
-        dimension in 10usize..256,  // Avoid dimension < 10 (hnsw_rs edge case)
-        count in 10usize..1000,     // Avoid count < 10 (hnsw_rs edge case)
+        dimension in 10usize..256,
+        count in 10usize..1000,
         k in 1usize..20             // Reasonable k values
     ) {
         // Should not crash on any valid inputs
@@ -287,7 +287,7 @@ proptest! {
 
         let mut idx = index.unwrap();
 
-        // Insert multiple vectors (at least 5) to avoid hnsw_rs destructor edge case
+        // Insert multiple vectors to exercise graph traversal on non-trivial topology.
         let insert_count = 5.min(count);
         for i in 0..insert_count {
             let mut raw = Vec::with_capacity(dimension);

@@ -57,6 +57,9 @@ pub mod metadata_filter;
 // Adaptive oversampling for filtered search
 pub mod adaptive_oversampling;
 
+// ANN backend abstraction (internal)
+pub(crate) mod ann_backend;
+
 // SIMD-accelerated vector math (runtime-dispatched, safe fallback)
 pub(crate) mod simd;
 

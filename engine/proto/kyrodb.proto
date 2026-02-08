@@ -13,7 +13,7 @@ service KyroDBService {
   // ============================================================================
   
   // Insert a single document with embedding
-  // Latency: ~100-200ns (hot tier write)
+  // Durability: ACK after WAL append (per fsync policy) and cold-tier update.
   rpc Insert(InsertRequest) returns (InsertResponse);
   
   // Insert multiple documents in a streaming fashion
@@ -44,7 +44,7 @@ service KyroDBService {
   rpc Query(QueryRequest) returns (QueryResponse);
   
   // k-NN vector similarity search
-  // Latency: <1ms P99 @ 10M vectors
+  // Latency/recall depend on HNSW params, dataset, and hardware.
   // Returns top-k most similar documents
   rpc Search(SearchRequest) returns (SearchResponse);
   

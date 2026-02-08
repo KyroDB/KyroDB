@@ -273,16 +273,11 @@ impl HotTier {
         } else {
             // Never flushed - check if any documents are old enough
             if !docs.is_empty() {
-                // Safety: docs guaranteed non-empty by check above (line 255)
-                // We hold the read lock, so no concurrent modification is possible
-                let oldest = docs
-                    .values()
-                    .map(|doc| doc.inserted_at)
-                    .min()
-                    .expect("BUG: docs cannot be empty (checked on line 255, read lock held)");
-
-                if oldest.elapsed() >= self.max_age {
-                    return true;
+                let oldest = docs.values().map(|doc| doc.inserted_at).min();
+                if let Some(oldest) = oldest {
+                    if oldest.elapsed() >= self.max_age {
+                        return true;
+                    }
                 }
             }
         }

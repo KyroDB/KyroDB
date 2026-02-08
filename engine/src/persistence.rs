@@ -33,6 +33,19 @@ const WAL_MAGIC: u32 = 0x57414C00; // "WAL\0"
 /// Snapshot magic number
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
 
+fn unix_timestamp_secs_now() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "system clock is before UNIX epoch; using timestamp=0"
+            );
+            0
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum WalOp {
@@ -605,10 +618,7 @@ impl Snapshot {
         metadata: Vec<(u64, HashMap<String, String>)>,
         last_wal_seq: u64,
     ) -> Result<Self> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let timestamp = unix_timestamp_secs_now();
 
         let mut snapshot = Self {
             version: 3, // WAL sequence tracking
@@ -972,10 +982,7 @@ impl Default for Manifest {
 
 impl Manifest {
     pub fn new() -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let timestamp = unix_timestamp_secs_now();
 
         Self {
             version: 1,

@@ -111,6 +111,7 @@ struct DatasetSummary {
 
 #[derive(Debug, Serialize)]
 struct RunConfig {
+    ann_backend: String,
     distance: String,
     k: usize,
     m: usize,
@@ -139,23 +140,35 @@ struct SweepResult {
 #[derive(Debug, Serialize)]
 struct RepetitionResult {
     recall_at_k: f64,
+    /// Search-only QPS (excludes recall/evaluation computation).
+    qps_search: f64,
+    /// End-to-end QPS for benchmark repetition (includes recall/evaluation).
+    qps_end_to_end: f64,
+    /// Backward-compatible alias for search-only QPS.
     qps: f64,
     p50_latency_ms: f64,
     p95_latency_ms: f64,
     p99_latency_ms: f64,
     measured_queries: usize,
     filtered_ground_truth_queries: usize,
+    search_elapsed_ms: f64,
+    evaluation_elapsed_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
 struct AggregateResult {
     recall_mean: f64,
     recall_std: f64,
+    /// Search-only QPS aggregate (kept as canonical `qps_*` for compatibility).
     qps_mean: f64,
     qps_std: f64,
+    end_to_end_qps_mean: f64,
+    end_to_end_qps_std: f64,
     p50_latency_ms_mean: f64,
     p95_latency_ms_mean: f64,
     p99_latency_ms_mean: f64,
+    search_elapsed_ms_mean: f64,
+    evaluation_elapsed_ms_mean: f64,
 }
 
 fn main() -> Result<()> {
@@ -293,6 +306,7 @@ fn main() -> Result<()> {
             truncated_queries: dataset.test_rows != original_queries,
         },
         config: RunConfig {
+            ann_backend: index.backend_name().to_string(),
             distance: format!("{:?}", distance).to_lowercase(),
             k: args.k,
             m: args.m,
@@ -433,10 +447,10 @@ fn load_ann_dataset(path: &Path) -> Result<AnnDataset> {
         );
     }
 
-    let train_rows = read_u64(&mut reader)? as usize;
-    let test_rows = read_u64(&mut reader)? as usize;
-    let dimension = read_u64(&mut reader)? as usize;
-    let neighbors_cols = read_u64(&mut reader)? as usize;
+    let train_rows = read_u64_as_usize(&mut reader, "train_rows")?;
+    let test_rows = read_u64_as_usize(&mut reader, "test_rows")?;
+    let dimension = read_u64_as_usize(&mut reader, "dimension")?;
+    let neighbors_cols = read_u64_as_usize(&mut reader, "neighbors_cols")?;
 
     if train_rows == 0 || test_rows == 0 || dimension == 0 || neighbors_cols == 0 {
         anyhow::bail!(
@@ -471,6 +485,12 @@ fn read_u64(reader: &mut impl Read) -> Result<u64> {
     let mut bytes = [0u8; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u64_as_usize(reader: &mut impl Read, field: &str) -> Result<usize> {
+    let value = read_u64(reader)?;
+    usize::try_from(value)
+        .with_context(|| format!("annbin header field '{}' overflows usize: {}", field, value))
 }
 
 fn read_f32_array(reader: &mut impl Read, count: usize) -> Result<Vec<f32>> {
@@ -536,20 +556,26 @@ fn run_sweep(
 
     for _ in 0..repetitions {
         let mut latencies_ns = Vec::with_capacity(dataset.test_rows);
-        let mut recall_sum = 0.0;
-        let mut recall_count = 0usize;
-        let mut filtered_ground_truth_queries = 0usize;
-
-        let start_all = Instant::now();
+        let mut query_results = Vec::with_capacity(dataset.test_rows);
+        let search_start = Instant::now();
 
         for q_idx in 0..dataset.test_rows {
             let query = dataset.test_row(q_idx);
             let start = Instant::now();
             let results = index.knn_search_with_ef(query, k, Some(ef_search))?;
             latencies_ns.push(start.elapsed().as_nanos() as u64);
+            query_results.push(results);
+        }
+        let search_elapsed = search_start.elapsed();
 
+        let evaluation_start = Instant::now();
+        let mut recall_sum = 0.0;
+        let mut recall_count = 0usize;
+        let mut filtered_ground_truth_queries = 0usize;
+
+        for (q_idx, results) in query_results.iter().enumerate() {
             let gt_row = dataset.neighbors_row(q_idx);
-            match recall_at_k(&results, gt_row, k, dataset.train_rows) {
+            match recall_at_k(results, gt_row, k, dataset.train_rows) {
                 Some(r) => {
                     recall_sum += r;
                     recall_count += 1;
@@ -559,11 +585,18 @@ fn run_sweep(
                 }
             }
         }
+        let evaluation_elapsed = evaluation_start.elapsed();
 
-        let elapsed = start_all.elapsed().as_secs_f64();
+        let search_elapsed_secs = search_elapsed.as_secs_f64();
+        let end_to_end_elapsed_secs = search_elapsed_secs + evaluation_elapsed.as_secs_f64();
         let measured = dataset.test_rows;
-        let qps = if elapsed > 0.0 {
-            measured as f64 / elapsed
+        let qps_search = if search_elapsed_secs > 0.0 {
+            measured as f64 / search_elapsed_secs
+        } else {
+            0.0
+        };
+        let qps_end_to_end = if end_to_end_elapsed_secs > 0.0 {
+            measured as f64 / end_to_end_elapsed_secs
         } else {
             0.0
         };
@@ -578,17 +611,25 @@ fn run_sweep(
 
         repetition_results.push(RepetitionResult {
             recall_at_k: recall,
-            qps,
+            qps_search,
+            qps_end_to_end,
+            qps: qps_search,
             p50_latency_ms: p50,
             p95_latency_ms: p95,
             p99_latency_ms: p99,
             measured_queries: measured,
             filtered_ground_truth_queries,
+            search_elapsed_ms: search_elapsed_secs * 1000.0,
+            evaluation_elapsed_ms: evaluation_elapsed.as_secs_f64() * 1000.0,
         });
     }
 
     let recall_values: Vec<f64> = repetition_results.iter().map(|r| r.recall_at_k).collect();
-    let qps_values: Vec<f64> = repetition_results.iter().map(|r| r.qps).collect();
+    let qps_values: Vec<f64> = repetition_results.iter().map(|r| r.qps_search).collect();
+    let end_to_end_qps_values: Vec<f64> = repetition_results
+        .iter()
+        .map(|r| r.qps_end_to_end)
+        .collect();
     let p50_values: Vec<f64> = repetition_results
         .iter()
         .map(|r| r.p50_latency_ms)
@@ -601,15 +642,27 @@ fn run_sweep(
         .iter()
         .map(|r| r.p99_latency_ms)
         .collect();
+    let search_elapsed_values: Vec<f64> = repetition_results
+        .iter()
+        .map(|r| r.search_elapsed_ms)
+        .collect();
+    let evaluation_elapsed_values: Vec<f64> = repetition_results
+        .iter()
+        .map(|r| r.evaluation_elapsed_ms)
+        .collect();
 
     let aggregate = AggregateResult {
         recall_mean: mean(&recall_values),
         recall_std: stddev(&recall_values),
         qps_mean: mean(&qps_values),
         qps_std: stddev(&qps_values),
+        end_to_end_qps_mean: mean(&end_to_end_qps_values),
+        end_to_end_qps_std: stddev(&end_to_end_qps_values),
         p50_latency_ms_mean: mean(&p50_values),
         p95_latency_ms_mean: mean(&p95_values),
         p99_latency_ms_mean: mean(&p99_values),
+        search_elapsed_ms_mean: mean(&search_elapsed_values),
+        evaluation_elapsed_ms_mean: mean(&evaluation_elapsed_values),
     };
 
     Ok(SweepResult {
@@ -699,4 +752,72 @@ fn stddev(values: &[f64]) -> f64 {
         .sum::<f64>()
         / values.len() as f64;
     variance.sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_dataset() -> AnnDataset {
+        // 4 training vectors in 2D laid on axes/diagonals.
+        let train_flat = vec![
+            1.0, 0.0, // id 0
+            0.0, 1.0, // id 1
+            1.0, 1.0, // id 2
+            -1.0, 0.0, // id 3
+        ];
+
+        // Two queries near id 0 and id 1.
+        let test_flat = vec![
+            0.9, 0.1, // q0
+            0.1, 0.9, // q1
+        ];
+
+        // Ground truth top-2 IDs for each query.
+        let neighbors_flat = vec![
+            0, 2, // q0
+            1, 2, // q1
+        ];
+
+        AnnDataset {
+            train_rows: 4,
+            test_rows: 2,
+            dimension: 2,
+            neighbors_cols: 2,
+            train_flat,
+            test_flat,
+            neighbors_flat,
+        }
+    }
+
+    #[test]
+    fn run_sweep_reports_search_and_end_to_end_qps() {
+        let dataset = tiny_dataset();
+        let mut index =
+            HnswVectorIndex::new_with_params(2, 4, DistanceMetric::Euclidean, 8, 32, false)
+                .expect("index init");
+        let batch = dataset.build_insert_batch().expect("batch build");
+        index
+            .parallel_insert_batch(&batch)
+            .expect("parallel insert should succeed");
+
+        let sweep = run_sweep(&index, &dataset, 2, 32, 1, 0).expect("sweep");
+        assert_eq!(sweep.repetitions.len(), 1);
+        let rep = &sweep.repetitions[0];
+
+        assert!(rep.qps_search > 0.0, "search qps should be > 0");
+        assert!(rep.qps_end_to_end > 0.0, "end-to-end qps should be > 0");
+        assert!(
+            rep.qps_search + 1e-9 >= rep.qps_end_to_end,
+            "search-only qps should be >= end-to-end qps"
+        );
+        assert!(
+            rep.evaluation_elapsed_ms >= 0.0,
+            "evaluation timing should be non-negative"
+        );
+        assert_eq!(rep.qps, rep.qps_search, "compatibility qps alias mismatch");
+
+        assert_eq!(sweep.aggregate.qps_mean, rep.qps_search);
+        assert_eq!(sweep.aggregate.end_to_end_qps_mean, rep.qps_end_to_end);
+    }
 }

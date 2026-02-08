@@ -33,7 +33,10 @@ use kyrodb_engine::{
     MetricsCollector, PointQueryTier, RateLimiter, SearchExecutionPath, SloThresholds, TenantInfo,
     TieredEngine, TieredEngineConfig,
 };
+use prost::Message;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -95,6 +98,146 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchErrorKind {
+    Timeout,
+    ResourceExhausted,
+    Validation,
+    Internal,
+}
+
+fn classify_search_error_message(message: &str) -> SearchErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        SearchErrorKind::Timeout
+    } else if lower.contains("saturated")
+        || lower.contains("resource exhausted")
+        || lower.contains("max in-flight")
+    {
+        SearchErrorKind::ResourceExhausted
+    } else if lower.contains("invalid")
+        || lower.contains("dimension mismatch")
+        || lower.contains("cannot be empty")
+        || lower.contains("must be")
+    {
+        SearchErrorKind::Validation
+    } else {
+        SearchErrorKind::Internal
+    }
+}
+
+fn apply_wal_health_overrides(
+    base: HealthStatus,
+    wal_inconsistent: bool,
+    wal_failed: u64,
+) -> HealthStatus {
+    if wal_inconsistent {
+        return HealthStatus::Unhealthy {
+            reason: "WAL inconsistent; writes disabled".to_string(),
+        };
+    }
+
+    if wal_failed > 0 {
+        return match base {
+            HealthStatus::Healthy => HealthStatus::Degraded {
+                reason: format!("{} failed WAL writes observed", wal_failed),
+            },
+            other => other,
+        };
+    }
+
+    base
+}
+
+#[cfg(target_os = "linux")]
+fn sample_process_memory_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some(rss_pages.saturating_mul(page_size as u64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sample_process_memory_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn sample_process_cpu_usage_percent(uptime: Duration) -> Option<f64> {
+    if uptime.is_zero() {
+        return None;
+    }
+
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let close = stat.rfind(')')?;
+    let rest = stat.get(close + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.len() <= 12 {
+        return None;
+    }
+
+    let utime_ticks: u64 = fields[11].parse().ok()?;
+    let stime_ticks: u64 = fields[12].parse().ok()?;
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_sec <= 0 {
+        return None;
+    }
+
+    let cpu_secs = (utime_ticks + stime_ticks) as f64 / ticks_per_sec as f64;
+    Some((cpu_secs / uptime.as_secs_f64()) * 100.0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sample_process_cpu_usage_percent(_uptime: Duration) -> Option<f64> {
+    None
+}
+
+#[cfg(unix)]
+fn sample_filesystem_used_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+
+    #[allow(clippy::unnecessary_cast)]
+    let blocks = stat.f_blocks as u64;
+    #[allow(clippy::unnecessary_cast)]
+    let free_blocks = stat.f_bfree as u64;
+    #[allow(clippy::unnecessary_cast)]
+    let frag_size = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
+
+    Some(blocks.saturating_sub(free_blocks).saturating_mul(frag_size))
+}
+
+#[cfg(not(unix))]
+fn sample_filesystem_used_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+fn refresh_system_metrics(state: &ServerState) {
+    if let Some(rss_bytes) = sample_process_memory_bytes() {
+        state.metrics.set_memory_used(rss_bytes);
+    }
+
+    if let Some(data_dir) = state.engine_config.data_dir.as_deref() {
+        if let Some(disk_used_bytes) = sample_filesystem_used_bytes(Path::new(data_dir)) {
+            state.metrics.set_disk_used(disk_used_bytes);
+        }
+    }
 }
 
 // ============================================================================
@@ -298,6 +441,13 @@ struct SearchPlan {
     ef_search_override: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BatchSearchKey {
+    search_k: usize,
+    ef_search_override: Option<usize>,
+    query_cache_scope: u64,
+}
+
 impl KyroDBServiceImpl {
     #[allow(clippy::result_large_err)]
     fn tenant_context<T>(&self, request: &Request<T>) -> Result<Option<TenantContext>, Status> {
@@ -368,6 +518,7 @@ impl KyroDBServiceImpl {
             SearchExecutionPath::HotTierOnly => search_response::SearchPath::HotTierOnly as i32,
             SearchExecutionPath::ColdTierOnly => search_response::SearchPath::ColdTierOnly as i32,
             SearchExecutionPath::HotAndCold => search_response::SearchPath::HotAndCold as i32,
+            SearchExecutionPath::Degraded => search_response::SearchPath::Unknown as i32,
         }
     }
 
@@ -392,17 +543,21 @@ impl KyroDBServiceImpl {
             .tenant_vector_counts
             .as_ref()
             .ok_or_else(|| Status::internal("tenant vector quota state not initialized"))?;
-        let current = counts.read().get(&tenant.tenant_id).copied().unwrap_or(0);
-        if current >= tenant.max_vectors {
+        let mut guard = counts.write();
+        let entry = guard.entry(tenant.tenant_id.clone()).or_insert(0);
+        if *entry >= tenant.max_vectors {
             return Err(Status::resource_exhausted(format!(
                 "max_vectors quota exceeded: tenant={} limit={}",
                 tenant.tenant_id, tenant.max_vectors
             )));
         }
+        *entry = entry.saturating_add(1);
 
         Ok(false)
     }
 
+    /// Adjust tenant vector counters for paths that do not reserve quota through
+    /// `enforce_vector_quota` (for example, out-of-band bulk-load ingestion).
     fn increment_tenant_vectors(&self, tenant: Option<&TenantContext>, count: usize) {
         if count == 0 {
             return;
@@ -493,6 +648,81 @@ impl KyroDBServiceImpl {
             search_k,
             ef_search_override,
         })
+    }
+
+    fn query_cache_scope(&self, tenant: Option<&TenantContext>, req: &SearchRequest) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        match tenant {
+            Some(t) => t.tenant_index.hash(&mut hasher),
+            None => u32::MAX.hash(&mut hasher),
+        }
+        req.namespace.hash(&mut hasher);
+
+        match &req.filter {
+            Some(filter) => {
+                1u8.hash(&mut hasher);
+                let mut encoded = Vec::new();
+                if filter.encode(&mut encoded).is_ok() {
+                    encoded.hash(&mut hasher);
+                } else {
+                    format!("{:?}", filter).hash(&mut hasher);
+                }
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+
+        hasher.finish()
+    }
+
+    fn map_search_error(&self, error: anyhow::Error) -> Status {
+        let message = error.to_string();
+        self.state.metrics.record_query_failure();
+
+        match classify_search_error_message(&message) {
+            SearchErrorKind::Timeout => {
+                self.state.metrics.record_error(ErrorCategory::Timeout);
+                Status::deadline_exceeded(format!("Search timed out: {}", message))
+            }
+            SearchErrorKind::ResourceExhausted => {
+                self.state
+                    .metrics
+                    .record_error(ErrorCategory::ResourceExhausted);
+                Status::resource_exhausted(format!("Search rejected: {}", message))
+            }
+            SearchErrorKind::Validation => {
+                self.state.metrics.record_error(ErrorCategory::Validation);
+                Status::invalid_argument(message)
+            }
+            SearchErrorKind::Internal => {
+                self.state.metrics.record_error(ErrorCategory::Internal);
+                Status::internal(format!("Search failed: {}", message))
+            }
+        }
+    }
+
+    fn record_search_path_metrics(&self, path: SearchExecutionPath) {
+        match path {
+            SearchExecutionPath::CacheHit => {
+                self.state.metrics.record_cache_hit(true);
+            }
+            SearchExecutionPath::HotTierOnly => {
+                self.state.metrics.record_cache_hit(false);
+                self.state.metrics.record_tier_hit(true);
+            }
+            SearchExecutionPath::ColdTierOnly => {
+                self.state.metrics.record_cache_hit(false);
+                self.state.metrics.record_tier_hit(false);
+            }
+            SearchExecutionPath::HotAndCold => {
+                self.state.metrics.record_cache_hit(false);
+                self.state.metrics.record_tier_hit(true);
+                self.state.metrics.record_tier_hit(false);
+            }
+            SearchExecutionPath::Degraded => {
+                self.state.metrics.record_cache_hit(false);
+            }
+        }
     }
 
     fn convert_distance_to_score(&self, dist: f32) -> f32 {
@@ -618,25 +848,24 @@ impl KyroDBServiceImpl {
         let start = Instant::now();
         self.enforce_rate_limit(tenant)?;
         let plan = self.validate_search_request(tenant, &req)?;
+        let query_cache_scope = self.query_cache_scope(tenant, &req);
 
         let engine = self.state.engine.read().await;
 
         let (results, search_path) = engine
-            .knn_search_with_timeouts_with_ef(
+            .knn_search_with_timeouts_with_ef_scoped(
                 &req.query_embedding,
                 plan.search_k,
                 plan.ef_search_override,
+                query_cache_scope,
             )
             .await
-            .map_err(|e| {
-                self.state.metrics.record_query_failure();
-                self.state.metrics.record_error(ErrorCategory::Internal);
-                Status::internal(format!("Search failed: {}", e))
-            })?;
+            .map_err(|e| self.map_search_error(e))?;
 
         let latency_ns = start.elapsed().as_nanos() as u64;
         self.state.metrics.record_query_latency(latency_ns);
         self.state.metrics.record_hnsw_search(latency_ns);
+        self.record_search_path_metrics(search_path);
 
         Ok(self.build_search_response(tenant, &req, results, &engine, latency_ns, search_path))
     }
@@ -651,80 +880,92 @@ impl KyroDBServiceImpl {
         }
 
         let mut results: Vec<Option<Result<SearchResponse, Status>>> = vec![None; requests.len()];
-        let mut groups: HashMap<Option<usize>, Vec<(usize, SearchRequest, SearchPlan)>> =
-            HashMap::new();
+        let mut validated: Vec<(usize, SearchRequest, SearchPlan)> =
+            Vec::with_capacity(requests.len());
 
         for (idx, req) in requests.into_iter().enumerate() {
             match self.validate_search_request(tenant, &req) {
-                Ok(plan) => {
-                    groups
-                        .entry(plan.ef_search_override)
-                        .or_default()
-                        .push((idx, req, plan));
-                }
+                Ok(plan) => validated.push((idx, req, plan)),
                 Err(e) => {
                     results[idx] = Some(Err(e));
                 }
             }
         }
 
-        let engine = self.state.engine.read().await;
+        let mut grouped: HashMap<BatchSearchKey, Vec<(usize, SearchRequest)>> = HashMap::new();
+        for (idx, req, plan) in validated {
+            let key = BatchSearchKey {
+                search_k: plan.search_k,
+                ef_search_override: plan.ef_search_override,
+                query_cache_scope: self.query_cache_scope(tenant, &req),
+            };
+            grouped.entry(key).or_default().push((idx, req));
+        }
 
-        for (ef_search_override, group) in groups {
-            let max_search_k = group
+        for (key, grouped_requests) in grouped {
+            let group_start = Instant::now();
+            let queries: Vec<Vec<f32>> = grouped_requests
                 .iter()
-                .map(|(_, _, plan)| plan.search_k)
-                .max()
-                .unwrap_or(0);
-
-            let queries: Vec<Vec<f32>> = group
-                .iter()
-                .map(|(_, req, _)| req.query_embedding.clone())
+                .map(|(_, req)| req.query_embedding.clone())
                 .collect();
 
-            let batch_start = Instant::now();
-
-            let batch_results = engine
-                .knn_search_batch_with_ef_detailed(&queries, max_search_k, ef_search_override)
-                .map_err(|e| {
-                    self.state.metrics.record_error(ErrorCategory::Internal);
-                    Status::internal(format!("Search failed: {}", e))
-                });
-
-            match batch_results {
-                Ok(batch_results) => {
-                    let latency_ns = batch_start.elapsed().as_nanos() as u64;
-                    let batch_len = group.len().max(1) as u64;
-                    let per_request_latency_ns = latency_ns / batch_len;
-                    for ((idx, req, _plan), (candidates, search_path)) in
-                        group.into_iter().zip(batch_results.into_iter())
-                    {
-                        self.state
-                            .metrics
-                            .record_query_latency(per_request_latency_ns);
-                        self.state
-                            .metrics
-                            .record_hnsw_search(per_request_latency_ns);
-                        let response = self.build_search_response(
-                            tenant,
-                            &req,
-                            candidates,
-                            &engine,
-                            per_request_latency_ns,
-                            search_path,
-                        );
-                        results[idx] = Some(Ok(response));
+            let group_results: Vec<(usize, Result<SearchResponse, Status>)> = {
+                let engine = self.state.engine.read().await;
+                match engine.knn_search_batch_with_ef_detailed_scoped(
+                    &queries,
+                    key.search_k,
+                    key.ef_search_override,
+                    key.query_cache_scope,
+                ) {
+                    Ok(batch_results) => {
+                        if batch_results.len() != grouped_requests.len() {
+                            let status = Status::internal(format!(
+                                "bulk_search internal mismatch: expected {} results, got {}",
+                                grouped_requests.len(),
+                                batch_results.len()
+                            ));
+                            grouped_requests
+                                .into_iter()
+                                .map(|(idx, _)| (idx, Err(status.clone())))
+                                .collect()
+                        } else {
+                            let elapsed_ns = group_start.elapsed().as_nanos() as u64;
+                            let per_query_latency_ns =
+                                (elapsed_ns / grouped_requests.len().max(1) as u64).max(1);
+                            grouped_requests
+                                .into_iter()
+                                .zip(batch_results.into_iter())
+                                .map(|((idx, req), (candidates, search_path))| {
+                                    self.state
+                                        .metrics
+                                        .record_query_latency(per_query_latency_ns);
+                                    self.state.metrics.record_hnsw_search(per_query_latency_ns);
+                                    self.record_search_path_metrics(search_path);
+                                    let response = self.build_search_response(
+                                        tenant,
+                                        &req,
+                                        candidates,
+                                        &engine,
+                                        per_query_latency_ns,
+                                        search_path,
+                                    );
+                                    (idx, Ok(response))
+                                })
+                                .collect()
+                        }
+                    }
+                    Err(e) => {
+                        let status = self.map_search_error(e);
+                        grouped_requests
+                            .into_iter()
+                            .map(|(idx, _)| (idx, Err(status.clone())))
+                            .collect()
                     }
                 }
-                Err(status) => {
-                    let status_code = status.code();
-                    let status_message = status.message().to_string();
-                    for (idx, _req, _plan) in group {
-                        self.state.metrics.record_query_failure();
-                        self.state.metrics.record_error(ErrorCategory::Internal);
-                        results[idx] = Some(Err(Status::new(status_code, status_message.clone())));
-                    }
-                }
+            };
+
+            for (idx, group_result) in group_results {
+                results[idx] = Some(group_result);
             }
         }
 
@@ -820,9 +1061,6 @@ impl KyroDbService for KyroDBServiceImpl {
             Ok(_) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 self.state.metrics.record_insert(true);
-                if !already_exists {
-                    self.increment_tenant_vectors(tenant.as_ref(), 1);
-                }
 
                 info!(
                     doc_id = req.doc_id,
@@ -840,6 +1078,9 @@ impl KyroDbService for KyroDBServiceImpl {
                 }))
             }
             Err(e) => {
+                if !already_exists {
+                    self.decrement_tenant_vectors(tenant.as_ref(), 1);
+                }
                 self.state.metrics.record_insert(false);
                 self.state.metrics.record_error(ErrorCategory::Internal);
                 error!(
@@ -866,7 +1107,6 @@ impl KyroDbService for KyroDBServiceImpl {
         let mut total_failed = 0u64;
         let mut last_error = String::new();
         let mut batch_count = 0u64;
-        let mut newly_inserted = 0usize;
 
         // Acquire lock per-operation to prevent deadlock
         // Holding write lock across stream.message().await causes deadlock
@@ -941,11 +1181,11 @@ impl KyroDbService for KyroDBServiceImpl {
                 match engine.insert(global_doc_id, req.embedding, metadata) {
                     Ok(_) => {
                         total_inserted += 1;
-                        if !already_exists {
-                            newly_inserted = newly_inserted.saturating_add(1);
-                        }
                     }
                     Err(e) => {
+                        if !already_exists {
+                            self.decrement_tenant_vectors(tenant.as_ref(), 1);
+                        }
                         total_failed += 1;
                         last_error = format!("{}", e);
                     }
@@ -963,7 +1203,6 @@ impl KyroDbService for KyroDBServiceImpl {
             throughput_docs_per_sec = (total_inserted as f64 / start.elapsed().as_secs_f64()),
             "Bulk insert completed"
         );
-        self.increment_tenant_vectors(tenant.as_ref(), newly_inserted);
 
         Ok(Response::new(InsertResponse {
             success: total_failed == 0,
@@ -1482,7 +1721,20 @@ impl KyroDbService for KyroDBServiceImpl {
         let start = Instant::now();
         match engine.query_with_source(global_doc_id, None) {
             Some((embedding, served_from)) => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let latency_ns = start.elapsed().as_nanos() as u64;
+                let latency_ms = latency_ns as f64 / 1_000_000.0;
+                self.state.metrics.record_query_latency(latency_ns);
+                match served_from {
+                    PointQueryTier::Cache => self.state.metrics.record_cache_hit(true),
+                    PointQueryTier::HotTier => {
+                        self.state.metrics.record_cache_hit(false);
+                        self.state.metrics.record_tier_hit(true);
+                    }
+                    PointQueryTier::ColdTier => {
+                        self.state.metrics.record_cache_hit(false);
+                        self.state.metrics.record_tier_hit(false);
+                    }
+                }
 
                 info!(
                     doc_id = req.doc_id,
@@ -1506,7 +1758,10 @@ impl KyroDbService for KyroDBServiceImpl {
                 }))
             }
             None => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let latency_ns = start.elapsed().as_nanos() as u64;
+                let latency_ms = latency_ns as f64 / 1_000_000.0;
+                self.state.metrics.record_query_latency(latency_ns);
+                self.state.metrics.record_cache_hit(false);
 
                 info!(
                     doc_id = req.doc_id,
@@ -1762,6 +2017,19 @@ impl KyroDbService for KyroDBServiceImpl {
 
             if found {
                 total_found += 1;
+                match served_from {
+                    PointQueryTier::Cache => self.state.metrics.record_cache_hit(true),
+                    PointQueryTier::HotTier => {
+                        self.state.metrics.record_cache_hit(false);
+                        self.state.metrics.record_tier_hit(true);
+                    }
+                    PointQueryTier::ColdTier => {
+                        self.state.metrics.record_cache_hit(false);
+                        self.state.metrics.record_tier_hit(false);
+                    }
+                }
+            } else {
+                self.state.metrics.record_cache_hit(false);
             }
 
             query_responses.push(QueryResponse {
@@ -1778,7 +2046,9 @@ impl KyroDbService for KyroDBServiceImpl {
             });
         }
 
-        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let latency_ns = start.elapsed().as_nanos() as u64;
+        let latency_ms = latency_ns as f64 / 1_000_000.0;
+        self.state.metrics.record_query_latency(latency_ns);
         info!(
             requested = total_requested,
             found = total_found,
@@ -1897,7 +2167,10 @@ impl KyroDbService for KyroDBServiceImpl {
                 filters.push(filter);
 
                 let combined = if filters.len() == 1 {
-                    filters.pop().unwrap()
+                    match filters.pop() {
+                        Some(single) => single,
+                        None => return Err(Status::internal("failed to combine delete filters")),
+                    }
                 } else {
                     MetadataFilter {
                         filter_type: Some(FilterType::AndFilter(AndFilter { filters })),
@@ -1953,7 +2226,18 @@ impl KyroDbService for KyroDBServiceImpl {
         let engine = self.state.engine.read().await;
         let stats = engine.stats();
 
-        let overall_health = self.state.metrics.health_status();
+        let wal_inconsistent = engine.cold_tier().is_wal_inconsistent();
+        let wal_failed = self
+            .state
+            .metrics
+            .get_wal_writes_failed()
+            .max(engine.cold_tier().wal_writes_failed());
+        self.state.metrics.set_wal_writes_failed_floor(wal_failed);
+        let overall_health = apply_wal_health_overrides(
+            self.state.metrics.health_status(),
+            wal_inconsistent,
+            wal_failed,
+        );
         let status = match overall_health {
             HealthStatus::Healthy => health_response::Status::Healthy,
             HealthStatus::Degraded { .. } => health_response::Status::Degraded,
@@ -2006,8 +2290,6 @@ impl KyroDbService for KyroDBServiceImpl {
         }
 
         if component_filter.is_empty() || component_filter == "wal" {
-            let wal_inconsistent = engine.cold_tier().is_wal_inconsistent();
-            let wal_failed = self.state.metrics.get_wal_writes_failed();
             let wal_status = if wal_inconsistent {
                 "unhealthy (WAL inconsistent; writes disabled)".to_string()
             } else if wal_failed > 0 {
@@ -2038,6 +2320,7 @@ impl KyroDbService for KyroDBServiceImpl {
         &self,
         _request: Request<MetricsRequest>,
     ) -> Result<Response<MetricsResponse>, Status> {
+        refresh_system_metrics(&self.state);
         let engine = self.state.engine.read().await;
         let stats = engine.stats();
         let cache_size = engine.cache_size() as u64;
@@ -2045,8 +2328,8 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let (p50_ns, p95_ns, p99_ns) = self.state.metrics.latency_percentiles_ns();
         let uptime_secs = self.state.metrics.uptime().as_secs_f64().max(1e-9);
-        let metrics_total_queries = self.state.metrics.get_total_queries();
-        let metrics_total_inserts = self.state.metrics.get_inserts_total();
+        let cpu_usage_percent =
+            sample_process_cpu_usage_percent(self.state.metrics.uptime()).unwrap_or(0.0);
 
         info!(
             cache_hit_rate = stats.cache_hit_rate,
@@ -2079,13 +2362,13 @@ impl KyroDbService for KyroDBServiceImpl {
             p99_latency_ms: p99_ns as f64 / 1_000_000.0,
             total_queries: stats.total_queries,
             total_inserts: stats.total_inserts,
-            queries_per_second: metrics_total_queries as f64 / uptime_secs,
-            inserts_per_second: metrics_total_inserts as f64 / uptime_secs,
+            queries_per_second: stats.total_queries as f64 / uptime_secs,
+            inserts_per_second: stats.total_inserts as f64 / uptime_secs,
 
             // System metrics
             memory_usage_bytes: self.state.metrics.get_memory_used_bytes(),
             disk_usage_bytes: self.state.metrics.get_disk_used_bytes(),
-            cpu_usage_percent: 0.0,
+            cpu_usage_percent,
 
             // Overall metrics
             overall_hit_rate: stats.overall_hit_rate * 100.0,
@@ -2209,8 +2492,26 @@ impl KyroDbService for KyroDBServiceImpl {
 // HTTP OBSERVABILITY ENDPOINTS
 // ============================================================================
 
+async fn wal_health_snapshot(state: &Arc<ServerState>) -> (bool, u64) {
+    let (wal_inconsistent, backend_wal_failed) = {
+        let engine = state.engine.read().await;
+        (
+            engine.cold_tier().is_wal_inconsistent(),
+            engine.cold_tier().wal_writes_failed(),
+        )
+    };
+    let wal_failed = state
+        .metrics
+        .get_wal_writes_failed()
+        .max(backend_wal_failed);
+    state.metrics.set_wal_writes_failed_floor(wal_failed);
+    (wal_inconsistent, wal_failed)
+}
+
 /// Prometheus /metrics endpoint handler
 async fn metrics_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
+    let _ = wal_health_snapshot(&state).await;
+    refresh_system_metrics(&state);
     let prometheus_text = state.metrics.export_prometheus();
 
     let mut resp = HttpResponse::new(Body::from(prometheus_text));
@@ -2224,7 +2525,9 @@ async fn metrics_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpR
 
 /// Health check /health endpoint (liveness probe)
 async fn health_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
-    let health = state.metrics.health_status();
+    let (wal_inconsistent, wal_failed) = wal_health_snapshot(&state).await;
+    let health =
+        apply_wal_health_overrides(state.metrics.health_status(), wal_inconsistent, wal_failed);
 
     let (status_code, body) = match health {
         HealthStatus::Healthy => (
@@ -2274,7 +2577,9 @@ async fn health_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRe
 
 /// Readiness check /ready endpoint (readiness probe)
 async fn ready_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
-    let health = state.metrics.health_status();
+    let (wal_inconsistent, wal_failed) = wal_health_snapshot(&state).await;
+    let health =
+        apply_wal_health_overrides(state.metrics.health_status(), wal_inconsistent, wal_failed);
 
     let (status_code, body) = match health {
         HealthStatus::Healthy | HealthStatus::Degraded { .. } => (
@@ -2804,42 +3109,49 @@ async fn main() -> anyhow::Result<()> {
         MetricsCollector::new_with_slo_thresholds(SloThresholds::from_config(&config.slo));
 
     if should_run_training {
-        let learned_strategy = learned_strategy_for_training
-            .expect("should_run_training implies learned strategy exists");
-        let logger = access_logger.expect("should_run_training implies access logger exists");
+        match (learned_strategy_for_training, access_logger) {
+            (Some(learned_strategy), Some(logger)) => {
+                let training_config = TrainingConfig {
+                    interval: Duration::from_secs(config.cache.training_interval_secs),
+                    window_duration: Duration::from_secs(config.cache.training_window_secs),
+                    recency_halflife: Duration::from_secs(config.cache.recency_halflife_secs),
+                    min_events_for_training: config.cache.min_training_samples.max(1),
+                    predictor_capacity: config
+                        .cache
+                        .capacity
+                        .saturating_mul(config.cache.predictor_capacity_multiplier.max(1))
+                        .min(config.hnsw.max_elements.max(1)),
+                    admission_threshold: config.cache.admission_threshold,
+                    auto_tune_enabled: config.cache.auto_tune_threshold,
+                    target_utilization: config.cache.target_utilization,
+                };
 
-        let training_config = TrainingConfig {
-            interval: Duration::from_secs(config.cache.training_interval_secs),
-            window_duration: Duration::from_secs(config.cache.training_window_secs),
-            recency_halflife: Duration::from_secs(config.cache.recency_halflife_secs),
-            min_events_for_training: config.cache.min_training_samples.max(1),
-            predictor_capacity: config
-                .cache
-                .capacity
-                .saturating_mul(config.cache.predictor_capacity_multiplier.max(1))
-                .min(config.hnsw.max_elements.max(1)),
-            admission_threshold: config.cache.admission_threshold,
-            auto_tune_enabled: config.cache.auto_tune_threshold,
-            target_utilization: config.cache.target_utilization,
-        };
+                let training_shutdown_rx = shutdown_tx.subscribe();
+                let _training_handle = spawn_training_task(
+                    logger,
+                    learned_strategy,
+                    training_config,
+                    None,
+                    Some(metrics.clone()),
+                    training_shutdown_rx,
+                )
+                .await;
 
-        let training_shutdown_rx = shutdown_tx.subscribe();
-        let _training_handle = spawn_training_task(
-            logger,
-            learned_strategy,
-            training_config,
-            None,
-            Some(metrics.clone()),
-            training_shutdown_rx,
-        )
-        .await;
-
-        info!(
-            interval_secs = config.cache.training_interval_secs,
-            window_secs = config.cache.training_window_secs,
-            logger_window_size = config.cache.logger_window_size,
-            "Learned cache background retraining enabled"
-        );
+                info!(
+                    interval_secs = config.cache.training_interval_secs,
+                    window_secs = config.cache.training_window_secs,
+                    logger_window_size = config.cache.logger_window_size,
+                    "Learned cache background retraining enabled"
+                );
+            }
+            _ => {
+                warn!(
+                    enabled = config.cache.enable_training_task,
+                    strategy = ?config.cache.strategy,
+                    "Learned cache training requested but dependencies were not initialized; training disabled"
+                );
+            }
+        }
     } else {
         info!(
             enabled = config.cache.enable_training_task,
@@ -3159,4 +3471,336 @@ async fn main() -> anyhow::Result<()> {
 
     result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_wal_health_overrides, classify_search_error_message, BatchSearchKey, HealthStatus,
+        InsertRequest, KyroDBServiceImpl, KyroDbService, SearchErrorKind, SearchRequest,
+        ServerState, TenantContext, TieredEngine, TieredEngineConfig,
+    };
+    use kyrodb_engine::{
+        cache_strategy::LruCacheStrategy, config::KyroDbConfig, MetricsCollector, QueryHashCache,
+        RateLimiter,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::RwLock;
+    use tonic::{Code, Request};
+
+    fn build_test_service_with_seed_data() -> Arc<KyroDBServiceImpl> {
+        let engine_config = TieredEngineConfig {
+            embedding_dimension: 16,
+            ..TieredEngineConfig::default()
+        };
+        let engine = TieredEngine::new(
+            Box::new(LruCacheStrategy::new(2048)),
+            Arc::new(QueryHashCache::new(2048, 0.90)),
+            Vec::new(),
+            Vec::new(),
+            engine_config.clone(),
+        )
+        .unwrap();
+
+        for doc_id in 1..=1024u64 {
+            let mut embedding = Vec::with_capacity(16);
+            for i in 0..16usize {
+                let base = (((doc_id as usize + 1) * (i + 3)) % 997) as f32 / 997.0;
+                embedding.push(base + 0.001);
+            }
+            engine.insert(doc_id, embedding, HashMap::new()).unwrap();
+        }
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
+        let state = Arc::new(ServerState {
+            engine: Arc::new(RwLock::new(engine)),
+            start_time: Instant::now(),
+            app_config: KyroDbConfig::default(),
+            engine_config,
+            shutdown_tx,
+            metrics: MetricsCollector::new(),
+            auth: None,
+            rate_limiter: None,
+            tenant_id_mapper: None,
+            tenant_vector_counts: None,
+        });
+
+        Arc::new(KyroDBServiceImpl { state })
+    }
+
+    fn build_test_service_with_tenant_quota(max_vectors: usize) -> Arc<KyroDBServiceImpl> {
+        let engine_config = TieredEngineConfig {
+            embedding_dimension: 16,
+            ..TieredEngineConfig::default()
+        };
+        let engine = TieredEngine::new(
+            Box::new(LruCacheStrategy::new(2048)),
+            Arc::new(QueryHashCache::new(2048, 0.90)),
+            Vec::new(),
+            Vec::new(),
+            engine_config.clone(),
+        )
+        .unwrap();
+
+        let mut app_config = KyroDbConfig::default();
+        app_config.auth.enabled = true;
+        app_config.rate_limit.enabled = true;
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
+        let state = Arc::new(ServerState {
+            engine: Arc::new(RwLock::new(engine)),
+            start_time: Instant::now(),
+            app_config,
+            engine_config,
+            shutdown_tx,
+            metrics: MetricsCollector::new(),
+            auth: None,
+            rate_limiter: Some(RateLimiter::new()),
+            tenant_id_mapper: None,
+            tenant_vector_counts: Some(parking_lot::RwLock::new(HashMap::new())),
+        });
+
+        let service = Arc::new(KyroDBServiceImpl { state });
+        let tenant_id = "tenant_quota".to_string();
+        if let Some(counts) = &service.state.tenant_vector_counts {
+            counts.write().insert(tenant_id, 0);
+        }
+
+        // Ensure the helper cannot silently ignore max_vectors=0.
+        assert!(max_vectors > 0, "max_vectors must be > 0 in quota tests");
+        service
+    }
+
+    fn tenant_ctx(max_vectors: usize) -> TenantContext {
+        TenantContext {
+            tenant_id: "tenant_quota".to_string(),
+            tenant_index: 7,
+            max_qps: 1_000_000,
+            max_vectors,
+        }
+    }
+
+    fn tenant_insert_request(
+        local_doc_id: u64,
+        embedding: Vec<f32>,
+        tenant: TenantContext,
+    ) -> Request<InsertRequest> {
+        let mut req = Request::new(InsertRequest {
+            doc_id: local_doc_id,
+            embedding,
+            metadata: HashMap::new(),
+            namespace: String::new(),
+        });
+        req.extensions_mut().insert(tenant);
+        req
+    }
+
+    #[test]
+    fn classify_search_errors_maps_timeout() {
+        assert_eq!(
+            classify_search_error_message("Cold tier timed out after 1000ms"),
+            SearchErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn classify_search_errors_maps_resource_exhausted() {
+        assert_eq!(
+            classify_search_error_message("Query queue saturated: 1024 in-flight queries"),
+            SearchErrorKind::ResourceExhausted
+        );
+    }
+
+    #[test]
+    fn classify_search_errors_maps_validation() {
+        assert_eq!(
+            classify_search_error_message("query dimension mismatch: expected 768 found 384"),
+            SearchErrorKind::Validation
+        );
+    }
+
+    #[test]
+    fn wal_inconsistency_forces_unhealthy() {
+        let health = apply_wal_health_overrides(HealthStatus::Healthy, true, 0);
+        assert!(matches!(health, HealthStatus::Unhealthy { .. }));
+    }
+
+    #[test]
+    fn wal_failures_degrade_healthy_status() {
+        let health = apply_wal_health_overrides(HealthStatus::Healthy, false, 3);
+        assert!(matches!(health, HealthStatus::Degraded { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bulk_batch_groups_do_not_starve_writers() {
+        let service = build_test_service_with_seed_data();
+
+        // Build many 1-query groups (distinct namespaces => distinct BatchSearchKey values)
+        // so the handler must repeatedly re-enter search execution per group.
+        let requests: Vec<SearchRequest> = (0..512usize)
+            .map(|i| {
+                let mut query_embedding = Vec::with_capacity(16);
+                for d in 0..16usize {
+                    let base = (((i + 7) * (d + 11)) % 997) as f32 / 997.0;
+                    query_embedding.push(base + 0.001);
+                }
+                SearchRequest {
+                    query_embedding,
+                    k: 10,
+                    ef_search: 128,
+                    include_embeddings: false,
+                    filter: None,
+                    metadata_filters: HashMap::new(),
+                    namespace: format!("ns_{i}"),
+                    min_score: 0.0,
+                }
+            })
+            .collect();
+
+        // Sanity check that request set spans many batch groups.
+        let mut groups = std::collections::HashSet::new();
+        for req in &requests {
+            groups.insert(BatchSearchKey {
+                search_k: req.k as usize,
+                ef_search_override: Some(req.ef_search as usize),
+                query_cache_scope: service.query_cache_scope(None, req),
+            });
+        }
+        assert!(groups.len() > 100, "expected many distinct batch groups");
+
+        let service_for_search = Arc::clone(&service);
+        let search_task = tokio::spawn(async move {
+            service_for_search
+                .handle_search_requests_batch(None, requests)
+                .await
+        });
+
+        // Let search acquire its first read-lock and start work.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let writer_engine = Arc::clone(&service.state.engine);
+        let writer_start = Instant::now();
+        let writer_guard = tokio::time::timeout(Duration::from_secs(2), writer_engine.write())
+            .await
+            .expect("writer lock acquisition timed out during bulk search");
+        writer_guard
+            .insert(99_999, vec![0.1; 16], HashMap::new())
+            .unwrap();
+        drop(writer_guard);
+        let writer_wait = writer_start.elapsed();
+
+        let responses = search_task.await.unwrap();
+        assert_eq!(responses.len(), 512);
+        assert!(
+            responses.iter().all(|r| r.is_ok()),
+            "all grouped bulk-search responses should succeed"
+        );
+        assert!(
+            writer_wait < Duration::from_secs(1),
+            "writer should not be starved behind entire bulk batch; waited {:?}",
+            writer_wait
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tenant_quota_enforced_atomically_under_concurrent_inserts() {
+        let service = build_test_service_with_tenant_quota(1);
+        let tenant = tenant_ctx(1);
+
+        let s1 = Arc::clone(&service);
+        let t1 = tenant.clone();
+        let h1 = tokio::spawn(async move {
+            let req = tenant_insert_request(1, vec![0.1; 16], t1);
+            s1.insert(req).await
+        });
+
+        let s2 = Arc::clone(&service);
+        let t2 = tenant.clone();
+        let h2 = tokio::spawn(async move {
+            let req = tenant_insert_request(2, vec![0.2; 16], t2);
+            s2.insert(req).await
+        });
+
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+
+        let success_count = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+        assert_eq!(
+            success_count, 1,
+            "exactly one concurrent insert should pass max_vectors=1"
+        );
+
+        let status_codes: Vec<Code> = [r1, r2]
+            .into_iter()
+            .filter_map(|result| result.err().map(|status| status.code()))
+            .collect();
+        assert!(
+            status_codes.contains(&Code::ResourceExhausted),
+            "one insert must fail with RESOURCE_EXHAUSTED, got {:?}",
+            status_codes
+        );
+
+        let quota_count = service
+            .state
+            .tenant_vector_counts
+            .as_ref()
+            .unwrap()
+            .read()
+            .get("tenant_quota")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            quota_count, 1,
+            "quota counter must remain consistent after concurrent inserts"
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_quota_reservation_rolls_back_after_failed_insert() {
+        let service = build_test_service_with_tenant_quota(1);
+        let tenant = tenant_ctx(1);
+
+        // Wrong dimension causes engine.insert() to fail after quota reservation.
+        let bad_req = tenant_insert_request(1, vec![0.1; 8], tenant.clone());
+        let bad_status = service
+            .insert(bad_req)
+            .await
+            .expect_err("insert with wrong dimension should fail");
+        assert_eq!(bad_status.code(), Code::Internal);
+
+        let after_failure_count = service
+            .state
+            .tenant_vector_counts
+            .as_ref()
+            .unwrap()
+            .read()
+            .get("tenant_quota")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            after_failure_count, 0,
+            "quota reservation must be rolled back when insert fails"
+        );
+
+        let good_req = tenant_insert_request(2, vec![0.2; 16], tenant);
+        let good_res = service.insert(good_req).await;
+        assert!(
+            good_res.is_ok(),
+            "quota rollback failed: subsequent valid insert was unexpectedly rejected: {:?}",
+            good_res.err()
+        );
+
+        let final_count = service
+            .state
+            .tenant_vector_counts
+            .as_ref()
+            .unwrap()
+            .read()
+            .get("tenant_quota")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(final_count, 1, "valid insert should consume one quota slot");
+    }
 }

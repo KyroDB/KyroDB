@@ -122,23 +122,33 @@ require_cmd() {
   fi
 }
 
+require_arg() {
+  local flag="$1"
+  local value="${2-}"
+  if [[ -z "${value}" ]] || [[ "${value}" == --* ]]; then
+    echo "missing value for ${flag}" >&2
+    usage
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --datasets) DATASETS="$2"; shift 2 ;;
-    --data-dir) DATA_DIR="$2"; shift 2 ;;
-    --out-root) OUT_ROOT="$2"; shift 2 ;;
-    --run-label) RUN_LABEL="$2"; shift 2 ;;
-    --m-values) M_VALUES="$2"; shift 2 ;;
-    --ef-construction-values) EF_CONSTRUCTION_VALUES="$2"; shift 2 ;;
-    --ef-search-values) EF_SEARCH_VALUES="$2"; shift 2 ;;
-    --recall-targets) RECALL_TARGETS="$2"; shift 2 ;;
-    --k) K="$2"; shift 2 ;;
-    --repetitions) REPETITIONS="$2"; shift 2 ;;
-    --warmup-queries) WARMUP_QUERIES="$2"; shift 2 ;;
-    --max-train) MAX_TRAIN="$2"; shift 2 ;;
-    --max-queries) MAX_QUERIES="$2"; shift 2 ;;
-    --threads) THREADS="$2"; shift 2 ;;
-    --python) PYTHON_BIN="$2"; shift 2 ;;
+    --datasets) require_arg "$1" "${2-}"; DATASETS="$2"; shift 2 ;;
+    --data-dir) require_arg "$1" "${2-}"; DATA_DIR="$2"; shift 2 ;;
+    --out-root) require_arg "$1" "${2-}"; OUT_ROOT="$2"; shift 2 ;;
+    --run-label) require_arg "$1" "${2-}"; RUN_LABEL="$2"; shift 2 ;;
+    --m-values) require_arg "$1" "${2-}"; M_VALUES="$2"; shift 2 ;;
+    --ef-construction-values) require_arg "$1" "${2-}"; EF_CONSTRUCTION_VALUES="$2"; shift 2 ;;
+    --ef-search-values) require_arg "$1" "${2-}"; EF_SEARCH_VALUES="$2"; shift 2 ;;
+    --recall-targets) require_arg "$1" "${2-}"; RECALL_TARGETS="$2"; shift 2 ;;
+    --k) require_arg "$1" "${2-}"; K="$2"; shift 2 ;;
+    --repetitions) require_arg "$1" "${2-}"; REPETITIONS="$2"; shift 2 ;;
+    --warmup-queries) require_arg "$1" "${2-}"; WARMUP_QUERIES="$2"; shift 2 ;;
+    --max-train) require_arg "$1" "${2-}"; MAX_TRAIN="$2"; shift 2 ;;
+    --max-queries) require_arg "$1" "${2-}"; MAX_QUERIES="$2"; shift 2 ;;
+    --threads) require_arg "$1" "${2-}"; THREADS="$2"; shift 2 ;;
+    --python) require_arg "$1" "${2-}"; PYTHON_BIN="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-download) SKIP_DOWNLOAD=1; shift ;;
     --force-reconvert) FORCE_RECONVERT=1; shift ;;
@@ -228,6 +238,10 @@ MANIFEST="${RUN_DIR}/manifest.txt"
   echo "warmup_queries=${WARMUP_QUERIES}"
   echo "max_train=${MAX_TRAIN}"
   echo "max_queries=${MAX_QUERIES}"
+  echo "metrics_schema=v2"
+  echo "qps_primary_metric=search_only"
+  echo "qps_end_to_end_metric=end_to_end_qps_mean"
+  echo "ann_backend_expected=kyro_single_graph"
   echo "python_bin=${PYTHON_BIN}"
   echo "threads=${THREADS:-default}"
   echo "host=$(hostname)"

@@ -84,10 +84,10 @@ def main() -> int:
         neighbors = neighbors[: args.max_queries]
 
     # Convert neighbors to u32 and validate range.
-    if np.issubdtype(neighbors.dtype, np.signedinteger):
+    if neighbors.size > 0 and np.issubdtype(neighbors.dtype, np.signedinteger):
         if np.any(neighbors < 0):
             raise SystemExit("neighbors contains negative ids, cannot convert to u32")
-    if np.max(neighbors) > np.iinfo(np.uint32).max:
+    if neighbors.size > 0 and np.max(neighbors) > np.iinfo(np.uint32).max:
         raise SystemExit("neighbors contains ids > u32::MAX, unsupported")
 
     neighbors = neighbors.astype(np.uint32, copy=False)

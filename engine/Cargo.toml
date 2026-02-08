@@ -58,8 +58,7 @@ loom = ["dep:loom"]
 
 
 [dependencies]
-# HNSW vector search
-hnsw_rs = { version = "0.3" }
+# Error handling and core engine orchestration
 anyhow = "1.0"
 
 # Learned frequency predictor for Hybrid Semantic Cache (no external deps, pure Rust)
@@ -137,10 +136,6 @@ loom = { version = "0.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
-
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-# SIMD-accelerated distances (AVX2/SSE2) for high-QPS ANN on x86_64.
-hnsw_rs = { version = "0.3", features = ["simdeez_f"] }
 
 [dev-dependencies]
 # Testing HNSW recall guarantees

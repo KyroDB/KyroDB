@@ -570,6 +570,10 @@ impl Default for EnvironmentConfig {
     }
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host.trim(), "127.0.0.1" | "::1" | "localhost")
+}
+
 // ============================================================================
 // Configuration Loading
 // ============================================================================
@@ -644,6 +648,14 @@ impl KyroDbConfig {
         anyhow::ensure!(
             !environment_type.is_empty(),
             "environment.type cannot be empty"
+        );
+        anyhow::ensure!(
+            matches!(
+                environment_type.as_str(),
+                "production" | "pilot" | "benchmark"
+            ),
+            "invalid environment.type '{}': expected one of production, pilot, benchmark",
+            self.environment.environment_type
         );
 
         // Server validation
@@ -864,9 +876,33 @@ impl KyroDbConfig {
                 "Pilot mode requires allow_fresh_start_on_recovery_failure=false"
             );
             anyhow::ensure!(
-                self.server.tls.enabled || matches!(self.server.host.as_str(), "127.0.0.1" | "::1"),
+                self.server.tls.enabled || is_loopback_host(&self.server.host),
                 "Pilot mode requires TLS for non-loopback gRPC bind addresses"
             );
+        }
+
+        if environment_type == "production" {
+            let grpc_loopback = is_loopback_host(&self.server.host);
+            let http_host = self
+                .server
+                .http_host
+                .as_deref()
+                .unwrap_or(&self.server.host);
+            let http_loopback = is_loopback_host(http_host);
+
+            if !grpc_loopback {
+                anyhow::ensure!(
+                    self.auth.enabled,
+                    "Production mode with non-loopback gRPC bind requires auth.enabled=true"
+                );
+            }
+
+            if !http_loopback {
+                anyhow::ensure!(
+                    self.server.observability_auth != ObservabilityAuthMode::Disabled,
+                    "Production mode with non-loopback HTTP observability bind requires server.observability_auth to protect endpoints"
+                );
+            }
         }
 
         // Authentication validation
@@ -969,7 +1005,10 @@ impl KyroDbConfig {
 /// ```
 pub fn generate_example_yaml() -> String {
     let config = KyroDbConfig::default();
-    serde_yaml::to_string(&config).expect("Failed to serialize default config")
+    match serde_yaml::to_string(&config) {
+        Ok(serialized) => serialized,
+        Err(error) => format!("# failed to serialize default config to YAML: {error}\n"),
+    }
 }
 
 /// Generate TOML config with default values (without explanatory comments).
@@ -984,7 +1023,10 @@ pub fn generate_example_yaml() -> String {
 /// ```
 pub fn generate_example_toml() -> String {
     let config = KyroDbConfig::default();
-    toml::to_string_pretty(&config).expect("Failed to serialize default config")
+    match toml::to_string_pretty(&config) {
+        Ok(serialized) => serialized,
+        Err(error) => format!("# failed to serialize default config to TOML: {error}\n"),
+    }
 }
 
 #[cfg(test)]
@@ -1117,6 +1159,16 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_environment_type_rejected() {
+        let mut config = KyroDbConfig::default();
+        config.environment.environment_type = "prod".to_string();
+        assert!(
+            config.validate().is_err(),
+            "unknown environment types must be rejected"
+        );
+    }
+
+    #[test]
     fn test_pilot_mode_requires_rate_limit_and_observability_auth() {
         let mut config = KyroDbConfig::default();
         config.environment.environment_type = "pilot".to_string();
@@ -1161,6 +1213,41 @@ mod tests {
         assert!(
             config.validate().is_ok(),
             "pilot mode config should pass with required guardrails"
+        );
+    }
+
+    #[test]
+    fn test_production_non_loopback_requires_auth() {
+        let mut config = KyroDbConfig::default();
+        config.server.host = "0.0.0.0".to_string();
+        assert!(
+            config.validate().is_err(),
+            "production mode must require auth on non-loopback gRPC bind"
+        );
+    }
+
+    #[test]
+    fn test_production_non_loopback_http_requires_observability_auth() {
+        let mut config = KyroDbConfig::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.auth.enabled = true;
+        config.auth.api_keys_file = Some(PathBuf::from("api_keys.yaml"));
+        assert!(
+            config.validate().is_err(),
+            "production mode must require observability auth when HTTP is non-loopback"
+        );
+    }
+
+    #[test]
+    fn test_production_non_loopback_secure_profile_passes() {
+        let mut config = KyroDbConfig::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.auth.enabled = true;
+        config.auth.api_keys_file = Some(PathBuf::from("api_keys.yaml"));
+        config.server.observability_auth = ObservabilityAuthMode::MetricsAndSlo;
+        assert!(
+            config.validate().is_ok(),
+            "production secure profile should pass"
         );
     }
 

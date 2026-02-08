@@ -38,11 +38,6 @@ Run with a config file:
 ./kyrodb_server --config config.yaml
 ```
 
-Run with the secure-by-default pilot profile:
-
-```bash
-./kyrodb_server --config config.pilot.toml
-```
 
 ## Configuration reference
 
@@ -53,9 +48,44 @@ server:
   host: "127.0.0.1"
   port: 50051
   http_port: 51051   # default is port + 1000 when unset
+  http_host: "127.0.0.1"  # optional; defaults to server.host
+  observability_auth: disabled  # disabled | metrics_and_slo | all
   max_connections: 10000
   connection_timeout_secs: 300
   shutdown_timeout_secs: 30
+  tls:
+    enabled: false
+    cert_path: null
+    key_path: null
+    ca_cert_path: null
+    require_client_cert: false
+```
+
+Notes:
+
+- `server.http_host` sets the HTTP observability bind host (`/metrics`, `/health`, `/ready`, `/slo`). When omitted, it defaults to `server.host`.
+- `server.observability_auth` controls auth on observability endpoints:
+  - `disabled`: no auth on observability endpoints.
+  - `metrics_and_slo`: require auth on `/metrics` and `/slo`.
+  - `all`: require auth on `/metrics`, `/health`, `/ready`, and `/slo`.
+- `server.observability_auth != disabled` requires `auth.enabled=true`.
+- `server.tls` configures gRPC TLS:
+  - `enabled=true` requires both `cert_path` and `key_path`.
+  - `require_client_cert=true` (mTLS) additionally requires `ca_cert_path`.
+- TLS fields under `server.tls` apply to the gRPC server. HTTP observability endpoints do not have an in-process TLS listener setting; for remote HTTP exposure, terminate TLS at an external proxy/load balancer and bind `server.http_host` conservatively.
+
+TLS example for non-loopback gRPC host:
+
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 50051
+  tls:
+    enabled: true
+    cert_path: "/etc/kyrodb/tls/server.crt"
+    key_path: "/etc/kyrodb/tls/server.key"
+    ca_cert_path: "/etc/kyrodb/tls/ca.crt"
+    require_client_cert: false
 ```
 
 ### Cache (used + partially wired)
@@ -256,6 +286,11 @@ Configuration is validated on startup. Common errors include:
   - `server.observability_auth != disabled`
   - `allow_fresh_start_on_recovery_failure=false`
   - TLS enabled for non-loopback gRPC hosts
+- `environment.type=production` with non-loopback bind requires:
+  - `auth.enabled=true` when `server.host` is non-loopback
+  - `server.observability_auth != disabled` when observability HTTP bind is non-loopback (`server.http_host` or `server.host`)
+
+These guardrails are coupled: `environment.type=pilot`/`production` checks evaluate `auth.enabled`, `rate_limit.enabled`, `server.observability_auth`, `server.http_host`, and `server.tls.*` together to prevent insecure remote exposure.
 
 ## Troubleshooting
 

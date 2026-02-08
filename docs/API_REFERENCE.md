@@ -269,6 +269,8 @@ curl http://localhost:51051/slo
 
 API key authentication is optional (disabled by default). Enable it in `config.yaml`:
 
+Note: for `environment.type=production`, non-loopback `server.host` requires `auth.enabled=true` at startup.
+
 ```yaml
 auth:
   enabled: true

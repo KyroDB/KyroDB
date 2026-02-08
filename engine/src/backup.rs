@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -108,6 +108,11 @@ impl Default for RetentionPolicy {
     }
 }
 
+const MAX_BACKUP_ARCHIVE_FILES: u32 = 1_000_000;
+const MAX_BACKUP_MEMBER_NAME_BYTES: u32 = 1024;
+const MAX_BACKUP_MEMBER_SIZE_BYTES: u64 = 1 << 40; // 1 TiB per member
+const BACKUP_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Shared utility function to list backups from a directory
 /// This eliminates code duplication between BackupManager and RestoreManager
 fn list_backups_from_dir(backup_dir: &Path) -> Result<Vec<BackupMetadata>> {
@@ -134,6 +139,156 @@ fn list_backups_from_dir(backup_dir: &Path) -> Result<Vec<BackupMetadata>> {
     Ok(backups)
 }
 
+#[cfg(unix)]
+fn open_restore_target(output_path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(output_path)
+        .with_context(|| format!("Failed to create restore target {}", output_path.display()))
+}
+
+#[cfg(not(unix))]
+fn open_restore_target(output_path: &Path) -> Result<File> {
+    // Best-effort fallback for platforms without O_NOFOLLOW.
+    // This check is not atomic with file creation and therefore cannot fully
+    // prevent TOCTOU symlink attacks on non-Unix systems.
+    if let Ok(meta) = fs::symlink_metadata(output_path) {
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "refusing to overwrite symlink during restore: {}",
+            output_path.display()
+        );
+        anyhow::ensure!(
+            !meta.is_dir(),
+            "refusing to overwrite directory during restore: {}",
+            output_path.display()
+        );
+    }
+
+    File::create(output_path)
+        .with_context(|| format!("Failed to create restore target {}", output_path.display()))
+}
+
+fn validate_backup_member_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "backup member name cannot be empty");
+
+    let path = Path::new(name);
+    anyhow::ensure!(
+        !path.is_absolute(),
+        "absolute paths are not allowed in backups"
+    );
+
+    let mut components = path.components();
+    let first = components
+        .next()
+        .ok_or_else(|| anyhow!("backup member path is empty"))?;
+    anyhow::ensure!(
+        components.next().is_none() && matches!(first, Component::Normal(_)),
+        "invalid backup member path '{}': only single-file names are allowed",
+        name
+    );
+
+    Ok(())
+}
+
+fn read_archive_file_count<R: Read>(reader: &mut R) -> Result<u32> {
+    let mut file_count_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut file_count_bytes)
+        .context("Failed to read file count")?;
+    let file_count = u32::from_le_bytes(file_count_bytes);
+    anyhow::ensure!(
+        file_count <= MAX_BACKUP_ARCHIVE_FILES,
+        "backup archive contains too many members: {} (max {})",
+        file_count,
+        MAX_BACKUP_ARCHIVE_FILES
+    );
+    Ok(file_count)
+}
+
+fn read_archive_member_header<R: Read>(reader: &mut R) -> Result<(String, u64)> {
+    let mut name_len_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut name_len_bytes)
+        .context("Failed to read filename length")?;
+    let name_len = u32::from_le_bytes(name_len_bytes);
+    anyhow::ensure!(name_len > 0, "backup member name length cannot be zero");
+    anyhow::ensure!(
+        name_len <= MAX_BACKUP_MEMBER_NAME_BYTES,
+        "backup member name length {} exceeds maximum {}",
+        name_len,
+        MAX_BACKUP_MEMBER_NAME_BYTES
+    );
+
+    let mut name_bytes = vec![0u8; name_len as usize];
+    reader
+        .read_exact(&mut name_bytes)
+        .context("Failed to read filename")?;
+    let name = String::from_utf8(name_bytes).context("backup member name is not valid UTF-8")?;
+    validate_backup_member_name(&name)?;
+
+    let mut data_len_bytes = [0u8; 8];
+    reader
+        .read_exact(&mut data_len_bytes)
+        .context("Failed to read data length")?;
+    let data_len = u64::from_le_bytes(data_len_bytes);
+    anyhow::ensure!(
+        data_len <= MAX_BACKUP_MEMBER_SIZE_BYTES,
+        "backup member '{}' size {} exceeds maximum supported size {}",
+        name,
+        data_len,
+        MAX_BACKUP_MEMBER_SIZE_BYTES
+    );
+
+    Ok((name, data_len))
+}
+
+fn stream_member_crc32<R: Read>(reader: &mut R, data_len: u64) -> Result<u32> {
+    let mut hasher = crc32fast::Hasher::new();
+    let mut remaining = data_len;
+    let mut buffer = [0u8; BACKUP_STREAM_CHUNK_BYTES];
+
+    while remaining > 0 {
+        let chunk = usize::try_from(remaining.min(BACKUP_STREAM_CHUNK_BYTES as u64))
+            .unwrap_or(BACKUP_STREAM_CHUNK_BYTES);
+        reader
+            .read_exact(&mut buffer[..chunk])
+            .context("Failed to read file data")?;
+        hasher.update(&buffer[..chunk]);
+        remaining -= chunk as u64;
+    }
+
+    Ok(hasher.finalize())
+}
+
+fn stream_member_to_writer<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    data_len: u64,
+) -> Result<()> {
+    let mut remaining = data_len;
+    let mut buffer = [0u8; BACKUP_STREAM_CHUNK_BYTES];
+
+    while remaining > 0 {
+        let chunk = usize::try_from(remaining.min(BACKUP_STREAM_CHUNK_BYTES as u64))
+            .unwrap_or(BACKUP_STREAM_CHUNK_BYTES);
+        reader
+            .read_exact(&mut buffer[..chunk])
+            .context("Failed to read backup member payload")?;
+        writer
+            .write_all(&buffer[..chunk])
+            .context("Failed to write restored backup member payload")?;
+        remaining -= chunk as u64;
+    }
+
+    Ok(())
+}
+
 /// Compute CRC32 checksum of a backup file
 /// This matches the algorithm used during backup creation
 /// Backup format: [file_count][name_len][name][data_len][data]...
@@ -143,45 +298,14 @@ pub fn compute_backup_checksum(backup_path: &Path) -> Result<u32> {
         File::open(backup_path).context("Failed to open backup file for checksum computation")?;
     let mut reader = BufReader::new(file);
 
-    // Read file count
-    let mut file_count_bytes = [0u8; 4];
-    reader
-        .read_exact(&mut file_count_bytes)
-        .context("Failed to read file count")?;
-    let file_count = u32::from_le_bytes(file_count_bytes);
+    let file_count = read_archive_file_count(&mut reader)?;
 
     let mut checksum = 0u32;
 
     // Process each file in the backup
     for _ in 0..file_count {
-        // Read filename length
-        let mut name_len_bytes = [0u8; 4];
-        reader
-            .read_exact(&mut name_len_bytes)
-            .context("Failed to read filename length")?;
-        let name_len = u32::from_le_bytes(name_len_bytes);
-
-        // Skip filename
-        let mut name_bytes = vec![0u8; name_len as usize];
-        reader
-            .read_exact(&mut name_bytes)
-            .context("Failed to read filename")?;
-
-        // Read data length
-        let mut data_len_bytes = [0u8; 8];
-        reader
-            .read_exact(&mut data_len_bytes)
-            .context("Failed to read data length")?;
-        let data_len = u64::from_le_bytes(data_len_bytes);
-
-        // Read and checksum file data
-        let mut file_data = vec![0u8; data_len as usize];
-        reader
-            .read_exact(&mut file_data)
-            .context("Failed to read file data")?;
-
-        // Update checksum (only from file content, matching backup creation)
-        checksum = checksum.wrapping_add(crc32fast::hash(&file_data));
+        let (_name, data_len) = read_archive_member_header(&mut reader)?;
+        checksum = checksum.wrapping_add(stream_member_crc32(&mut reader, data_len)?);
     }
 
     Ok(checksum)
@@ -213,10 +337,16 @@ impl BackupManager {
 
         // Generate backup ID first
         let backup_id = Uuid::new_v4();
-        let backup_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is set before Unix epoch (1970-01-01) - this should never happen on a properly configured system")
-            .as_secs();
+        let backup_timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "system clock is before UNIX epoch; using backup timestamp=0"
+                );
+                0
+            }
+        };
 
         let backup_path = self.backup_dir.join(format!("backup_{}.tar", backup_id));
 
@@ -791,12 +921,10 @@ impl RestoreManager {
             }
 
             // Safety: chain is initialized with metadata on line 776, so it's never empty
-            if chain
-                .last()
-                .expect("BUG: chain cannot be empty (initialized with metadata on line 776)")
-                .backup_type
-                != BackupType::Full
-            {
+            let Some(chain_tail) = chain.last() else {
+                return Err(anyhow!("No full backup found in chain"));
+            };
+            if chain_tail.backup_type != BackupType::Full {
                 return Err(anyhow!("No full backup found in chain"));
             }
 
@@ -806,6 +934,13 @@ impl RestoreManager {
         };
 
         info!("Restore chain has {} backups", restore_chain.len());
+
+        // Preflight integrity verification: never clear live data if backups are invalid.
+        let mut verified_archives = Vec::with_capacity(restore_chain.len());
+        for backup_metadata in &restore_chain {
+            let backup_path = self.verify_backup_archive(backup_metadata)?;
+            verified_archives.push((backup_metadata.id, backup_path));
+        }
 
         // Clear data directory with safeguards
         self.clear_data_directory(clear_options)?;
@@ -820,8 +955,8 @@ impl RestoreManager {
         }
 
         // Restore each backup in chain
-        for backup_metadata in &restore_chain {
-            self.extract_backup(backup_metadata.id)?;
+        for (backup_id, backup_path) in verified_archives {
+            self.extract_backup_archive(backup_id, &backup_path)?;
         }
 
         info!("Restore completed successfully");
@@ -829,45 +964,56 @@ impl RestoreManager {
         Ok(())
     }
 
-    /// Extract a backup tar file to data directory
-    fn extract_backup(&self, backup_id: Uuid) -> Result<()> {
+    fn backup_archive_path(&self, backup_id: Uuid) -> PathBuf {
+        self.backup_dir.join(format!("backup_{}.tar", backup_id))
+    }
+
+    fn verify_backup_archive(&self, metadata: &BackupMetadata) -> Result<PathBuf> {
+        let backup_path = self.backup_archive_path(metadata.id);
+        if !backup_path.exists() {
+            return Err(anyhow!("Backup file not found: {}", metadata.id));
+        }
+
+        let computed_checksum = compute_backup_checksum(&backup_path).with_context(|| {
+            format!(
+                "failed to validate backup archive structure for {}",
+                metadata.id
+            )
+        })?;
+        anyhow::ensure!(
+            computed_checksum == metadata.checksum,
+            "backup checksum mismatch for {}: expected 0x{:08X}, computed 0x{:08X}",
+            metadata.id,
+            metadata.checksum,
+            computed_checksum
+        );
+
+        Ok(backup_path)
+    }
+
+    /// Extract a pre-verified backup archive into `data_dir`.
+    fn extract_backup_archive(&self, backup_id: Uuid, backup_path: &Path) -> Result<()> {
         debug!("Extracting backup: {}", backup_id);
 
-        let backup_path = self.backup_dir.join(format!("backup_{}.tar", backup_id));
-        if !backup_path.exists() {
-            return Err(anyhow!("Backup file not found: {}", backup_id));
-        }
+        fs::create_dir_all(&self.data_dir).context("Failed to create restore data directory")?;
 
         let backup_file = File::open(backup_path)?;
         let mut reader = BufReader::new(backup_file);
 
-        // Read file count
-        let mut count_bytes = [0u8; 4];
-        reader.read_exact(&mut count_bytes)?;
-        let file_count = u32::from_le_bytes(count_bytes);
+        let file_count = read_archive_file_count(&mut reader)?;
 
         // Extract each file
         for _ in 0..file_count {
-            // Read filename
-            let mut name_len_bytes = [0u8; 4];
-            reader.read_exact(&mut name_len_bytes)?;
-            let name_len = u32::from_le_bytes(name_len_bytes);
-
-            let mut name_bytes = vec![0u8; name_len as usize];
-            reader.read_exact(&mut name_bytes)?;
-            let name = String::from_utf8(name_bytes)?;
-
-            // Read file data
-            let mut data_len_bytes = [0u8; 8];
-            reader.read_exact(&mut data_len_bytes)?;
-            let data_len = u64::from_le_bytes(data_len_bytes);
-
-            let mut data = vec![0u8; data_len as usize];
-            reader.read_exact(&mut data)?;
+            let (name, data_len) = read_archive_member_header(&mut reader)?;
 
             // Write to data directory
             let output_path = self.data_dir.join(&name);
-            fs::write(output_path, data)?;
+            let output_file = open_restore_target(&output_path)?;
+            let mut writer = BufWriter::new(output_file);
+            stream_member_to_writer(&mut reader, &mut writer, data_len)?;
+            writer.flush().with_context(|| {
+                format!("Failed to flush restore target {}", output_path.display())
+            })?;
 
             debug!("Extracted file: {}", name);
         }
@@ -932,6 +1078,13 @@ impl RestoreManager {
             incrementals.len()
         );
 
+        // Preflight integrity verification before any destructive action.
+        let mut verified_archives = Vec::with_capacity(incrementals.len().saturating_add(1));
+        verified_archives.push((full_backup.id, self.verify_backup_archive(full_backup)?));
+        for incremental in &incrementals {
+            verified_archives.push((incremental.id, self.verify_backup_archive(incremental)?));
+        }
+
         // Clear data directory with safeguards
         self.clear_data_directory(clear_options)?;
 
@@ -944,12 +1097,9 @@ impl RestoreManager {
             return Ok(());
         }
 
-        // Restore full backup
-        self.extract_backup(full_backup.id)?;
-
-        // Restore incrementals in order
-        for incremental in &incrementals {
-            self.extract_backup(incremental.id)?;
+        // Restore full backup and incrementals in order
+        for (backup_id, backup_path) in verified_archives {
+            self.extract_backup_archive(backup_id, &backup_path)?;
         }
 
         info!("PITR restore completed successfully");
@@ -1351,9 +1501,29 @@ impl S3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    fn write_archive_with_entries(backup_path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(backup_path).unwrap();
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(&(entries.len() as u32).to_le_bytes())
+            .unwrap();
+        for (name, payload) in entries {
+            writer
+                .write_all(&(name.len() as u32).to_le_bytes())
+                .unwrap();
+            writer.write_all(name.as_bytes()).unwrap();
+            writer
+                .write_all(&(payload.len() as u64).to_le_bytes())
+                .unwrap();
+            writer.write_all(payload).unwrap();
+        }
+        writer.flush().unwrap();
+    }
 
     #[test]
     fn test_backup_manager_create_full() {
@@ -1462,6 +1632,167 @@ mod tests {
 
         let snapshot = fs::read(temp_restore.path().join("snapshot_50")).unwrap();
         assert_eq!(snapshot, b"original data");
+    }
+
+    #[test]
+    fn test_restore_rejects_path_traversal_archive_member() {
+        let temp_backup = TempDir::new().unwrap();
+        let temp_restore = TempDir::new().unwrap();
+        let escaped_target = temp_restore.path().parent().unwrap().join("pwned.txt");
+        let backup_id = Uuid::new_v4();
+
+        let backup_tar = temp_backup.path().join(format!("backup_{}.tar", backup_id));
+        write_archive_with_entries(&backup_tar, &[("../pwned.txt", b"owned")]);
+        let checksum_err = compute_backup_checksum(&backup_tar).unwrap_err();
+        assert!(
+            checksum_err
+                .to_string()
+                .contains("invalid backup member path"),
+            "unexpected checksum validation error: {checksum_err}"
+        );
+
+        let metadata = BackupMetadata {
+            id: backup_id,
+            timestamp: 1,
+            backup_type: BackupType::Full,
+            size_bytes: 5,
+            vector_count: 0,
+            checksum: 0,
+            parent_id: None,
+            description: "malicious".to_string(),
+        };
+        fs::write(
+            temp_backup
+                .path()
+                .join(format!("backup_{}.json", backup_id)),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let restore_mgr = RestoreManager::new(temp_backup.path(), temp_restore.path()).unwrap();
+        let err = restore_mgr
+            .restore_from_backup_with_options(
+                backup_id,
+                &ClearDirectoryOptions::new().with_allow_clear(true),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to validate backup archive structure"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !escaped_target.exists(),
+            "path traversal must not create files outside restore directory"
+        );
+    }
+
+    #[test]
+    fn test_restore_rejects_oversized_archive_member() {
+        let temp_backup = TempDir::new().unwrap();
+        let temp_restore = TempDir::new().unwrap();
+        let backup_id = Uuid::new_v4();
+
+        let backup_tar = temp_backup.path().join(format!("backup_{}.tar", backup_id));
+        let file = File::create(&backup_tar).unwrap();
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&1u32.to_le_bytes()).unwrap();
+        let name = "MANIFEST".as_bytes();
+        writer
+            .write_all(&(name.len() as u32).to_le_bytes())
+            .unwrap();
+        writer.write_all(name).unwrap();
+        writer
+            .write_all(&(MAX_BACKUP_MEMBER_SIZE_BYTES + 1).to_le_bytes())
+            .unwrap();
+        writer.flush().unwrap();
+        let checksum_err = compute_backup_checksum(&backup_tar).unwrap_err();
+        assert!(
+            checksum_err
+                .to_string()
+                .contains("exceeds maximum supported size"),
+            "unexpected checksum validation error: {checksum_err}"
+        );
+
+        let metadata = BackupMetadata {
+            id: backup_id,
+            timestamp: 1,
+            backup_type: BackupType::Full,
+            size_bytes: 0,
+            vector_count: 0,
+            checksum: 0,
+            parent_id: None,
+            description: "oversized".to_string(),
+        };
+        fs::write(
+            temp_backup
+                .path()
+                .join(format!("backup_{}.json", backup_id)),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let restore_mgr = RestoreManager::new(temp_backup.path(), temp_restore.path()).unwrap();
+        let err = restore_mgr
+            .restore_from_backup_with_options(
+                backup_id,
+                &ClearDirectoryOptions::new().with_allow_clear(true),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to validate backup archive structure"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_restore_preflight_integrity_check_prevents_data_loss() {
+        let temp_data = TempDir::new().unwrap();
+        let temp_backup = TempDir::new().unwrap();
+        let temp_restore = TempDir::new().unwrap();
+
+        fs::write(temp_data.path().join("MANIFEST"), "snapshot_number: 7\n").unwrap();
+        fs::write(temp_data.path().join("snapshot_7"), b"snapshot").unwrap();
+
+        let backup_mgr = BackupManager::new(temp_backup.path(), temp_data.path()).unwrap();
+        let metadata = backup_mgr.create_full_backup("valid".to_string()).unwrap();
+        let backup_tar = temp_backup
+            .path()
+            .join(format!("backup_{}.tar", metadata.id));
+
+        // Tamper with archive payload to force checksum mismatch.
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(&backup_tar)
+            .unwrap();
+        let len = file.metadata().unwrap().len();
+        file.seek(SeekFrom::Start(len.saturating_sub(1))).unwrap();
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last).unwrap();
+        file.seek(SeekFrom::Start(len.saturating_sub(1))).unwrap();
+        file.write_all(&[last[0] ^ 0xFF]).unwrap();
+        file.flush().unwrap();
+
+        let sentinel = temp_restore.path().join("KEEP_ME");
+        fs::write(&sentinel, b"do-not-delete").unwrap();
+
+        let restore_mgr = RestoreManager::new(temp_backup.path(), temp_restore.path()).unwrap();
+        let err = restore_mgr
+            .restore_from_backup_with_options(
+                metadata.id,
+                &ClearDirectoryOptions::new().with_allow_clear(true),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            sentinel.exists(),
+            "preflight verification must fail before clearing restore directory"
+        );
     }
 
     #[test]

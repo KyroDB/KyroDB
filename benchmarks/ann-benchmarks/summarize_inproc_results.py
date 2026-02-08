@@ -26,6 +26,7 @@ from typing import Dict, Iterable, List, Sequence
 class Candidate:
     dataset: str
     source_json: str
+    ann_backend: str
     distance: str
     k: int
     m: int
@@ -35,6 +36,11 @@ class Candidate:
     warmup_queries: int
     recall: float
     recall_std: float
+    qps_search: float
+    qps_end_to_end: float
+    search_elapsed_ms: float
+    evaluation_elapsed_ms: float
+    # Backward-compatible alias of search QPS.
     qps: float
     qps_std: float
     p50_ms: float
@@ -113,6 +119,7 @@ def load_candidates(paths: Iterable[Path]) -> tuple[List[Candidate], List[Dict[s
                     Candidate(
                         dataset=str(dataset),
                         source_json=str(path),
+                        ann_backend=str(config.get("ann_backend", "unknown")),
                         distance=str(config["distance"]),
                         k=int(config["k"]),
                         m=int(config["m"]),
@@ -122,7 +129,15 @@ def load_candidates(paths: Iterable[Path]) -> tuple[List[Candidate], List[Dict[s
                         warmup_queries=int(config["warmup_queries"]),
                         recall=float(aggregate["recall_mean"]),
                         recall_std=float(aggregate["recall_std"]),
-                        qps=float(aggregate["qps_mean"]),
+                        qps_search=float(aggregate.get("qps_mean", 0.0)),
+                        qps_end_to_end=float(
+                            aggregate.get("end_to_end_qps_mean", aggregate.get("qps_mean", 0.0))
+                        ),
+                        search_elapsed_ms=float(aggregate.get("search_elapsed_ms_mean", 0.0)),
+                        evaluation_elapsed_ms=float(
+                            aggregate.get("evaluation_elapsed_ms_mean", 0.0)
+                        ),
+                        qps=float(aggregate.get("qps_mean", 0.0)),
                         qps_std=float(aggregate["qps_std"]),
                         p50_ms=float(aggregate["p50_latency_ms_mean"]),
                         p95_ms=float(aggregate["p95_latency_ms_mean"]),
@@ -218,10 +233,10 @@ def render_markdown(
     lines.append("## Best QPS At Recall Targets")
     lines.append("")
     lines.append(
-        "| dataset | target_recall | met_target | recall | qps | p95_ms | p99_ms | m | ef_construction | ef_search | source_json |"
+        "| dataset | target_recall | met_target | recall | qps_search | qps_e2e | p95_ms | p99_ms | m | ef_construction | ef_search | source_json |"
     )
     lines.append(
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
     )
     for dataset in sorted(grouped):
         best = dataset_summaries[dataset]["best_by_target"]
@@ -233,12 +248,13 @@ def render_markdown(
             cand = entry["candidate"]
             met = "yes" if entry["met_target"] else "no"
             lines.append(
-                "| {dataset} | {target} | {met} | {recall} | {qps} | {p95} | {p99} | {m} | {efc} | {efs} | `{src}` |".format(
+                "| {dataset} | {target} | {met} | {recall} | {qps} | {qps_e2e} | {p95} | {p99} | {m} | {efc} | {efs} | `{src}` |".format(
                     dataset=dataset,
                     target=format_float(target, 2),
                     met=met,
                     recall=format_float(float(cand["recall"]), 4),
                     qps=format_float(float(cand["qps"]), 2),
+                    qps_e2e=format_float(float(cand["qps_end_to_end"]), 2),
                     p95=format_float(float(cand["p95_ms"]), 3),
                     p99=format_float(float(cand["p99_ms"]), 3),
                     m=int(cand["m"]),
@@ -252,7 +268,7 @@ def render_markdown(
     lines.append("## Dataset Extremes")
     lines.append("")
     lines.append(
-        "| dataset | max_recall | qps_at_max_recall | max_qps | recall_at_max_qps | build_vec_per_sec | index_mem_gb | candidates |"
+        "| dataset | max_recall | qps_search_at_max_recall | max_qps_search | recall_at_max_qps | build_vec_per_sec | index_mem_gb | candidates |"
     )
     lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
     for dataset in sorted(grouped):
@@ -284,21 +300,22 @@ def render_markdown(
         lines.append(f"### Recall >= {format_float(target, 2)}")
         lines.append("")
         lines.append(
-            "| rank | dataset | met_target | recall | qps | p95_ms | p99_ms | m | ef_construction | ef_search |"
+            "| rank | dataset | met_target | recall | qps_search | qps_e2e | p95_ms | p99_ms | m | ef_construction | ef_search |"
         )
-        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         ranking: List[Candidate] = []
         for dataset in sorted(grouped):
             ranking.extend(grouped[dataset])
         ranking = sorted(ranking, key=lambda row: ranking_sort_key(row, target))
         for idx, row in enumerate(ranking[: min(20, len(ranking))], start=1):
             lines.append(
-                "| {rank} | {dataset} | {met} | {recall} | {qps} | {p95} | {p99} | {m} | {efc} | {efs} |".format(
+                "| {rank} | {dataset} | {met} | {recall} | {qps} | {qps_e2e} | {p95} | {p99} | {m} | {efc} | {efs} |".format(
                     rank=idx,
                     dataset=row.dataset,
                     met="yes" if row.recall >= target else "no",
                     recall=format_float(row.recall, 4),
                     qps=format_float(row.qps, 2),
+                    qps_e2e=format_float(row.qps_end_to_end, 2),
                     p95=format_float(row.p95_ms, 3),
                     p99=format_float(row.p99_ms, 3),
                     m=row.m,
@@ -313,15 +330,18 @@ def render_markdown(
     for dataset in sorted(grouped):
         lines.append(f"### {dataset}")
         lines.append("")
-        lines.append("| recall | qps | p95_ms | p99_ms | m | ef_construction | ef_search |")
-        lines.append("|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append(
+            "| recall | qps_search | qps_e2e | p95_ms | p99_ms | m | ef_construction | ef_search |"
+        )
+        lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|")
         frontier = dataset_summaries[dataset]["pareto_frontier"]
         assert isinstance(frontier, list)
         for row in frontier[:top_frontier]:
             lines.append(
-                "| {recall} | {qps} | {p95} | {p99} | {m} | {efc} | {efs} |".format(
+                "| {recall} | {qps} | {qps_e2e} | {p95} | {p99} | {m} | {efc} | {efs} |".format(
                     recall=format_float(float(row["recall"]), 4),
                     qps=format_float(float(row["qps"]), 2),
+                    qps_e2e=format_float(float(row["qps_end_to_end"]), 2),
                     p95=format_float(float(row["p95_ms"]), 3),
                     p99=format_float(float(row["p99_ms"]), 3),
                     m=int(row["m"]),

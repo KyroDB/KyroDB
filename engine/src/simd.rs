@@ -240,14 +240,37 @@ use std::arch::x86_64::*;
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "fma")]
 unsafe fn dot_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
-    let mut acc = _mm256_setzero_ps();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
     let chunks = len / 8;
-    for i in 0..chunks {
+    let chunks4 = chunks / 4;
+    for i in 0..chunks4 {
+        let off = i * 32;
+        let va = _mm256_loadu_ps(a.as_ptr().add(off));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off));
+        acc0 = _mm256_fmadd_ps(va, vb, acc0);
+
+        let va = _mm256_loadu_ps(a.as_ptr().add(off + 8));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off + 8));
+        acc1 = _mm256_fmadd_ps(va, vb, acc1);
+
+        let va = _mm256_loadu_ps(a.as_ptr().add(off + 16));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off + 16));
+        acc2 = _mm256_fmadd_ps(va, vb, acc2);
+
+        let va = _mm256_loadu_ps(a.as_ptr().add(off + 24));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off + 24));
+        acc3 = _mm256_fmadd_ps(va, vb, acc3);
+    }
+    for i in (chunks4 * 4)..chunks {
         let off = i * 8;
         let va = _mm256_loadu_ps(a.as_ptr().add(off));
         let vb = _mm256_loadu_ps(b.as_ptr().add(off));
-        acc = _mm256_fmadd_ps(va, vb, acc);
+        acc0 = _mm256_fmadd_ps(va, vb, acc0);
     }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
     let mut sum: f32 = tmp.iter().sum();
@@ -261,14 +284,37 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "fma")]
 unsafe fn dot_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
-    let mut acc = _mm512_setzero_ps();
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
     let chunks = len / 16;
-    for i in 0..chunks {
+    let chunks4 = chunks / 4;
+    for i in 0..chunks4 {
+        let off = i * 64;
+        let va = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
+        acc0 = _mm512_fmadd_ps(va, vb, acc0);
+
+        let va = _mm512_loadu_ps(a.as_ptr().add(off + 16) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(off + 16) as *const _);
+        acc1 = _mm512_fmadd_ps(va, vb, acc1);
+
+        let va = _mm512_loadu_ps(a.as_ptr().add(off + 32) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(off + 32) as *const _);
+        acc2 = _mm512_fmadd_ps(va, vb, acc2);
+
+        let va = _mm512_loadu_ps(a.as_ptr().add(off + 48) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(off + 48) as *const _);
+        acc3 = _mm512_fmadd_ps(va, vb, acc3);
+    }
+    for i in (chunks4 * 4)..chunks {
         let off = i * 16;
         let va = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
         let vb = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
-        acc = _mm512_fmadd_ps(va, vb, acc);
+        acc0 = _mm512_fmadd_ps(va, vb, acc0);
     }
+    let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
     let mut tmp = [0.0f32; 16];
     _mm512_storeu_ps(tmp.as_mut_ptr() as *mut _, acc);
     let mut sum: f32 = tmp.iter().sum();
@@ -302,13 +348,32 @@ unsafe fn dot_f32_sse2(a: &[f32], b: &[f32], len: usize) -> f32 {
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "fma")]
 unsafe fn sum_squares_f32_avx2(v: &[f32]) -> f32 {
-    let mut acc = _mm256_setzero_ps();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
     let chunks = v.len() / 8;
-    for i in 0..chunks {
+    let chunks4 = chunks / 4;
+    for i in 0..chunks4 {
+        let off = i * 32;
+        let x = _mm256_loadu_ps(v.as_ptr().add(off));
+        acc0 = _mm256_fmadd_ps(x, x, acc0);
+
+        let x = _mm256_loadu_ps(v.as_ptr().add(off + 8));
+        acc1 = _mm256_fmadd_ps(x, x, acc1);
+
+        let x = _mm256_loadu_ps(v.as_ptr().add(off + 16));
+        acc2 = _mm256_fmadd_ps(x, x, acc2);
+
+        let x = _mm256_loadu_ps(v.as_ptr().add(off + 24));
+        acc3 = _mm256_fmadd_ps(x, x, acc3);
+    }
+    for i in (chunks4 * 4)..chunks {
         let off = i * 8;
         let x = _mm256_loadu_ps(v.as_ptr().add(off));
-        acc = _mm256_fmadd_ps(x, x, acc);
+        acc0 = _mm256_fmadd_ps(x, x, acc0);
     }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
     let mut sum: f32 = tmp.iter().sum();
@@ -323,13 +388,32 @@ unsafe fn sum_squares_f32_avx2(v: &[f32]) -> f32 {
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "fma")]
 unsafe fn sum_squares_f32_avx512(v: &[f32]) -> f32 {
-    let mut acc = _mm512_setzero_ps();
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
     let chunks = v.len() / 16;
-    for i in 0..chunks {
+    let chunks4 = chunks / 4;
+    for i in 0..chunks4 {
+        let off = i * 64;
+        let x = _mm512_loadu_ps(v.as_ptr().add(off) as *const _);
+        acc0 = _mm512_fmadd_ps(x, x, acc0);
+
+        let x = _mm512_loadu_ps(v.as_ptr().add(off + 16) as *const _);
+        acc1 = _mm512_fmadd_ps(x, x, acc1);
+
+        let x = _mm512_loadu_ps(v.as_ptr().add(off + 32) as *const _);
+        acc2 = _mm512_fmadd_ps(x, x, acc2);
+
+        let x = _mm512_loadu_ps(v.as_ptr().add(off + 48) as *const _);
+        acc3 = _mm512_fmadd_ps(x, x, acc3);
+    }
+    for i in (chunks4 * 4)..chunks {
         let off = i * 16;
         let x = _mm512_loadu_ps(v.as_ptr().add(off) as *const _);
-        acc = _mm512_fmadd_ps(x, x, acc);
+        acc0 = _mm512_fmadd_ps(x, x, acc0);
     }
+    let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
     let mut tmp = [0.0f32; 16];
     _mm512_storeu_ps(tmp.as_mut_ptr() as *mut _, acc);
     let mut sum: f32 = tmp.iter().sum();
@@ -364,15 +448,42 @@ unsafe fn sum_squares_f32_sse2(v: &[f32]) -> f32 {
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "fma")]
 unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
-    let mut acc = _mm256_setzero_ps();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
     let chunks = len / 8;
-    for i in 0..chunks {
+    let chunks4 = chunks / 4;
+    for i in 0..chunks4 {
+        let off = i * 32;
+        let va = _mm256_loadu_ps(a.as_ptr().add(off));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off));
+        let d = _mm256_sub_ps(va, vb);
+        acc0 = _mm256_fmadd_ps(d, d, acc0);
+
+        let va = _mm256_loadu_ps(a.as_ptr().add(off + 8));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off + 8));
+        let d = _mm256_sub_ps(va, vb);
+        acc1 = _mm256_fmadd_ps(d, d, acc1);
+
+        let va = _mm256_loadu_ps(a.as_ptr().add(off + 16));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off + 16));
+        let d = _mm256_sub_ps(va, vb);
+        acc2 = _mm256_fmadd_ps(d, d, acc2);
+
+        let va = _mm256_loadu_ps(a.as_ptr().add(off + 24));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(off + 24));
+        let d = _mm256_sub_ps(va, vb);
+        acc3 = _mm256_fmadd_ps(d, d, acc3);
+    }
+    for i in (chunks4 * 4)..chunks {
         let off = i * 8;
         let va = _mm256_loadu_ps(a.as_ptr().add(off));
         let vb = _mm256_loadu_ps(b.as_ptr().add(off));
         let d = _mm256_sub_ps(va, vb);
-        acc = _mm256_fmadd_ps(d, d, acc);
+        acc0 = _mm256_fmadd_ps(d, d, acc0);
     }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
     let mut sum: f32 = tmp.iter().sum();
@@ -387,15 +498,42 @@ unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "fma")]
 unsafe fn l2_distance_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
-    let mut acc = _mm512_setzero_ps();
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
     let chunks = len / 16;
-    for i in 0..chunks {
+    let chunks4 = chunks / 4;
+    for i in 0..chunks4 {
+        let off = i * 64;
+        let va = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
+        let d = _mm512_sub_ps(va, vb);
+        acc0 = _mm512_fmadd_ps(d, d, acc0);
+
+        let va = _mm512_loadu_ps(a.as_ptr().add(off + 16) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(off + 16) as *const _);
+        let d = _mm512_sub_ps(va, vb);
+        acc1 = _mm512_fmadd_ps(d, d, acc1);
+
+        let va = _mm512_loadu_ps(a.as_ptr().add(off + 32) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(off + 32) as *const _);
+        let d = _mm512_sub_ps(va, vb);
+        acc2 = _mm512_fmadd_ps(d, d, acc2);
+
+        let va = _mm512_loadu_ps(a.as_ptr().add(off + 48) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(off + 48) as *const _);
+        let d = _mm512_sub_ps(va, vb);
+        acc3 = _mm512_fmadd_ps(d, d, acc3);
+    }
+    for i in (chunks4 * 4)..chunks {
         let off = i * 16;
         let va = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
         let vb = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
         let d = _mm512_sub_ps(va, vb);
-        acc = _mm512_fmadd_ps(d, d, acc);
+        acc0 = _mm512_fmadd_ps(d, d, acc0);
     }
+    let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
     let mut tmp = [0.0f32; 16];
     _mm512_storeu_ps(tmp.as_mut_ptr() as *mut _, acc);
     let mut sum: f32 = tmp.iter().sum();

@@ -653,7 +653,7 @@ fn generate_mock_embeddings(corpus_size: usize, embedding_dim: usize) -> Vec<Vec
     }
 
     let noise_stddev = 0.05;
-    let noise = Normal::new(0.0, noise_stddev).expect("valid noise distribution");
+    let noise = Normal::new(0.0, noise_stddev).ok();
 
     (0..corpus_size)
         .map(|doc_id| {
@@ -661,8 +661,10 @@ fn generate_mock_embeddings(corpus_size: usize, embedding_dim: usize) -> Vec<Vec
             let mut embedding = topic_bases[topic_index].clone();
 
             let mut doc_rng = ChaCha8Rng::seed_from_u64(doc_id as u64);
-            for value in embedding.iter_mut() {
-                *value += noise.sample(&mut doc_rng) as f32;
+            if let Some(noise_dist) = &noise {
+                for value in embedding.iter_mut() {
+                    *value += noise_dist.sample(&mut doc_rng) as f32;
+                }
             }
 
             normalize_embedding(&mut embedding);

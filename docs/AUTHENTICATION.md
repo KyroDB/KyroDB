@@ -10,10 +10,14 @@ The quota is forward-enforced: existing vectors are not removed automatically.
 
 API key authentication is integrated with the gRPC server. When `auth.enabled` is set, all gRPC requests must include an API key.
 
+In `environment.type=production`, a non-loopback gRPC bind (`server.host`) now requires `auth.enabled=true` at startup validation time.
+
 HTTP observability endpoints (`/metrics`, `/health`, `/ready`, `/slo`) are unauthenticated by default for operational simplicity, but can (and typically should) be protected in production via either:
 
 - Binding the HTTP server to a restricted interface using `server.http_host` (e.g., loopback only)
 - Requiring API key auth using `server.observability_auth` (same headers as gRPC)
+
+In `environment.type=production`, if observability HTTP is non-loopback (`server.http_host` or fallback `server.host`), startup validation requires `server.observability_auth != disabled`.
 
 ## Configuration
 

@@ -36,6 +36,7 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -120,10 +121,14 @@ pub enum SearchExecutionPath {
     HotTierOnly,
     ColdTierOnly,
     HotAndCold,
+    /// Neither tier was successfully queried (e.g. both circuit breakers open,
+    /// both tiers timed out, or empty database with no hot-tier data).
+    Degraded,
 }
 
 const NORMALIZATION_NORM_SQ_MIN: f32 = 0.98;
 const NORMALIZATION_NORM_SQ_MAX: f32 = 1.02;
+const DEFAULT_QUERY_CACHE_SCOPE: u64 = 0;
 
 /// Configuration for tiered engine
 #[derive(Debug, Clone)]
@@ -450,6 +455,16 @@ impl TieredEngine {
     /// Set access logger (for cache training)
     pub fn set_access_logger(&mut self, logger: Arc<RwLock<AccessPatternLogger>>) {
         self.access_logger = Some(logger);
+    }
+
+    #[inline]
+    fn refresh_queue_depth_metric(&self) {
+        let available_permits = self.query_semaphore.available_permits();
+        let in_flight = self
+            .config
+            .max_concurrent_queries
+            .saturating_sub(available_permits) as u64;
+        self.stats.write().current_queue_depth = in_flight;
     }
 
     /// Query - unified three-tier path
@@ -935,6 +950,21 @@ impl TieredEngine {
         k: usize,
         ef_search_override: Option<usize>,
     ) -> Result<(Vec<SearchResult>, SearchExecutionPath)> {
+        self.knn_search_with_ef_detailed_scoped(
+            query,
+            k,
+            ef_search_override,
+            DEFAULT_QUERY_CACHE_SCOPE,
+        )
+    }
+
+    pub fn knn_search_with_ef_detailed_scoped(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+        query_cache_scope: u64,
+    ) -> Result<(Vec<SearchResult>, SearchExecutionPath)> {
         if query.is_empty() {
             anyhow::bail!("query embedding cannot be empty");
         }
@@ -947,25 +977,23 @@ impl TieredEngine {
             anyhow::bail!("k must be <= 10,000 (requested: {})", k);
         }
 
-        // Check dimension consistency (only if cold tier has documents)
+        // Validate dimension against configured cold-tier index dimension.
         let backend_dim = (*self.cold_tier).dimension();
-        let cold_tier_has_docs = backend_dim != 0;
-
-        if cold_tier_has_docs && query.len() != backend_dim {
+        if backend_dim != 0 && query.len() != backend_dim {
             anyhow::bail!(
                 "query dimension mismatch: expected {} found {}",
                 backend_dim,
                 query.len()
             );
         }
+        let cold_tier_has_docs = !self.cold_tier.is_empty();
 
-        let mut normalized_query = query.to_vec();
-        normalize_in_place_if_needed(self.config.hnsw_distance, &mut normalized_query)?;
-        let query = normalized_query.as_slice();
+        let normalized_query = normalize_query_for_search(self.config.hnsw_distance, query)?;
+        let query = normalized_query.as_ref();
 
         let cacheable = ef_search_override.is_none();
         if cacheable {
-            if let Some(cached) = self.query_cache.get(query, k) {
+            if let Some(cached) = self.query_cache.get_scoped(query_cache_scope, query, k) {
                 let mut stats = self.stats.write();
                 stats.query_cache_hits += 1;
                 stats.total_queries += 1;
@@ -1023,8 +1051,16 @@ impl TieredEngine {
         let merged_results = Self::merge_knn_results(hot_results, cold_results, k);
 
         if cacheable && !merged_results.is_empty() {
-            self.query_cache
-                .insert_with_k(normalized_query, merged_results.clone(), k);
+            let cache_query = match normalized_query {
+                Cow::Owned(owned) => owned,
+                Cow::Borrowed(borrowed) => borrowed.to_vec(),
+            };
+            self.query_cache.insert_with_k_scoped(
+                query_cache_scope,
+                cache_query,
+                merged_results.clone(),
+                k,
+            );
         }
 
         debug!(
@@ -1070,6 +1106,21 @@ impl TieredEngine {
         k: usize,
         ef_search_override: Option<usize>,
     ) -> Result<Vec<(Vec<SearchResult>, SearchExecutionPath)>> {
+        self.knn_search_batch_with_ef_detailed_scoped(
+            queries,
+            k,
+            ef_search_override,
+            DEFAULT_QUERY_CACHE_SCOPE,
+        )
+    }
+
+    pub fn knn_search_batch_with_ef_detailed_scoped(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        ef_search_override: Option<usize>,
+        query_cache_scope: u64,
+    ) -> Result<Vec<(Vec<SearchResult>, SearchExecutionPath)>> {
         if queries.is_empty() {
             return Ok(vec![]);
         }
@@ -1083,14 +1134,14 @@ impl TieredEngine {
         }
 
         let backend_dim = (*self.cold_tier).dimension();
-        let cold_tier_has_docs = backend_dim != 0;
+        let cold_tier_has_docs = !self.cold_tier.is_empty();
 
         let mut normalized_queries = Vec::with_capacity(queries.len());
         for (i, query) in queries.iter().enumerate() {
             if query.is_empty() {
                 anyhow::bail!("query {} embedding cannot be empty", i);
             }
-            if cold_tier_has_docs && query.len() != backend_dim {
+            if backend_dim != 0 && query.len() != backend_dim {
                 anyhow::bail!(
                     "query {} dimension mismatch: expected {} found {}",
                     i,
@@ -1098,9 +1149,10 @@ impl TieredEngine {
                     query.len()
                 );
             }
-            let mut normalized = query.clone();
-            normalize_in_place_if_needed(self.config.hnsw_distance, &mut normalized)?;
-            normalized_queries.push(normalized);
+            normalized_queries.push(normalize_query_for_search(
+                self.config.hnsw_distance,
+                query,
+            )?);
         }
 
         let cacheable = ef_search_override.is_none();
@@ -1111,7 +1163,10 @@ impl TieredEngine {
 
         if cacheable {
             for (i, query) in normalized_queries.iter().enumerate() {
-                if let Some(cached) = self.query_cache.get(query, k) {
+                if let Some(cached) =
+                    self.query_cache
+                        .get_scoped(query_cache_scope, query.as_ref(), k)
+                {
                     cached_results[i] = Some(cached);
                     cache_hits += 1;
                 } else {
@@ -1135,17 +1190,22 @@ impl TieredEngine {
         }
 
         if miss_indices.is_empty() {
-            let results = cached_results
-                .into_iter()
-                .map(|r| r.expect("cacheable queries should be filled"))
-                .map(|r| (r, SearchExecutionPath::CacheHit))
-                .collect();
+            let mut results = Vec::with_capacity(cached_results.len());
+            for (idx, cached) in cached_results.into_iter().enumerate() {
+                let cached = cached.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "query cache invariant violated: missing cached result at index {}",
+                        idx
+                    )
+                })?;
+                results.push((cached, SearchExecutionPath::CacheHit));
+            }
             return Ok(results);
         }
 
         let miss_queries: Vec<Vec<f32>> = miss_indices
             .iter()
-            .map(|&i| normalized_queries[i].clone())
+            .map(|&i| normalized_queries[i].as_ref().to_vec())
             .collect();
 
         let hot_results: Vec<Vec<(u64, f32)>> = miss_queries
@@ -1187,12 +1247,16 @@ impl TieredEngine {
                 continue;
             }
 
-            let hot = hot_iter
-                .next()
-                .expect("hot results length mismatch for cache misses");
-            let cold = cold_iter
-                .next()
-                .expect("cold results length mismatch for cache misses");
+            let hot = hot_iter.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "hot results length mismatch: expected one entry per cache miss query"
+                )
+            })?;
+            let cold = cold_iter.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cold results length mismatch: expected one entry per cache miss query"
+                )
+            })?;
             let merged_results = Self::merge_knn_results(hot, cold, k);
             let path = if cold_tier_has_docs {
                 SearchExecutionPath::HotAndCold
@@ -1200,8 +1264,13 @@ impl TieredEngine {
                 SearchExecutionPath::HotTierOnly
             };
             if cacheable && !merged_results.is_empty() {
-                self.query_cache.insert_with_k(
-                    normalized_queries[i].clone(),
+                let cache_query = match &normalized_queries[i] {
+                    Cow::Owned(owned) => owned.clone(),
+                    Cow::Borrowed(borrowed) => borrowed.to_vec(),
+                };
+                self.query_cache.insert_with_k_scoped(
+                    query_cache_scope,
+                    cache_query,
                     merged_results.clone(),
                     k,
                 );
@@ -1282,14 +1351,14 @@ impl TieredEngine {
     /// 3. Cold tier timeout → Return partial results if available
     ///
     /// # Returns
-    /// - `Ok(Vec<SearchResult>)`: Full or partial results
-    /// - `Err(...)`: All layers failed or timed out with no results, or queue saturated
+    /// - `Ok(Vec<SearchResult>)`: Full, partial, or empty results
+    /// - `Err(...)`: Queue saturated or invalid request
     pub async fn knn_search_with_timeouts(
         &self,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SearchResult>> {
-        self.knn_search_with_timeouts_with_ef(query, k, None)
+        self.knn_search_with_timeouts_with_ef_scoped(query, k, None, DEFAULT_QUERY_CACHE_SCOPE)
             .await
             .map(|(results, _)| results)
     }
@@ -1299,6 +1368,22 @@ impl TieredEngine {
         query: &[f32],
         k: usize,
         ef_search_override: Option<usize>,
+    ) -> Result<(Vec<SearchResult>, SearchExecutionPath)> {
+        self.knn_search_with_timeouts_with_ef_scoped(
+            query,
+            k,
+            ef_search_override,
+            DEFAULT_QUERY_CACHE_SCOPE,
+        )
+        .await
+    }
+
+    pub async fn knn_search_with_timeouts_with_ef_scoped(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+        query_cache_scope: u64,
     ) -> Result<(Vec<SearchResult>, SearchExecutionPath)> {
         if query.is_empty() {
             anyhow::bail!("query embedding cannot be empty");
@@ -1310,20 +1395,21 @@ impl TieredEngine {
             anyhow::bail!("k must be <= 10,000 (requested: {})", k);
         }
 
-        // Validate dimension consistency when cold tier is initialized.
+        // Validate dimension against configured cold-tier index dimension.
         let backend_dim = (*self.cold_tier).dimension();
-        let cold_tier_has_docs = backend_dim != 0;
-        if cold_tier_has_docs && query.len() != backend_dim {
+        if backend_dim != 0 && query.len() != backend_dim {
             anyhow::bail!(
                 "query dimension mismatch: expected {} found {}",
                 backend_dim,
                 query.len()
             );
         }
+        let cacheable = ef_search_override.is_none();
+        let cold_tier_has_docs = !self.cold_tier.is_empty();
 
         // Load shedding: Try to acquire semaphore permit
-        // Note: _permit is kept alive to hold the permit until function returns (RAII guard)
-        let _permit = match self.query_semaphore.try_acquire() {
+        // Keep permit alive for the full search scope.
+        let permit = match self.query_semaphore.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
                 // Queue saturated - reject query
@@ -1331,6 +1417,7 @@ impl TieredEngine {
                     let mut stats = self.stats.write();
                     stats.queries_rejected += 1;
                 }
+                self.refresh_queue_depth_metric();
                 return Err(anyhow!(
                     "Query queue saturated: {} in-flight queries (max: {})",
                     self.config.max_concurrent_queries,
@@ -1338,30 +1425,37 @@ impl TieredEngine {
                 ));
             }
         };
+        self.refresh_queue_depth_metric();
 
-        // Update queue depth metric
-        {
-            let mut stats = self.stats.write();
-            let available_permits = self.query_semaphore.available_permits();
-            stats.current_queue_depth =
-                (self.config.max_concurrent_queries - available_permits) as u64;
-        }
+        let normalized_query = match normalize_query_for_search(self.config.hnsw_distance, query) {
+            Ok(query) => query,
+            Err(e) => {
+                drop(permit);
+                self.refresh_queue_depth_metric();
+                return Err(e);
+            }
+        };
 
-        let mut normalized_query = query.to_vec();
-        normalize_in_place_if_needed(self.config.hnsw_distance, &mut normalized_query)?;
-
-        let cacheable = ef_search_override.is_none();
         if cacheable {
-            if let Some(cached) = self.query_cache.get(&normalized_query, k) {
-                let mut stats = self.stats.write();
-                stats.query_cache_hits += 1;
-                stats.total_queries += 1;
+            if let Some(cached) =
+                self.query_cache
+                    .get_scoped(query_cache_scope, normalized_query.as_ref(), k)
+            {
+                {
+                    let mut stats = self.stats.write();
+                    stats.query_cache_hits += 1;
+                    stats.total_queries += 1;
+                }
+                drop(permit);
+                self.refresh_queue_depth_metric();
                 return Ok((cached, SearchExecutionPath::CacheHit));
             } else {
                 let mut stats = self.stats.write();
                 stats.query_cache_misses += 1;
             }
         }
+
+        let normalized_query = normalized_query.into_owned();
         {
             let mut stats = self.stats.write();
             stats.total_queries += 1;
@@ -1490,44 +1584,46 @@ impl TieredEngine {
             };
         }
 
-        // Permit is automatically dropped here, releasing the semaphore
-
-        // Return results or error
-        if !results.is_empty() {
-            if partial {
-                let mut stats = self.stats.write();
-                stats.partial_results_returned += 1;
-                info!("Returning {} partial results after timeout", results.len());
-            }
-
-            // Filter out any NaN distances (shouldn't happen in normal operation,
-            // but serves as defensive check against floating-point computation errors)
-            results.retain(|r| !r.distance.is_nan());
-
-            // Deduplicate and take top k
-            results.sort_by(|a, b| {
-                a.distance
-                    .partial_cmp(&b.distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            results.truncate(k);
-
-            if cacheable && !partial && !results.is_empty() {
-                self.query_cache
-                    .insert_with_k(normalized_query.clone(), results.clone(), k);
-            }
-            let path = if hot_accessed && cold_accessed {
-                SearchExecutionPath::HotAndCold
-            } else if cold_accessed {
-                SearchExecutionPath::ColdTierOnly
-            } else {
-                SearchExecutionPath::HotTierOnly
-            };
-
-            Ok((results, path))
-        } else {
-            Err(anyhow!("All layers failed or timed out with no results"))
+        if partial && !results.is_empty() {
+            let mut stats = self.stats.write();
+            stats.partial_results_returned += 1;
+            info!("Returning {} partial results after timeout", results.len());
         }
+
+        // Filter out any NaN distances (shouldn't happen in normal operation,
+        // but serves as defensive check against floating-point computation errors)
+        results.retain(|r| !r.distance.is_nan());
+
+        // Deduplicate and take top k
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(k);
+
+        if cacheable && !partial && !results.is_empty() {
+            self.query_cache.insert_with_k_scoped(
+                query_cache_scope,
+                normalized_query.clone(),
+                results.clone(),
+                k,
+            );
+        }
+
+        let path = if hot_accessed && cold_accessed {
+            SearchExecutionPath::HotAndCold
+        } else if cold_accessed {
+            SearchExecutionPath::ColdTierOnly
+        } else if hot_accessed {
+            SearchExecutionPath::HotTierOnly
+        } else {
+            SearchExecutionPath::Degraded
+        };
+
+        drop(permit);
+        self.refresh_queue_depth_metric();
+        Ok((results, path))
     }
 
     /// Insert document
@@ -1988,6 +2084,33 @@ fn normalize_in_place_if_needed(distance: DistanceMetric, embedding: &mut [f32])
     }
 
     Ok(())
+}
+
+fn normalize_query_for_search<'a>(
+    distance: DistanceMetric,
+    query: &'a [f32],
+) -> Result<Cow<'a, [f32]>> {
+    if !matches!(
+        distance,
+        DistanceMetric::Cosine | DistanceMetric::InnerProduct
+    ) {
+        return Ok(Cow::Borrowed(query));
+    }
+
+    let norm_sq = crate::simd::sum_squares_f32(query);
+    if norm_sq <= f32::EPSILON {
+        anyhow::bail!("embedding norm is zero; cannot normalize");
+    }
+    if (NORMALIZATION_NORM_SQ_MIN..=NORMALIZATION_NORM_SQ_MAX).contains(&norm_sq) {
+        return Ok(Cow::Borrowed(query));
+    }
+
+    let inv_norm = 1.0 / norm_sq.sqrt();
+    let mut normalized = query.to_vec();
+    for value in &mut normalized {
+        *value *= inv_norm;
+    }
+    Ok(Cow::Owned(normalized))
 }
 
 #[cfg(test)]
@@ -2747,6 +2870,63 @@ mod tests {
         let query2 = normalize(vec![1.0, 2.0]);
         let result = engine.knn_search_with_timeouts(&query2, 3).await;
         assert!(result.is_ok());
+        assert_eq!(engine.stats().current_queue_depth, 0);
+    }
+
+    #[tokio::test]
+    async fn test_scoped_query_cache_isolation() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        let cache = LruCacheStrategy::new(10);
+        let embeddings = vec![normalize(vec![1.0, 2.0]); 4];
+        let initial_metadata = vec![std::collections::HashMap::new(); 4];
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 100,
+            data_dir: None,
+            embedding_dimension: 2,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
+
+        let query = normalize(vec![1.0, 2.0]);
+
+        let (first_scope_a, path_a1) = engine
+            .knn_search_with_timeouts_with_ef_scoped(&query, 3, None, 7)
+            .await
+            .expect("scope A first search should succeed");
+        assert!(!first_scope_a.is_empty());
+        assert_ne!(path_a1, SearchExecutionPath::CacheHit);
+
+        let (_, path_a2) = engine
+            .knn_search_with_timeouts_with_ef_scoped(&query, 3, None, 7)
+            .await
+            .expect("scope A second search should succeed");
+        assert_eq!(path_a2, SearchExecutionPath::CacheHit);
+
+        let (_, path_b1) = engine
+            .knn_search_with_timeouts_with_ef_scoped(&query, 3, None, 11)
+            .await
+            .expect("scope B first search should succeed");
+        assert_ne!(
+            path_b1,
+            SearchExecutionPath::CacheHit,
+            "scope B must not reuse scope A cache entry"
+        );
     }
 
     #[tokio::test]
@@ -2783,12 +2963,12 @@ mod tests {
         // Open cold tier circuit breaker
         engine.cold_tier_circuit_breaker.open();
 
-        // k-NN search should fail gracefully (no results)
+        // k-NN search should degrade gracefully to an empty result set.
         let query = normalize(vec![1.0, 2.0]);
         let result = engine.knn_search_with_timeouts(&query, 3).await;
 
-        // Should return error (all layers failed)
-        assert!(result.is_err());
+        let results = result.expect("search should return empty results instead of internal error");
+        assert!(results.is_empty());
 
         // Check circuit breaker rejection was counted
         let stats = engine.stats();

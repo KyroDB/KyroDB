@@ -716,6 +716,24 @@ impl MetricsCollector {
         self.inner.wal_writes_failed.load(Ordering::Relaxed)
     }
 
+    /// Raise WAL failure counter to at least `observed`.
+    ///
+    /// Used when subsystem-local WAL error accounting is merged into global metrics.
+    pub fn set_wal_writes_failed_floor(&self, observed: u64) {
+        let mut current = self.inner.wal_writes_failed.load(Ordering::Relaxed);
+        while current < observed {
+            match self.inner.wal_writes_failed.compare_exchange_weak(
+                current,
+                observed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Get WAL retries total count
     pub fn get_wal_retries_total(&self) -> u64 {
         self.inner.wal_retries_total.load(Ordering::Relaxed)
@@ -1148,7 +1166,9 @@ impl LatencyHistogram {
             self.cached_sorted = Some(sorted);
         }
 
-        let sorted = self.cached_sorted.as_ref().unwrap();
+        let Some(sorted) = self.cached_sorted.as_ref() else {
+            return 0;
+        };
         let idx = ((p / 100.0) * len as f64) as usize;
         let idx = idx.min(len - 1);
         sorted[idx]
