@@ -12,7 +12,7 @@ API key authentication is integrated with the gRPC server. When `auth.enabled` i
 
 In `environment.type=production`, a non-loopback gRPC bind (`server.host`) now requires `auth.enabled=true` at startup validation time.
 
-HTTP observability endpoints (`/metrics`, `/health`, `/ready`, `/slo`) are unauthenticated by default for operational simplicity, but can (and typically should) be protected in production via either:
+HTTP observability endpoints (`/metrics`, `/health`, `/ready`, `/slo`, `/usage`) are unauthenticated by default for operational simplicity, but can (and typically should) be protected in production via either (with `/usage` called out separately below because it has stricter auth behavior):
 
 - Binding the HTTP server to a restricted interface using `server.http_host` (e.g., loopback only)
 - Requiring API key auth using `server.observability_auth` (same headers as gRPC)
@@ -67,6 +67,7 @@ KyroDB exposes HTTP endpoints intended for monitoring and orchestration:
 - `GET /health`
 - `GET /ready`
 - `GET /slo`
+- `GET /usage` (per-tenant usage snapshots)
 
 These endpoints are often deployed on internal networks. If you expose them outside a trusted boundary, protect them.
 
@@ -75,6 +76,9 @@ These endpoints are often deployed on internal networks. If you expose them outs
 - `disabled` (default): no auth on any observability endpoint.
 - `metrics_and_slo`: require auth for `/metrics` and `/slo` only.
 - `all`: require auth for `/metrics`, `/health`, `/ready`, and `/slo`.
+
+`/usage` is always auth-protected when `auth.enabled=true` (independent of `server.observability_auth`) because it contains tenant billing data.
+When `auth.enabled=false`, usage tracking is disabled and `/usage` returns `404`.
 
 Any non-`disabled` value requires `auth.enabled=true` and a valid `auth.api_keys_file`.
 

@@ -537,7 +537,8 @@ impl FlatGraph {
         if inserted_level > self.max_layer {
             let existing_count = self.dense_to_origin.len() - 1;
             for _ in (self.max_layer + 1)..=inserted_level {
-                self.neighbors_by_layer.push(vec![Vec::new(); existing_count]);
+                self.neighbors_by_layer
+                    .push(vec![Vec::new(); existing_count]);
                 self.entry_by_layer.push(new_dense);
             }
             self.max_layer = inserted_level;
@@ -597,9 +598,9 @@ impl FlatGraph {
             // edge survives so the new node remains reachable from the rest of the
             // graph. Extreme outliers may lose all reverse edges during pruning
             // because they are the farthest neighbor for every connected node.
-            let reachable = selected.iter().any(|&nbr| {
-                self.neighbors_by_layer[layer][nbr as usize].contains(&new_dense)
-            });
+            let reachable = selected
+                .iter()
+                .any(|&nbr| self.neighbors_by_layer[layer][nbr as usize].contains(&new_dense));
             if !reachable {
                 if let Some(&closest_nbr) = selected.first() {
                     let nbr_list = &mut self.neighbors_by_layer[layer][closest_nbr as usize];
@@ -837,7 +838,9 @@ impl SingleGraphBackend {
 
         // Phase 1: Greedy descent from the top of the existing graph down to
         // one layer above the node's insert level (standard HNSW approach).
-        let top = flat.max_layer.min(flat.entry_by_layer.len().saturating_sub(1));
+        let top = flat
+            .max_layer
+            .min(flat.entry_by_layer.len().saturating_sub(1));
         let mut entry = flat.entry_by_layer[top];
         if entry as usize >= flat.len() {
             entry = 0;
@@ -1184,9 +1187,9 @@ mod tests {
 
         // Per-layer candidates: dense_id=0 is the only existing node.
         let layer_candidates = vec![
-            vec![(0u32, 2.0f32)],  // layer 0
-            vec![(0u32, 2.0f32)],  // layer 1
-            vec![(0u32, 2.0f32)],  // layer 2
+            vec![(0u32, 2.0f32)], // layer 0
+            vec![(0u32, 2.0f32)], // layer 1
+            vec![(0u32, 2.0f32)], // layer 2
         ];
         let ok = flat.connect_with_layer_candidates(2, &[1.0, 1.0], 2, &layer_candidates, 8, 4);
         assert!(ok, "connect_with_layer_candidates should succeed");

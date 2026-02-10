@@ -48,6 +48,7 @@ HTTP observability endpoints:
 - `GET /health`
 - `GET /ready`
 - `GET /slo`
+- `GET /usage` (per-tenant usage snapshots; auth-enabled mode)
 
 ## Read path (search)
 

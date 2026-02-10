@@ -1,0 +1,84 @@
+# KyroDB secure baseline for external pilots.
+# This profile is designed to pass environment.type=pilot validation.
+#
+# Notes:
+# - This template binds to loopback by default.
+# - If you change server.host to non-loopback, enable TLS and provide cert/key paths.
+
+environment:
+  type: pilot
+
+server:
+  host: "127.0.0.1"
+  port: 50051
+  http_host: "127.0.0.1"
+  observability_auth: metrics_and_slo
+  tls:
+    enabled: false
+    require_client_cert: false
+    # cert_path: "/etc/kyrodb/tls/server.crt"
+    # key_path: "/etc/kyrodb/tls/server.key"
+    # ca_cert_path: "/etc/kyrodb/tls/ca.crt"
+
+auth:
+  enabled: true
+  api_keys_file: "data/api_keys.yaml"
+
+rate_limit:
+  enabled: true
+  max_qps_per_connection: 1000
+  max_qps_global: 100000
+  burst_capacity: 10000
+
+persistence:
+  data_dir: "./data"
+  wal_flush_interval_ms: 100
+  fsync_policy: data_only
+  snapshot_interval_mutations: 10000
+  max_wal_size_bytes: 104857600
+  enable_recovery: true
+  allow_fresh_start_on_recovery_failure: false
+
+cache:
+  capacity: 10000
+  strategy: learned
+  training_interval_secs: 600
+  training_window_secs: 3600
+  recency_halflife_secs: 1800
+  enable_training_task: true
+  logger_window_size: 1000000
+  predictor_capacity_multiplier: 4
+  query_cache_capacity: 100
+  query_cache_similarity_threshold: 0.52 # Deliberately recall-oriented for pilot; raise toward 0.70-0.80 if semantic false matches appear.
+  min_training_samples: 100
+  admission_threshold: 0.15
+  auto_tune_threshold: true
+  target_utilization: 0.85
+
+hnsw:
+  max_elements: 100000
+  m: 16
+  ef_construction: 200
+  ef_search: 50
+  dimension: 768
+  distance: cosine
+  disable_normalization_check: false
+
+slo:
+  p99_latency_ms: 10.0 # End-to-end query SLO target. This is independent of timeout guardrails below.
+  cache_hit_rate: 0.70
+  error_rate: 0.001
+  availability: 0.999
+  min_samples: 100
+
+timeouts:
+  cache_ms: 10
+  hot_tier_ms: 50
+  cold_tier_ms: 1000 # Worst-case fail-safe timeout budget for cold-tier search, not expected steady-state latency.
+
+logging:
+  level: info
+  format: json
+  rotation: true
+  max_file_size_bytes: 104857600
+  max_files: 10

@@ -192,7 +192,7 @@ distance = "euclidean"
     2) Move or clear the existing data directory (e.g., `/var/lib/kyrodb/data`).
     3) Start KyroDB with the updated config.
     4) Stream all vectors via `BulkInsert`, then call `FlushHotTier` and optionally `CreateSnapshot`.
-  - API details are in [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+  - API details are in [API_REFERENCE.md](API_REFERENCE.md).
 
 4. Restart and re-run the validation procedure
 

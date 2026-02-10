@@ -61,6 +61,14 @@ impl TenantUsage {
         self.query_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record multiple query operations at once.
+    pub fn record_query_batch(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.query_count.fetch_add(count, Ordering::Relaxed);
+    }
+
     /// Record a vector insertion
     ///
     /// Increments insert_count and vector_count by 1.
@@ -77,6 +85,22 @@ impl TenantUsage {
         self.vector_count.fetch_add(1, Ordering::Relaxed);
         self.storage_bytes
             .fetch_add(vector_size_bytes, Ordering::Relaxed);
+    }
+
+    /// Record multiple vector insertions.
+    ///
+    /// `insertions` should represent newly-created vectors (not upserts) so
+    /// vector_count/storage remain accurate.
+    pub fn record_insert_batch(&self, insertions: u64, vector_size_bytes: u64) {
+        if insertions == 0 {
+            return;
+        }
+        self.insert_count.fetch_add(insertions, Ordering::Relaxed);
+        self.vector_count.fetch_add(insertions, Ordering::Relaxed);
+        self.storage_bytes.fetch_add(
+            insertions.saturating_mul(vector_size_bytes),
+            Ordering::Relaxed,
+        );
     }
 
     /// Record a vector deletion
@@ -97,6 +121,26 @@ impl TenantUsage {
         self.storage_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
                 Some(val.saturating_sub(vector_size_bytes))
+            })
+            .ok();
+    }
+
+    /// Record multiple vector deletions.
+    pub fn record_delete_batch(&self, deletions: u64, vector_size_bytes: u64) {
+        if deletions == 0 {
+            return;
+        }
+        self.delete_count.fetch_add(deletions, Ordering::Relaxed);
+
+        self.vector_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                Some(val.saturating_sub(deletions))
+            })
+            .ok();
+
+        self.storage_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                Some(val.saturating_sub(deletions.saturating_mul(vector_size_bytes)))
             })
             .ok();
     }
@@ -320,6 +364,22 @@ mod tests {
         let snapshot = usage.snapshot();
         assert_eq!(snapshot.query_count, 2);
         assert_eq!(snapshot.insert_count, 1);
+        assert_eq!(snapshot.vector_count, 1);
+        assert_eq!(snapshot.storage_bytes, 1536);
+    }
+
+    #[test]
+    fn test_tenant_usage_batch_operations() {
+        let usage = TenantUsage::new();
+
+        usage.record_query_batch(10);
+        usage.record_insert_batch(3, 1536);
+        usage.record_delete_batch(2, 1536);
+
+        let snapshot = usage.snapshot();
+        assert_eq!(snapshot.query_count, 10);
+        assert_eq!(snapshot.insert_count, 3);
+        assert_eq!(snapshot.delete_count, 2);
         assert_eq!(snapshot.vector_count, 1);
         assert_eq!(snapshot.storage_bytes, 1536);
     }

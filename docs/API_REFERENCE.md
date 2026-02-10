@@ -141,6 +141,7 @@ These endpoints are read-only and used for monitoring:
 - `GET /ready` - Readiness check
 - `GET /slo` - SLO breach status
 - `GET /metrics` - Prometheus metrics
+- `GET /usage` - Per-tenant usage snapshots (billing/ops)
 
 ### Base URL
 
@@ -151,6 +152,8 @@ http://localhost:51051
 HTTP port is `gRPC port + 1000` (e.g., if gRPC is 50051, HTTP is 51051).
 
 **Important**: HTTP API is for observability/monitoring only. **All vector operations must use gRPC**.
+
+`/usage` is sensitive and is intended for authenticated internal operators.
 
 ### Endpoints
 
@@ -265,6 +268,46 @@ curl http://localhost:51051/slo
 
 ---
 
+#### GET /usage
+
+Per-tenant usage snapshot for billing and operations.
+
+When `auth.enabled=true`, this endpoint requires an API key (same headers as gRPC).
+When `auth.enabled=false`, usage tracking is disabled and this endpoint returns `404`.
+
+**Request:**
+```bash
+curl -H "x-api-key: <API_KEY>" http://localhost:51051/usage
+```
+
+**Response:**
+```json
+{
+  "generated_at": 1739250000,
+  "totals": {
+    "query_count": 12345,
+    "vector_count": 100000,
+    "storage_bytes": 307200000,
+    "billable_events": 12567
+  },
+  "tenants": [
+    {
+      "tenant_id": "acme_corp",
+      "query_count": 12000,
+      "insert_count": 550,
+      "delete_count": 50,
+      "vector_count": 50000,
+      "storage_bytes": 153600000,
+      "storage_mb": 146.48,
+      "storage_gb": 0.14,
+      "billable_events": 12600
+    }
+  ]
+}
+```
+
+---
+
 ## Authentication
 
 API key authentication is optional (disabled by default). Enable it in `config.yaml`:
@@ -317,7 +360,7 @@ Configured in `config.yaml`:
 rate_limit:
   enabled: true
   max_qps_global: 10000
-  max_qps_per_client: 1000
+  max_qps_per_connection: 1000
 ```
 
 Rate limit errors return gRPC status code `RESOURCE_EXHAUSTED`.

@@ -168,6 +168,17 @@ SLO targets:
 - Error rate: < 0.1%
 - Availability: > 99.9%
 
+### Usage snapshots (billing/ops)
+
+Per-tenant usage is available at `GET /usage` when `auth.enabled=true`.
+Authentication setup (API keys file, key format, and headers) is documented in [Authentication and multi-tenancy](AUTHENTICATION.md).
+`/usage` accepts either `x-api-key: <key>` or `authorization: Bearer <key>`.
+When `auth.enabled=false`, usage tracking is disabled and `/usage` returns `404`.
+
+```bash
+curl -H "x-api-key: <API_KEY>" http://localhost:51051/usage
+```
+
 ## Prometheus alerts
 
 ```yaml

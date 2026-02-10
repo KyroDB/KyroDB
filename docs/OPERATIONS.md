@@ -13,6 +13,7 @@ HTTP endpoints:
 - `GET /ready` (readiness)
 - `GET /metrics` (Prometheus)
 - `GET /slo` (SLO breach status and current values)
+- `GET /usage` (per-tenant usage snapshots; auth required when enabled)
 
 ## Quick checks
 

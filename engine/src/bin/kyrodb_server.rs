@@ -31,7 +31,7 @@ use kyrodb_engine::{
     config::ObservabilityAuthMode,
     AuthManager, ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, Manifest,
     MetricsCollector, PointQueryTier, RateLimiter, SearchExecutionPath, SloThresholds, TenantInfo,
-    TieredEngine, TieredEngineConfig,
+    TieredEngine, TieredEngineConfig, UsageTracker,
 };
 use prost::Message;
 use std::collections::{HashMap, HashSet};
@@ -92,6 +92,9 @@ const MAX_TOTAL_BULK_LOAD_DOCUMENTS: u64 = 10_000_000;
 
 /// Maximum k value for k-NN search to prevent excessive computation
 const MAX_KNN_K: u32 = 1000;
+
+/// Interval for persisting per-tenant usage snapshots to disk.
+const USAGE_EXPORT_INTERVAL_SECS: u64 = 60;
 
 fn unix_timestamp_secs() -> u64 {
     SystemTime::now()
@@ -429,6 +432,7 @@ struct ServerState {
     rate_limiter: Option<RateLimiter>,
     tenant_id_mapper: Option<TenantIdMapper>,
     tenant_vector_counts: Option<parking_lot::RwLock<HashMap<String, usize>>>,
+    usage_tracker: Option<Arc<UsageTracker>>,
 }
 
 /// gRPC service implementation
@@ -584,6 +588,72 @@ impl KyroDBServiceImpl {
             if let Some(entry) = guard.get_mut(&tenant.tenant_id) {
                 *entry = entry.saturating_sub(count);
             }
+        }
+    }
+
+    fn tenant_usage(
+        &self,
+        tenant: Option<&TenantContext>,
+    ) -> Option<Arc<kyrodb_engine::TenantUsage>> {
+        let tenant = tenant?;
+        let tracker = self.state.usage_tracker.as_ref()?;
+        Some(tracker.get_or_create(&tenant.tenant_id))
+    }
+
+    #[inline]
+    fn vector_bytes_for_embedding_len(embedding_len: usize) -> u64 {
+        (embedding_len as u64).saturating_mul(std::mem::size_of::<f32>() as u64)
+    }
+
+    #[inline]
+    fn configured_vector_bytes(&self) -> u64 {
+        Self::vector_bytes_for_embedding_len(self.state.app_config.hnsw.dimension)
+    }
+
+    #[inline]
+    fn record_tenant_query_usage(&self, tenant: Option<&TenantContext>) {
+        if let Some(usage) = self.tenant_usage(tenant) {
+            usage.record_query();
+        }
+    }
+
+    #[inline]
+    fn record_tenant_query_usage_batch(&self, tenant: Option<&TenantContext>, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Some(usage) = self.tenant_usage(tenant) {
+            usage.record_query_batch(count);
+        }
+    }
+
+    #[inline]
+    fn record_tenant_insert_usage(
+        &self,
+        tenant: Option<&TenantContext>,
+        insertions: u64,
+        vector_size_bytes: u64,
+    ) {
+        if insertions == 0 {
+            return;
+        }
+        if let Some(usage) = self.tenant_usage(tenant) {
+            usage.record_insert_batch(insertions, vector_size_bytes);
+        }
+    }
+
+    #[inline]
+    fn record_tenant_delete_usage(
+        &self,
+        tenant: Option<&TenantContext>,
+        deletions: u64,
+        vector_size_bytes: u64,
+    ) {
+        if deletions == 0 {
+            return;
+        }
+        if let Some(usage) = self.tenant_usage(tenant) {
+            usage.record_delete_batch(deletions, vector_size_bytes);
         }
     }
 
@@ -866,6 +936,7 @@ impl KyroDBServiceImpl {
         self.state.metrics.record_query_latency(latency_ns);
         self.state.metrics.record_hnsw_search(latency_ns);
         self.record_search_path_metrics(search_path);
+        self.record_tenant_query_usage(tenant);
 
         Ok(self.build_search_response(tenant, &req, results, &engine, latency_ns, search_path))
     }
@@ -941,6 +1012,7 @@ impl KyroDBServiceImpl {
                                         .record_query_latency(per_query_latency_ns);
                                     self.state.metrics.record_hnsw_search(per_query_latency_ns);
                                     self.record_search_path_metrics(search_path);
+                                    self.record_tenant_query_usage(tenant);
                                     let response = self.build_search_response(
                                         tenant,
                                         &req,
@@ -1036,6 +1108,7 @@ impl KyroDbService for KyroDBServiceImpl {
         tracing::Span::current().record("doc_id", req.doc_id);
 
         let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
+        let vector_size_bytes = Self::vector_bytes_for_embedding_len(req.embedding.len());
 
         let engine = self.state.engine.write().await;
         let already_exists = self.enforce_vector_quota(tenant.as_ref(), &engine, global_doc_id)?;
@@ -1061,6 +1134,9 @@ impl KyroDbService for KyroDBServiceImpl {
             Ok(_) => {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 self.state.metrics.record_insert(true);
+                if !already_exists {
+                    self.record_tenant_insert_usage(tenant.as_ref(), 1, vector_size_bytes);
+                }
 
                 info!(
                     doc_id = req.doc_id,
@@ -1181,6 +1257,15 @@ impl KyroDbService for KyroDBServiceImpl {
                 match engine.insert(global_doc_id, req.embedding, metadata) {
                     Ok(_) => {
                         total_inserted += 1;
+                        if !already_exists {
+                            self.record_tenant_insert_usage(
+                                tenant.as_ref(),
+                                1,
+                                Self::vector_bytes_for_embedding_len(
+                                    self.state.app_config.hnsw.dimension,
+                                ),
+                            );
+                        }
                     }
                     Err(e) => {
                         if !already_exists {
@@ -1349,6 +1434,11 @@ impl KyroDbService for KyroDBServiceImpl {
                                 .filter(|doc_id| engine.exists(**doc_id))
                                 .count();
                             self.increment_tenant_vectors(tenant.as_ref(), inserted_now);
+                            self.record_tenant_insert_usage(
+                                tenant.as_ref(),
+                                inserted_now as u64,
+                                self.configured_vector_bytes(),
+                            );
                         }
                     }
                     Err(e) => {
@@ -1399,6 +1489,11 @@ impl KyroDbService for KyroDBServiceImpl {
                             .filter(|doc_id| engine.exists(**doc_id))
                             .count();
                         self.increment_tenant_vectors(tenant.as_ref(), inserted_now);
+                        self.record_tenant_insert_usage(
+                            tenant.as_ref(),
+                            inserted_now as u64,
+                            self.configured_vector_bytes(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -1512,6 +1607,11 @@ impl KyroDbService for KyroDBServiceImpl {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 if existed {
                     self.decrement_tenant_vectors(tenant.as_ref(), 1);
+                    self.record_tenant_delete_usage(
+                        tenant.as_ref(),
+                        1,
+                        self.configured_vector_bytes(),
+                    );
                 }
 
                 if existed {
@@ -1689,6 +1789,7 @@ impl KyroDbService for KyroDBServiceImpl {
             let expected = tenant.tenant_index.to_string();
             if metadata.get("__tenant_idx__") != Some(&expected) {
                 // Hide cross-tenant existence.
+                self.record_tenant_query_usage(Some(tenant));
                 return Ok(Response::new(QueryResponse {
                     found: false,
                     doc_id: req.doc_id,
@@ -1707,6 +1808,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 .unwrap_or("");
             if doc_namespace != req.namespace {
                 // Hide cross-namespace existence.
+                self.record_tenant_query_usage(tenant.as_ref());
                 return Ok(Response::new(QueryResponse {
                     found: false,
                     doc_id: req.doc_id,
@@ -1724,6 +1826,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 let latency_ns = start.elapsed().as_nanos() as u64;
                 let latency_ms = latency_ns as f64 / 1_000_000.0;
                 self.state.metrics.record_query_latency(latency_ns);
+                self.record_tenant_query_usage(tenant.as_ref());
                 match served_from {
                     PointQueryTier::Cache => self.state.metrics.record_cache_hit(true),
                     PointQueryTier::HotTier => {
@@ -1762,6 +1865,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 let latency_ms = latency_ns as f64 / 1_000_000.0;
                 self.state.metrics.record_query_latency(latency_ns);
                 self.state.metrics.record_cache_hit(false);
+                self.record_tenant_query_usage(tenant.as_ref());
 
                 info!(
                     doc_id = req.doc_id,
@@ -2049,6 +2153,7 @@ impl KyroDbService for KyroDBServiceImpl {
         let latency_ns = start.elapsed().as_nanos() as u64;
         let latency_ms = latency_ns as f64 / 1_000_000.0;
         self.state.metrics.record_query_latency(latency_ns);
+        self.record_tenant_query_usage_batch(tenant.as_ref(), total_requested as u64);
         info!(
             requested = total_requested,
             found = total_found,
@@ -2190,6 +2295,11 @@ impl KyroDbService for KyroDBServiceImpl {
                 // Record metrics for observability
                 self.state.metrics.record_query_latency(latency_ns);
                 self.decrement_tenant_vectors(tenant.as_ref(), count as usize);
+                self.record_tenant_delete_usage(
+                    tenant.as_ref(),
+                    count,
+                    self.configured_vector_bytes(),
+                );
 
                 info!(
                     deleted = count,
@@ -2654,21 +2764,97 @@ async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRespo
         })
 }
 
+/// Per-tenant usage snapshots (queries/inserts/deletes/storage) for billing systems.
+async fn usage_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
+    let Some(usage_tracker) = state.usage_tracker.as_ref() else {
+        return HttpResponse::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(Body::from(
+                serde_json::json!({
+                    "error": "usage tracking disabled (auth.enabled=false)"
+                })
+                .to_string(),
+            ))
+            .unwrap_or_else(|_| {
+                let mut resp = HttpResponse::new(Body::from("{\"error\":\"internal_error\"}"));
+                *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                resp.headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                resp
+            });
+    };
+
+    let mut snapshots: Vec<(String, kyrodb_engine::UsageSnapshot)> =
+        usage_tracker.get_all_snapshots().into_iter().collect();
+    snapshots.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total_queries: u64 = snapshots.iter().map(|(_, s)| s.query_count).sum();
+    let total_vectors: u64 = snapshots.iter().map(|(_, s)| s.vector_count).sum();
+    let total_storage_bytes: u64 = snapshots.iter().map(|(_, s)| s.storage_bytes).sum();
+    let total_billable_events: u64 = snapshots.iter().map(|(_, s)| s.billable_events()).sum();
+
+    let tenants: Vec<serde_json::Value> = snapshots
+        .into_iter()
+        .map(|(tenant_id, snapshot)| {
+            serde_json::json!({
+                "tenant_id": tenant_id,
+                "query_count": snapshot.query_count,
+                "insert_count": snapshot.insert_count,
+                "delete_count": snapshot.delete_count,
+                "vector_count": snapshot.vector_count,
+                "storage_bytes": snapshot.storage_bytes,
+                "storage_mb": snapshot.storage_mb(),
+                "storage_gb": snapshot.storage_gb(),
+                "billable_events": snapshot.billable_events(),
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "generated_at": unix_timestamp_secs(),
+        "totals": {
+            "query_count": total_queries,
+            "vector_count": total_vectors,
+            "storage_bytes": total_storage_bytes,
+            "billable_events": total_billable_events,
+        },
+        "tenants": tenants,
+    });
+
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| {
+            let mut resp = HttpResponse::new(Body::from("{\"error\":\"internal_error\"}"));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            resp.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            resp
+        })
+}
+
 async fn observability_auth_middleware(
     AxumState(state): AxumState<Arc<ServerState>>,
     req: axum::http::Request<Body>,
     next: Next,
 ) -> HttpResponse<Body> {
     let mode = state.app_config.server.observability_auth;
-    if mode == ObservabilityAuthMode::Disabled {
+    let path = req.uri().path();
+
+    if mode == ObservabilityAuthMode::Disabled && path != "/usage" {
         return next.run(req).await;
     }
 
-    let path = req.uri().path();
-    let requires_auth = match mode {
-        ObservabilityAuthMode::Disabled => false,
-        ObservabilityAuthMode::MetricsAndSlo => matches!(path, "/metrics" | "/slo"),
-        ObservabilityAuthMode::All => true,
+    let requires_auth = if path == "/usage" {
+        state.app_config.auth.enabled
+    } else {
+        match mode {
+            ObservabilityAuthMode::Disabled => false,
+            ObservabilityAuthMode::MetricsAndSlo => matches!(path, "/metrics" | "/slo"),
+            ObservabilityAuthMode::All => true,
+        }
     };
 
     if !requires_auth {
@@ -3241,6 +3427,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let usage_tracker = if config.auth.enabled {
+        Some(Arc::new(UsageTracker::new()))
+    } else {
+        None
+    };
+
     // Create shared server state
     let state = Arc::new(ServerState {
         engine: engine_arc,
@@ -3253,7 +3445,74 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter,
         tenant_id_mapper,
         tenant_vector_counts,
+        usage_tracker,
     });
+
+    if let Some(usage_tracker) = state.usage_tracker.clone() {
+        let usage_dir = config.persistence.data_dir.join("usage");
+        let latest_usage_csv = usage_dir.join("tenant_usage_latest.csv");
+        let mut usage_shutdown_rx = shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            if let Err(e) = std::fs::create_dir_all(&usage_dir) {
+                error!(
+                    error = %e,
+                    path = %usage_dir.display(),
+                    "Failed to create usage export directory"
+                );
+                return;
+            }
+
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(USAGE_EXPORT_INTERVAL_SECS));
+            info!(
+                interval_secs = USAGE_EXPORT_INTERVAL_SECS,
+                path = %latest_usage_csv.display(),
+                "Usage export task started"
+            );
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = usage_tracker.export_csv(&latest_usage_csv) {
+                            error!(
+                                error = %e,
+                                path = %latest_usage_csv.display(),
+                                "Periodic usage snapshot export failed"
+                            );
+                        }
+                    }
+                    _ = usage_shutdown_rx.recv() => {
+                        if let Err(e) = usage_tracker.export_csv(&latest_usage_csv) {
+                            error!(
+                                error = %e,
+                                path = %latest_usage_csv.display(),
+                                "Final usage latest snapshot export failed"
+                            );
+                        }
+
+                        let shutdown_csv = usage_dir.join(format!(
+                            "tenant_usage_shutdown_{}.csv",
+                            unix_timestamp_secs()
+                        ));
+                        if let Err(e) = usage_tracker.export_csv(&shutdown_csv) {
+                            error!(
+                                error = %e,
+                                path = %shutdown_csv.display(),
+                                "Final usage shutdown snapshot export failed"
+                            );
+                        } else {
+                            info!(
+                                path = %shutdown_csv.display(),
+                                "Usage export task wrote shutdown snapshot"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // Create gRPC service with engine Arc reference
     let grpc_service = KyroDBServiceImpl {
@@ -3266,15 +3525,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route("/slo", get(slo_handler))
+        .route("/usage", get(usage_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    if config.server.observability_auth != ObservabilityAuthMode::Disabled {
-        http_app = http_app.layer(middleware::from_fn_with_state(
-            state.clone(),
-            observability_auth_middleware,
-        ));
-    }
+    // Always apply middleware so `/usage` stays auth-protected when
+    // `auth.enabled=true`, even if `server.observability_auth=disabled`.
+    http_app = http_app.layer(middleware::from_fn_with_state(
+        state.clone(),
+        observability_auth_middleware,
+    ));
 
     // HTTP port for observability (from config)
     let http_port = config.http_port();
@@ -3289,6 +3549,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET /health   - Liveness probe");
     info!("  GET /ready    - Readiness probe");
     info!("  GET /slo      - SLO breach status");
+    info!("  GET /usage    - Per-tenant usage snapshots");
 
     // Spawn HTTP server with proper error handling
     let http_addr_clone = http_addr;
@@ -3476,19 +3737,31 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_wal_health_overrides, classify_search_error_message, BatchSearchKey, HealthStatus,
-        InsertRequest, KyroDBServiceImpl, KyroDbService, SearchErrorKind, SearchRequest,
+        apply_wal_health_overrides, classify_search_error_message, observability_auth_middleware,
+        usage_handler, BatchSearchKey, DeleteRequest, HealthStatus, InsertRequest,
+        KyroDBServiceImpl, KyroDbService, QueryRequest, SearchErrorKind, SearchRequest,
         ServerState, TenantContext, TieredEngine, TieredEngineConfig,
     };
+    use axum::{
+        body::Body,
+        http::{Request as AxumRequest, StatusCode as AxumStatusCode},
+        middleware,
+        routing::get,
+        Router,
+    };
     use kyrodb_engine::{
-        cache_strategy::LruCacheStrategy, config::KyroDbConfig, MetricsCollector, QueryHashCache,
-        RateLimiter,
+        cache_strategy::LruCacheStrategy,
+        config::{KyroDbConfig, ObservabilityAuthMode},
+        AuthManager, MetricsCollector, QueryHashCache, RateLimiter, TenantInfo, UsageTracker,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::RwLock;
     use tonic::{Code, Request};
+    use tower::ServiceExt;
+
+    const TEST_OBS_API_KEY: &str = "kyro_tenant_obs_0123456789abcdef0123456789abcdef";
 
     fn build_test_service_with_seed_data() -> Arc<KyroDBServiceImpl> {
         let engine_config = TieredEngineConfig {
@@ -3525,6 +3798,7 @@ mod tests {
             rate_limiter: None,
             tenant_id_mapper: None,
             tenant_vector_counts: None,
+            usage_tracker: None,
         });
 
         Arc::new(KyroDBServiceImpl { state })
@@ -3560,6 +3834,7 @@ mod tests {
             rate_limiter: Some(RateLimiter::new()),
             tenant_id_mapper: None,
             tenant_vector_counts: Some(parking_lot::RwLock::new(HashMap::new())),
+            usage_tracker: Some(Arc::new(UsageTracker::new())),
         });
 
         let service = Arc::new(KyroDBServiceImpl { state });
@@ -3595,6 +3870,100 @@ mod tests {
         });
         req.extensions_mut().insert(tenant);
         req
+    }
+
+    fn tenant_query_request(local_doc_id: u64, tenant: TenantContext) -> Request<QueryRequest> {
+        let mut req = Request::new(QueryRequest {
+            doc_id: local_doc_id,
+            include_embedding: false,
+            namespace: String::new(),
+        });
+        req.extensions_mut().insert(tenant);
+        req
+    }
+
+    fn tenant_delete_request(local_doc_id: u64, tenant: TenantContext) -> Request<DeleteRequest> {
+        let mut req = Request::new(DeleteRequest {
+            doc_id: local_doc_id,
+            namespace: String::new(),
+        });
+        req.extensions_mut().insert(tenant);
+        req
+    }
+
+    fn build_observability_test_state(
+        auth_enabled: bool,
+        observability_auth: ObservabilityAuthMode,
+    ) -> Arc<ServerState> {
+        let engine_config = TieredEngineConfig {
+            embedding_dimension: 16,
+            ..TieredEngineConfig::default()
+        };
+        let engine = TieredEngine::new(
+            Box::new(LruCacheStrategy::new(1024)),
+            Arc::new(QueryHashCache::new(128, 0.90)),
+            Vec::new(),
+            Vec::new(),
+            engine_config.clone(),
+        )
+        .unwrap();
+
+        let mut app_config = KyroDbConfig::default();
+        app_config.auth.enabled = auth_enabled;
+        app_config.server.observability_auth = observability_auth;
+
+        let auth = if auth_enabled {
+            let auth = AuthManager::new();
+            auth.add_key(
+                TEST_OBS_API_KEY.to_string(),
+                TenantInfo {
+                    tenant_id: "tenant_obs".to_string(),
+                    tenant_name: "Tenant Observability".to_string(),
+                    max_qps: 1_000,
+                    max_vectors: 10_000,
+                    enabled: true,
+                    created_at: String::new(),
+                },
+            )
+            .expect("test API key should be valid");
+            Some(auth)
+        } else {
+            None
+        };
+
+        let usage_tracker = if auth_enabled {
+            let tracker = Arc::new(UsageTracker::new());
+            tracker.get_or_create("tenant_obs").record_query();
+            Some(tracker)
+        } else {
+            None
+        };
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
+        Arc::new(ServerState {
+            engine: Arc::new(RwLock::new(engine)),
+            start_time: Instant::now(),
+            app_config,
+            engine_config,
+            shutdown_tx,
+            metrics: MetricsCollector::new(),
+            auth,
+            rate_limiter: None,
+            tenant_id_mapper: None,
+            tenant_vector_counts: None,
+            usage_tracker,
+        })
+    }
+
+    fn build_observability_test_app(state: Arc<ServerState>) -> Router {
+        Router::new()
+            .route("/usage", get(usage_handler))
+            .route("/metrics", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                observability_auth_middleware,
+            ))
+            .with_state(state)
     }
 
     #[test]
@@ -3802,5 +4171,145 @@ mod tests {
             .copied()
             .unwrap_or(0);
         assert_eq!(final_count, 1, "valid insert should consume one quota slot");
+    }
+
+    #[tokio::test]
+    async fn tenant_usage_tracks_insert_query_delete_lifecycle() {
+        let service = build_test_service_with_tenant_quota(10);
+        let tenant = tenant_ctx(10);
+
+        let insert_req = tenant_insert_request(1, vec![0.1; 16], tenant.clone());
+        let insert_resp = service
+            .insert(insert_req)
+            .await
+            .expect("insert should succeed");
+        assert!(insert_resp.get_ref().success);
+
+        let query_req = tenant_query_request(1, tenant.clone());
+        let query_resp = service
+            .query(query_req)
+            .await
+            .expect("query should succeed");
+        assert!(query_resp.get_ref().found);
+
+        let delete_req = tenant_delete_request(1, tenant);
+        let delete_resp = service
+            .delete(delete_req)
+            .await
+            .expect("delete should succeed");
+        assert!(delete_resp.get_ref().success);
+        assert!(delete_resp.get_ref().existed);
+
+        let usage = service
+            .state
+            .usage_tracker
+            .as_ref()
+            .expect("usage tracker should be initialized in auth mode")
+            .get_snapshot("tenant_quota")
+            .expect("tenant usage should exist");
+
+        assert_eq!(usage.query_count, 1);
+        assert_eq!(usage.insert_count, 1);
+        assert_eq!(usage.delete_count, 1);
+        assert_eq!(usage.vector_count, 0);
+        assert_eq!(usage.storage_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_usage_does_not_double_count_upsert_storage() {
+        let service = build_test_service_with_tenant_quota(10);
+        let tenant = tenant_ctx(10);
+
+        let first_insert = tenant_insert_request(1, vec![0.1; 16], tenant.clone());
+        let first_resp = service
+            .insert(first_insert)
+            .await
+            .expect("first insert should succeed");
+        assert!(first_resp.get_ref().success);
+
+        let second_insert = tenant_insert_request(1, vec![0.2; 16], tenant);
+        let second_resp = service
+            .insert(second_insert)
+            .await
+            .expect("upsert should succeed");
+        assert!(second_resp.get_ref().success);
+
+        let usage = service
+            .state
+            .usage_tracker
+            .as_ref()
+            .expect("usage tracker should be initialized in auth mode")
+            .get_snapshot("tenant_quota")
+            .expect("tenant usage should exist");
+
+        assert_eq!(usage.insert_count, 1);
+        assert_eq!(usage.vector_count, 1);
+        assert_eq!(usage.storage_bytes, 16 * 4);
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_requires_auth_when_observability_auth_disabled() {
+        let state = build_observability_test_state(true, ObservabilityAuthMode::Disabled);
+        let app = build_observability_test_app(state);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/usage")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(unauthenticated.status(), AxumStatusCode::UNAUTHORIZED);
+
+        let authenticated = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/usage")
+                    .header("x-api-key", TEST_OBS_API_KEY)
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(authenticated.status(), AxumStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_returns_not_found_when_auth_disabled() {
+        let state = build_observability_test_state(false, ObservabilityAuthMode::Disabled);
+        let app = build_observability_test_app(state);
+
+        let response = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/usage")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), AxumStatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_stays_open_when_observability_auth_disabled() {
+        let state = build_observability_test_state(true, ObservabilityAuthMode::Disabled);
+        let app = build_observability_test_app(state);
+
+        let response = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
     }
 }

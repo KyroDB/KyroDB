@@ -63,11 +63,14 @@ server:
 
 Notes:
 
-- `server.http_host` sets the HTTP observability bind host (`/metrics`, `/health`, `/ready`, `/slo`). When omitted, it defaults to `server.host`.
-- `server.observability_auth` controls auth on observability endpoints:
+- `server.http_host` sets the HTTP observability bind host (`/metrics`, `/health`, `/ready`, `/slo`, `/usage`). When omitted, it defaults to `server.host`.
+- `server.observability_auth` controls auth on `/metrics`, `/health`, `/ready`, and `/slo`:
   - `disabled`: no auth on observability endpoints.
   - `metrics_and_slo`: require auth on `/metrics` and `/slo`.
   - `all`: require auth on `/metrics`, `/health`, `/ready`, and `/slo`.
+- `GET /usage` is controlled independently by `auth.enabled`:
+  - `auth.enabled=true`: `/usage` always requires API key auth (regardless of `server.observability_auth`).
+  - `auth.enabled=false`: usage tracking is disabled and `/usage` returns `404`.
 - `server.observability_auth != disabled` requires `auth.enabled=true`.
 - `server.tls` configures gRPC TLS:
   - `enabled=true` requires both `cert_path` and `key_path`.
@@ -119,6 +122,7 @@ Notes:
 - `cache.hot_tier_max_age_secs` controls hot-tier max age; if omitted, the server falls back to `cache.training_interval_secs` for backward compatibility.
 - `cache.training_interval_secs` controls the training cadence for the learned predictor.
 - `cache.strategy` is used by `kyrodb_server` (lru/learned/abtest).
+- `cache.query_cache_similarity_threshold=0.52` is an intentionally recall-oriented default for semantic query cache reuse; if you observe false semantic matches, increase toward `0.70-0.80`.
 
 ### HNSW (used)
 
@@ -223,6 +227,11 @@ timeouts:
   hot_tier_ms: 50
   cold_tier_ms: 1000
 ```
+
+Notes:
+
+- Timeout values are per-layer fail-safe ceilings, not SLO targets.
+- `slo.p99_latency_ms` is measured end-to-end query latency; keep your hit-rate profile high enough that cold-tier worst-case budgets are rare in steady state.
 
 ### Environment mode (used)
 
