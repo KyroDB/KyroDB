@@ -177,6 +177,35 @@ When `auth.enabled=false`, usage tracking is disabled and `/usage` returns `404`
 
 ```bash
 curl -H "x-api-key: <API_KEY>" http://localhost:51051/usage
+# or with Bearer token:
+curl -H "authorization: Bearer <API_KEY>" http://localhost:51051/usage
+```
+
+Example response:
+
+```json
+{
+  "generated_at": 1736210042,
+  "totals": {
+    "query_count": 15420,
+    "vector_count": 1200000,
+    "storage_bytes": 1048576000,
+    "billable_events": 16680
+  },
+  "tenants": [
+    {
+      "tenant_id": "tenant-abc123",
+      "query_count": 15420,
+      "insert_count": 1300,
+      "delete_count": 40,
+      "vector_count": 1200000,
+      "storage_bytes": 1048576000,
+      "storage_mb": 1000.0,
+      "storage_gb": 0.9765625,
+      "billable_events": 16680
+    }
+  ]
+}
 ```
 
 ## Prometheus alerts

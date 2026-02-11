@@ -84,13 +84,17 @@ def main() -> int:
         neighbors = neighbors[: args.max_queries]
 
     # Convert neighbors to u32 and validate range.
-    if neighbors.size > 0 and np.issubdtype(neighbors.dtype, np.signedinteger):
+    if neighbors.size > 0:
+        if np.any(~np.isfinite(neighbors)):
+            raise SystemExit("neighbors contains non-finite values, cannot convert to u32")
         if np.any(neighbors < 0):
             raise SystemExit("neighbors contains negative ids, cannot convert to u32")
-    if neighbors.size > 0 and np.max(neighbors) > np.iinfo(np.uint32).max:
-        raise SystemExit("neighbors contains ids > u32::MAX, unsupported")
+        if np.issubdtype(neighbors.dtype, np.floating):
+            if np.any(np.floor(neighbors) != neighbors):
+                raise SystemExit("neighbors contains non-integer values, cannot convert to u32")
+        if np.max(neighbors) > np.iinfo(np.uint32).max:
+            raise SystemExit("neighbors contains ids > u32::MAX, unsupported")
 
-    neighbors = neighbors.astype(np.uint32, copy=False)
     train = np.ascontiguousarray(train, dtype=np.float32)
     test = np.ascontiguousarray(test, dtype=np.float32)
     neighbors = np.ascontiguousarray(neighbors, dtype=np.uint32)

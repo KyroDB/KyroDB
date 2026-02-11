@@ -50,6 +50,8 @@ fn create_test_engine() -> TestEngineGuard {
         hnsw_ef_construction: 200,
         hnsw_ef_search: 50,
         hnsw_disable_normalization_check: false,
+        hnsw_ann_search_mode: kyrodb_engine::config::AnnSearchMode::Fp32Strict,
+        hnsw_quantized_rerank_multiplier: 8,
         data_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
         fsync_policy: kyrodb_engine::FsyncPolicy::Never,
         snapshot_interval: 1000,

@@ -12,7 +12,7 @@ API key authentication is integrated with the gRPC server. When `auth.enabled` i
 
 In `environment.type=production`, a non-loopback gRPC bind (`server.host`) now requires `auth.enabled=true` at startup validation time.
 
-HTTP observability endpoints (`/metrics`, `/health`, `/ready`, `/slo`, `/usage`) are unauthenticated by default for operational simplicity, but can (and typically should) be protected in production via either (with `/usage` called out separately below because it has stricter auth behavior):
+HTTP observability endpoints `/metrics`, `/health`, `/ready`, and `/slo` are unauthenticated by default and are governed by `server.observability_auth` (see [Observability endpoint protection](#observability-endpoint-protection) below). `/usage` behaves differently: it requires authentication whenever `auth.enabled=true` (independent of `server.observability_auth`) and returns `404` when `auth.enabled=false`. All of these endpoints can (and typically should) be protected in production via either:
 
 - Binding the HTTP server to a restricted interface using `server.http_host` (e.g., loopback only)
 - Requiring API key auth using `server.observability_auth` (same headers as gRPC)
@@ -26,8 +26,8 @@ Enable authentication and point to the API keys file:
 ```yaml
 # config.yaml
 auth:
-  enabled: true
-  api_keys_file: "data/api_keys.yaml"
+    enabled: true
+    api_keys_file: "data/api_keys.yaml"
 ```
 
 For external pilots, prefer `config.pilot.toml` / `config.pilot.yaml` and keep `environment.type=pilot`.
@@ -37,20 +37,20 @@ For external pilots, prefer `config.pilot.toml` / `config.pilot.yaml` and keep `
 ```yaml
 # data/api_keys.yaml
 api_keys:
-  - key: kyro_acme_corp_a3f9d8e2c1b4567890abcdef12345678
-    tenant_id: acme_corp
-    tenant_name: Acme Corporation
-    max_qps: 1000
-    max_vectors: 10000000
-    created_at: "2025-10-01T00:00:00Z"
-    enabled: true
+    - key: kyro_acme_corp_a3f9d8e2c1b4567890abcdef12345678
+      tenant_id: acme_corp
+      tenant_name: Acme Corporation
+      max_qps: 1000
+      max_vectors: 10000000
+      created_at: "2025-10-01T00:00:00Z"
+      enabled: true
 
-  - key: kyro_startup_x_b4e8f1a9d2c3567890fedcba98765432
-    tenant_id: startup_x
-    tenant_name: Startup X
-    max_qps: 100
-    max_vectors: 100000
-    enabled: true
+    - key: kyro_startup_x_b4e8f1a9d2c3567890fedcba98765432
+      tenant_id: startup_x
+      tenant_name: Startup X
+      max_qps: 100
+      max_vectors: 100000
+      enabled: true
 ```
 
 Notes:
@@ -86,12 +86,12 @@ Example: bind observability to loopback and require auth for `/metrics` and `/sl
 
 ```yaml
 server:
-  http_host: "127.0.0.1"
-  observability_auth: metrics_and_slo
+    http_host: "127.0.0.1"
+    observability_auth: metrics_and_slo
 
 auth:
-  enabled: true
-  api_keys_file: "data/api_keys.yaml"
+    enabled: true
+    api_keys_file: "data/api_keys.yaml"
 ```
 
 ## API key format
@@ -132,9 +132,9 @@ When authentication is enabled:
 - `doc_id` values are tenant-scoped; the server maps them to a global ID internally.
 - `doc_id` must fit within a 32-bit unsigned integer for each tenant.
 - Reserved metadata keys `__tenant_id__`, `__tenant_idx__`, and `__namespace__` are managed by the server and will be overwritten if provided by clients.
-  - `__tenant_id__`: the authenticated tenant's string identifier (e.g., `"acme_corp"`).
-  - `__tenant_idx__`: the server-assigned numeric tenant index used for internal doc_id mapping.
-  - `__namespace__`: scopes resources within a tenant to a logical partition (e.g., environment, project, or dataset). When provided in the gRPC request, the server overwrites this key with the canonical value derived from the request's `namespace` field. For details on namespace behavior, see the [API Reference](API_REFERENCE.md).
+    - `__tenant_id__`: the authenticated tenant's string identifier (e.g., `"acme_corp"`).
+    - `__tenant_idx__`: the server-assigned numeric tenant index used for internal doc_id mapping.
+    - `__namespace__`: scopes resources within a tenant to a logical partition (e.g., environment, project, or dataset). When provided in the gRPC request, the server overwrites this key with the canonical value derived from the request's `namespace` field. For details on namespace behavior, see the [API Reference](API_REFERENCE.md).
 - `max_qps` is enforced per tenant and returns `RESOURCE_EXHAUSTED` on overflow.
 
 ## `doc_id` range limits
@@ -148,11 +148,11 @@ Example (gateway-style JSON error payload):
 
 ```json
 {
-  "error": {
-    "code": "DOC_ID_OUT_OF_RANGE",
-    "message": "doc_id exceeds tenant-local max (u32)",
-    "status": 400
-  }
+    "error": {
+        "code": "DOC_ID_OUT_OF_RANGE",
+        "message": "doc_id exceeds tenant-local max (u32)",
+        "status": 400
+    }
 }
 ```
 

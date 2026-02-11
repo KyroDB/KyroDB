@@ -584,6 +584,16 @@ pub struct Snapshot {
     /// `#[serde(default)]` keeps backward compatibility with older snapshots.
     #[serde(default)]
     pub distance: Option<crate::config::DistanceMetric>,
+    /// ANN search mode used by the index that produced this snapshot.
+    ///
+    /// Optional for backward compatibility with older snapshots.
+    #[serde(default)]
+    pub ann_search_mode: Option<crate::config::AnnSearchMode>,
+    /// Quantized rerank multiplier used by the index that produced this snapshot.
+    ///
+    /// Optional for backward compatibility with older snapshots.
+    #[serde(default)]
+    pub quantized_rerank_multiplier: Option<usize>,
     /// Last WAL sequence number included in this snapshot.
     /// `#[serde(default)]` keeps backward compatibility with older snapshots.
     #[serde(default)]
@@ -618,6 +628,26 @@ impl Snapshot {
         metadata: Vec<(u64, HashMap<String, String>)>,
         last_wal_seq: u64,
     ) -> Result<Self> {
+        Self::new_with_ann_config(
+            dimension,
+            distance,
+            crate::config::AnnSearchMode::Fp32Strict,
+            8,
+            documents,
+            metadata,
+            last_wal_seq,
+        )
+    }
+
+    pub fn new_with_ann_config(
+        dimension: usize,
+        distance: crate::config::DistanceMetric,
+        ann_search_mode: crate::config::AnnSearchMode,
+        quantized_rerank_multiplier: usize,
+        documents: Vec<(u64, Vec<f32>)>,
+        metadata: Vec<(u64, HashMap<String, String>)>,
+        last_wal_seq: u64,
+    ) -> Result<Self> {
         let timestamp = unix_timestamp_secs_now();
 
         let mut snapshot = Self {
@@ -626,6 +656,8 @@ impl Snapshot {
             doc_count: documents.len(),
             dimension,
             distance: Some(distance),
+            ann_search_mode: Some(ann_search_mode),
+            quantized_rerank_multiplier: Some(quantized_rerank_multiplier),
             documents,
             metadata,
             last_wal_seq,
@@ -745,6 +777,27 @@ impl Snapshot {
                 "Snapshot missing distance metric; assuming default. Verify metric to avoid incorrect search results."
             );
             snapshot.distance = Some(assumed);
+        }
+        if snapshot.ann_search_mode.is_none() {
+            let assumed = crate::config::AnnSearchMode::Fp32Strict;
+            warn!(
+                snapshot = %path.display(),
+                version = snapshot.version,
+                timestamp = snapshot.timestamp,
+                assumed_ann_search_mode = ?assumed,
+                "Snapshot missing ann_search_mode; assuming fp32_strict."
+            );
+            snapshot.ann_search_mode = Some(assumed);
+        }
+        if snapshot.quantized_rerank_multiplier.is_none() {
+            warn!(
+                snapshot = %path.display(),
+                version = snapshot.version,
+                timestamp = snapshot.timestamp,
+                assumed_quantized_rerank_multiplier = 8usize,
+                "Snapshot missing quantized_rerank_multiplier; assuming 8."
+            );
+            snapshot.quantized_rerank_multiplier = Some(8);
         }
 
         Ok(snapshot)
@@ -892,6 +945,15 @@ impl Snapshot {
             }
         }
 
+        if let Some(multiplier) = self.quantized_rerank_multiplier {
+            if !(1..=64).contains(&multiplier) {
+                bail!(
+                    "Snapshot quantized_rerank_multiplier must be in [1, 64], found {}",
+                    multiplier
+                );
+            }
+        }
+
         Self::validate_alignment(&self.documents, &self.metadata)?;
 
         Ok(())
@@ -947,6 +1009,8 @@ impl Snapshot {
             documents: legacy.documents,
             metadata,
             distance: None,
+            ann_search_mode: None,
+            quantized_rerank_multiplier: None,
             last_wal_seq: 0,
         }
     }
@@ -960,6 +1024,8 @@ impl Snapshot {
             documents: legacy.documents,
             metadata: legacy.metadata,
             distance: None,
+            ann_search_mode: None,
+            quantized_rerank_multiplier: None,
             last_wal_seq: 0,
         }
     }

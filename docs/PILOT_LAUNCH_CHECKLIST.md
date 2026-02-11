@@ -7,10 +7,12 @@ Go/no-go checklist for external startup pilots.
 - [ ] `environment.type=pilot` is set.
 - [ ] `auth.enabled=true` and `auth.api_keys_file` exists.
 - [ ] `rate_limit.enabled=true`.
-- [ ] `server.observability_auth != disabled`.
+- [ ] `server.observability_auth` is set to `metrics_and_slo` or `all` (not `disabled`).
 - [ ] `persistence.allow_fresh_start_on_recovery_failure=false`.
 - [ ] If `server.host` is non-loopback, TLS is enabled with valid cert/key paths.
 - [ ] API keys are unique per startup tenant and stored outside git.
+- [ ] Audit logging enabled for authentication, authorization, and data operations.
+- [ ] Audit logs include tenant ID, operation type, timestamp, and result.
 
 Reference profile: `config.pilot.toml` / `config.pilot.yaml`.
 
@@ -27,6 +29,8 @@ Reference profile: `config.pilot.toml` / `config.pilot.yaml`.
 - [ ] Backup create/list/restore verified in staging.
 - [ ] Recovery startup test completed from snapshot + WAL tail.
 - [ ] `/health`, `/ready`, `/slo`, `/metrics` endpoints verified.
+- [ ] Rollback procedure documented and tested (config revert, traffic cutover, data sync).
+- [ ] Rollback decision authority and communication plan defined.
 
 ## 4. Performance Readiness (Must Pass)
 

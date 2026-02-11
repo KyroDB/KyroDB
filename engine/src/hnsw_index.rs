@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use crate::ann_backend::{create_default_backend, AnnBackend};
-use crate::config::DistanceMetric;
+use crate::config::{AnnSearchMode, DistanceMetric};
 
 const NORMALIZATION_NORM_SQ_MIN: f32 = 0.98;
 const NORMALIZATION_NORM_SQ_MAX: f32 = 1.02;
@@ -42,11 +42,14 @@ pub struct HnswVectorIndex {
     m: usize,
     ef_construction: usize,
     disable_normalization_check: bool,
+    ann_search_mode: AnnSearchMode,
+    quantized_rerank_multiplier: usize,
 }
 
 impl HnswVectorIndex {
     pub const DEFAULT_M: usize = 16;
     pub const DEFAULT_EF_CONSTRUCTION: usize = 200;
+    pub const DEFAULT_QUANTIZED_RERANK_MULTIPLIER: usize = 8;
 
     /// Create new HNSW index
     ///
@@ -96,6 +99,29 @@ impl HnswVectorIndex {
         ef_construction: usize,
         disable_normalization_check: bool,
     ) -> Result<Self> {
+        Self::new_with_params_and_search_mode(
+            dimension,
+            max_elements,
+            distance,
+            m,
+            ef_construction,
+            disable_normalization_check,
+            AnnSearchMode::Fp32Strict,
+            Self::DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_params_and_search_mode(
+        dimension: usize,
+        max_elements: usize,
+        distance: DistanceMetric,
+        m: usize,
+        ef_construction: usize,
+        disable_normalization_check: bool,
+        ann_search_mode: AnnSearchMode,
+        quantized_rerank_multiplier: usize,
+    ) -> Result<Self> {
         if dimension == 0 {
             anyhow::bail!("dimension must be > 0");
         }
@@ -108,13 +134,27 @@ impl HnswVectorIndex {
         if ef_construction == 0 {
             anyhow::bail!("HNSW ef_construction must be > 0");
         }
+        if !(1..=64).contains(&quantized_rerank_multiplier) {
+            anyhow::bail!(
+                "quantized_rerank_multiplier must be in [1, 64], got {}",
+                quantized_rerank_multiplier
+            );
+        }
 
         // Calculate max_layer based on max_elements
         let max_layer = 16.min(((max_elements as f32).ln().ceil() as usize).max(1));
 
         // KyroDB default ANN backend. Isolated behind a trait so we can replace
         // the implementation without changing higher-level engine behavior.
-        let backend = create_default_backend(distance, m, max_elements, max_layer, ef_construction);
+        let backend = create_default_backend(
+            distance,
+            m,
+            max_elements,
+            max_layer,
+            ef_construction,
+            ann_search_mode,
+            quantized_rerank_multiplier,
+        );
         let backend_name = backend.name();
 
         Ok(Self {
@@ -127,6 +167,8 @@ impl HnswVectorIndex {
             m,
             ef_construction,
             disable_normalization_check,
+            ann_search_mode,
+            quantized_rerank_multiplier,
         })
     }
 
@@ -138,6 +180,9 @@ impl HnswVectorIndex {
                 self.dimension,
                 embedding.len()
             );
+        }
+        if embedding.iter().any(|v| !v.is_finite()) {
+            anyhow::bail!("embedding contains non-finite values");
         }
 
         if self.current_count >= self.max_elements {
@@ -225,6 +270,9 @@ impl HnswVectorIndex {
                     embedding.len()
                 );
             }
+            if embedding.iter().any(|v| !v.is_finite()) {
+                anyhow::bail!("Batch insert: embedding[{}] contains non-finite values", i);
+            }
             if needs_norm_check {
                 let norm_sq = crate::simd::sum_squares_f32(embedding);
                 if !(NORMALIZATION_NORM_SQ_MIN..=NORMALIZATION_NORM_SQ_MAX).contains(&norm_sq) {
@@ -276,6 +324,9 @@ impl HnswVectorIndex {
                 self.dimension,
                 query.len()
             );
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            anyhow::bail!("query contains non-finite values");
         }
 
         if k == 0 {
@@ -366,6 +417,14 @@ impl HnswVectorIndex {
         self.backend_name
     }
 
+    pub fn ann_search_mode(&self) -> AnnSearchMode {
+        self.ann_search_mode
+    }
+
+    pub fn quantized_rerank_multiplier(&self) -> usize {
+        self.quantized_rerank_multiplier
+    }
+
     /// Estimate memory usage assuming M=16, avg 2 layers/node, +10% overhead
     pub fn estimate_memory_bytes(&self) -> usize {
         if self.current_count == 0 {
@@ -430,6 +489,27 @@ mod tests {
 
         let wrong_query = vec![0.1; 256];
         assert!(index.knn_search(&wrong_query, 10).is_err());
+    }
+
+    #[test]
+    fn test_hnsw_rejects_non_finite_input_vectors_and_queries() {
+        let mut index = HnswVectorIndex::new(4, 10).unwrap();
+
+        let bad_insert = [0.1, f32::NAN, 0.2, 0.3];
+        assert!(
+            index.add_vector(1, &bad_insert).is_err(),
+            "insert must reject non-finite embeddings"
+        );
+
+        index
+            .add_vector(2, &normalize(vec![1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+
+        let bad_query = [0.1, f32::INFINITY, 0.2, 0.3];
+        assert!(
+            index.knn_search(&bad_query, 1).is_err(),
+            "search must reject non-finite query vectors"
+        );
     }
 
     #[test]

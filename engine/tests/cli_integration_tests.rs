@@ -36,6 +36,7 @@ fn test_cli_backup_create_full() -> Result<()> {
         data_path,
         FsyncPolicy::Always,
         10,
+        100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
     drop(backend);
@@ -90,6 +91,7 @@ fn test_cli_backup_list() -> Result<()> {
         data_path,
         FsyncPolicy::Always,
         10,
+        100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
     drop(backend);
@@ -136,6 +138,7 @@ fn test_cli_backup_list_json() -> Result<()> {
         data_path,
         FsyncPolicy::Always,
         10,
+        100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
     drop(backend);
@@ -184,6 +187,7 @@ fn test_cli_restore_from_backup() -> Result<()> {
         data_path,
         FsyncPolicy::Always,
         10,
+        100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
     drop(backend);
@@ -251,6 +255,7 @@ fn test_cli_prune_backups() -> Result<()> {
         data_path,
         FsyncPolicy::Always,
         10,
+        100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
     drop(backend);
@@ -351,6 +356,7 @@ fn test_cli_verify_backup() -> Result<()> {
         data_path,
         FsyncPolicy::Always,
         10,
+        100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
     drop(backend);
@@ -402,6 +408,7 @@ fn test_cli_incremental_backup() -> Result<()> {
         data_path,
         FsyncPolicy::Always,
         10,
+        100 * 1024 * 1024,
     )?;
     backend.sync_wal()?;
 
@@ -476,6 +483,7 @@ fn test_cli_point_in_time_restore() -> Result<()> {
         data_path,
         FsyncPolicy::Always,
         10,
+        100 * 1024 * 1024,
     )?;
     backend.sync_wal()?;
 

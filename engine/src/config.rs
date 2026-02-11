@@ -270,6 +270,14 @@ pub struct HnswConfig {
 
     /// Disable L2-normalization checks for inner-product vectors (performance opt-out)
     pub disable_normalization_check: bool,
+
+    /// Search compute mode for ANN traversal.
+    pub ann_search_mode: AnnSearchMode,
+
+    /// Candidate expansion factor before fp32 rerank in quantized modes.
+    ///
+    /// Effective rerank candidates = `k * quantized_rerank_multiplier`.
+    pub quantized_rerank_multiplier: usize,
 }
 
 impl Default for HnswConfig {
@@ -282,8 +290,22 @@ impl Default for HnswConfig {
             dimension: 768, // Common for sentence transformers
             distance: DistanceMetric::Cosine,
             disable_normalization_check: false,
+            ann_search_mode: AnnSearchMode::Fp32Strict,
+            quantized_rerank_multiplier: 8,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnSearchMode {
+    /// Full-precision fp32 traversal and scoring.
+    #[default]
+    Fp32Strict,
+    /// SQ8 approximate traversal with fp32 rerank of top candidates.
+    Sq8Rerank,
+    /// SQ4 approximate traversal with fp32 rerank of top candidates.
+    Sq4Rerank,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -749,8 +771,8 @@ impl KyroDbConfig {
             self.hnsw.max_elements
         );
         anyhow::ensure!(
-            self.hnsw.m >= 5 && self.hnsw.m <= 48,
-            "HNSW M parameter should be in range [5, 48] for optimal performance, got {}",
+            self.hnsw.m >= 5 && self.hnsw.m <= 128,
+            "HNSW M parameter should be in range [5, 128], got {}",
             self.hnsw.m
         );
         anyhow::ensure!(
@@ -784,6 +806,13 @@ impl KyroDbConfig {
                 self.hnsw.ef_search, self.hnsw.ef_construction
             );
         }
+
+        anyhow::ensure!(
+            self.hnsw.quantized_rerank_multiplier >= 1
+                && self.hnsw.quantized_rerank_multiplier <= 64,
+            "quantized_rerank_multiplier must be in range [1, 64], got {}",
+            self.hnsw.quantized_rerank_multiplier
+        );
 
         // Persistence validation
         anyhow::ensure!(
@@ -1127,12 +1156,34 @@ mod tests {
         assert!(config.validate().is_err(), "M < 5 should fail");
 
         // M too large
-        config.hnsw.m = 50;
-        assert!(config.validate().is_err(), "M > 48 should fail");
+        config.hnsw.m = 129;
+        assert!(config.validate().is_err(), "M > 128 should fail");
 
         // M in valid range
         config.hnsw.m = 16;
         assert!(config.validate().is_ok(), "M = 16 should pass");
+    }
+
+    #[test]
+    fn test_quantized_rerank_multiplier_range() {
+        let mut config = KyroDbConfig::default();
+        config.hnsw.quantized_rerank_multiplier = 0;
+        assert!(
+            config.validate().is_err(),
+            "quantized_rerank_multiplier=0 should fail"
+        );
+
+        config.hnsw.quantized_rerank_multiplier = 65;
+        assert!(
+            config.validate().is_err(),
+            "quantized_rerank_multiplier>64 should fail"
+        );
+
+        config.hnsw.quantized_rerank_multiplier = 8;
+        assert!(
+            config.validate().is_ok(),
+            "quantized_rerank_multiplier in range should pass"
+        );
     }
 
     #[test]

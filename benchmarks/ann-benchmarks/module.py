@@ -53,6 +53,29 @@ class KyroDB(BaseANN):
         self.M = int(params.get("M", 16))
         self.ef_construction = int(params.get("ef_construction", 200))
         self.ef_search = int(params.get("ef_search", 50))
+        self.ann_search_mode = str(
+            params.get(
+                "ann_search_mode",
+                os.environ.get("KYRODB_BENCH_ANN_SEARCH_MODE", "fp32-strict"),
+            )
+        ).strip().lower().replace("_", "-")
+        self.quantized_rerank_multiplier = int(
+            params.get(
+                "quantized_rerank_multiplier",
+                os.environ.get("KYRODB_BENCH_QUANTIZED_RERANK_MULTIPLIER", "8"),
+            )
+        )
+
+        if self.ann_search_mode not in {"fp32-strict", "sq8-rerank", "sq4-rerank"}:
+            raise ValueError(
+                "ann_search_mode must be one of fp32-strict|sq8-rerank|sq4-rerank, "
+                f"got '{self.ann_search_mode}'"
+            )
+        if not (1 <= self.quantized_rerank_multiplier <= 64):
+            raise ValueError(
+                "quantized_rerank_multiplier must be in [1, 64], "
+                f"got {self.quantized_rerank_multiplier}"
+            )
 
         self.host = os.environ.get("KYRODB_HOST", "127.0.0.1")
         self.port = int(os.environ.get("KYRODB_PORT", "50051"))
@@ -125,6 +148,10 @@ class KyroDB(BaseANN):
         env["KYRODB__HNSW__M"] = str(self.M)
         env["KYRODB__HNSW__EF_CONSTRUCTION"] = str(self.ef_construction)
         env["KYRODB__HNSW__MAX_ELEMENTS"] = str(int(max_elements))
+        env["KYRODB__HNSW__ANN_SEARCH_MODE"] = self.ann_search_mode.replace("-", "_")
+        env["KYRODB__HNSW__QUANTIZED_RERANK_MULTIPLIER"] = str(
+            self.quantized_rerank_multiplier
+        )
 
         # Bench runs should measure ANN performance, not durability.
         env.setdefault("KYRODB__ENVIRONMENT__TYPE", "benchmark")
@@ -155,11 +182,13 @@ class KyroDB(BaseANN):
         env.setdefault("KYRODB__LOGGING__LEVEL", "warn")
 
         self._logger.info(
-            "Starting kyrodb_server (port=%s http_port=%s dim=%s metric=%s)",
+            "Starting kyrodb_server (port=%s http_port=%s dim=%s metric=%s ann_mode=%s rerank_mult=%s)",
             self.port,
             self.port + 1000,
             dimension,
             env["KYRODB__HNSW__DISTANCE"],
+            env["KYRODB__HNSW__ANN_SEARCH_MODE"],
+            env["KYRODB__HNSW__QUANTIZED_RERANK_MULTIPLIER"],
         )
 
         self._server_stdout_path = os.path.join(self._data_dir, "kyrodb_server.stdout.log")
@@ -195,6 +224,8 @@ class KyroDB(BaseANN):
         stderr_tail = None
         if self._server_stderr_path is not None:
             try:
+                if self._server_stderr is not None:
+                    self._server_stderr.flush()
                 with open(self._server_stderr_path, "rb") as f:
                     data = f.read()
                 stderr_tail = data[-8192:].decode("utf-8", errors="replace")

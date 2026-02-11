@@ -560,9 +560,38 @@ impl KyroDBServiceImpl {
         Ok(false)
     }
 
-    /// Adjust tenant vector counters for paths that do not reserve quota through
-    /// `enforce_vector_quota` (for example, out-of-band bulk-load ingestion).
-    fn increment_tenant_vectors(&self, tenant: Option<&TenantContext>, count: usize) {
+    /// Reserve vector quota slots atomically before a bulk insert.
+    fn reserve_tenant_vectors(
+        &self,
+        tenant: Option<&TenantContext>,
+        count: usize,
+    ) -> Result<(), Status> {
+        if count == 0 {
+            return Ok(());
+        }
+        let Some(tenant) = tenant else {
+            return Ok(());
+        };
+
+        let counts = self
+            .state
+            .tenant_vector_counts
+            .as_ref()
+            .ok_or_else(|| Status::internal("tenant vector quota state not initialized"))?;
+        let mut guard = counts.write();
+        let entry = guard.entry(tenant.tenant_id.clone()).or_insert(0);
+        if entry.saturating_add(count) > tenant.max_vectors {
+            return Err(Status::resource_exhausted(format!(
+                "max_vectors quota exceeded: tenant={} limit={}",
+                tenant.tenant_id, tenant.max_vectors
+            )));
+        }
+        *entry = entry.saturating_add(count);
+        Ok(())
+    }
+
+    /// Release reserved quota slots that were not consumed by a bulk insert.
+    fn release_reserved_tenant_vectors(&self, tenant: Option<&TenantContext>, count: usize) {
         if count == 0 {
             return;
         }
@@ -571,8 +600,9 @@ impl KyroDBServiceImpl {
         };
         if let Some(counts) = &self.state.tenant_vector_counts {
             let mut guard = counts.write();
-            let entry = guard.entry(tenant.tenant_id.clone()).or_insert(0);
-            *entry = entry.saturating_add(count);
+            if let Some(entry) = guard.get_mut(&tenant.tenant_id) {
+                *entry = entry.saturating_sub(count);
+            }
         }
     }
 
@@ -769,6 +799,19 @@ impl KyroDBServiceImpl {
                 Status::internal(format!("Search failed: {}", message))
             }
         }
+    }
+
+    fn map_snapshot_error(&self, error: anyhow::Error) -> Status {
+        let message = error.to_string();
+        if message.contains("Persistence not enabled") {
+            return Status::failed_precondition(
+                "snapshot creation requires persistence to be enabled",
+            );
+        }
+        if message.contains("disk space critically low") {
+            return Status::resource_exhausted(format!("snapshot rejected: {}", message));
+        }
+        Status::internal(format!("snapshot creation failed: {}", message))
     }
 
     fn record_search_path_metrics(&self, path: SearchExecutionPath) {
@@ -1401,39 +1444,26 @@ impl KyroDbService for KyroDBServiceImpl {
                 let batch_len = batch.len() as u64;
                 let engine = self.state.engine.write().await;
                 let mut new_doc_ids = HashSet::new();
-                if let Some(tenant_ctx) = tenant.as_ref() {
+                if tenant.is_some() {
                     for (doc_id, _, _) in &batch {
                         if !engine.exists(*doc_id) {
                             new_doc_ids.insert(*doc_id);
                         }
                     }
-                    if !new_doc_ids.is_empty() {
-                        let counts = self.state.tenant_vector_counts.as_ref().ok_or_else(|| {
-                            Status::internal("tenant vector quota state not initialized")
-                        })?;
-                        let current = counts
-                            .read()
-                            .get(&tenant_ctx.tenant_id)
-                            .copied()
-                            .unwrap_or(0);
-                        if current.saturating_add(new_doc_ids.len()) > tenant_ctx.max_vectors {
-                            return Err(Status::resource_exhausted(format!(
-                                "max_vectors quota exceeded: tenant={} limit={}",
-                                tenant_ctx.tenant_id, tenant_ctx.max_vectors
-                            )));
-                        }
-                    }
                 }
+                let reserved_slots = new_doc_ids.len();
+                self.reserve_tenant_vectors(tenant.as_ref(), reserved_slots)?;
                 match engine.bulk_load_cold_tier(batch) {
                     Ok((loaded, failed, _duration_ms, _rate)) => {
                         total_loaded += loaded;
                         total_failed_insertion += failed;
-                        if !new_doc_ids.is_empty() {
+                        if reserved_slots > 0 {
                             let inserted_now = new_doc_ids
                                 .iter()
                                 .filter(|doc_id| engine.exists(**doc_id))
                                 .count();
-                            self.increment_tenant_vectors(tenant.as_ref(), inserted_now);
+                            let release = reserved_slots.saturating_sub(inserted_now);
+                            self.release_reserved_tenant_vectors(tenant.as_ref(), release);
                             self.record_tenant_insert_usage(
                                 tenant.as_ref(),
                                 inserted_now as u64,
@@ -1442,6 +1472,7 @@ impl KyroDbService for KyroDBServiceImpl {
                         }
                     }
                     Err(e) => {
+                        self.release_reserved_tenant_vectors(tenant.as_ref(), reserved_slots);
                         error!(error = %e, "BulkLoadHnsw: batch load failed");
                         last_error = format!("Bulk load failed: {}", e);
                         total_failed_insertion += batch_len;
@@ -1456,39 +1487,26 @@ impl KyroDbService for KyroDBServiceImpl {
             let batch_len = batch.len() as u64;
             let engine = self.state.engine.write().await;
             let mut new_doc_ids = HashSet::new();
-            if let Some(tenant_ctx) = tenant.as_ref() {
+            if tenant.is_some() {
                 for (doc_id, _, _) in &batch {
                     if !engine.exists(*doc_id) {
                         new_doc_ids.insert(*doc_id);
                     }
                 }
-                if !new_doc_ids.is_empty() {
-                    let counts = self.state.tenant_vector_counts.as_ref().ok_or_else(|| {
-                        Status::internal("tenant vector quota state not initialized")
-                    })?;
-                    let current = counts
-                        .read()
-                        .get(&tenant_ctx.tenant_id)
-                        .copied()
-                        .unwrap_or(0);
-                    if current.saturating_add(new_doc_ids.len()) > tenant_ctx.max_vectors {
-                        return Err(Status::resource_exhausted(format!(
-                            "max_vectors quota exceeded: tenant={} limit={}",
-                            tenant_ctx.tenant_id, tenant_ctx.max_vectors
-                        )));
-                    }
-                }
             }
+            let reserved_slots = new_doc_ids.len();
+            self.reserve_tenant_vectors(tenant.as_ref(), reserved_slots)?;
             match engine.bulk_load_cold_tier(batch) {
                 Ok((loaded, failed, _duration_ms, _rate)) => {
                     total_loaded += loaded;
                     total_failed_insertion += failed;
-                    if !new_doc_ids.is_empty() {
+                    if reserved_slots > 0 {
                         let inserted_now = new_doc_ids
                             .iter()
                             .filter(|doc_id| engine.exists(**doc_id))
                             .count();
-                        self.increment_tenant_vectors(tenant.as_ref(), inserted_now);
+                        let release = reserved_slots.saturating_sub(inserted_now);
+                        self.release_reserved_tenant_vectors(tenant.as_ref(), release);
                         self.record_tenant_insert_usage(
                             tenant.as_ref(),
                             inserted_now as u64,
@@ -1497,6 +1515,7 @@ impl KyroDbService for KyroDBServiceImpl {
                     }
                 }
                 Err(e) => {
+                    self.release_reserved_tenant_vectors(tenant.as_ref(), reserved_slots);
                     error!(error = %e, "BulkLoadHnsw: final batch load failed");
                     last_error = format!("Bulk load failed: {}", e);
                     total_failed_insertion += batch_len;
@@ -2430,6 +2449,7 @@ impl KyroDbService for KyroDBServiceImpl {
         &self,
         _request: Request<MetricsRequest>,
     ) -> Result<Response<MetricsResponse>, Status> {
+        let _ = wal_health_snapshot(&self.state).await;
         refresh_system_metrics(&self.state);
         let engine = self.state.engine.read().await;
         let stats = engine.stats();
@@ -2538,18 +2558,21 @@ impl KyroDbService for KyroDBServiceImpl {
             ));
         }
 
-        let engine = self.state.engine.read().await;
-        engine
-            .cold_tier()
-            .create_snapshot()
-            .map_err(|e| Status::internal(format!("snapshot creation failed: {}", e)))?;
-
         let data_dir = self
             .state
             .engine_config
             .data_dir
             .clone()
-            .ok_or_else(|| Status::internal("data_dir not configured"))?;
+            .ok_or_else(|| Status::failed_precondition("data_dir not configured"))?;
+        let cold_tier = {
+            let engine = self.state.engine.read().await;
+            engine.cold_tier_handle()
+        };
+
+        cold_tier
+            .create_snapshot()
+            .map_err(|e| self.map_snapshot_error(e))?;
+
         let manifest_path = std::path::Path::new(&data_dir).join("MANIFEST");
         let manifest = Manifest::load(&manifest_path)
             .map_err(|e| Status::internal(format!("failed to load MANIFEST: {}", e)))?;
@@ -2560,7 +2583,7 @@ impl KyroDbService for KyroDBServiceImpl {
         let snapshot_size_bytes = std::fs::metadata(&snapshot_path)
             .map(|m| m.len())
             .map_err(|e| Status::internal(format!("failed to stat snapshot: {}", e)))?;
-        let documents_snapshotted = engine.cold_tier().len() as u64;
+        let documents_snapshotted = cold_tier.len() as u64;
 
         Ok(Response::new(SnapshotResponse {
             success: true,
@@ -3064,6 +3087,8 @@ async fn main() -> anyhow::Result<()> {
         hnsw_m = config.hnsw.m,
         hnsw_ef_construction = config.hnsw.ef_construction,
         hnsw_ef_search = config.hnsw.ef_search,
+        hnsw_ann_search_mode = ?config.hnsw.ann_search_mode,
+        hnsw_quantized_rerank_multiplier = config.hnsw.quantized_rerank_multiplier,
         log_level = log_level,
         "Configuration loaded"
     );
@@ -3095,6 +3120,8 @@ async fn main() -> anyhow::Result<()> {
         hnsw_ef_construction: config.hnsw.ef_construction,
         hnsw_ef_search: config.hnsw.ef_search,
         hnsw_disable_normalization_check: config.hnsw.disable_normalization_check,
+        hnsw_ann_search_mode: config.hnsw.ann_search_mode,
+        hnsw_quantized_rerank_multiplier: config.hnsw.quantized_rerank_multiplier,
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
         fsync_policy,
         snapshot_interval: config.snapshot_interval_mutations(),
@@ -3740,7 +3767,7 @@ mod tests {
         apply_wal_health_overrides, classify_search_error_message, observability_auth_middleware,
         usage_handler, BatchSearchKey, DeleteRequest, HealthStatus, InsertRequest,
         KyroDBServiceImpl, KyroDbService, QueryRequest, SearchErrorKind, SearchRequest,
-        ServerState, TenantContext, TieredEngine, TieredEngineConfig,
+        ServerState, SnapshotRequest, TenantContext, TieredEngine, TieredEngineConfig,
     };
     use axum::{
         body::Body,
@@ -3757,6 +3784,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
     use tokio::sync::RwLock;
     use tonic::{Code, Request};
     use tower::ServiceExt;
@@ -3846,6 +3874,45 @@ mod tests {
         // Ensure the helper cannot silently ignore max_vectors=0.
         assert!(max_vectors > 0, "max_vectors must be > 0 in quota tests");
         service
+    }
+
+    fn build_test_service_with_persistence() -> (Arc<KyroDBServiceImpl>, TempDir) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let engine_config = TieredEngineConfig {
+            embedding_dimension: 16,
+            data_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            snapshot_interval: 2,
+            ..TieredEngineConfig::default()
+        };
+        let engine = TieredEngine::new(
+            Box::new(LruCacheStrategy::new(2048)),
+            Arc::new(QueryHashCache::new(2048, 0.90)),
+            Vec::new(),
+            Vec::new(),
+            engine_config.clone(),
+        )
+        .expect("engine init");
+
+        engine
+            .insert(1, vec![0.01; 16], HashMap::new())
+            .expect("seed insert");
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
+        let state = Arc::new(ServerState {
+            engine: Arc::new(RwLock::new(engine)),
+            start_time: Instant::now(),
+            app_config: KyroDbConfig::default(),
+            engine_config,
+            shutdown_tx,
+            metrics: MetricsCollector::new(),
+            auth: None,
+            rate_limiter: None,
+            tenant_id_mapper: None,
+            tenant_vector_counts: None,
+            usage_tracker: None,
+        });
+
+        (Arc::new(KyroDBServiceImpl { state }), temp_dir)
     }
 
     fn tenant_ctx(max_vectors: usize) -> TenantContext {
@@ -4126,6 +4193,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tenant_bulk_quota_reservation_is_atomic_and_releasable() {
+        let service = build_test_service_with_tenant_quota(2);
+        let tenant = tenant_ctx(2);
+
+        service
+            .reserve_tenant_vectors(Some(&tenant), 2)
+            .expect("initial reservation must succeed");
+
+        let err = service
+            .reserve_tenant_vectors(Some(&tenant), 1)
+            .expect_err("reservation past max_vectors must fail");
+        assert_eq!(err.code(), Code::ResourceExhausted);
+
+        service.release_reserved_tenant_vectors(Some(&tenant), 1);
+        service
+            .reserve_tenant_vectors(Some(&tenant), 1)
+            .expect("released reservation should be reusable");
+
+        let quota_count = service
+            .state
+            .tenant_vector_counts
+            .as_ref()
+            .expect("tenant vector quota map")
+            .read()
+            .get("tenant_quota")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(quota_count, 2, "quota counter must stay bounded");
+    }
+
     #[tokio::test]
     async fn tenant_quota_reservation_rolls_back_after_failed_insert() {
         let service = build_test_service_with_tenant_quota(1);
@@ -4311,5 +4409,56 @@ mod tests {
             .expect("request should succeed");
 
         assert_eq!(response.status(), AxumStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_rejects_custom_path() {
+        let service = build_test_service_with_seed_data();
+        let res = service
+            .create_snapshot(Request::new(SnapshotRequest {
+                path: "/tmp/custom.snap".to_string(),
+            }))
+            .await;
+        let status = res.expect_err("custom path must be rejected");
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_requires_persistence() {
+        let service = build_test_service_with_seed_data();
+        let res = service
+            .create_snapshot(Request::new(SnapshotRequest {
+                path: String::new(),
+            }))
+            .await;
+        let status = res.expect_err("snapshot should fail when persistence is disabled");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_succeeds_with_persistence() {
+        let (service, _temp_dir) = build_test_service_with_persistence();
+        let res = service
+            .create_snapshot(Request::new(SnapshotRequest {
+                path: String::new(),
+            }))
+            .await
+            .expect("snapshot should succeed with persistence enabled")
+            .into_inner();
+        assert!(res.success, "snapshot response should report success");
+        assert!(
+            !res.snapshot_path.is_empty(),
+            "snapshot response must include snapshot path"
+        );
+        let snapshot_path = std::path::Path::new(&res.snapshot_path);
+        assert!(snapshot_path.exists(), "snapshot file should exist on disk");
+        assert!(
+            res.snapshot_size_bytes > 0,
+            "snapshot response must report non-zero snapshot size"
+        );
+        assert!(
+            res.documents_snapshotted >= 1,
+            "snapshot should include seeded documents"
+        );
     }
 }

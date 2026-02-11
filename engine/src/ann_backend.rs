@@ -9,51 +9,22 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::collections::{BinaryHeap, HashMap};
 
-use crate::config::DistanceMetric;
+use crate::ann_quant::{quantization_kind_for_mode, QuantizedStorage};
+use crate::config::{AnnSearchMode, DistanceMetric};
 use crate::hnsw_index::SearchResult;
 
 const MIN_EF_CONSTRUCTION: usize = 128;
-const DENSE_VISITED_MAX_NODES: usize = 262_144;
-const SPARSE_VISITED_RETAIN_CAPACITY: usize = 65_536;
 const SCRATCH_HEAP_RETAIN_CAPACITY: usize = 32_768;
+const VISITED_TOUCHED_RETAIN_CAPACITY: usize = 131_072;
+const VISITED_BITSET_RETAIN_WORDS: usize = (8 * 1024 * 1024) / std::mem::size_of::<u64>();
 const PARALLEL_STAGING_THRESHOLD: usize = 128;
 const PARALLEL_STAGING_CHUNK_SIZE: usize = 512;
-
-#[derive(Default)]
-struct U32IdentityHasher {
-    value: u64,
-}
-
-impl Hasher for U32IdentityHasher {
-    fn finish(&self) -> u64 {
-        self.value
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = 0u64;
-        for &byte in bytes {
-            hash = hash.wrapping_mul(131).wrapping_add(byte as u64);
-        }
-        self.value = hash;
-    }
-
-    fn write_u32(&mut self, i: u32) {
-        self.value = i as u64;
-    }
-
-    fn write_u64(&mut self, i: u64) {
-        self.value = i;
-    }
-
-    fn write_usize(&mut self, i: usize) {
-        self.value = i as u64;
-    }
-}
-
-type SparseVisitedSet = HashSet<u32, BuildHasherDefault<U32IdentityHasher>>;
+#[cfg(target_arch = "x86_64")]
+const PREFETCH_CACHELINE_BYTES: usize = 64;
+const INVALID_DENSE_ID: u32 = u32::MAX;
+const DEFAULT_QUANTIZED_RERANK_MULTIPLIER: usize = 8;
 
 #[inline]
 fn metric_distance(distance: DistanceMetric, query: &[f32], candidate: &[f32]) -> f32 {
@@ -111,21 +82,103 @@ pub(crate) trait AnnBackend: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+struct LayerAdjacency {
+    cap: usize,
+    counts: Vec<u16>,
+    neighbors: Vec<u32>,
+}
+
+impl LayerAdjacency {
+    fn new(cap: usize, node_count: usize) -> Self {
+        let cap = cap.max(1);
+        Self {
+            cap,
+            counts: vec![0; node_count],
+            neighbors: vec![INVALID_DENSE_ID; node_count.saturating_mul(cap)],
+        }
+    }
+
+    fn reserve_nodes(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        self.counts.reserve(additional);
+        self.neighbors.reserve(additional.saturating_mul(self.cap));
+    }
+
+    fn push_node(&mut self) {
+        self.counts.push(0);
+        self.neighbors
+            .extend(std::iter::repeat_n(INVALID_DENSE_ID, self.cap));
+    }
+
+    fn neighbors(&self, dense_id: u32) -> &[u32] {
+        let idx = dense_id as usize;
+        let count = self.counts[idx] as usize;
+        let start = idx.saturating_mul(self.cap);
+        &self.neighbors[start..start + count]
+    }
+
+    fn set_neighbors(&mut self, dense_id: u32, values: &[u32]) {
+        let idx = dense_id as usize;
+        let start = idx.saturating_mul(self.cap);
+        let count = values.len().min(self.cap);
+        self.counts[idx] = count as u16;
+        self.neighbors[start..start + count].copy_from_slice(&values[..count]);
+        for slot in &mut self.neighbors[start + count..start + self.cap] {
+            *slot = INVALID_DENSE_ID;
+        }
+    }
+
+    fn estimated_memory_bytes(&self) -> usize {
+        self.counts.len() * std::mem::size_of::<u16>()
+            + self.neighbors.len() * std::mem::size_of::<u32>()
+    }
+}
+
+#[derive(Debug, Clone)]
 struct FlatGraph {
     distance: DistanceMetric,
     dimension: usize,
     vectors: Vec<f32>,
+    quantized: Option<QuantizedStorage>,
+    ann_search_mode: AnnSearchMode,
+    quantized_rerank_multiplier: usize,
     dense_to_origin: Vec<u64>,
     origin_to_dense: HashMap<u64, u32>,
-    neighbors_by_layer: Vec<Vec<Vec<u32>>>,
+    layer0_neighbor_cap: usize,
+    upper_layer_neighbor_cap: usize,
+    neighbors_by_layer: Vec<LayerAdjacency>,
     entry_by_layer: Vec<u32>,
     max_layer: usize,
 }
 
 impl FlatGraph {
-    fn new_single(distance: DistanceMetric, embedding: &[f32], doc_id: u64) -> Option<Self> {
+    fn new_single(
+        distance: DistanceMetric,
+        embedding: &[f32],
+        doc_id: u64,
+        layer0_neighbor_cap: usize,
+        upper_layer_neighbor_cap: usize,
+        ann_search_mode: AnnSearchMode,
+        quantized_rerank_multiplier: usize,
+    ) -> Option<Self> {
         if embedding.is_empty() {
             return None;
+        }
+
+        let mut quantized = quantization_kind_for_mode(ann_search_mode)
+            .map(|kind| QuantizedStorage::new(kind, embedding.len()));
+        let mut effective_search_mode = ann_search_mode;
+        let mut quantization_failed = false;
+        if let Some(store) = quantized.as_mut() {
+            if store.append(embedding).is_err() {
+                quantization_failed = true;
+            }
+        }
+        if quantization_failed {
+            quantized = None;
+            effective_search_mode = AnnSearchMode::Fp32Strict;
         }
 
         let mut origin_to_dense = HashMap::with_capacity(1);
@@ -135,9 +188,14 @@ impl FlatGraph {
             distance,
             dimension: embedding.len(),
             vectors: embedding.to_vec(),
+            quantized,
+            ann_search_mode: effective_search_mode,
+            quantized_rerank_multiplier: quantized_rerank_multiplier.max(1),
             dense_to_origin: vec![doc_id],
             origin_to_dense,
-            neighbors_by_layer: vec![vec![Vec::new()]],
+            layer0_neighbor_cap: layer0_neighbor_cap.max(1),
+            upper_layer_neighbor_cap: upper_layer_neighbor_cap.max(1),
+            neighbors_by_layer: vec![LayerAdjacency::new(layer0_neighbor_cap.max(1), 1)],
             entry_by_layer: vec![0],
             max_layer: 0,
         })
@@ -162,7 +220,7 @@ impl FlatGraph {
 
     #[inline]
     fn neighbors(&self, layer: usize, dense_id: u32) -> &[u32] {
-        &self.neighbors_by_layer[layer][dense_id as usize]
+        self.neighbors_by_layer[layer].neighbors(dense_id)
     }
 
     fn estimated_memory_bytes(&self) -> usize {
@@ -174,13 +232,16 @@ impl FlatGraph {
             self.origin_to_dense.len() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
         let map_overhead_bytes = self.origin_to_dense.len() * 16;
 
-        let mut layer_adj_bytes = 0usize;
-        for layer in &self.neighbors_by_layer {
-            layer_adj_bytes += layer.len() * std::mem::size_of::<Vec<u32>>();
-            for nbrs in layer {
-                layer_adj_bytes += nbrs.len() * std::mem::size_of::<u32>();
-            }
-        }
+        let layer_adj_bytes = self
+            .neighbors_by_layer
+            .iter()
+            .map(LayerAdjacency::estimated_memory_bytes)
+            .sum::<usize>();
+        let quantized_bytes = self
+            .quantized
+            .as_ref()
+            .map(QuantizedStorage::estimated_memory_bytes)
+            .unwrap_or(0);
 
         vectors_bytes
             + dense_to_origin_bytes
@@ -188,6 +249,7 @@ impl FlatGraph {
             + map_payload_bytes
             + map_overhead_bytes
             + layer_adj_bytes
+            + quantized_bytes
     }
 
     fn reserve_for_additional(&mut self, additional: usize) {
@@ -198,13 +260,16 @@ impl FlatGraph {
             .reserve(additional.saturating_mul(self.dimension));
         self.dense_to_origin.reserve(additional);
         self.origin_to_dense.reserve(additional);
+        if let Some(store) = self.quantized.as_mut() {
+            store.reserve_for_additional(additional);
+        }
         for layer in &mut self.neighbors_by_layer {
-            layer.reserve(additional);
+            layer.reserve_nodes(additional);
         }
     }
 
     #[inline]
-    fn prefetch_dense_vector(&self, dense_id: u32) {
+    fn prefetch_dense_vector(&self, dense_id: u32, frontier_depth: usize, ef: usize) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
@@ -215,12 +280,23 @@ impl FlatGraph {
             }
             let ptr = self.vector_at(dense_id).as_ptr() as *const i8;
             _mm_prefetch(ptr, _MM_HINT_T0);
-            if self.dimension > 16 {
-                _mm_prefetch(ptr.add(64), _MM_HINT_T0);
+            let bytes = self.dimension.saturating_mul(std::mem::size_of::<f32>());
+            let mut lines = 1usize;
+            if bytes > PREFETCH_CACHELINE_BYTES || frontier_depth > (ef / 3).max(32) {
+                lines = 2;
+            }
+            if bytes > (2 * PREFETCH_CACHELINE_BYTES) || frontier_depth > (ef / 2).max(64) {
+                lines = 3;
+            }
+            for line in 1..lines {
+                _mm_prefetch(
+                    ptr.add(line.saturating_mul(PREFETCH_CACHELINE_BYTES)),
+                    _MM_HINT_T0,
+                );
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
-        let _ = dense_id;
+        let _ = (dense_id, frontier_depth, ef);
     }
 
     fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult> {
@@ -228,6 +304,13 @@ impl FlatGraph {
             return Vec::new();
         }
 
+        if matches!(self.ann_search_mode, AnnSearchMode::Fp32Strict) {
+            return self.search_fp32(query, k, ef_search);
+        }
+        self.search_quantized_rerank(query, k, ef_search)
+    }
+
+    fn search_fp32(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult> {
         let ef = ef_search.max(k).min(self.len().max(1));
         let mut entry = self.entry_by_layer[self.max_layer];
         if entry as usize >= self.len() {
@@ -241,7 +324,7 @@ impl FlatGraph {
             entry_dist = new_dist;
         }
 
-        self.search_layer0(query, entry, entry_dist, k, ef)
+        self.search_layer0_exact(query, entry, entry_dist, k, ef)
     }
 
     fn greedy_descent_layer(
@@ -256,7 +339,7 @@ impl FlatGraph {
             let neighbors = self.neighbors(layer, current);
             for (idx, &nbr) in neighbors.iter().enumerate() {
                 if let Some(&next) = neighbors.get(idx + 1) {
-                    self.prefetch_dense_vector(next);
+                    self.prefetch_dense_vector(next, 1, 1);
                 }
                 if nbr as usize >= self.len() {
                     continue;
@@ -274,7 +357,7 @@ impl FlatGraph {
         }
     }
 
-    fn search_layer0(
+    fn search_layer0_exact(
         &self,
         query: &[f32],
         entry: u32,
@@ -311,7 +394,7 @@ impl FlatGraph {
                 let neighbors = self.neighbors(0, candidate.dense_id);
                 for (idx, &nbr) in neighbors.iter().enumerate() {
                     if let Some(&next) = neighbors.get(idx + 1) {
-                        self.prefetch_dense_vector(next);
+                        self.prefetch_dense_vector(next, scratch.results.len(), ef);
                     }
                     if nbr as usize >= self.len() {
                         continue;
@@ -356,8 +439,202 @@ impl FlatGraph {
                     .unwrap_or(Ordering::Equal)
             });
             out.truncate(k);
+            scratch.finish_query();
             out
         })
+    }
+
+    #[inline]
+    fn query_norm_sq(&self, query: &[f32]) -> f32 {
+        crate::simd::sum_squares_f32(query)
+    }
+
+    #[inline]
+    fn approx_distance_to(
+        &self,
+        quantized: &QuantizedStorage,
+        query: &[f32],
+        query_norm_sq: f32,
+        dense_id: u32,
+    ) -> f32 {
+        quantized
+            .distance_approx(self.distance, query, query_norm_sq, dense_id)
+            .unwrap_or_else(|| self.distance_to(query, dense_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn greedy_descent_layer_approx(
+        &self,
+        quantized: &QuantizedStorage,
+        query: &[f32],
+        query_norm_sq: f32,
+        mut current: u32,
+        mut current_dist: f32,
+        layer: usize,
+        ef: usize,
+    ) -> (u32, f32) {
+        loop {
+            let mut improved = false;
+            let neighbors = self.neighbors(layer, current);
+            for (idx, &nbr) in neighbors.iter().enumerate() {
+                if let Some(&next) = neighbors.get(idx + 1) {
+                    self.prefetch_dense_vector(next, 1, ef);
+                }
+                if nbr as usize >= self.len() {
+                    continue;
+                }
+                let d = self.approx_distance_to(quantized, query, query_norm_sq, nbr);
+                if d < current_dist {
+                    current = nbr;
+                    current_dist = d;
+                    improved = true;
+                }
+            }
+            if !improved {
+                return (current, current_dist);
+            }
+        }
+    }
+
+    fn search_layer0_approx_ids(
+        &self,
+        quantized: &QuantizedStorage,
+        query: &[f32],
+        query_norm_sq: f32,
+        entry: u32,
+        entry_dist: f32,
+        ef: usize,
+    ) -> Vec<(u32, f32)> {
+        FLAT_SEARCH_SCRATCH.with(|scratch_cell| {
+            let mut scratch = scratch_cell.borrow_mut();
+            scratch.prepare(self.len(), ef);
+            scratch.mark_visited(entry);
+            scratch.candidates.push(CandidateHeapItem {
+                neg_distance: -entry_dist,
+                dense_id: entry,
+            });
+            scratch.results.push(ResultHeapItem {
+                distance: entry_dist,
+                dense_id: entry,
+            });
+
+            while let Some(candidate) = scratch.candidates.pop() {
+                let candidate_dist = -candidate.neg_distance;
+                if scratch.results.len() >= ef {
+                    let worst_dist = scratch
+                        .results
+                        .peek()
+                        .map(|v| v.distance)
+                        .unwrap_or(f32::MAX);
+                    if candidate_dist > worst_dist {
+                        break;
+                    }
+                }
+
+                let neighbors = self.neighbors(0, candidate.dense_id);
+                for (idx, &nbr) in neighbors.iter().enumerate() {
+                    if let Some(&next) = neighbors.get(idx + 1) {
+                        self.prefetch_dense_vector(next, scratch.results.len(), ef);
+                    }
+                    if nbr as usize >= self.len() {
+                        continue;
+                    }
+                    if scratch.was_visited(nbr) {
+                        continue;
+                    }
+                    scratch.mark_visited(nbr);
+                    let d = self.approx_distance_to(quantized, query, query_norm_sq, nbr);
+                    let can_push = scratch.results.len() < ef
+                        || scratch
+                            .results
+                            .peek()
+                            .map(|v| d < v.distance)
+                            .unwrap_or(true);
+                    if can_push {
+                        scratch.candidates.push(CandidateHeapItem {
+                            neg_distance: -d,
+                            dense_id: nbr,
+                        });
+                        scratch.results.push(ResultHeapItem {
+                            distance: d,
+                            dense_id: nbr,
+                        });
+                        if scratch.results.len() > ef {
+                            let _ = scratch.results.pop();
+                        }
+                    }
+                }
+            }
+
+            let mut out = Vec::with_capacity(scratch.results.len());
+            while let Some(item) = scratch.results.pop() {
+                out.push((item.dense_id, item.distance));
+            }
+            out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            scratch.finish_query();
+            out
+        })
+    }
+
+    fn search_quantized_rerank(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Vec<SearchResult> {
+        let Some(quantized) = self.quantized.as_ref() else {
+            return self.search_fp32(query, k, ef_search);
+        };
+        if quantized.is_empty() {
+            return self.search_fp32(query, k, ef_search);
+        }
+
+        let ef = ef_search.max(k).min(self.len().max(1));
+        let mut entry = self.entry_by_layer[self.max_layer];
+        if entry as usize >= self.len() {
+            entry = 0;
+        }
+        let query_norm_sq = self.query_norm_sq(query);
+        let mut entry_dist = self.approx_distance_to(quantized, query, query_norm_sq, entry);
+
+        for layer in (1..=self.max_layer).rev() {
+            let (new_entry, new_dist) = self.greedy_descent_layer_approx(
+                quantized,
+                query,
+                query_norm_sq,
+                entry,
+                entry_dist,
+                layer,
+                ef,
+            );
+            entry = new_entry;
+            entry_dist = new_dist;
+        }
+
+        let approx =
+            self.search_layer0_approx_ids(quantized, query, query_norm_sq, entry, entry_dist, ef);
+        if approx.is_empty() {
+            return Vec::new();
+        }
+
+        let rerank_count = k
+            .saturating_mul(self.quantized_rerank_multiplier.max(1))
+            .max(k)
+            .min(approx.len());
+        let mut reranked = Vec::with_capacity(rerank_count);
+        for &(dense_id, _) in approx.iter().take(rerank_count) {
+            reranked.push(SearchResult {
+                doc_id: self.dense_to_origin[dense_id as usize],
+                distance: self.distance_to(query, dense_id),
+            });
+        }
+        reranked.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
+        reranked.truncate(k);
+        reranked
     }
 
     /// Beam search at a specified graph layer.
@@ -410,7 +687,7 @@ impl FlatGraph {
                 let neighbors = self.neighbors(layer, candidate.dense_id);
                 for (idx, &nbr) in neighbors.iter().enumerate() {
                     if let Some(&next) = neighbors.get(idx + 1) {
-                        self.prefetch_dense_vector(next);
+                        self.prefetch_dense_vector(next, scratch.results.len(), ef);
                     }
                     if nbr as usize >= self.len() {
                         continue;
@@ -447,6 +724,7 @@ impl FlatGraph {
                 out.push((item.dense_id, item.distance));
             }
             out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            scratch.finish_query();
             out
         })
     }
@@ -456,6 +734,77 @@ impl FlatGraph {
         metric_distance(self.distance, self.vector_at(lhs), self.vector_at(rhs))
     }
 
+    fn set_layer_neighbors(&mut self, layer: usize, dense_id: u32, values: &[u32]) {
+        if layer >= self.neighbors_by_layer.len() {
+            return;
+        }
+        self.neighbors_by_layer[layer].set_neighbors(dense_id, values);
+    }
+
+    fn select_diverse_neighbors(
+        &self,
+        query_dense: u32,
+        candidates: &[(u32, f32)],
+        max_neighbors: usize,
+    ) -> Vec<u32> {
+        if max_neighbors == 0 || candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut selected = Vec::with_capacity(max_neighbors);
+        let mut seen = HashMap::<u32, ()>::with_capacity(candidates.len().min(256));
+
+        // HNSW neighbor diversity heuristic:
+        // accept candidate `c` if it is not closer to any already-selected node
+        // than it is to the query node.
+        for &(cand, dist_to_query) in candidates {
+            if cand == query_dense || cand as usize >= self.len() {
+                continue;
+            }
+            if seen.insert(cand, ()).is_some() {
+                continue;
+            }
+
+            let mut diversified = true;
+            for &chosen in &selected {
+                let dist_to_chosen = self.distance_between_dense(cand, chosen);
+                if dist_to_chosen < dist_to_query {
+                    diversified = false;
+                    break;
+                }
+            }
+
+            if diversified {
+                selected.push(cand);
+                if selected.len() >= max_neighbors {
+                    return selected;
+                }
+            }
+        }
+
+        // Fallback fill to honor max_neighbors when data geometry is highly clustered.
+        if selected.len() < max_neighbors {
+            let mut selected_lookup = HashMap::<u32, ()>::with_capacity(selected.len().max(1));
+            for &cand in &selected {
+                selected_lookup.insert(cand, ());
+            }
+            for &(cand, _) in candidates {
+                if cand == query_dense || cand as usize >= self.len() {
+                    continue;
+                }
+                if selected_lookup.insert(cand, ()).is_some() {
+                    continue;
+                }
+                selected.push(cand);
+                if selected.len() >= max_neighbors {
+                    break;
+                }
+            }
+        }
+
+        selected
+    }
+
     fn prune_layer_neighbors(&mut self, layer: usize, dense_id: u32, max_neighbors: usize) {
         if self.neighbors_by_layer.is_empty() || max_neighbors == 0 {
             return;
@@ -463,42 +812,81 @@ impl FlatGraph {
         if layer >= self.neighbors_by_layer.len() {
             return;
         }
-        let idx = dense_id as usize;
-        if idx >= self.neighbors_by_layer[layer].len() {
+        if dense_id as usize >= self.len() {
             return;
         }
-        if self.neighbors_by_layer[layer][idx].len() <= max_neighbors {
+        if self.neighbors(layer, dense_id).len() <= max_neighbors {
             return;
         }
 
-        let current = self.neighbors_by_layer[layer][idx].clone();
+        let current = self.neighbors(layer, dense_id).to_vec();
         let mut scored = Vec::with_capacity(current.len());
+        let mut seen = HashMap::<u32, ()>::with_capacity(current.len().min(256));
         for nbr in current {
-            if nbr == dense_id {
+            if nbr == dense_id || nbr as usize >= self.len() {
+                continue;
+            }
+            if seen.insert(nbr, ()).is_some() {
                 continue;
             }
             let d = self.distance_between_dense(dense_id, nbr);
-            scored.push((d, nbr));
+            scored.push((nbr, d));
         }
         scored.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
+            a.1.partial_cmp(&b.1)
                 .unwrap_or(Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
         });
 
-        let mut pruned = Vec::with_capacity(max_neighbors);
-        let mut last_kept = None::<u32>;
-        for (_, nbr) in scored {
-            if last_kept == Some(nbr) {
+        let pruned = self.select_diverse_neighbors(dense_id, &scored, max_neighbors);
+        self.set_layer_neighbors(layer, dense_id, &pruned);
+    }
+
+    fn merge_and_prune_reverse_edge(
+        &mut self,
+        layer: usize,
+        target_dense: u32,
+        incoming_dense: u32,
+        max_neighbors: usize,
+    ) -> bool {
+        if layer >= self.neighbors_by_layer.len()
+            || target_dense as usize >= self.len()
+            || incoming_dense as usize >= self.len()
+            || target_dense == incoming_dense
+        {
+            return false;
+        }
+
+        let mut scored = Vec::with_capacity(self.neighbors(layer, target_dense).len() + 1);
+        let mut seen = HashMap::<u32, ()>::with_capacity(scored.capacity().max(1));
+
+        for &nbr in self.neighbors(layer, target_dense) {
+            if nbr == target_dense || nbr as usize >= self.len() {
                 continue;
             }
-            last_kept = Some(nbr);
-            pruned.push(nbr);
-            if pruned.len() >= max_neighbors {
-                break;
+            if seen.insert(nbr, ()).is_some() {
+                continue;
             }
+            scored.push((nbr, self.distance_between_dense(target_dense, nbr)));
         }
-        self.neighbors_by_layer[layer][idx] = pruned;
+
+        if seen.insert(incoming_dense, ()).is_none() {
+            scored.push((
+                incoming_dense,
+                self.distance_between_dense(target_dense, incoming_dense),
+            ));
+        }
+
+        scored.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let merged = self.select_diverse_neighbors(target_dense, &scored, max_neighbors);
+        let kept_incoming = merged.contains(&incoming_dense);
+        self.set_layer_neighbors(layer, target_dense, &merged);
+        kept_incoming
     }
 
     /// Connect a freshly-added node using per-layer candidate lists.
@@ -523,6 +911,16 @@ impl FlatGraph {
             return false;
         }
 
+        let quantization_failed = if let Some(store) = self.quantized.as_mut() {
+            store.append(embedding).is_err()
+        } else {
+            false
+        };
+        if quantization_failed {
+            self.quantized = None;
+            self.ann_search_mode = AnnSearchMode::Fp32Strict;
+        }
+
         let new_dense = self.dense_to_origin.len() as u32;
         self.vectors.extend_from_slice(embedding);
         self.dense_to_origin.push(doc_id);
@@ -530,22 +928,24 @@ impl FlatGraph {
 
         // Ensure layer structure accommodates the inserted level.
         if self.neighbors_by_layer.is_empty() {
-            self.neighbors_by_layer = vec![Vec::new()];
+            self.neighbors_by_layer = vec![LayerAdjacency::new(self.layer0_neighbor_cap, 0)];
             self.entry_by_layer = vec![new_dense];
             self.max_layer = 0;
         }
         if inserted_level > self.max_layer {
             let existing_count = self.dense_to_origin.len() - 1;
             for _ in (self.max_layer + 1)..=inserted_level {
-                self.neighbors_by_layer
-                    .push(vec![Vec::new(); existing_count]);
+                self.neighbors_by_layer.push(LayerAdjacency::new(
+                    self.upper_layer_neighbor_cap,
+                    existing_count,
+                ));
                 self.entry_by_layer.push(new_dense);
             }
             self.max_layer = inserted_level;
         }
         // Add empty neighbor slot for the new node at every active layer.
         for layer_nbrs in &mut self.neighbors_by_layer {
-            layer_nbrs.push(Vec::new());
+            layer_nbrs.push_node();
         }
 
         // Connect at each layer using ranked candidates from the build plan.
@@ -565,28 +965,17 @@ impl FlatGraph {
                 None => continue,
             };
 
-            // Select closest unique candidates capped at max_nbrs.
-            let mut selected: Vec<u32> = Vec::with_capacity(max_nbrs);
-            for &(dense_id, _dist) in candidates {
-                if dense_id == new_dense || dense_id as usize >= self.len() {
-                    continue;
-                }
-                if !selected.contains(&dense_id) {
-                    selected.push(dense_id);
-                    if selected.len() >= max_nbrs {
-                        break;
-                    }
-                }
-            }
+            let selected = self.select_diverse_neighbors(new_dense, candidates, max_nbrs);
 
             // Forward edges: new_node -> selected neighbors.
-            self.neighbors_by_layer[layer][new_dense as usize] = selected.clone();
+            self.set_layer_neighbors(layer, new_dense, &selected);
 
             // Reverse edges: neighbor -> new_node (bidirectional connectivity).
+            let mut reachable = false;
             for &nbr in &selected {
-                let nbr_list = &mut self.neighbors_by_layer[layer][nbr as usize];
-                // new_dense was freshly allocated; reverse edges cannot already contain it.
-                nbr_list.push(new_dense);
+                if self.merge_and_prune_reverse_edge(layer, nbr, new_dense, max_nbrs) {
+                    reachable = true;
+                }
             }
 
             // Prune overflow on reverse neighbor lists.
@@ -598,15 +987,10 @@ impl FlatGraph {
             // edge survives so the new node remains reachable from the rest of the
             // graph. Extreme outliers may lose all reverse edges during pruning
             // because they are the farthest neighbor for every connected node.
-            let reachable = selected
-                .iter()
-                .any(|&nbr| self.neighbors_by_layer[layer][nbr as usize].contains(&new_dense));
             if !reachable {
                 if let Some(&closest_nbr) = selected.first() {
-                    let nbr_list = &mut self.neighbors_by_layer[layer][closest_nbr as usize];
-                    if !nbr_list.contains(&new_dense) {
-                        nbr_list.push(new_dense);
-                    }
+                    let _ =
+                        self.merge_and_prune_reverse_edge(layer, closest_nbr, new_dense, max_nbrs);
                 }
             }
         }
@@ -675,44 +1059,44 @@ impl Ord for ResultHeapItem {
 
 #[derive(Default)]
 struct FlatSearchScratch {
-    visited_generation: Vec<u32>,
-    visited_sparse: SparseVisitedSet,
-    current_generation: u32,
-    use_sparse_visited: bool,
+    visited_bits: Vec<u64>,
+    touched_dense_ids: Vec<u32>,
+    trim_visited_after_query: bool,
     candidates: BinaryHeap<CandidateHeapItem>,
     results: BinaryHeap<ResultHeapItem>,
 }
 
 impl FlatSearchScratch {
-    fn prepare(&mut self, node_count: usize, target_heap_len: usize) {
-        self.use_sparse_visited = node_count > DENSE_VISITED_MAX_NODES;
-        let target_heap_len = target_heap_len.max(16);
-
-        if self.use_sparse_visited {
-            self.visited_sparse.clear();
-            if self.visited_sparse.capacity() > SPARSE_VISITED_RETAIN_CAPACITY {
-                self.visited_sparse
-                    .shrink_to(SPARSE_VISITED_RETAIN_CAPACITY);
-            }
-            if self.visited_generation.len() > DENSE_VISITED_MAX_NODES {
-                self.visited_generation.truncate(DENSE_VISITED_MAX_NODES);
-                self.visited_generation.shrink_to(DENSE_VISITED_MAX_NODES);
-            }
-        } else {
-            self.visited_sparse.clear();
-            if self.visited_sparse.capacity() > SPARSE_VISITED_RETAIN_CAPACITY {
-                self.visited_sparse
-                    .shrink_to(SPARSE_VISITED_RETAIN_CAPACITY);
-            }
-            if self.visited_generation.len() < node_count {
-                self.visited_generation.resize(node_count, 0);
-            }
-            self.current_generation = self.current_generation.wrapping_add(1);
-            if self.current_generation == 0 {
-                self.visited_generation.fill(0);
-                self.current_generation = 1;
+    #[inline]
+    fn clear_visited_bits(&mut self) {
+        for dense_id in self.touched_dense_ids.drain(..) {
+            let word = (dense_id as usize) >> 6;
+            let bit = 1u64 << (dense_id as usize & 63);
+            if let Some(slot) = self.visited_bits.get_mut(word) {
+                *slot &= !bit;
             }
         }
+    }
+
+    fn prepare(&mut self, node_count: usize, target_heap_len: usize) {
+        self.clear_visited_bits();
+        if self.touched_dense_ids.capacity() > VISITED_TOUCHED_RETAIN_CAPACITY {
+            self.touched_dense_ids
+                .shrink_to(VISITED_TOUCHED_RETAIN_CAPACITY);
+        }
+
+        let required_words = node_count.saturating_add(63) / 64;
+        if self.visited_bits.len() < required_words {
+            self.visited_bits.resize(required_words, 0);
+        }
+        self.trim_visited_after_query = required_words > VISITED_BITSET_RETAIN_WORDS;
+        if !self.trim_visited_after_query
+            && self.visited_bits.capacity() > VISITED_BITSET_RETAIN_WORDS
+        {
+            self.visited_bits.shrink_to(VISITED_BITSET_RETAIN_WORDS);
+        }
+
+        let target_heap_len = target_heap_len.max(16);
 
         self.candidates.clear();
         self.results.clear();
@@ -734,24 +1118,37 @@ impl FlatSearchScratch {
     }
 
     #[inline]
-    fn was_visited(&self, dense_id: u32) -> bool {
-        if self.use_sparse_visited {
-            return self.visited_sparse.contains(&dense_id);
+    fn finish_query(&mut self) {
+        self.clear_visited_bits();
+        if self.trim_visited_after_query {
+            self.visited_bits.clear();
+            self.visited_bits.shrink_to(VISITED_BITSET_RETAIN_WORDS);
+            self.trim_visited_after_query = false;
         }
-        self.visited_generation
-            .get(dense_id as usize)
-            .map(|generation| *generation == self.current_generation)
+    }
+
+    #[inline]
+    fn was_visited(&self, dense_id: u32) -> bool {
+        let idx = dense_id as usize;
+        let word = idx >> 6;
+        let bit = 1u64 << (idx & 63);
+        self.visited_bits
+            .get(word)
+            .map(|slot| (*slot & bit) != 0)
             .unwrap_or(true)
     }
 
     #[inline]
     fn mark_visited(&mut self, dense_id: u32) {
-        if self.use_sparse_visited {
-            let _ = self.visited_sparse.insert(dense_id);
+        let idx = dense_id as usize;
+        let word = idx >> 6;
+        let bit = 1u64 << (idx & 63);
+        let Some(slot) = self.visited_bits.get_mut(word) else {
             return;
-        }
-        if let Some(entry) = self.visited_generation.get_mut(dense_id as usize) {
-            *entry = self.current_generation;
+        };
+        if (*slot & bit) == 0 {
+            *slot |= bit;
+            self.touched_dense_ids.push(dense_id);
         }
     }
 }
@@ -767,6 +1164,8 @@ thread_local! {
 pub(crate) struct SingleGraphBackend {
     distance: DistanceMetric,
     flat_graph: RwLock<Option<FlatGraph>>,
+    ann_search_mode: AnnSearchMode,
+    quantized_rerank_multiplier: usize,
     m: usize,
     ef_construction: usize,
     layer0_neighbor_cap: usize,
@@ -791,11 +1190,16 @@ impl SingleGraphBackend {
         _max_elements: usize,
         max_layer: usize,
         ef_construction: usize,
+        ann_search_mode: AnnSearchMode,
+        quantized_rerank_multiplier: usize,
     ) -> Self {
         let m = m.max(4);
         Self {
             distance,
             flat_graph: RwLock::new(None),
+            ann_search_mode,
+            quantized_rerank_multiplier: quantized_rerank_multiplier
+                .clamp(1, DEFAULT_QUANTIZED_RERANK_MULTIPLIER * 8),
             m,
             ef_construction: ef_construction.max(MIN_EF_CONSTRUCTION),
             layer0_neighbor_cap: (2 * m).max(8),
@@ -915,7 +1319,15 @@ impl AnnBackend for SingleGraphBackend {
             return;
         }
 
-        *flat_guard = FlatGraph::new_single(self.distance, embedding, origin_id as u64);
+        *flat_guard = FlatGraph::new_single(
+            self.distance,
+            embedding,
+            origin_id as u64,
+            self.layer0_neighbor_cap,
+            self.upper_layer_neighbor_cap,
+            self.ann_search_mode,
+            self.quantized_rerank_multiplier,
+        );
     }
 
     fn parallel_insert_slice(&self, batch: &[(&[f32], usize)]) {
@@ -957,7 +1369,15 @@ impl AnnBackend for SingleGraphBackend {
                         self.insert_into_existing_flat(flat, embedding, origin_id);
                     }
                 } else {
-                    *flat_guard = FlatGraph::new_single(self.distance, embedding, origin_id as u64);
+                    *flat_guard = FlatGraph::new_single(
+                        self.distance,
+                        embedding,
+                        origin_id as u64,
+                        self.layer0_neighbor_cap,
+                        self.upper_layer_neighbor_cap,
+                        self.ann_search_mode,
+                        self.quantized_rerank_multiplier,
+                    );
                 }
             }
         }
@@ -987,6 +1407,8 @@ pub(crate) fn create_default_backend(
     max_elements: usize,
     max_layer: usize,
     ef_construction: usize,
+    ann_search_mode: AnnSearchMode,
+    quantized_rerank_multiplier: usize,
 ) -> Box<dyn AnnBackend> {
     Box::new(SingleGraphBackend::new(
         distance,
@@ -994,13 +1416,15 @@ pub(crate) fn create_default_backend(
         max_elements,
         max_layer,
         ef_construction,
+        ann_search_mode,
+        quantized_rerank_multiplier,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap as StdHashMap;
+    use std::collections::HashSet;
 
     fn make_vec(seed: usize) -> Vec<f32> {
         vec![
@@ -1011,8 +1435,44 @@ mod tests {
         ]
     }
 
+    fn backend_with_defaults(
+        distance: DistanceMetric,
+        m: usize,
+        max_elements: usize,
+        max_layer: usize,
+        ef_construction: usize,
+    ) -> SingleGraphBackend {
+        backend_with_mode(
+            distance,
+            m,
+            max_elements,
+            max_layer,
+            ef_construction,
+            AnnSearchMode::Fp32Strict,
+        )
+    }
+
+    fn backend_with_mode(
+        distance: DistanceMetric,
+        m: usize,
+        max_elements: usize,
+        max_layer: usize,
+        ef_construction: usize,
+        ann_search_mode: AnnSearchMode,
+    ) -> SingleGraphBackend {
+        SingleGraphBackend::new(
+            distance,
+            m,
+            max_elements,
+            max_layer,
+            ef_construction,
+            ann_search_mode,
+            DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
+        )
+    }
+
     fn seeded_backend() -> SingleGraphBackend {
-        let backend = SingleGraphBackend::new(DistanceMetric::Euclidean, 16, 20_000, 8, 200);
+        let backend = backend_with_defaults(DistanceMetric::Euclidean, 16, 20_000, 8, 200);
         let vectors: Vec<Vec<f32>> = (0..256).map(make_vec).collect();
         let batch: Vec<(&[f32], usize)> = vectors
             .iter()
@@ -1038,29 +1498,95 @@ mod tests {
         out
     }
 
+    fn synthetic_manifold_vec(seed: usize, dim: usize, latent_dim: usize) -> Vec<f32> {
+        let latent_dim = latent_dim.max(2);
+        let latent = pseudo_random_vec(seed ^ 0x9E37, latent_dim);
+        let mut out = Vec::with_capacity(dim);
+        let mut state = splitmix64(seed as u64 ^ 0xC0FF_EE12_3456_7890);
+        for d in 0..dim {
+            let a = latent[d % latent_dim];
+            let b = latent[(d * 7 + 3) % latent_dim];
+            let c = latent[(d * 11 + 1) % latent_dim];
+            state = splitmix64(state);
+            let noise = ((state & 0x3FF) as f32 / 1024.0 - 0.5) * 0.02;
+            out.push(0.65 * a + 0.25 * b + 0.10 * c + noise);
+        }
+        out
+    }
+
+    fn normalize(v: &mut [f32]) {
+        let norm_sq: f32 = v.iter().map(|x| x * x).sum();
+        if norm_sq > 0.0 {
+            let inv = norm_sq.sqrt().recip();
+            for x in v {
+                *x *= inv;
+            }
+        }
+    }
+
+    fn recall_against_bruteforce(
+        backend: &SingleGraphBackend,
+        dataset: &[Vec<f32>],
+        distance: DistanceMetric,
+        query_indices: &[usize],
+        k: usize,
+        ef_search: usize,
+    ) -> f64 {
+        let mut total_hits = 0usize;
+        let mut total_expected = 0usize;
+
+        for &query_idx in query_indices {
+            let query = &dataset[query_idx];
+            let approx = backend.search(query, k, ef_search);
+            let approx_ids = approx.iter().map(|r| r.doc_id).collect::<HashSet<_>>();
+
+            let mut exact = (0..dataset.len())
+                .map(|idx| (idx as u64, metric_distance(distance, query, &dataset[idx])))
+                .collect::<Vec<_>>();
+            exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            exact.truncate(k);
+
+            let hits = exact
+                .into_iter()
+                .filter(|(doc_id, _)| approx_ids.contains(doc_id))
+                .count();
+            total_hits += hits;
+            total_expected += k;
+        }
+
+        total_hits as f64 / total_expected as f64
+    }
+
     #[test]
-    fn flat_search_scratch_uses_sparse_visited_for_large_graphs() {
+    fn flat_search_scratch_uses_bounded_dense_visited_for_large_graphs() {
         let mut scratch = FlatSearchScratch::default();
-        scratch.prepare(DENSE_VISITED_MAX_NODES + 1, 128);
+        let large_node_count = (VISITED_BITSET_RETAIN_WORDS + 1) * 64;
+        scratch.prepare(large_node_count, 128);
         assert!(
-            scratch.use_sparse_visited,
-            "large node counts should switch to sparse visited tracking"
+            scratch.trim_visited_after_query,
+            "large node counts should mark visited bitset for post-query trimming"
         );
 
         scratch.mark_visited(42);
         assert!(scratch.was_visited(42));
         assert!(
-            scratch.visited_generation.len() <= DENSE_VISITED_MAX_NODES,
-            "dense visited array must remain capped in sparse mode"
+            scratch.visited_bits.len() >= large_node_count / 64,
+            "visited bitset should expand to cover dense IDs in large graphs"
+        );
+        scratch.finish_query();
+        assert!(
+            scratch.visited_bits.capacity() <= VISITED_BITSET_RETAIN_WORDS * 2,
+            "visited bitset should release retained capacity after large query"
         );
     }
 
     #[test]
-    fn flat_search_scratch_releases_excess_sparse_and_heap_capacity() {
+    fn flat_search_scratch_releases_excess_buffers_and_heap_capacity() {
         let mut scratch = FlatSearchScratch::default();
-        scratch.prepare(DENSE_VISITED_MAX_NODES + 1, 128);
+        let large_node_count = (VISITED_BITSET_RETAIN_WORDS + 4) * 64;
+        scratch.prepare(large_node_count, 128);
 
-        for id in 0..(SPARSE_VISITED_RETAIN_CAPACITY as u32 * 2) {
+        for id in 0..(VISITED_TOUCHED_RETAIN_CAPACITY as u32 * 2) {
             scratch.mark_visited(id);
             scratch.candidates.push(CandidateHeapItem {
                 neg_distance: -(id as f32),
@@ -1072,18 +1598,28 @@ mod tests {
             });
         }
 
-        let sparse_cap_before = scratch.visited_sparse.capacity();
+        let touched_cap_before = scratch.touched_dense_ids.capacity();
+        let visited_bits_cap_before = scratch.visited_bits.capacity();
         let candidates_cap_before = scratch.candidates.capacity();
         let results_cap_before = scratch.results.capacity();
 
-        scratch.prepare(DENSE_VISITED_MAX_NODES + 1, 128);
+        scratch.finish_query();
+        scratch.prepare(256, 64);
         assert!(
-            scratch.visited_sparse.capacity() < sparse_cap_before,
-            "sparse visited set should release some retained capacity"
+            scratch.touched_dense_ids.capacity() < touched_cap_before,
+            "touched dense-id tracking should release some retained capacity"
         );
         assert!(
-            scratch.visited_sparse.capacity() <= SPARSE_VISITED_RETAIN_CAPACITY * 2,
-            "sparse visited set should release excess retained capacity"
+            scratch.touched_dense_ids.capacity() <= VISITED_TOUCHED_RETAIN_CAPACITY * 2,
+            "touched dense-id tracking should release excess retained capacity"
+        );
+        assert!(
+            scratch.visited_bits.capacity() < visited_bits_cap_before,
+            "visited bitset should release some retained capacity"
+        );
+        assert!(
+            scratch.visited_bits.capacity() <= VISITED_BITSET_RETAIN_WORDS * 2,
+            "visited bitset should release excess retained capacity"
         );
         assert!(
             scratch.candidates.capacity() < candidates_cap_before,
@@ -1105,7 +1641,7 @@ mod tests {
 
     #[test]
     fn backend_inserts_are_immediately_query_visible() {
-        let backend = SingleGraphBackend::new(DistanceMetric::Euclidean, 16, 20_000, 8, 200);
+        let backend = backend_with_defaults(DistanceMetric::Euclidean, 16, 20_000, 8, 200);
         let point = vec![42.0, -7.0, 1.5, 0.5];
 
         backend.insert(&point, 9_001);
@@ -1114,6 +1650,62 @@ mod tests {
         let results = backend.search(&point, 5, 128);
         assert!(!results.is_empty());
         assert!(contains_doc(&results, 9_001));
+    }
+
+    #[test]
+    fn quantized_sq8_mode_keeps_inserted_point_retrievable() {
+        let backend = backend_with_mode(
+            DistanceMetric::Euclidean,
+            24,
+            10_000,
+            8,
+            400,
+            AnnSearchMode::Sq8Rerank,
+        );
+        let point = vec![1.2, -0.8, 0.4, 0.9];
+        backend.insert(&point, 501);
+        backend.insert(&[1.1, -0.75, 0.35, 0.95], 502);
+
+        let results = backend.search(&point, 5, 256);
+        assert!(
+            contains_doc(&results, 501),
+            "sq8 rerank mode should return inserted query-nearest document"
+        );
+
+        let flat = backend.flat_graph.read();
+        let quant = flat.as_ref().and_then(|f| f.quantized.as_ref());
+        assert!(
+            quant.is_some(),
+            "sq8 mode should materialize quantized payload"
+        );
+    }
+
+    #[test]
+    fn quantized_sq4_mode_keeps_inserted_point_retrievable() {
+        let backend = backend_with_mode(
+            DistanceMetric::Euclidean,
+            24,
+            10_000,
+            8,
+            400,
+            AnnSearchMode::Sq4Rerank,
+        );
+        let point = vec![0.25, 0.5, -0.75, 1.0, -0.1, 0.2];
+        backend.insert(&point, 601);
+        backend.insert(&[0.2, 0.45, -0.7, 0.95, -0.15, 0.25], 602);
+
+        let results = backend.search(&point, 5, 512);
+        assert!(
+            contains_doc(&results, 601),
+            "sq4 rerank mode should return inserted query-nearest document"
+        );
+
+        let flat = backend.flat_graph.read();
+        let quant = flat.as_ref().and_then(|f| f.quantized.as_ref());
+        assert!(
+            quant.is_some(),
+            "sq4 mode should materialize quantized payload"
+        );
     }
 
     #[test]
@@ -1140,7 +1732,7 @@ mod tests {
             .get(&9_999)
             .expect("missing new dense id for incremental insert");
         assert!(
-            !flat.neighbors_by_layer[0][new_dense as usize].is_empty(),
+            !flat.neighbors(0, new_dense).is_empty(),
             "incremental node should have at least one layer-0 edge"
         );
 
@@ -1171,19 +1763,16 @@ mod tests {
 
     #[test]
     fn flat_incremental_insert_extends_upper_layers_when_insert_level_is_high() {
-        let mut origin_to_dense = StdHashMap::new();
-        origin_to_dense.insert(1u64, 0u32);
-
-        let mut flat = FlatGraph {
-            distance: DistanceMetric::Euclidean,
-            dimension: 2,
-            vectors: vec![0.0, 0.0],
-            dense_to_origin: vec![1],
-            origin_to_dense,
-            neighbors_by_layer: vec![vec![vec![]]],
-            entry_by_layer: vec![0],
-            max_layer: 0,
-        };
+        let mut flat = FlatGraph::new_single(
+            DistanceMetric::Euclidean,
+            &[0.0, 0.0],
+            1,
+            8,
+            4,
+            AnnSearchMode::Fp32Strict,
+            DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
+        )
+        .expect("seed node should create a flat graph");
 
         // Per-layer candidates: dense_id=0 is the only existing node.
         let layer_candidates = vec![
@@ -1200,17 +1789,17 @@ mod tests {
         assert_eq!(*flat.origin_to_dense.get(&2).unwrap_or(&u32::MAX), 1);
 
         // Layer-0: candidate edge is retained and bidirectional.
-        assert!(flat.neighbors_by_layer[0][1].contains(&0));
-        assert!(flat.neighbors_by_layer[0][0].contains(&1));
+        assert!(flat.neighbors(0, 1).contains(&0));
+        assert!(flat.neighbors(0, 0).contains(&1));
 
         // Upper layers: connected via per-layer candidates.
-        assert!(flat.neighbors_by_layer[1][1].contains(&0));
-        assert!(flat.neighbors_by_layer[2][1].contains(&0));
+        assert!(flat.neighbors(1, 1).contains(&0));
+        assert!(flat.neighbors(2, 1).contains(&0));
     }
 
     #[test]
     fn backend_respects_ef_construction_floor() {
-        let backend = SingleGraphBackend::new(DistanceMetric::Euclidean, 16, 10_000, 8, 1024);
+        let backend = backend_with_defaults(DistanceMetric::Euclidean, 16, 10_000, 8, 1024);
         assert!(
             backend.ef_construction >= 1024,
             "ef_construction should honor the caller-supplied value"
@@ -1239,7 +1828,7 @@ mod tests {
         const K: usize = 10;
         const QUERIES: usize = 64;
 
-        let backend = SingleGraphBackend::new(DistanceMetric::Euclidean, 24, DATASET_SIZE, 8, 400);
+        let backend = backend_with_defaults(DistanceMetric::Euclidean, 24, DATASET_SIZE, 8, 400);
         let dataset: Vec<Vec<f32>> = (0..DATASET_SIZE)
             .map(|seed| pseudo_random_vec(seed, DIM))
             .collect();
@@ -1281,6 +1870,113 @@ mod tests {
             recall >= 0.90,
             "recall regression: expected >= 0.90, got {:.4}",
             recall
+        );
+    }
+
+    #[test]
+    fn backend_recall_regression_guard_hard_euclidean_manifold() {
+        const DATASET_SIZE: usize = 768;
+        const DIM: usize = 256;
+        const LATENT_DIM: usize = 24;
+        const K: usize = 10;
+        const QUERIES: usize = 48;
+
+        let backend = backend_with_defaults(DistanceMetric::Euclidean, 40, DATASET_SIZE, 8, 800);
+        let dataset: Vec<Vec<f32>> = (0..DATASET_SIZE)
+            .map(|seed| synthetic_manifold_vec(seed, DIM, LATENT_DIM))
+            .collect();
+        let batch: Vec<(&[f32], usize)> = dataset
+            .iter()
+            .enumerate()
+            .map(|(id, v)| (v.as_slice(), id))
+            .collect();
+        backend.parallel_insert_slice(&batch);
+
+        let query_indices = (0..QUERIES)
+            .map(|i| i * (DATASET_SIZE / QUERIES))
+            .collect::<Vec<_>>();
+        let recall_ef256 = recall_against_bruteforce(
+            &backend,
+            &dataset,
+            DistanceMetric::Euclidean,
+            &query_indices,
+            K,
+            256,
+        );
+        let recall_ef1024 = recall_against_bruteforce(
+            &backend,
+            &dataset,
+            DistanceMetric::Euclidean,
+            &query_indices,
+            K,
+            1024,
+        );
+
+        assert!(
+            recall_ef1024 + f64::EPSILON >= recall_ef256,
+            "recall must be monotonic with larger ef_search on hard euclidean manifold (ef256={:.4}, ef1024={:.4})",
+            recall_ef256,
+            recall_ef1024
+        );
+        assert!(
+            recall_ef1024 >= 0.88,
+            "hard euclidean recall regression: expected >= 0.88 at ef=1024, got {:.4}",
+            recall_ef1024
+        );
+    }
+
+    #[test]
+    fn backend_recall_regression_guard_hard_cosine_manifold() {
+        const DATASET_SIZE: usize = 768;
+        const DIM: usize = 192;
+        const LATENT_DIM: usize = 28;
+        const K: usize = 10;
+        const QUERIES: usize = 48;
+
+        let backend = backend_with_defaults(DistanceMetric::Cosine, 48, DATASET_SIZE, 8, 800);
+        let mut dataset: Vec<Vec<f32>> = (0..DATASET_SIZE)
+            .map(|seed| synthetic_manifold_vec(seed ^ 0xBEEF, DIM, LATENT_DIM))
+            .collect();
+        for v in &mut dataset {
+            normalize(v);
+        }
+        let batch: Vec<(&[f32], usize)> = dataset
+            .iter()
+            .enumerate()
+            .map(|(id, v)| (v.as_slice(), id))
+            .collect();
+        backend.parallel_insert_slice(&batch);
+
+        let query_indices = (0..QUERIES)
+            .map(|i| i * (DATASET_SIZE / QUERIES))
+            .collect::<Vec<_>>();
+        let recall_ef256 = recall_against_bruteforce(
+            &backend,
+            &dataset,
+            DistanceMetric::Cosine,
+            &query_indices,
+            K,
+            256,
+        );
+        let recall_ef1024 = recall_against_bruteforce(
+            &backend,
+            &dataset,
+            DistanceMetric::Cosine,
+            &query_indices,
+            K,
+            1024,
+        );
+
+        assert!(
+            recall_ef1024 + f64::EPSILON >= recall_ef256,
+            "recall must be monotonic with larger ef_search on hard cosine manifold (ef256={:.4}, ef1024={:.4})",
+            recall_ef256,
+            recall_ef1024
+        );
+        assert!(
+            recall_ef1024 >= 0.84,
+            "hard cosine recall regression: expected >= 0.84 at ef=1024, got {:.4}",
+            recall_ef1024
         );
     }
 }

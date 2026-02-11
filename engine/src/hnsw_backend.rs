@@ -5,7 +5,7 @@
 //!
 //! **Persistence**: WAL + snapshots for durability and fast recovery.
 
-use crate::config::DistanceMetric;
+use crate::config::{AnnSearchMode, DistanceMetric};
 use crate::hnsw_index::{HnswVectorIndex, SearchResult};
 use crate::metadata_filter;
 use crate::metrics::MetricsCollector;
@@ -445,7 +445,16 @@ impl HnswBackend {
         let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.write());
 
         // Capture index construction params before we swap it.
-        let (dimension, capacity, distance, m, ef_construction, disable_norm_check) = {
+        let (
+            dimension,
+            capacity,
+            distance,
+            m,
+            ef_construction,
+            disable_norm_check,
+            ann_search_mode,
+            quantized_rerank_multiplier,
+        ) = {
             let idx = self.index.read();
             (
                 idx.dimension(),
@@ -454,6 +463,8 @@ impl HnswBackend {
                 idx.m(),
                 idx.ef_construction(),
                 idx.normalization_check_disabled(),
+                idx.ann_search_mode(),
+                idx.quantized_rerank_multiplier(),
             )
         };
 
@@ -501,13 +512,15 @@ impl HnswBackend {
         }
 
         // Rebuild HNSW index from compacted live docs using parallel insertion.
-        let mut new_index = HnswVectorIndex::new_with_params(
+        let mut new_index = HnswVectorIndex::new_with_params_and_search_mode(
             dimension,
             capacity,
             distance,
             m,
             ef_construction,
             disable_norm_check,
+            ann_search_mode,
+            quantized_rerank_multiplier,
         )?;
         let batch: Vec<(&[f32], usize)> = store
             .embeddings
@@ -559,6 +572,8 @@ impl HnswBackend {
             HnswVectorIndex::DEFAULT_M,
             HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
             false,
+            AnnSearchMode::Fp32Strict,
+            HnswVectorIndex::DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
         )
     }
 
@@ -574,6 +589,8 @@ impl HnswBackend {
         hnsw_m: usize,
         hnsw_ef_construction: usize,
         disable_normalization_check: bool,
+        ann_search_mode: AnnSearchMode,
+        quantized_rerank_multiplier: usize,
     ) -> Result<Self> {
         if dimension == 0 {
             anyhow::bail!("embedding dimension must be > 0");
@@ -586,13 +603,15 @@ impl HnswBackend {
             );
         }
 
-        let mut index = HnswVectorIndex::new_with_params(
+        let mut index = HnswVectorIndex::new_with_params_and_search_mode(
             dimension,
             max_elements,
             distance,
             hnsw_m,
             hnsw_ef_construction,
             disable_normalization_check,
+            ann_search_mode,
+            quantized_rerank_multiplier,
         )?;
 
         // Build HNSW index from embeddings
@@ -697,6 +716,8 @@ impl HnswBackend {
             HnswVectorIndex::DEFAULT_M,
             HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
             false,
+            AnnSearchMode::Fp32Strict,
+            HnswVectorIndex::DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
         )
     }
 
@@ -716,6 +737,8 @@ impl HnswBackend {
         hnsw_m: usize,
         hnsw_ef_construction: usize,
         disable_normalization_check: bool,
+        ann_search_mode: AnnSearchMode,
+        quantized_rerank_multiplier: usize,
     ) -> Result<Self> {
         if dimension == 0 {
             anyhow::bail!("embedding dimension must be > 0");
@@ -731,13 +754,15 @@ impl HnswBackend {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
 
-        let mut index = HnswVectorIndex::new_with_params(
+        let mut index = HnswVectorIndex::new_with_params_and_search_mode(
             dimension,
             max_elements,
             distance,
             hnsw_m,
             hnsw_ef_construction,
             disable_normalization_check,
+            ann_search_mode,
+            quantized_rerank_multiplier,
         )?;
 
         // Build HNSW index
@@ -875,6 +900,8 @@ impl HnswBackend {
             HnswVectorIndex::DEFAULT_M,
             HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
             false,
+            AnnSearchMode::Fp32Strict,
+            HnswVectorIndex::DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
         )
     }
 
@@ -892,6 +919,8 @@ impl HnswBackend {
         hnsw_m: usize,
         hnsw_ef_construction: usize,
         disable_normalization_check: bool,
+        ann_search_mode: AnnSearchMode,
+        quantized_rerank_multiplier: usize,
     ) -> Result<Self> {
         if embedding_dimension == 0 {
             anyhow::bail!("embedding dimension must be > 0");
@@ -943,6 +972,26 @@ impl HnswBackend {
                             "configured distance metric {:?} does not match snapshot distance metric {:?}",
                             distance,
                             snapshot_distance
+                        );
+                    }
+                    let snapshot_ann_search_mode = snapshot
+                        .ann_search_mode
+                        .unwrap_or(AnnSearchMode::Fp32Strict);
+                    if snapshot_ann_search_mode != ann_search_mode {
+                        anyhow::bail!(
+                            "configured ANN search mode {:?} does not match snapshot ANN search mode {:?}",
+                            ann_search_mode,
+                            snapshot_ann_search_mode
+                        );
+                    }
+                    let snapshot_rerank_multiplier = snapshot
+                        .quantized_rerank_multiplier
+                        .unwrap_or(HnswVectorIndex::DEFAULT_QUANTIZED_RERANK_MULTIPLIER);
+                    if snapshot_rerank_multiplier != quantized_rerank_multiplier {
+                        anyhow::bail!(
+                            "configured quantized_rerank_multiplier {} does not match snapshot value {}",
+                            quantized_rerank_multiplier,
+                            snapshot_rerank_multiplier
                         );
                     }
                     dimension = if snapshot_has_docs {
@@ -1073,13 +1122,15 @@ impl HnswBackend {
         }
 
         // Rebuild HNSW index from recovered documents.
-        let mut index = HnswVectorIndex::new_with_params(
+        let mut index = HnswVectorIndex::new_with_params_and_search_mode(
             dimension,
             max_elements,
             distance,
             hnsw_m,
             hnsw_ef_construction,
             disable_normalization_check,
+            ann_search_mode,
+            quantized_rerank_multiplier,
         )?;
 
         let mut docs_vec: Vec<(u64, Vec<f32>, HashMap<String, String>)> = documents
@@ -1737,8 +1788,23 @@ impl HnswBackend {
         };
 
         let doc_count = documents.len();
-        let distance = self.index.read().distance_metric();
-        let snapshot = Snapshot::new(dimension, distance, documents, metadata_vec, last_wal_seq)?;
+        let (distance, ann_search_mode, quantized_rerank_multiplier) = {
+            let index = self.index.read();
+            (
+                index.distance_metric(),
+                index.ann_search_mode(),
+                index.quantized_rerank_multiplier(),
+            )
+        };
+        let snapshot = Snapshot::new_with_ann_config(
+            dimension,
+            distance,
+            ann_search_mode,
+            quantized_rerank_multiplier,
+            documents,
+            metadata_vec,
+            last_wal_seq,
+        )?;
 
         // Save snapshot with timestamp
         let snapshot_timestamp = Self::file_id();
@@ -2339,19 +2405,31 @@ impl HnswBackend {
         }
 
         let search_k = std::cmp::min(k * 2, 10_000);
-        let index = self.index.read();
-        let distance = index.distance_metric();
+        let distance = self.index.read().distance_metric();
 
-        // Process query ANN traversals in parallel while holding only the index read lock.
-        let raw_results: Vec<Result<Vec<SearchResult>>> = queries
-            .par_iter()
-            .map(|query| {
-                let normalized_query = normalize_query_if_needed(distance, query)?;
-                index.knn_search_with_ef(normalized_query.as_ref(), search_k, ef_search_override)
-            })
-            .collect();
-        let raw_results: Vec<Vec<SearchResult>> = raw_results.into_iter().collect::<Result<_>>()?;
-        drop(index);
+        // Bound index read-lock hold time to improve writer fairness under large bulk-search batches.
+        // Keep chunked parallel execution to preserve batched throughput advantages.
+        let worker_count = rayon::current_num_threads().max(1);
+        let batch_chunk_size = worker_count.saturating_mul(8).max(32);
+        let mut raw_results: Vec<Vec<SearchResult>> = Vec::with_capacity(queries.len());
+        for chunk in queries.chunks(batch_chunk_size) {
+            let index = self.index.read();
+            let chunk_results: Vec<Result<Vec<SearchResult>>> = chunk
+                .par_iter()
+                .map(|query| {
+                    let normalized_query = normalize_query_if_needed(distance, query)?;
+                    index.knn_search_with_ef(
+                        normalized_query.as_ref(),
+                        search_k,
+                        ef_search_override,
+                    )
+                })
+                .collect();
+            let chunk_results: Vec<Vec<SearchResult>> =
+                chunk_results.into_iter().collect::<Result<_>>()?;
+            raw_results.extend(chunk_results);
+            drop(index);
+        }
 
         // Map internal IDs to external IDs in a single doc_store read pass (no O(N) clone).
         let store = self.doc_store.read();

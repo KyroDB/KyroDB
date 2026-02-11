@@ -28,7 +28,7 @@
 //!        → Background flush reconciles remaining hot-only state (if any)
 //! ```
 
-use crate::config::DistanceMetric;
+use crate::config::{AnnSearchMode, DistanceMetric};
 use crate::proto::MetadataFilter;
 use crate::{
     AccessPatternLogger, CacheStrategy, CachedVector, CircuitBreaker, FsyncPolicy, HnswBackend,
@@ -166,6 +166,12 @@ pub struct TieredEngineConfig {
     /// Disable L2-normalization checks for inner-product vectors (performance opt-out).
     pub hnsw_disable_normalization_check: bool,
 
+    /// ANN search compute mode for cold-tier index traversal.
+    pub hnsw_ann_search_mode: AnnSearchMode,
+
+    /// Candidate expansion multiplier before fp32 rerank in quantized modes.
+    pub hnsw_quantized_rerank_multiplier: usize,
+
     /// Persistence data directory
     pub data_dir: Option<String>,
 
@@ -206,6 +212,9 @@ impl Default for TieredEngineConfig {
             hnsw_ef_construction: crate::hnsw_index::HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
             hnsw_ef_search: 50,
             hnsw_disable_normalization_check: false,
+            hnsw_ann_search_mode: AnnSearchMode::Fp32Strict,
+            hnsw_quantized_rerank_multiplier:
+                crate::hnsw_index::HnswVectorIndex::DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
             data_dir: None,
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 10_000,
@@ -306,6 +315,8 @@ impl TieredEngine {
                 config.hnsw_m,
                 config.hnsw_ef_construction,
                 config.hnsw_disable_normalization_check,
+                config.hnsw_ann_search_mode,
+                config.hnsw_quantized_rerank_multiplier,
             )?)
         } else {
             // Without persistence (testing only)
@@ -318,6 +329,8 @@ impl TieredEngine {
                 config.hnsw_m,
                 config.hnsw_ef_construction,
                 config.hnsw_disable_normalization_check,
+                config.hnsw_ann_search_mode,
+                config.hnsw_quantized_rerank_multiplier,
             )?)
         };
 
@@ -423,6 +436,8 @@ impl TieredEngine {
             config.hnsw_m,
             config.hnsw_ef_construction,
             config.hnsw_disable_normalization_check,
+            config.hnsw_ann_search_mode,
+            config.hnsw_quantized_rerank_multiplier,
         )?);
 
         // Create fresh hot tier (ephemeral)
@@ -844,27 +859,33 @@ impl TieredEngine {
 
     /// Batch delete documents by ID
     pub fn batch_delete(&self, doc_ids: &[u64]) -> Result<u64> {
-        let unique_deleted = doc_ids
+        let mut unique_doc_ids: Vec<u64> = doc_ids.to_vec();
+        unique_doc_ids.sort_unstable();
+        unique_doc_ids.dedup();
+
+        // Best-effort pre-delete existence count. This can drift under concurrent
+        // insert/delete races, but avoids double-counting duplicate IDs in input.
+        let unique_deleted = unique_doc_ids
             .iter()
             .filter(|&&id| self.hot_tier.exists(id) || self.cold_tier.exists(id))
             .count() as u64;
 
         // Delete from hot tier (efficient batch)
-        self.hot_tier.batch_delete(doc_ids);
+        self.hot_tier.batch_delete(&unique_doc_ids);
 
         // Delete from cold tier (efficient batch with WAL logging)
-        self.cold_tier.batch_delete(doc_ids)?;
+        self.cold_tier.batch_delete(&unique_doc_ids)?;
 
         // Invalidate caches
         {
             let cache = self.cache_strategy.write();
-            for &id in doc_ids {
+            for &id in &unique_doc_ids {
                 cache.invalidate(id);
             }
         }
 
         // Query cache invalidation
-        for &id in doc_ids {
+        for &id in &unique_doc_ids {
             self.query_cache.invalidate_doc(id);
         }
 
@@ -1047,6 +1068,9 @@ impl TieredEngine {
             }
         }
 
+        let hot_non_empty = !hot_results.is_empty();
+        let cold_non_empty = !cold_results.is_empty();
+
         // Step 3: Merge and deduplicate results from hot tier + cold tier
         let merged_results = Self::merge_knn_results(hot_results, cold_results, k);
 
@@ -1069,10 +1093,12 @@ impl TieredEngine {
             merged_results.len()
         );
 
-        let path = if cold_tier_has_docs {
-            SearchExecutionPath::HotAndCold
-        } else {
-            SearchExecutionPath::HotTierOnly
+        let path = match (hot_non_empty, cold_non_empty, cold_tier_has_docs) {
+            (true, true, _) => SearchExecutionPath::HotAndCold,
+            (true, false, _) => SearchExecutionPath::HotTierOnly,
+            (false, true, _) => SearchExecutionPath::ColdTierOnly,
+            (false, false, true) => SearchExecutionPath::HotAndCold,
+            (false, false, false) => SearchExecutionPath::HotTierOnly,
         };
 
         Ok((merged_results, path))
@@ -1257,11 +1283,15 @@ impl TieredEngine {
                     "cold results length mismatch: expected one entry per cache miss query"
                 )
             })?;
+            let hot_non_empty = !hot.is_empty();
+            let cold_non_empty = !cold.is_empty();
             let merged_results = Self::merge_knn_results(hot, cold, k);
-            let path = if cold_tier_has_docs {
-                SearchExecutionPath::HotAndCold
-            } else {
-                SearchExecutionPath::HotTierOnly
+            let path = match (hot_non_empty, cold_non_empty, cold_tier_has_docs) {
+                (true, true, _) => SearchExecutionPath::HotAndCold,
+                (true, false, _) => SearchExecutionPath::HotTierOnly,
+                (false, true, _) => SearchExecutionPath::ColdTierOnly,
+                (false, false, true) => SearchExecutionPath::HotAndCold,
+                (false, false, false) => SearchExecutionPath::HotTierOnly,
             };
             if cacheable && !merged_results.is_empty() {
                 let cache_query = match &normalized_queries[i] {
@@ -2054,6 +2084,12 @@ impl TieredEngine {
     /// Get cold tier reference (for direct access if needed)
     pub fn cold_tier(&self) -> &HnswBackend {
         &self.cold_tier
+    }
+
+    /// Cloneable handle to cold tier for long-running operations that should
+    /// not hold the outer `TieredEngine` lock.
+    pub fn cold_tier_handle(&self) -> Arc<HnswBackend> {
+        Arc::clone(&self.cold_tier)
     }
 
     /// Get hot tier reference (for testing/inspection)
@@ -2927,6 +2963,81 @@ mod tests {
             SearchExecutionPath::CacheHit,
             "scope B must not reuse scope A cache entry"
         );
+    }
+
+    #[test]
+    fn test_sync_search_path_reports_cold_tier_only_when_hot_misses() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        let cache = LruCacheStrategy::new(10);
+        let embeddings = vec![normalize(vec![1.0, 0.0]), normalize(vec![0.0, 1.0])];
+        let initial_metadata = vec![std::collections::HashMap::new(); embeddings.len()];
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 100,
+            data_dir: None,
+            embedding_dimension: 2,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
+
+        let query = normalize(vec![1.0, 0.0]);
+        let (_results, path) = engine
+            .knn_search_with_ef_detailed_scoped(&query, 1, Some(64), 99)
+            .expect("sync search should succeed");
+        assert_eq!(path, SearchExecutionPath::ColdTierOnly);
+    }
+
+    #[test]
+    fn test_batch_search_path_reports_cold_tier_only_when_hot_misses() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        let cache = LruCacheStrategy::new(10);
+        let embeddings = vec![normalize(vec![1.0, 0.0]), normalize(vec![0.0, 1.0])];
+        let initial_metadata = vec![std::collections::HashMap::new(); embeddings.len()];
+        let query_cache = Arc::new(QueryHashCache::new(100, 0.85));
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 100,
+            data_dir: None,
+            embedding_dimension: 2,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
+
+        let query = normalize(vec![1.0, 0.0]);
+        let detailed = engine
+            .knn_search_batch_with_ef_detailed_scoped(&[query], 1, Some(64), 99)
+            .expect("batch search should succeed");
+        assert_eq!(detailed.len(), 1);
+        assert_eq!(detailed[0].1, SearchExecutionPath::ColdTierOnly);
     }
 
     #[tokio::test]

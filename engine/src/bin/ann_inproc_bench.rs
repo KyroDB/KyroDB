@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use kyrodb_engine::config::DistanceMetric;
+use kyrodb_engine::config::{AnnSearchMode, DistanceMetric};
 use kyrodb_engine::hnsw_index::{HnswVectorIndex, SearchResult};
 use serde::Serialize;
 use std::fs::File;
@@ -23,6 +23,23 @@ impl From<DistanceArg> for DistanceMetric {
             DistanceArg::Cosine => DistanceMetric::Cosine,
             DistanceArg::Euclidean => DistanceMetric::Euclidean,
             DistanceArg::InnerProduct => DistanceMetric::InnerProduct,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AnnSearchModeArg {
+    Fp32Strict,
+    Sq8Rerank,
+    Sq4Rerank,
+}
+
+impl From<AnnSearchModeArg> for AnnSearchMode {
+    fn from(value: AnnSearchModeArg) -> Self {
+        match value {
+            AnnSearchModeArg::Fp32Strict => AnnSearchMode::Fp32Strict,
+            AnnSearchModeArg::Sq8Rerank => AnnSearchMode::Sq8Rerank,
+            AnnSearchModeArg::Sq4Rerank => AnnSearchMode::Sq4Rerank,
         }
     }
 }
@@ -74,6 +91,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     disable_normalization_check: bool,
 
+    #[arg(long, value_enum, default_value_t = AnnSearchModeArg::Fp32Strict)]
+    ann_search_mode: AnnSearchModeArg,
+
+    #[arg(long, default_value_t = 8)]
+    quantized_rerank_multiplier: usize,
+
     #[arg(long, value_name = "FILE")]
     output_json: Option<PathBuf>,
 }
@@ -112,6 +135,8 @@ struct DatasetSummary {
 #[derive(Debug, Serialize)]
 struct RunConfig {
     ann_backend: String,
+    ann_search_mode: String,
+    quantized_rerank_multiplier: usize,
     distance: String,
     k: usize,
     m: usize,
@@ -226,9 +251,11 @@ fn main() -> Result<()> {
     }
 
     eprintln!(
-        "inproc config: dataset={} distance={:?} train={} queries={} dim={} k={} m={} ef_construction={} ef_search={:?}",
+        "inproc config: dataset={} distance={:?} mode={:?} rerank_mult={} train={} queries={} dim={} k={} m={} ef_construction={} ef_search={:?}",
         dataset_name,
         distance,
+        args.ann_search_mode,
+        args.quantized_rerank_multiplier,
         dataset.train_rows,
         dataset.test_rows,
         dataset.dimension,
@@ -238,13 +265,16 @@ fn main() -> Result<()> {
         args.ef_search
     );
 
-    let mut index = HnswVectorIndex::new_with_params(
+    let ann_search_mode: AnnSearchMode = args.ann_search_mode.into();
+    let mut index = HnswVectorIndex::new_with_params_and_search_mode(
         dataset.dimension,
         dataset.train_rows,
         distance,
         args.m,
         args.ef_construction,
         args.disable_normalization_check,
+        ann_search_mode,
+        args.quantized_rerank_multiplier,
     )
     .context("failed to create HNSW index")?;
 
@@ -307,6 +337,8 @@ fn main() -> Result<()> {
         },
         config: RunConfig {
             ann_backend: index.backend_name().to_string(),
+            ann_search_mode: format!("{:?}", ann_search_mode).to_lowercase(),
+            quantized_rerank_multiplier: args.quantized_rerank_multiplier,
             distance: format!("{:?}", distance).to_lowercase(),
             k: args.k,
             m: args.m,
