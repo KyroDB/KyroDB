@@ -42,11 +42,3 @@ float:
             ann_search_mode: sq8-rerank
             quantized_rerank_multiplier: 8
           query_args: [[128], [256], [512], [768], [1024], [1536]]
-
-        ann_sq4_experimental:
-          args:
-            M: 40
-            ef_construction: 800
-            ann_search_mode: sq4-rerank
-            quantized_rerank_multiplier: 8
-          query_args: [[128], [256], [512], [768], [1024], [1536]]

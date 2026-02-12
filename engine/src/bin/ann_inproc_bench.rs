@@ -31,7 +31,6 @@ impl From<DistanceArg> for DistanceMetric {
 enum AnnSearchModeArg {
     Fp32Strict,
     Sq8Rerank,
-    Sq4Rerank,
 }
 
 impl From<AnnSearchModeArg> for AnnSearchMode {
@@ -39,7 +38,6 @@ impl From<AnnSearchModeArg> for AnnSearchMode {
         match value {
             AnnSearchModeArg::Fp32Strict => AnnSearchMode::Fp32Strict,
             AnnSearchModeArg::Sq8Rerank => AnnSearchMode::Sq8Rerank,
-            AnnSearchModeArg::Sq4Rerank => AnnSearchMode::Sq4Rerank,
         }
     }
 }

@@ -425,27 +425,14 @@ impl HnswVectorIndex {
         self.quantized_rerank_multiplier
     }
 
-    /// Estimate memory usage assuming M=16, avg 2 layers/node, +10% overhead
+    /// Estimate backend memory usage for the active ANN engine layout.
     pub fn estimate_memory_bytes(&self) -> usize {
         if self.current_count == 0 {
             return 0;
         }
-
-        // Vector data storage
-        let vector_data_bytes = self.current_count * self.dimension * std::mem::size_of::<f32>();
-
-        // Graph structure (neighbors + edge weights)
-        // Assuming max_nb_connection=self.m, average 2 layers per node
-        let max_nb_connection = self.m;
-        let avg_layers = 2;
-        let graph_bytes =
-            self.current_count * max_nb_connection * avg_layers * std::mem::size_of::<usize>();
-
-        // Metadata overhead (10% estimate)
-        let total_without_overhead = vector_data_bytes + graph_bytes;
-        let overhead = total_without_overhead / 10;
-
-        total_without_overhead + overhead + self.backend.estimated_memory_bytes()
+        // Backends expose exact-ish internal layout accounting; avoid layering
+        // legacy rough formulas on top (which double-counts vectors/graph state).
+        self.backend.estimated_memory_bytes()
     }
 }
 

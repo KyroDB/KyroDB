@@ -134,7 +134,6 @@ hnsw:
   # ANN search compute mode:
   # - fp32_strict: full-precision traversal
   # - sq8_rerank: SQ8 approximate traversal + fp32 rerank
-  # - sq4_rerank: SQ4 approximate traversal + fp32 rerank
   ann_search_mode: fp32_strict
 
   # Candidate expansion factor before fp32 rerank in quantized modes.

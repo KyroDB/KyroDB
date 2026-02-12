@@ -66,9 +66,9 @@ class KyroDB(BaseANN):
             )
         )
 
-        if self.ann_search_mode not in {"fp32-strict", "sq8-rerank", "sq4-rerank"}:
+        if self.ann_search_mode not in {"fp32-strict", "sq8-rerank"}:
             raise ValueError(
-                "ann_search_mode must be one of fp32-strict|sq8-rerank|sq4-rerank, "
+                "ann_search_mode must be one of fp32-strict|sq8-rerank, "
                 f"got '{self.ann_search_mode}'"
             )
         if not (1 <= self.quantized_rerank_multiplier <= 64):

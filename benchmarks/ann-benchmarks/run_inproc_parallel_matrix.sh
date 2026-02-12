@@ -63,7 +63,7 @@ Core options:
   --warmup-queries INT
   --max-train INT
   --max-queries INT
-  --ann-search-mode MODE              fp32-strict|sq8-rerank|sq4-rerank
+  --ann-search-mode MODE              fp32-strict|sq8-rerank
   --quantized-rerank-multiplier INT  [1..64]
 
 Parallelization options:
@@ -219,8 +219,8 @@ if [[ "${THREADS_PER_JOB}" -lt 1 ]]; then
   echo "threads-per-job must be >= 1" >&2
   exit 1
 fi
-if [[ "${ANN_SEARCH_MODE}" != "fp32-strict" && "${ANN_SEARCH_MODE}" != "sq8-rerank" && "${ANN_SEARCH_MODE}" != "sq4-rerank" ]]; then
-  echo "ann-search-mode must be one of: fp32-strict, sq8-rerank, sq4-rerank" >&2
+if [[ "${ANN_SEARCH_MODE}" != "fp32-strict" && "${ANN_SEARCH_MODE}" != "sq8-rerank" ]]; then
+  echo "ann-search-mode must be one of: fp32-strict, sq8-rerank" >&2
   exit 1
 fi
 if [[ "${QUANTIZED_RERANK_MULTIPLIER}" -lt 1 || "${QUANTIZED_RERANK_MULTIPLIER}" -gt 64 ]]; then

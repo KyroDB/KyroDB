@@ -60,7 +60,7 @@ Options:
   --warmup-queries INT        Warmup queries per sweep (default: 200)
   --max-train INT             Optional train truncation at benchmark-time (default: 0 = full)
   --max-queries INT           Optional query truncation at benchmark-time (default: 0 = full)
-  --ann-search-mode MODE      ANN search mode: fp32-strict|sq8-rerank|sq4-rerank (default: fp32-strict)
+  --ann-search-mode MODE      ANN search mode: fp32-strict|sq8-rerank (default: fp32-strict)
   --quantized-rerank-multiplier INT
                               Candidate expansion factor before fp32 rerank in quantized modes (default: 8)
   --threads INT               Export RAYON_NUM_THREADS for run reproducibility
@@ -237,8 +237,8 @@ if [[ ! "${QUANTIZED_RERANK_MULTIPLIER}" =~ ^[0-9]+$ ]]; then
   echo "quantized-rerank-multiplier must be an integer >= 0" >&2
   exit 1
 fi
-if [[ "${ANN_SEARCH_MODE}" != "fp32-strict" && "${ANN_SEARCH_MODE}" != "sq8-rerank" && "${ANN_SEARCH_MODE}" != "sq4-rerank" ]]; then
-  echo "ann-search-mode must be one of: fp32-strict, sq8-rerank, sq4-rerank" >&2
+if [[ "${ANN_SEARCH_MODE}" != "fp32-strict" && "${ANN_SEARCH_MODE}" != "sq8-rerank" ]]; then
+  echo "ann-search-mode must be one of: fp32-strict, sq8-rerank" >&2
   exit 1
 fi
 

@@ -304,8 +304,6 @@ pub enum AnnSearchMode {
     Fp32Strict,
     /// SQ8 approximate traversal with fp32 rerank of top candidates.
     Sq8Rerank,
-    /// SQ4 approximate traversal with fp32 rerank of top candidates.
-    Sq4Rerank,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::ann_quant::{quantization_kind_for_mode, QuantizedStorage};
 use crate::config::{AnnSearchMode, DistanceMetric};
@@ -445,8 +445,15 @@ impl FlatGraph {
     }
 
     #[inline]
-    fn query_norm_sq(&self, query: &[f32]) -> f32 {
-        crate::simd::sum_squares_f32(query)
+    fn query_norms(&self, query: &[f32]) -> (f32, f32) {
+        let norm_sq = crate::simd::sum_squares_f32(query);
+        let norm = norm_sq.sqrt();
+        let inv_norm = if norm > 0.0 && norm.is_finite() {
+            norm.recip()
+        } else {
+            0.0
+        };
+        (norm_sq, inv_norm)
     }
 
     #[inline]
@@ -455,10 +462,17 @@ impl FlatGraph {
         quantized: &QuantizedStorage,
         query: &[f32],
         query_norm_sq: f32,
+        query_inv_norm: f32,
         dense_id: u32,
     ) -> f32 {
         quantized
-            .distance_approx(self.distance, query, query_norm_sq, dense_id)
+            .distance_approx(
+                self.distance,
+                query,
+                query_norm_sq,
+                query_inv_norm,
+                dense_id,
+            )
             .unwrap_or_else(|| self.distance_to(query, dense_id))
     }
 
@@ -468,6 +482,7 @@ impl FlatGraph {
         quantized: &QuantizedStorage,
         query: &[f32],
         query_norm_sq: f32,
+        query_inv_norm: f32,
         mut current: u32,
         mut current_dist: f32,
         layer: usize,
@@ -483,7 +498,8 @@ impl FlatGraph {
                 if nbr as usize >= self.len() {
                     continue;
                 }
-                let d = self.approx_distance_to(quantized, query, query_norm_sq, nbr);
+                let d =
+                    self.approx_distance_to(quantized, query, query_norm_sq, query_inv_norm, nbr);
                 if d < current_dist {
                     current = nbr;
                     current_dist = d;
@@ -501,6 +517,7 @@ impl FlatGraph {
         quantized: &QuantizedStorage,
         query: &[f32],
         query_norm_sq: f32,
+        query_inv_norm: f32,
         entry: u32,
         entry_dist: f32,
         ef: usize,
@@ -543,7 +560,13 @@ impl FlatGraph {
                         continue;
                     }
                     scratch.mark_visited(nbr);
-                    let d = self.approx_distance_to(quantized, query, query_norm_sq, nbr);
+                    let d = self.approx_distance_to(
+                        quantized,
+                        query,
+                        query_norm_sq,
+                        query_inv_norm,
+                        nbr,
+                    );
                     let can_push = scratch.results.len() < ef
                         || scratch
                             .results
@@ -594,14 +617,16 @@ impl FlatGraph {
         if entry as usize >= self.len() {
             entry = 0;
         }
-        let query_norm_sq = self.query_norm_sq(query);
-        let mut entry_dist = self.approx_distance_to(quantized, query, query_norm_sq, entry);
+        let (query_norm_sq, query_inv_norm) = self.query_norms(query);
+        let mut entry_dist =
+            self.approx_distance_to(quantized, query, query_norm_sq, query_inv_norm, entry);
 
         for layer in (1..=self.max_layer).rev() {
             let (new_entry, new_dist) = self.greedy_descent_layer_approx(
                 quantized,
                 query,
                 query_norm_sq,
+                query_inv_norm,
                 entry,
                 entry_dist,
                 layer,
@@ -611,8 +636,15 @@ impl FlatGraph {
             entry_dist = new_dist;
         }
 
-        let approx =
-            self.search_layer0_approx_ids(quantized, query, query_norm_sq, entry, entry_dist, ef);
+        let approx = self.search_layer0_approx_ids(
+            quantized,
+            query,
+            query_norm_sq,
+            query_inv_norm,
+            entry,
+            entry_dist,
+            ef,
+        );
         if approx.is_empty() {
             return Vec::new();
         }
@@ -752,7 +784,7 @@ impl FlatGraph {
         }
 
         let mut selected = Vec::with_capacity(max_neighbors);
-        let mut seen = HashMap::<u32, ()>::with_capacity(candidates.len().min(256));
+        let mut selected_lookup = HashSet::<u32>::with_capacity((max_neighbors * 2).max(8));
 
         // HNSW neighbor diversity heuristic:
         // accept candidate `c` if it is not closer to any already-selected node
@@ -761,7 +793,7 @@ impl FlatGraph {
             if cand == query_dense || cand as usize >= self.len() {
                 continue;
             }
-            if seen.insert(cand, ()).is_some() {
+            if !selected_lookup.insert(cand) {
                 continue;
             }
 
@@ -779,20 +811,18 @@ impl FlatGraph {
                 if selected.len() >= max_neighbors {
                     return selected;
                 }
+            } else {
+                selected_lookup.remove(&cand);
             }
         }
 
         // Fallback fill to honor max_neighbors when data geometry is highly clustered.
         if selected.len() < max_neighbors {
-            let mut selected_lookup = HashMap::<u32, ()>::with_capacity(selected.len().max(1));
-            for &cand in &selected {
-                selected_lookup.insert(cand, ());
-            }
             for &(cand, _) in candidates {
                 if cand == query_dense || cand as usize >= self.len() {
                     continue;
                 }
-                if selected_lookup.insert(cand, ()).is_some() {
+                if !selected_lookup.insert(cand) {
                     continue;
                 }
                 selected.push(cand);
@@ -803,43 +833,6 @@ impl FlatGraph {
         }
 
         selected
-    }
-
-    fn prune_layer_neighbors(&mut self, layer: usize, dense_id: u32, max_neighbors: usize) {
-        if self.neighbors_by_layer.is_empty() || max_neighbors == 0 {
-            return;
-        }
-        if layer >= self.neighbors_by_layer.len() {
-            return;
-        }
-        if dense_id as usize >= self.len() {
-            return;
-        }
-        if self.neighbors(layer, dense_id).len() <= max_neighbors {
-            return;
-        }
-
-        let current = self.neighbors(layer, dense_id).to_vec();
-        let mut scored = Vec::with_capacity(current.len());
-        let mut seen = HashMap::<u32, ()>::with_capacity(current.len().min(256));
-        for nbr in current {
-            if nbr == dense_id || nbr as usize >= self.len() {
-                continue;
-            }
-            if seen.insert(nbr, ()).is_some() {
-                continue;
-            }
-            let d = self.distance_between_dense(dense_id, nbr);
-            scored.push((nbr, d));
-        }
-        scored.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-
-        let pruned = self.select_diverse_neighbors(dense_id, &scored, max_neighbors);
-        self.set_layer_neighbors(layer, dense_id, &pruned);
     }
 
     fn merge_and_prune_reverse_edge(
@@ -857,20 +850,41 @@ impl FlatGraph {
             return false;
         }
 
-        let mut scored = Vec::with_capacity(self.neighbors(layer, target_dense).len() + 1);
-        let mut seen = HashMap::<u32, ()>::with_capacity(scored.capacity().max(1));
+        let current = self.neighbors(layer, target_dense);
+        if current.iter().any(|&nbr| nbr == incoming_dense) {
+            return true;
+        }
+        if current.len() < max_neighbors {
+            let mut merged = Vec::with_capacity(current.len() + 1);
+            let mut seen = HashSet::<u32>::with_capacity(current.len() + 1);
+            for &nbr in current {
+                if nbr == target_dense || nbr as usize >= self.len() {
+                    continue;
+                }
+                if seen.insert(nbr) {
+                    merged.push(nbr);
+                }
+            }
+            if seen.insert(incoming_dense) {
+                merged.push(incoming_dense);
+            }
+            self.set_layer_neighbors(layer, target_dense, &merged);
+            return seen.contains(&incoming_dense);
+        }
 
-        for &nbr in self.neighbors(layer, target_dense) {
+        let mut scored = Vec::with_capacity(current.len() + 1);
+        let mut seen = HashSet::<u32>::with_capacity(current.len() + 1);
+        for &nbr in current {
             if nbr == target_dense || nbr as usize >= self.len() {
                 continue;
             }
-            if seen.insert(nbr, ()).is_some() {
+            if !seen.insert(nbr) {
                 continue;
             }
             scored.push((nbr, self.distance_between_dense(target_dense, nbr)));
         }
 
-        if seen.insert(incoming_dense, ()).is_none() {
+        if seen.insert(incoming_dense) {
             scored.push((
                 incoming_dense,
                 self.distance_between_dense(target_dense, incoming_dense),
@@ -883,8 +897,12 @@ impl FlatGraph {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        let merged = self.select_diverse_neighbors(target_dense, &scored, max_neighbors);
-        let kept_incoming = merged.contains(&incoming_dense);
+        let mut merged = self.select_diverse_neighbors(target_dense, &scored, max_neighbors);
+        let mut kept_incoming = merged.iter().any(|&nbr| nbr == incoming_dense);
+        if !kept_incoming && merged.len() < max_neighbors {
+            merged.push(incoming_dense);
+            kept_incoming = true;
+        }
         self.set_layer_neighbors(layer, target_dense, &merged);
         kept_incoming
     }
@@ -976,11 +994,6 @@ impl FlatGraph {
                 if self.merge_and_prune_reverse_edge(layer, nbr, new_dense, max_nbrs) {
                     reachable = true;
                 }
-            }
-
-            // Prune overflow on reverse neighbor lists.
-            for &nbr in &selected {
-                self.prune_layer_neighbors(layer, nbr, max_nbrs);
             }
 
             // Connectivity guarantee: after pruning, verify at least one reverse
@@ -1677,34 +1690,6 @@ mod tests {
         assert!(
             quant.is_some(),
             "sq8 mode should materialize quantized payload"
-        );
-    }
-
-    #[test]
-    fn quantized_sq4_mode_keeps_inserted_point_retrievable() {
-        let backend = backend_with_mode(
-            DistanceMetric::Euclidean,
-            24,
-            10_000,
-            8,
-            400,
-            AnnSearchMode::Sq4Rerank,
-        );
-        let point = vec![0.25, 0.5, -0.75, 1.0, -0.1, 0.2];
-        backend.insert(&point, 601);
-        backend.insert(&[0.2, 0.45, -0.7, 0.95, -0.15, 0.25], 602);
-
-        let results = backend.search(&point, 5, 512);
-        assert!(
-            contains_doc(&results, 601),
-            "sq4 rerank mode should return inserted query-nearest document"
-        );
-
-        let flat = backend.flat_graph.read();
-        let quant = flat.as_ref().and_then(|f| f.quantized.as_ref());
-        assert!(
-            quant.is_some(),
-            "sq4 mode should materialize quantized payload"
         );
     }
 
