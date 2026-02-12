@@ -51,6 +51,11 @@ impl HnswVectorIndex {
     pub const DEFAULT_EF_CONSTRUCTION: usize = 200;
     pub const DEFAULT_QUANTIZED_RERANK_MULTIPLIER: usize = 8;
 
+    fn compute_max_layer(max_elements: usize, m: usize) -> usize {
+        let m_for_layers = m.max(2) as f64;
+        (((max_elements as f64).ln() / m_for_layers.ln()).ceil() as usize).clamp(1, 16)
+    }
+
     /// Create new HNSW index
     ///
     /// # Parameters
@@ -141,8 +146,9 @@ impl HnswVectorIndex {
             );
         }
 
-        // Calculate max_layer based on max_elements
-        let max_layer = 16.min(((max_elements as f32).ln().ceil() as usize).max(1));
+        // Calculate max_layer using HNSW scaling: O(log_M(N)).
+        // This avoids over-allocating upper graph layers for high-M indexes.
+        let max_layer = Self::compute_max_layer(max_elements, m);
 
         // KyroDB default ANN backend. Isolated behind a trait so we can replace
         // the implementation without changing higher-level engine behavior.
@@ -535,6 +541,19 @@ mod tests {
     fn test_default_backend_is_single_graph() {
         let index = HnswVectorIndex::new(128, 1000).unwrap();
         assert_eq!(index.backend_name(), "kyro_single_graph");
+    }
+
+    #[test]
+    fn test_max_layer_scales_with_m() {
+        let at_m16 = HnswVectorIndex::compute_max_layer(1_000_000, 16);
+        let at_m56 = HnswVectorIndex::compute_max_layer(1_000_000, 56);
+        assert!(
+            at_m56 < at_m16,
+            "larger M should reduce upper-layer budget (m16={}, m56={})",
+            at_m16,
+            at_m56
+        );
+        assert!(at_m56 >= 1);
     }
 
     #[test]

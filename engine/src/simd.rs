@@ -570,18 +570,61 @@ unsafe fn l2_distance_f32_sse2(a: &[f32], b: &[f32], len: usize) -> f32 {
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "fma")]
 unsafe fn dot_and_norms_f32_avx2(a: &[f32], b: &[f32], len: usize) -> (f32, f32, f32) {
-    let mut dot = _mm256_setzero_ps();
-    let mut na = _mm256_setzero_ps();
-    let mut nb = _mm256_setzero_ps();
+    let mut dot0 = _mm256_setzero_ps();
+    let mut dot1 = _mm256_setzero_ps();
+    let mut dot2 = _mm256_setzero_ps();
+    let mut dot3 = _mm256_setzero_ps();
+    let mut na0 = _mm256_setzero_ps();
+    let mut na1 = _mm256_setzero_ps();
+    let mut na2 = _mm256_setzero_ps();
+    let mut na3 = _mm256_setzero_ps();
+    let mut nb0 = _mm256_setzero_ps();
+    let mut nb1 = _mm256_setzero_ps();
+    let mut nb2 = _mm256_setzero_ps();
+    let mut nb3 = _mm256_setzero_ps();
+
     let chunks = len / 8;
-    for i in 0..chunks {
-        let off = i * 8;
-        let va = _mm256_loadu_ps(a.as_ptr().add(off));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(off));
+    let chunks4 = chunks / 4;
+    for i in 0..chunks4 {
+        let off = i * 32;
+
+        let va0 = _mm256_loadu_ps(a.as_ptr().add(off));
+        let vb0 = _mm256_loadu_ps(b.as_ptr().add(off));
+        dot0 = _mm256_fmadd_ps(va0, vb0, dot0);
+        na0 = _mm256_fmadd_ps(va0, va0, na0);
+        nb0 = _mm256_fmadd_ps(vb0, vb0, nb0);
+
+        let va1 = _mm256_loadu_ps(a.as_ptr().add(off + 8));
+        let vb1 = _mm256_loadu_ps(b.as_ptr().add(off + 8));
+        dot1 = _mm256_fmadd_ps(va1, vb1, dot1);
+        na1 = _mm256_fmadd_ps(va1, va1, na1);
+        nb1 = _mm256_fmadd_ps(vb1, vb1, nb1);
+
+        let va2 = _mm256_loadu_ps(a.as_ptr().add(off + 16));
+        let vb2 = _mm256_loadu_ps(b.as_ptr().add(off + 16));
+        dot2 = _mm256_fmadd_ps(va2, vb2, dot2);
+        na2 = _mm256_fmadd_ps(va2, va2, na2);
+        nb2 = _mm256_fmadd_ps(vb2, vb2, nb2);
+
+        let va3 = _mm256_loadu_ps(a.as_ptr().add(off + 24));
+        let vb3 = _mm256_loadu_ps(b.as_ptr().add(off + 24));
+        dot3 = _mm256_fmadd_ps(va3, vb3, dot3);
+        na3 = _mm256_fmadd_ps(va3, va3, na3);
+        nb3 = _mm256_fmadd_ps(vb3, vb3, nb3);
+    }
+
+    let mut dot = _mm256_add_ps(_mm256_add_ps(dot0, dot1), _mm256_add_ps(dot2, dot3));
+    let mut na = _mm256_add_ps(_mm256_add_ps(na0, na1), _mm256_add_ps(na2, na3));
+    let mut nb = _mm256_add_ps(_mm256_add_ps(nb0, nb1), _mm256_add_ps(nb2, nb3));
+
+    for i in (chunks4 * 32..chunks * 8).step_by(8) {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
         dot = _mm256_fmadd_ps(va, vb, dot);
         na = _mm256_fmadd_ps(va, va, na);
         nb = _mm256_fmadd_ps(vb, vb, nb);
     }
+
     let mut dot_tmp = [0.0f32; 8];
     let mut na_tmp = [0.0f32; 8];
     let mut nb_tmp = [0.0f32; 8];
@@ -605,18 +648,61 @@ unsafe fn dot_and_norms_f32_avx2(a: &[f32], b: &[f32], len: usize) -> (f32, f32,
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "fma")]
 unsafe fn dot_and_norms_f32_avx512(a: &[f32], b: &[f32], len: usize) -> (f32, f32, f32) {
-    let mut dot = _mm512_setzero_ps();
-    let mut na = _mm512_setzero_ps();
-    let mut nb = _mm512_setzero_ps();
+    let mut dot0 = _mm512_setzero_ps();
+    let mut dot1 = _mm512_setzero_ps();
+    let mut dot2 = _mm512_setzero_ps();
+    let mut dot3 = _mm512_setzero_ps();
+    let mut na0 = _mm512_setzero_ps();
+    let mut na1 = _mm512_setzero_ps();
+    let mut na2 = _mm512_setzero_ps();
+    let mut na3 = _mm512_setzero_ps();
+    let mut nb0 = _mm512_setzero_ps();
+    let mut nb1 = _mm512_setzero_ps();
+    let mut nb2 = _mm512_setzero_ps();
+    let mut nb3 = _mm512_setzero_ps();
+
     let chunks = len / 16;
-    for i in 0..chunks {
-        let off = i * 16;
-        let va = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
-        let vb = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
+    let chunks4 = chunks / 4;
+    for i in 0..chunks4 {
+        let off = i * 64;
+
+        let va0 = _mm512_loadu_ps(a.as_ptr().add(off) as *const _);
+        let vb0 = _mm512_loadu_ps(b.as_ptr().add(off) as *const _);
+        dot0 = _mm512_fmadd_ps(va0, vb0, dot0);
+        na0 = _mm512_fmadd_ps(va0, va0, na0);
+        nb0 = _mm512_fmadd_ps(vb0, vb0, nb0);
+
+        let va1 = _mm512_loadu_ps(a.as_ptr().add(off + 16) as *const _);
+        let vb1 = _mm512_loadu_ps(b.as_ptr().add(off + 16) as *const _);
+        dot1 = _mm512_fmadd_ps(va1, vb1, dot1);
+        na1 = _mm512_fmadd_ps(va1, va1, na1);
+        nb1 = _mm512_fmadd_ps(vb1, vb1, nb1);
+
+        let va2 = _mm512_loadu_ps(a.as_ptr().add(off + 32) as *const _);
+        let vb2 = _mm512_loadu_ps(b.as_ptr().add(off + 32) as *const _);
+        dot2 = _mm512_fmadd_ps(va2, vb2, dot2);
+        na2 = _mm512_fmadd_ps(va2, va2, na2);
+        nb2 = _mm512_fmadd_ps(vb2, vb2, nb2);
+
+        let va3 = _mm512_loadu_ps(a.as_ptr().add(off + 48) as *const _);
+        let vb3 = _mm512_loadu_ps(b.as_ptr().add(off + 48) as *const _);
+        dot3 = _mm512_fmadd_ps(va3, vb3, dot3);
+        na3 = _mm512_fmadd_ps(va3, va3, na3);
+        nb3 = _mm512_fmadd_ps(vb3, vb3, nb3);
+    }
+
+    let mut dot = _mm512_add_ps(_mm512_add_ps(dot0, dot1), _mm512_add_ps(dot2, dot3));
+    let mut na = _mm512_add_ps(_mm512_add_ps(na0, na1), _mm512_add_ps(na2, na3));
+    let mut nb = _mm512_add_ps(_mm512_add_ps(nb0, nb1), _mm512_add_ps(nb2, nb3));
+
+    for i in (chunks4 * 64..chunks * 16).step_by(16) {
+        let va = _mm512_loadu_ps(a.as_ptr().add(i) as *const _);
+        let vb = _mm512_loadu_ps(b.as_ptr().add(i) as *const _);
         dot = _mm512_fmadd_ps(va, vb, dot);
         na = _mm512_fmadd_ps(va, va, na);
         nb = _mm512_fmadd_ps(vb, vb, nb);
     }
+
     let mut dot_tmp = [0.0f32; 16];
     let mut na_tmp = [0.0f32; 16];
     let mut nb_tmp = [0.0f32; 16];

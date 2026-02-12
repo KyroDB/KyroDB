@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::ann_quant::{quantization_kind_for_mode, QuantizedStorage};
 use crate::config::{AnnSearchMode, DistanceMetric};
@@ -23,8 +23,10 @@ const PARALLEL_STAGING_THRESHOLD: usize = 128;
 const PARALLEL_STAGING_CHUNK_SIZE: usize = 512;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_CACHELINE_BYTES: usize = 64;
+const PREFETCH_NEIGHBOR_LOOKAHEAD_MAX: usize = 2;
 const INVALID_DENSE_ID: u32 = u32::MAX;
 const DEFAULT_QUANTIZED_RERANK_MULTIPLIER: usize = 8;
+const DIVERSIFIED_CANDIDATE_BUDGET_MULTIPLIER: usize = 12;
 
 #[inline]
 fn metric_distance(distance: DistanceMetric, query: &[f32], candidate: &[f32]) -> f32 {
@@ -84,17 +86,32 @@ pub(crate) trait AnnBackend: Send + Sync {
 #[derive(Debug, Clone)]
 struct LayerAdjacency {
     cap: usize,
+    sparse: bool,
     counts: Vec<u16>,
     neighbors: Vec<u32>,
+    dense_to_slot: Vec<u32>,
 }
 
 impl LayerAdjacency {
-    fn new(cap: usize, node_count: usize) -> Self {
+    fn new_dense(cap: usize, node_count: usize) -> Self {
         let cap = cap.max(1);
         Self {
             cap,
+            sparse: false,
             counts: vec![0; node_count],
             neighbors: vec![INVALID_DENSE_ID; node_count.saturating_mul(cap)],
+            dense_to_slot: Vec::new(),
+        }
+    }
+
+    fn new_sparse(cap: usize, node_count: usize) -> Self {
+        let cap = cap.max(1);
+        Self {
+            cap,
+            sparse: true,
+            counts: Vec::new(),
+            neighbors: Vec::new(),
+            dense_to_slot: vec![INVALID_DENSE_ID; node_count],
         }
     }
 
@@ -102,28 +119,101 @@ impl LayerAdjacency {
         if additional == 0 {
             return;
         }
+        if self.sparse {
+            self.dense_to_slot.reserve(additional);
+            return;
+        }
         self.counts.reserve(additional);
         self.neighbors.reserve(additional.saturating_mul(self.cap));
     }
 
-    fn push_node(&mut self) {
+    fn push_node(&mut self, present_in_layer: bool) {
+        if self.sparse {
+            self.dense_to_slot.push(INVALID_DENSE_ID);
+            if present_in_layer {
+                let dense_id = (self.dense_to_slot.len() - 1) as u32;
+                let _ = self.ensure_slot(dense_id);
+            }
+            return;
+        }
+
         self.counts.push(0);
         self.neighbors
             .extend(std::iter::repeat_n(INVALID_DENSE_ID, self.cap));
     }
 
+    fn has_dense(&self, dense_id: u32) -> bool {
+        self.slot_for_dense(dense_id).is_some()
+    }
+
+    fn slot_for_dense(&self, dense_id: u32) -> Option<usize> {
+        let dense = dense_id as usize;
+        if self.sparse {
+            let slot = *self.dense_to_slot.get(dense)?;
+            if slot == INVALID_DENSE_ID {
+                return None;
+            }
+            return Some(slot as usize);
+        }
+
+        if dense >= self.counts.len() {
+            return None;
+        }
+        Some(dense)
+    }
+
+    fn ensure_slot(&mut self, dense_id: u32) -> Option<usize> {
+        if !self.sparse {
+            let dense = dense_id as usize;
+            if dense >= self.counts.len() {
+                return None;
+            }
+            return Some(dense);
+        }
+
+        let dense = dense_id as usize;
+        if dense >= self.dense_to_slot.len() {
+            return None;
+        }
+        let existing = self.dense_to_slot[dense];
+        if existing != INVALID_DENSE_ID {
+            return Some(existing as usize);
+        }
+
+        let slot = self.counts.len();
+        self.counts.push(0);
+        self.neighbors
+            .extend(std::iter::repeat_n(INVALID_DENSE_ID, self.cap));
+        self.dense_to_slot[dense] = slot as u32;
+        Some(slot)
+    }
+
     fn neighbors(&self, dense_id: u32) -> &[u32] {
-        let idx = dense_id as usize;
-        let count = self.counts[idx] as usize;
-        let start = idx.saturating_mul(self.cap);
+        let Some(slot) = self.slot_for_dense(dense_id) else {
+            return &[];
+        };
+        let count = self.counts[slot] as usize;
+        let start = slot.saturating_mul(self.cap);
         &self.neighbors[start..start + count]
     }
 
     fn set_neighbors(&mut self, dense_id: u32, values: &[u32]) {
-        let idx = dense_id as usize;
-        let start = idx.saturating_mul(self.cap);
-        let count = values.len().min(self.cap);
-        self.counts[idx] = count as u16;
+        let slot_opt = if self.sparse {
+            if values.is_empty() {
+                None
+            } else {
+                self.ensure_slot(dense_id)
+            }
+        } else {
+            self.ensure_slot(dense_id)
+        };
+        let Some(slot) = slot_opt else {
+            return;
+        };
+
+        let start = slot.saturating_mul(self.cap);
+        let count = values.len().min(self.cap).min(u16::MAX as usize);
+        self.counts[slot] = count as u16;
         self.neighbors[start..start + count].copy_from_slice(&values[..count]);
         for slot in &mut self.neighbors[start + count..start + self.cap] {
             *slot = INVALID_DENSE_ID;
@@ -133,6 +223,7 @@ impl LayerAdjacency {
     fn estimated_memory_bytes(&self) -> usize {
         self.counts.len() * std::mem::size_of::<u16>()
             + self.neighbors.len() * std::mem::size_of::<u32>()
+            + self.dense_to_slot.len() * std::mem::size_of::<u32>()
     }
 }
 
@@ -195,7 +286,7 @@ impl FlatGraph {
             origin_to_dense,
             layer0_neighbor_cap: layer0_neighbor_cap.max(1),
             upper_layer_neighbor_cap: upper_layer_neighbor_cap.max(1),
-            neighbors_by_layer: vec![LayerAdjacency::new(layer0_neighbor_cap.max(1), 1)],
+            neighbors_by_layer: vec![LayerAdjacency::new_dense(layer0_neighbor_cap.max(1), 1)],
             entry_by_layer: vec![0],
             max_layer: 0,
         })
@@ -299,6 +390,25 @@ impl FlatGraph {
         let _ = (dense_id, frontier_depth, ef);
     }
 
+    #[inline]
+    fn prefetch_neighbor_lookahead(
+        &self,
+        neighbors: &[u32],
+        idx: usize,
+        frontier_depth: usize,
+        ef: usize,
+    ) {
+        if let Some(&next) = neighbors.get(idx + 1) {
+            self.prefetch_dense_vector(next, frontier_depth, ef);
+        }
+        let enable_second_hop = self.dimension >= 512 || frontier_depth > (ef / 2).max(64);
+        if enable_second_hop && PREFETCH_NEIGHBOR_LOOKAHEAD_MAX >= 2 {
+            if let Some(&next2) = neighbors.get(idx + 2) {
+                self.prefetch_dense_vector(next2, frontier_depth, ef);
+            }
+        }
+    }
+
     fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult> {
         if self.len() == 0 || k == 0 {
             return Vec::new();
@@ -334,14 +444,13 @@ impl FlatGraph {
         mut current_dist: f32,
         layer: usize,
     ) -> (u32, f32) {
+        let node_count = self.len();
         loop {
             let mut improved = false;
             let neighbors = self.neighbors(layer, current);
             for (idx, &nbr) in neighbors.iter().enumerate() {
-                if let Some(&next) = neighbors.get(idx + 1) {
-                    self.prefetch_dense_vector(next, 1, 1);
-                }
-                if nbr as usize >= self.len() {
+                self.prefetch_neighbor_lookahead(neighbors, idx, 1, 1);
+                if nbr as usize >= node_count {
                     continue;
                 }
                 let d = self.distance_to(query, nbr);
@@ -367,7 +476,8 @@ impl FlatGraph {
     ) -> Vec<SearchResult> {
         FLAT_SEARCH_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
-            scratch.prepare(self.len(), ef);
+            let node_count = self.len();
+            scratch.prepare(node_count, ef);
             scratch.mark_visited(entry);
             scratch.candidates.push(CandidateHeapItem {
                 neg_distance: -entry_dist,
@@ -377,26 +487,18 @@ impl FlatGraph {
                 distance: entry_dist,
                 dense_id: entry,
             });
+            let mut worst_dist = entry_dist;
 
             while let Some(candidate) = scratch.candidates.pop() {
                 let candidate_dist = -candidate.neg_distance;
-                if scratch.results.len() >= ef {
-                    let worst_dist = scratch
-                        .results
-                        .peek()
-                        .map(|v| v.distance)
-                        .unwrap_or(f32::MAX);
-                    if candidate_dist > worst_dist {
-                        break;
-                    }
+                if scratch.results.len() >= ef && candidate_dist > worst_dist {
+                    break;
                 }
 
                 let neighbors = self.neighbors(0, candidate.dense_id);
                 for (idx, &nbr) in neighbors.iter().enumerate() {
-                    if let Some(&next) = neighbors.get(idx + 1) {
-                        self.prefetch_dense_vector(next, scratch.results.len(), ef);
-                    }
-                    if nbr as usize >= self.len() {
+                    self.prefetch_neighbor_lookahead(neighbors, idx, scratch.results.len(), ef);
+                    if nbr as usize >= node_count {
                         continue;
                     }
                     if scratch.was_visited(nbr) {
@@ -404,12 +506,7 @@ impl FlatGraph {
                     }
                     scratch.mark_visited(nbr);
                     let d = self.distance_to(query, nbr);
-                    let can_push = scratch.results.len() < ef
-                        || scratch
-                            .results
-                            .peek()
-                            .map(|v| d < v.distance)
-                            .unwrap_or(true);
+                    let can_push = scratch.results.len() < ef || d < worst_dist;
                     if can_push {
                         scratch.candidates.push(CandidateHeapItem {
                             neg_distance: -d,
@@ -422,6 +519,11 @@ impl FlatGraph {
                         if scratch.results.len() > ef {
                             let _ = scratch.results.pop();
                         }
+                        worst_dist = scratch
+                            .results
+                            .peek()
+                            .map(|v| v.distance)
+                            .unwrap_or(f32::MAX);
                     }
                 }
             }
@@ -488,14 +590,13 @@ impl FlatGraph {
         layer: usize,
         ef: usize,
     ) -> (u32, f32) {
+        let node_count = self.len();
         loop {
             let mut improved = false;
             let neighbors = self.neighbors(layer, current);
             for (idx, &nbr) in neighbors.iter().enumerate() {
-                if let Some(&next) = neighbors.get(idx + 1) {
-                    self.prefetch_dense_vector(next, 1, ef);
-                }
-                if nbr as usize >= self.len() {
+                self.prefetch_neighbor_lookahead(neighbors, idx, 1, ef);
+                if nbr as usize >= node_count {
                     continue;
                 }
                 let d =
@@ -512,6 +613,7 @@ impl FlatGraph {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_layer0_approx_ids(
         &self,
         quantized: &QuantizedStorage,
@@ -524,7 +626,8 @@ impl FlatGraph {
     ) -> Vec<(u32, f32)> {
         FLAT_SEARCH_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
-            scratch.prepare(self.len(), ef);
+            let node_count = self.len();
+            scratch.prepare(node_count, ef);
             scratch.mark_visited(entry);
             scratch.candidates.push(CandidateHeapItem {
                 neg_distance: -entry_dist,
@@ -534,26 +637,18 @@ impl FlatGraph {
                 distance: entry_dist,
                 dense_id: entry,
             });
+            let mut worst_dist = entry_dist;
 
             while let Some(candidate) = scratch.candidates.pop() {
                 let candidate_dist = -candidate.neg_distance;
-                if scratch.results.len() >= ef {
-                    let worst_dist = scratch
-                        .results
-                        .peek()
-                        .map(|v| v.distance)
-                        .unwrap_or(f32::MAX);
-                    if candidate_dist > worst_dist {
-                        break;
-                    }
+                if scratch.results.len() >= ef && candidate_dist > worst_dist {
+                    break;
                 }
 
                 let neighbors = self.neighbors(0, candidate.dense_id);
                 for (idx, &nbr) in neighbors.iter().enumerate() {
-                    if let Some(&next) = neighbors.get(idx + 1) {
-                        self.prefetch_dense_vector(next, scratch.results.len(), ef);
-                    }
-                    if nbr as usize >= self.len() {
+                    self.prefetch_neighbor_lookahead(neighbors, idx, scratch.results.len(), ef);
+                    if nbr as usize >= node_count {
                         continue;
                     }
                     if scratch.was_visited(nbr) {
@@ -567,12 +662,7 @@ impl FlatGraph {
                         query_inv_norm,
                         nbr,
                     );
-                    let can_push = scratch.results.len() < ef
-                        || scratch
-                            .results
-                            .peek()
-                            .map(|v| d < v.distance)
-                            .unwrap_or(true);
+                    let can_push = scratch.results.len() < ef || d < worst_dist;
                     if can_push {
                         scratch.candidates.push(CandidateHeapItem {
                             neg_distance: -d,
@@ -585,6 +675,11 @@ impl FlatGraph {
                         if scratch.results.len() > ef {
                             let _ = scratch.results.pop();
                         }
+                        worst_dist = scratch
+                            .results
+                            .peek()
+                            .map(|v| v.distance)
+                            .unwrap_or(f32::MAX);
                     }
                 }
             }
@@ -692,7 +787,8 @@ impl FlatGraph {
 
         FLAT_SEARCH_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
-            scratch.prepare(self.len(), ef);
+            let node_count = self.len();
+            scratch.prepare(node_count, ef);
             scratch.mark_visited(entry);
             scratch.candidates.push(CandidateHeapItem {
                 neg_distance: -entry_dist,
@@ -702,26 +798,18 @@ impl FlatGraph {
                 distance: entry_dist,
                 dense_id: entry,
             });
+            let mut worst_dist = entry_dist;
 
             while let Some(candidate) = scratch.candidates.pop() {
                 let candidate_dist = -candidate.neg_distance;
-                if scratch.results.len() >= ef {
-                    let worst_dist = scratch
-                        .results
-                        .peek()
-                        .map(|v| v.distance)
-                        .unwrap_or(f32::MAX);
-                    if candidate_dist > worst_dist {
-                        break;
-                    }
+                if scratch.results.len() >= ef && candidate_dist > worst_dist {
+                    break;
                 }
 
                 let neighbors = self.neighbors(layer, candidate.dense_id);
                 for (idx, &nbr) in neighbors.iter().enumerate() {
-                    if let Some(&next) = neighbors.get(idx + 1) {
-                        self.prefetch_dense_vector(next, scratch.results.len(), ef);
-                    }
-                    if nbr as usize >= self.len() {
+                    self.prefetch_neighbor_lookahead(neighbors, idx, scratch.results.len(), ef);
+                    if nbr as usize >= node_count {
                         continue;
                     }
                     if scratch.was_visited(nbr) {
@@ -729,12 +817,7 @@ impl FlatGraph {
                     }
                     scratch.mark_visited(nbr);
                     let d = self.distance_to(query, nbr);
-                    let can_push = scratch.results.len() < ef
-                        || scratch
-                            .results
-                            .peek()
-                            .map(|v| d < v.distance)
-                            .unwrap_or(true);
+                    let can_push = scratch.results.len() < ef || d < worst_dist;
                     if can_push {
                         scratch.candidates.push(CandidateHeapItem {
                             neg_distance: -d,
@@ -747,6 +830,11 @@ impl FlatGraph {
                         if scratch.results.len() > ef {
                             let _ = scratch.results.pop();
                         }
+                        worst_dist = scratch
+                            .results
+                            .peek()
+                            .map(|v| v.distance)
+                            .unwrap_or(f32::MAX);
                     }
                 }
             }
@@ -784,16 +872,18 @@ impl FlatGraph {
         }
 
         let mut selected = Vec::with_capacity(max_neighbors);
-        let mut selected_lookup = HashSet::<u32>::with_capacity((max_neighbors * 2).max(8));
+        let budget = candidates
+            .len()
+            .min(max_neighbors.saturating_mul(DIVERSIFIED_CANDIDATE_BUDGET_MULTIPLIER));
 
         // HNSW neighbor diversity heuristic:
         // accept candidate `c` if it is not closer to any already-selected node
         // than it is to the query node.
-        for &(cand, dist_to_query) in candidates {
+        for &(cand, dist_to_query) in candidates.iter().take(budget) {
             if cand == query_dense || cand as usize >= self.len() {
                 continue;
             }
-            if !selected_lookup.insert(cand) {
+            if selected.contains(&cand) {
                 continue;
             }
 
@@ -811,18 +901,16 @@ impl FlatGraph {
                 if selected.len() >= max_neighbors {
                     return selected;
                 }
-            } else {
-                selected_lookup.remove(&cand);
             }
         }
 
         // Fallback fill to honor max_neighbors when data geometry is highly clustered.
         if selected.len() < max_neighbors {
-            for &(cand, _) in candidates {
+            for &(cand, _) in candidates.iter().take(budget) {
                 if cand == query_dense || cand as usize >= self.len() {
                     continue;
                 }
-                if !selected_lookup.insert(cand) {
+                if selected.contains(&cand) {
                     continue;
                 }
                 selected.push(cand);
@@ -849,42 +937,43 @@ impl FlatGraph {
         {
             return false;
         }
+        if !self.neighbors_by_layer[layer].has_dense(target_dense) {
+            return false;
+        }
 
         let current = self.neighbors(layer, target_dense);
-        if current.iter().any(|&nbr| nbr == incoming_dense) {
+        if current.contains(&incoming_dense) {
             return true;
         }
         if current.len() < max_neighbors {
             let mut merged = Vec::with_capacity(current.len() + 1);
-            let mut seen = HashSet::<u32>::with_capacity(current.len() + 1);
             for &nbr in current {
                 if nbr == target_dense || nbr as usize >= self.len() {
                     continue;
                 }
-                if seen.insert(nbr) {
+                if !merged.contains(&nbr) {
                     merged.push(nbr);
                 }
             }
-            if seen.insert(incoming_dense) {
+            if !merged.contains(&incoming_dense) {
                 merged.push(incoming_dense);
             }
             self.set_layer_neighbors(layer, target_dense, &merged);
-            return seen.contains(&incoming_dense);
+            return merged.contains(&incoming_dense);
         }
 
         let mut scored = Vec::with_capacity(current.len() + 1);
-        let mut seen = HashSet::<u32>::with_capacity(current.len() + 1);
         for &nbr in current {
             if nbr == target_dense || nbr as usize >= self.len() {
                 continue;
             }
-            if !seen.insert(nbr) {
+            if scored.iter().any(|(seen, _)| *seen == nbr) {
                 continue;
             }
             scored.push((nbr, self.distance_between_dense(target_dense, nbr)));
         }
 
-        if seen.insert(incoming_dense) {
+        if !scored.iter().any(|(seen, _)| *seen == incoming_dense) {
             scored.push((
                 incoming_dense,
                 self.distance_between_dense(target_dense, incoming_dense),
@@ -898,7 +987,7 @@ impl FlatGraph {
         });
 
         let mut merged = self.select_diverse_neighbors(target_dense, &scored, max_neighbors);
-        let mut kept_incoming = merged.iter().any(|&nbr| nbr == incoming_dense);
+        let mut kept_incoming = merged.contains(&incoming_dense);
         if !kept_incoming && merged.len() < max_neighbors {
             merged.push(incoming_dense);
             kept_incoming = true;
@@ -946,14 +1035,14 @@ impl FlatGraph {
 
         // Ensure layer structure accommodates the inserted level.
         if self.neighbors_by_layer.is_empty() {
-            self.neighbors_by_layer = vec![LayerAdjacency::new(self.layer0_neighbor_cap, 0)];
+            self.neighbors_by_layer = vec![LayerAdjacency::new_dense(self.layer0_neighbor_cap, 0)];
             self.entry_by_layer = vec![new_dense];
             self.max_layer = 0;
         }
         if inserted_level > self.max_layer {
             let existing_count = self.dense_to_origin.len() - 1;
             for _ in (self.max_layer + 1)..=inserted_level {
-                self.neighbors_by_layer.push(LayerAdjacency::new(
+                self.neighbors_by_layer.push(LayerAdjacency::new_sparse(
                     self.upper_layer_neighbor_cap,
                     existing_count,
                 ));
@@ -961,13 +1050,17 @@ impl FlatGraph {
             }
             self.max_layer = inserted_level;
         }
-        // Add empty neighbor slot for the new node at every active layer.
-        for layer_nbrs in &mut self.neighbors_by_layer {
-            layer_nbrs.push_node();
-        }
-
         // Connect at each layer using ranked candidates from the build plan.
         let effective_level = inserted_level.min(self.max_layer);
+
+        // Add neighbor slot metadata for the new node. Layer 0 is dense and always
+        // present; upper layers are sparse and only allocate storage for nodes whose
+        // sampled level includes that layer.
+        for (layer, layer_nbrs) in self.neighbors_by_layer.iter_mut().enumerate() {
+            let present_in_layer = layer == 0 || layer <= effective_level;
+            layer_nbrs.push_node(present_in_layer);
+        }
+
         for layer in 0..=effective_level {
             let max_nbrs = if layer == 0 {
                 layer0_max_neighbors
@@ -1780,6 +1873,67 @@ mod tests {
         // Upper layers: connected via per-layer candidates.
         assert!(flat.neighbors(1, 1).contains(&0));
         assert!(flat.neighbors(2, 1).contains(&0));
+    }
+
+    #[test]
+    fn sparse_upper_layers_allocate_only_for_member_nodes() {
+        let mut flat = FlatGraph::new_single(
+            DistanceMetric::Euclidean,
+            &[0.0, 0.0],
+            1,
+            8,
+            4,
+            AnnSearchMode::Fp32Strict,
+            DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
+        )
+        .expect("seed node should create a flat graph");
+
+        // Introduce one high-level node so upper layers exist.
+        let high_layer_candidates = vec![
+            vec![(0u32, 1.0f32)],
+            vec![(0u32, 1.0f32)],
+            vec![(0u32, 1.0f32)],
+            vec![(0u32, 1.0f32)],
+        ];
+        assert!(flat.connect_with_layer_candidates(
+            2,
+            &[1.0, 1.0],
+            3,
+            &high_layer_candidates,
+            8,
+            4
+        ));
+
+        // Insert many layer-0-only nodes; sparse upper layers should not allocate
+        // per-node neighbor slots for them.
+        for i in 0..128u64 {
+            let layer0_candidates = vec![vec![(1u32, 1.0f32), (0u32, 2.0f32)]];
+            let x = i as f32 * 0.01 + 2.0;
+            assert!(flat.connect_with_layer_candidates(
+                10_000 + i,
+                &[x, x * 0.5],
+                0,
+                &layer0_candidates,
+                8,
+                4
+            ));
+        }
+
+        assert_eq!(flat.neighbors_by_layer.len(), 4);
+        let total_nodes = flat.len();
+        // Layer 1..3 should keep slot maps sized by dense-id, but neighbor payload
+        // should only be allocated for the single high-level member.
+        for layer in 1..=3 {
+            let adj = &flat.neighbors_by_layer[layer];
+            assert_eq!(adj.dense_to_slot.len(), total_nodes);
+            assert_eq!(adj.counts.len(), 1, "layer {} should stay sparse", layer);
+            assert_eq!(
+                adj.neighbors.len(),
+                adj.cap,
+                "layer {} payload should have one slot",
+                layer
+            );
+        }
     }
 
     #[test]

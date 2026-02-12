@@ -561,6 +561,7 @@ impl KyroDBServiceImpl {
     }
 
     /// Reserve vector quota slots atomically before a bulk insert.
+    #[allow(clippy::result_large_err)]
     fn reserve_tenant_vectors(
         &self,
         tenant: Option<&TenantContext>,
