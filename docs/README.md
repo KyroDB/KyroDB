@@ -17,6 +17,7 @@ Complete guide to KyroDB - the fastest vector database for AI workloads.
 3. [**CLI Backup Reference**](CLI_BACKUP_REFERENCE.md) - Quick reference for backup commands
 4. [**Observability**](OBSERVABILITY.md) - Prometheus metrics, Grafana dashboards, alerting
 5. [**Operations Guide**](OPERATIONS.md) - Troubleshooting common issues
+6. [**Robustness Validation**](ROBUSTNESS_VALIDATION.md) - Soak, sanitizer, and ANN FP32 benchmark gates
 
 
 ## For Developers

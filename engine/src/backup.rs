@@ -366,27 +366,21 @@ impl BackupManager {
 
         // Collect files to backup
         let mut files_to_backup = Vec::new();
-        let mut total_size = 0u64;
         let mut vector_count = 0u64;
 
         // Add MANIFEST
         if manifest_path.exists() {
-            let size = fs::metadata(&manifest_path)?.len();
             files_to_backup.push(("MANIFEST".to_string(), manifest_path.clone()));
-            total_size += size;
         }
 
         // Add current snapshot
         if snapshot_number > 0 {
             let snapshot_path = self.data_dir.join(format!("snapshot_{}", snapshot_number));
             if snapshot_path.exists() {
-                let size = fs::metadata(&snapshot_path)?.len();
                 files_to_backup.push((
                     format!("snapshot_{}", snapshot_number),
                     snapshot_path.clone(),
                 ));
-                total_size += size;
-
                 // Vector count not tracked for full backups
                 // Parsing snapshot format would require loading entire file into memory
                 // which defeats the purpose of lightweight backup creation.
@@ -422,12 +416,10 @@ impl BackupManager {
         // Take last 5 WAL files
         for entry in wal_files.iter().rev().take(5) {
             let path = entry.path();
-            let size = fs::metadata(&path)?.len();
             files_to_backup.push((
                 entry.file_name().to_string_lossy().to_string(),
                 path.clone(),
             ));
-            total_size += size;
         }
 
         // Create tar archive
@@ -461,12 +453,15 @@ impl BackupManager {
         writer.flush()?;
         drop(writer);
 
+        // Store the archive byte size so CLI verification can compare against on-disk artifact size.
+        let archive_size = fs::metadata(&backup_path)?.len();
+
         // Create metadata with the same backup_id
         let metadata = BackupMetadata {
             id: backup_id,
             timestamp: backup_timestamp,
             backup_type: BackupType::Full,
-            size_bytes: total_size,
+            size_bytes: archive_size,
             vector_count,
             checksum,
             parent_id: None,
@@ -552,7 +547,6 @@ impl BackupManager {
                 .unwrap_or(0)
         });
 
-        let mut total_size = 0u64;
         let mut checksum = 0u32;
 
         // Create tar archive with WAL files
@@ -580,19 +574,21 @@ impl BackupManager {
             writer.write_all(&(buffer.len() as u64).to_le_bytes())?;
             writer.write_all(&buffer)?;
 
-            total_size += buffer.len() as u64;
             checksum = checksum.wrapping_add(crc32fast::hash(&buffer));
         }
 
         writer.flush()?;
         drop(writer);
 
+        // Store the archive byte size so CLI verification can compare against on-disk artifact size.
+        let archive_size = fs::metadata(&backup_path)?.len();
+
         // Create metadata with the same backup_id
         let metadata = BackupMetadata {
             id: backup_id,
             timestamp: backup_timestamp,
             backup_type: BackupType::Incremental,
-            size_bytes: total_size,
+            size_bytes: archive_size,
             vector_count: 0, // Vector count not tracked in incremental
             checksum,
             parent_id: Some(parent_id),

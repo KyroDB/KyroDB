@@ -1377,8 +1377,6 @@ async fn main() -> Result<()> {
         hnsw_ef_construction: kyrodb_engine::hnsw_index::HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
         hnsw_ef_search: 50,
         hnsw_disable_normalization_check: false,
-        hnsw_ann_search_mode: kyrodb_engine::config::AnnSearchMode::Fp32Strict,
-        hnsw_quantized_rerank_multiplier: 8,
         data_dir: None, // No persistence for validation
         fsync_policy: kyrodb_engine::FsyncPolicy::Never,
         snapshot_interval: 10000,

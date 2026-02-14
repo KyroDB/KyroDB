@@ -28,7 +28,7 @@
 //!        → Background flush reconciles remaining hot-only state (if any)
 //! ```
 
-use crate::config::{AnnSearchMode, DistanceMetric};
+use crate::config::DistanceMetric;
 use crate::proto::MetadataFilter;
 use crate::{
     AccessPatternLogger, CacheStrategy, CachedVector, CircuitBreaker, FsyncPolicy, HnswBackend,
@@ -166,12 +166,6 @@ pub struct TieredEngineConfig {
     /// Disable L2-normalization checks for inner-product vectors (performance opt-out).
     pub hnsw_disable_normalization_check: bool,
 
-    /// ANN search compute mode for cold-tier index traversal.
-    pub hnsw_ann_search_mode: AnnSearchMode,
-
-    /// Candidate expansion multiplier before fp32 rerank in quantized modes.
-    pub hnsw_quantized_rerank_multiplier: usize,
-
     /// Persistence data directory
     pub data_dir: Option<String>,
 
@@ -212,9 +206,6 @@ impl Default for TieredEngineConfig {
             hnsw_ef_construction: crate::hnsw_index::HnswVectorIndex::DEFAULT_EF_CONSTRUCTION,
             hnsw_ef_search: 50,
             hnsw_disable_normalization_check: false,
-            hnsw_ann_search_mode: AnnSearchMode::Fp32Strict,
-            hnsw_quantized_rerank_multiplier:
-                crate::hnsw_index::HnswVectorIndex::DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
             data_dir: None,
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 10_000,
@@ -315,8 +306,6 @@ impl TieredEngine {
                 config.hnsw_m,
                 config.hnsw_ef_construction,
                 config.hnsw_disable_normalization_check,
-                config.hnsw_ann_search_mode,
-                config.hnsw_quantized_rerank_multiplier,
             )?)
         } else {
             // Without persistence (testing only)
@@ -329,8 +318,6 @@ impl TieredEngine {
                 config.hnsw_m,
                 config.hnsw_ef_construction,
                 config.hnsw_disable_normalization_check,
-                config.hnsw_ann_search_mode,
-                config.hnsw_quantized_rerank_multiplier,
             )?)
         };
 
@@ -436,8 +423,6 @@ impl TieredEngine {
             config.hnsw_m,
             config.hnsw_ef_construction,
             config.hnsw_disable_normalization_check,
-            config.hnsw_ann_search_mode,
-            config.hnsw_quantized_rerank_multiplier,
         )?);
 
         // Create fresh hot tier (ephemeral)

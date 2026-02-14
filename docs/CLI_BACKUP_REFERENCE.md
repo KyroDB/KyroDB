@@ -34,15 +34,17 @@ Create a new full or incremental backup.
 
 ```bash
 # Full backup
-./target/release/kyrodb_backup create \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  create \
   --description "Daily backup"
 
 # Incremental backup (requires reference backup ID)
-./target/release/kyrodb_backup create \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  create \
   --incremental \
   --reference 550e8400-e29b-41d4-a716-446655440000 \
   --description "Hourly incremental"
@@ -78,14 +80,16 @@ List all available backups in table or JSON format. The default output format de
 
 ```bash
 # Table format (available with `cli-tools`; default only when built with `cli-tools`)
-./target/release/kyrodb_backup list \
-  --data-dir ./data \
-  --backup-dir ./backups
-
-# JSON format for scripting
-./target/release/kyrodb_backup list \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  list
+
+# JSON format for scripting
+./target/release/kyrodb_backup \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  list \
   --format json
 ```
 
@@ -130,15 +134,17 @@ Restore database from a backup or to a specific point in time.
 export BACKUP_ALLOW_CLEAR=true
 
 # Restore from specific backup
-./target/release/kyrodb_backup restore \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  restore \
   --backup-id 550e8400-e29b-41d4-a716-446655440000
 
 # Point-in-time restore (Unix timestamp)
-./target/release/kyrodb_backup restore \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  restore \
   --point-in-time 1729090200
 
 # With custom directories
@@ -172,9 +178,10 @@ Remove old backups based on retention policy.
 
 ```bash
 # Custom retention policy
-./target/release/kyrodb_backup prune \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  prune \
   --keep-daily 14 \
   --keep-weekly 8 \
   --keep-monthly 12
@@ -206,9 +213,10 @@ Verify backup file integrity and checksum.
 
 ```bash
 # Verify specific backup
-./target/release/kyrodb_backup verify \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  verify \
   550e8400-e29b-41d4-a716-446655440000
 ```
 
@@ -251,15 +259,17 @@ Checksum: 0xABCD1234
 ```bash
 #!/bin/bash
 # Get latest backup ID
-LATEST=$(./target/release/kyrodb_backup list \
+LATEST=$(./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  list \
   --format json | jq -r '.[0].id')
 
 # Create incremental backup
-./target/release/kyrodb_backup create \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  create \
   --incremental \
   --reference "$LATEST" \
   --description "Hourly backup $(date +%H:%M)"
@@ -270,26 +280,30 @@ LATEST=$(./target/release/kyrodb_backup list \
 ```bash
 #!/bin/bash
 # List available backups
-./target/release/kyrodb_backup list \
-  --data-dir ./data \
-  --backup-dir ./backups
-
-# Restore from latest backup
-LATEST=$(./target/release/kyrodb_backup list \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  list
+
+# Restore from latest backup
+LATEST=$(./target/release/kyrodb_backup \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  list \
   --format json | jq -r '.[0].id')
 
 export BACKUP_ALLOW_CLEAR=true
-./target/release/kyrodb_backup restore \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  restore \
   --backup-id "$LATEST"
 
 # Verify restore success
-./target/release/kyrodb_backup verify \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  verify \
   "$LATEST"
 ```
 
@@ -298,9 +312,10 @@ export BACKUP_ALLOW_CLEAR=true
 ```bash
 #!/bin/bash
 # Create pre-upgrade backup
-./target/release/kyrodb_backup create \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  create \
   --description "Pre-upgrade backup v2.0"
 
 # Perform upgrade
@@ -308,16 +323,18 @@ export BACKUP_ALLOW_CLEAR=true
 
 # If upgrade fails, restore
 if [ $? -ne 0 ]; then
-  BACKUP_ID=$(./target/release/kyrodb_backup list \
-    --data-dir ./data \
-    --backup-dir ./backups \
+  BACKUP_ID=$(./target/release/kyrodb_backup \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  list \
     --format json | \
     jq -r '.[] | select(.description | contains("Pre-upgrade")) | .id' | \
     head -1)
   export BACKUP_ALLOW_CLEAR=true
-  ./target/release/kyrodb_backup restore \
-    --data-dir ./data \
-    --backup-dir ./backups \
+  ./target/release/kyrodb_backup \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  restore \
     --backup-id "$BACKUP_ID"
 fi
 ```
@@ -443,9 +460,10 @@ The backup CLI does not emit Prometheus metrics. Use exit codes and periodic ver
 
 ```bash
 # Verify backups exist
-BACKUP_COUNT=$(./target/release/kyrodb_backup list \
+BACKUP_COUNT=$(./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  list \
   --format json | jq 'length')
 if [ "$BACKUP_COUNT" -eq 0 ]; then
   echo "CRITICAL: No backups found"

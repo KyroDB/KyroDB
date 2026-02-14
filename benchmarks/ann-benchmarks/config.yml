@@ -34,11 +34,3 @@ float:
             M: 32
             ef_construction: 600
           query_args: [[128], [256], [512], [768], [1024]]
-
-        ann_sq8_frontier:
-          args:
-            M: 40
-            ef_construction: 800
-            ann_search_mode: sq8-rerank
-            quantized_rerank_multiplier: 8
-          query_args: [[128], [256], [512], [768], [1024], [1536]]

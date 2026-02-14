@@ -3088,8 +3088,6 @@ async fn main() -> anyhow::Result<()> {
         hnsw_m = config.hnsw.m,
         hnsw_ef_construction = config.hnsw.ef_construction,
         hnsw_ef_search = config.hnsw.ef_search,
-        hnsw_ann_search_mode = ?config.hnsw.ann_search_mode,
-        hnsw_quantized_rerank_multiplier = config.hnsw.quantized_rerank_multiplier,
         log_level = log_level,
         "Configuration loaded"
     );
@@ -3121,8 +3119,6 @@ async fn main() -> anyhow::Result<()> {
         hnsw_ef_construction: config.hnsw.ef_construction,
         hnsw_ef_search: config.hnsw.ef_search,
         hnsw_disable_normalization_check: config.hnsw.disable_normalization_check,
-        hnsw_ann_search_mode: config.hnsw.ann_search_mode,
-        hnsw_quantized_rerank_multiplier: config.hnsw.quantized_rerank_multiplier,
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
         fsync_policy,
         snapshot_interval: config.snapshot_interval_mutations(),

@@ -296,6 +296,11 @@ fn test_backup_create_and_verify_checksum() {
     // Verify backup file exists
     let backup_path = backup_dir.join(format!("backup_{}.tar", metadata.id));
     assert!(backup_path.exists());
+    let backup_file_size = fs::metadata(&backup_path).unwrap().len();
+    assert_eq!(
+        backup_file_size, metadata.size_bytes,
+        "metadata size_bytes must match archive byte size"
+    );
 
     // Compute checksum and verify it matches metadata
     let computed_checksum = compute_backup_checksum(&backup_path).unwrap();
@@ -309,6 +314,7 @@ fn test_backup_create_and_verify_checksum() {
         serde_json::from_str(&fs::read_to_string(metadata_path).unwrap()).unwrap();
     assert_eq!(loaded_metadata.id, metadata.id);
     assert_eq!(loaded_metadata.checksum, metadata.checksum);
+    assert_eq!(loaded_metadata.size_bytes, backup_file_size);
 }
 
 /// Test that prune_backups respects min_age_days

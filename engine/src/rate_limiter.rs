@@ -285,7 +285,7 @@ impl Default for RateLimiter {
 mod tests {
     use super::*;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_token_bucket_basic() {
@@ -490,20 +490,30 @@ mod tests {
     fn test_high_qps_precision() {
         let mut bucket = TokenBucket::new(10000); // 10K QPS
 
-        // Consume all tokens
-        for _ in 0..10000 {
-            assert!(bucket.try_consume());
-        }
+        // Start from a deterministic empty state.
+        bucket.tokens = 0.0;
+        bucket.last_refill = Instant::now();
 
-        // Wait 1ms (should refill ~10 tokens)
+        // Measure elapsed time around refill to avoid scheduler-dependent flakiness.
+        // Under sanitizers, the observed elapsed time can be much larger than 1ms.
+        let refill_start = Instant::now();
         thread::sleep(Duration::from_millis(1));
-
+        let elapsed_before = refill_start.elapsed().as_secs_f64();
         let available = bucket.available_tokens();
-        // Allow wider range due to timing variance (OS scheduler, CPU load, etc.)
+        let elapsed_after = refill_start.elapsed().as_secs_f64();
+        let expected_min = (elapsed_before * 10_000.0).min(10_000.0);
+        let expected_max = (elapsed_after * 10_000.0).min(10_000.0);
+        let slack = 5.0;
+
         assert!(
-            (5.0..=30.0).contains(&available),
-            "Expected ~10 tokens, got {}",
-            available
+            available + slack >= expected_min && available <= expected_max + slack,
+            "Expected refill within [{:.3}, {:.3}] (+/- {:.1}) tokens, got {:.3} (elapsed_before={:.6}s elapsed_after={:.6}s)",
+            expected_min,
+            expected_max,
+            slack,
+            available,
+            elapsed_before,
+            elapsed_after
         );
     }
 

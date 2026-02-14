@@ -22,53 +22,61 @@ cargo build --bin kyrodb_backup --release --features cli-tools
 
 ```bash
 # Create full backup (default)
-./target/release/kyrodb_backup create \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  create \
   --description "Daily backup"
 
 # Create incremental backup
-./target/release/kyrodb_backup create \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  create \
   --incremental \
   --reference <PARENT_BACKUP_ID> \
   --description "Hourly incremental"
 
 # List all backups
-./target/release/kyrodb_backup list \
-  --data-dir ./data \
-  --backup-dir ./backups
-
-# List backups in JSON format
-./target/release/kyrodb_backup list \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  list
+
+# List backups in JSON format
+./target/release/kyrodb_backup \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  list \
   --format json
 
 # Restore from backup (DANGEROUS: may clear/overwrite --data-dir)
 export BACKUP_ALLOW_CLEAR=true
-./target/release/kyrodb_backup restore \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  restore \
   --backup-id <BACKUP_ID>
 
 # Restore to specific point in time (Unix timestamp)
-./target/release/kyrodb_backup restore \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  restore \
   --point-in-time <UNIX_TIMESTAMP>
 
 # Verify backup integrity
-./target/release/kyrodb_backup verify \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  verify \
   <BACKUP_ID>
 
 # Prune old backups
-./target/release/kyrodb_backup prune \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  prune \
   --keep-daily 7 \
   --keep-weekly 4 \
   --keep-monthly 6
@@ -151,7 +159,7 @@ systemctl stop kyrodb
 
 ```bash
 export BACKUP_ALLOW_CLEAR=true
-./target/release/kyrodb_backup restore --backup-id <BACKUP_ID> --data-dir ./data --backup-dir ./backups
+./target/release/kyrodb_backup --data-dir ./data --backup-dir ./backups restore --backup-id <BACKUP_ID>
 ```
 
 3. Start KyroDB
@@ -289,9 +297,10 @@ Keep backups organized and storage costs low.
 
 ```bash
 # Custom retention policy
-./target/release/kyrodb_backup prune \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  prune \
   --keep-daily 30 \
   --keep-weekly 12 \
   --keep-monthly 12 \
@@ -354,9 +363,10 @@ Add to crontab:
 
 ```bash
 # Verify backup integrity and checksum
-./target/release/kyrodb_backup verify \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  verify \
   <BACKUP_ID>
 ```
 
@@ -407,9 +417,10 @@ systemctl stop kyrodb
 export BACKUP_ALLOW_CLEAR=true
 
 # 3. Perform restore
-./target/release/kyrodb_backup restore \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  restore \
   --backup-id <BACKUP_ID>
 
 # 4. Start the server
@@ -430,9 +441,10 @@ aws s3 sync ./backups s3://your-bucket/kyrodb-backups/
 aws s3 sync s3://your-bucket/kyrodb-backups/ ./backups
 
 # Then restore locally
-./target/release/kyrodb_backup restore \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  restore \
   --backup-id <BACKUP_ID>
 ```
 
@@ -448,7 +460,7 @@ BACKUP_DIR=/backups
 MAX_AGE_HOURS=26  # Alert if no backup in 26 hours
 
 # Get latest backup timestamp
-LATEST=$(kyrodb_backup list --backup-dir $BACKUP_DIR --format json | \
+LATEST=$(kyrodb_backup --backup-dir $BACKUP_DIR list --format json | \
   jq -r '.[0].timestamp')
 
 NOW=$(date +%s)
@@ -471,9 +483,10 @@ echo "OK: Latest backup is $AGE_HOURS hours old"
 df -h ./backups
 
 # Prune old backups using retention policy
-./target/release/kyrodb_backup prune \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  prune \
   --min-age-days 1
 
 # Or move to cheaper storage
@@ -485,19 +498,22 @@ rm -rf ./backups/*
 
 ```bash
 # Backup may be corrupted - verify it
-./target/release/kyrodb_backup verify \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  verify \
   <BACKUP_ID>
 
 # If corrupted, use previous backup
-./target/release/kyrodb_backup list \
-  --data-dir ./data \
-  --backup-dir ./backups
-
-./target/release/kyrodb_backup restore \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  list
+
+./target/release/kyrodb_backup \
+  --data-dir ./data \
+  --backup-dir ./backups \
+  restore \
   --backup-id <PREVIOUS_BACKUP_ID>
 ```
 
@@ -507,9 +523,10 @@ rm -rf ./backups/*
 # Error: Parent backup not found
 
 # Solution: Create new full backup
-./target/release/kyrodb_backup create \
+./target/release/kyrodb_backup \
   --data-dir ./data \
   --backup-dir ./backups \
+  create \
   --description "New full backup (chain reset)"
 ```
 

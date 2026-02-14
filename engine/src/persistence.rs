@@ -32,6 +32,7 @@ const WAL_MAGIC: u32 = 0x57414C00; // "WAL\0"
 
 /// Snapshot magic number
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
+const SNAPSHOT_VERSION: u32 = 4;
 
 fn unix_timestamp_secs_now() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -581,42 +582,9 @@ pub struct Snapshot {
     ///
     /// This is critical for correctness: building/searching with the wrong metric can destroy recall.
     ///
-    /// `#[serde(default)]` keeps backward compatibility with older snapshots.
-    #[serde(default)]
-    pub distance: Option<crate::config::DistanceMetric>,
-    /// ANN search mode used by the index that produced this snapshot.
-    ///
-    /// Optional for backward compatibility with older snapshots.
-    #[serde(default)]
-    pub ann_search_mode: Option<crate::config::AnnSearchMode>,
-    /// Quantized rerank multiplier used by the index that produced this snapshot.
-    ///
-    /// Optional for backward compatibility with older snapshots.
-    #[serde(default)]
-    pub quantized_rerank_multiplier: Option<usize>,
+    pub distance: crate::config::DistanceMetric,
     /// Last WAL sequence number included in this snapshot.
-    /// `#[serde(default)]` keeps backward compatibility with older snapshots.
-    #[serde(default)]
     pub last_wal_seq: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct LegacySnapshotV1 {
-    pub version: u32,
-    pub timestamp: u64,
-    pub doc_count: usize,
-    pub dimension: usize,
-    pub documents: Vec<(u64, Vec<f32>)>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct LegacySnapshotV2 {
-    pub version: u32,
-    pub timestamp: u64,
-    pub doc_count: usize,
-    pub dimension: usize,
-    pub documents: Vec<(u64, Vec<f32>)>,
-    pub metadata: Vec<(u64, HashMap<String, String>)>,
 }
 
 impl Snapshot {
@@ -628,36 +596,14 @@ impl Snapshot {
         metadata: Vec<(u64, HashMap<String, String>)>,
         last_wal_seq: u64,
     ) -> Result<Self> {
-        Self::new_with_ann_config(
-            dimension,
-            distance,
-            crate::config::AnnSearchMode::Fp32Strict,
-            8,
-            documents,
-            metadata,
-            last_wal_seq,
-        )
-    }
-
-    pub fn new_with_ann_config(
-        dimension: usize,
-        distance: crate::config::DistanceMetric,
-        ann_search_mode: crate::config::AnnSearchMode,
-        quantized_rerank_multiplier: usize,
-        documents: Vec<(u64, Vec<f32>)>,
-        metadata: Vec<(u64, HashMap<String, String>)>,
-        last_wal_seq: u64,
-    ) -> Result<Self> {
         let timestamp = unix_timestamp_secs_now();
 
         let mut snapshot = Self {
-            version: 3, // WAL sequence tracking
+            version: SNAPSHOT_VERSION,
             timestamp,
             doc_count: documents.len(),
             dimension,
-            distance: Some(distance),
-            ann_search_mode: Some(ann_search_mode),
-            quantized_rerank_multiplier: Some(quantized_rerank_multiplier),
+            distance,
             documents,
             metadata,
             last_wal_seq,
@@ -748,58 +694,18 @@ impl Snapshot {
         }
 
         // Deserialize
-        let mut snapshot = match bincode::deserialize::<Snapshot>(&snapshot_bytes) {
-            Ok(snapshot) => snapshot,
-            Err(primary_err) => match bincode::deserialize::<LegacySnapshotV2>(&snapshot_bytes) {
-                Ok(legacy) => Snapshot::from_legacy_v2(legacy),
-                Err(_) => match bincode::deserialize::<LegacySnapshotV1>(&snapshot_bytes) {
-                    Ok(legacy) => {
-                        warn!(
-                            "Loaded legacy snapshot v1 without metadata; upgrading in-memory representation"
-                        );
-                        Snapshot::from_legacy(legacy)
-                    }
-                    Err(_) => {
-                        return Err(primary_err).context("Failed to deserialize snapshot");
-                    }
-                },
-            },
-        };
+        let mut snapshot: Snapshot =
+            bincode::deserialize(&snapshot_bytes).context("Failed to deserialize snapshot")?;
+
+        if snapshot.version != SNAPSHOT_VERSION {
+            bail!(
+                "Unsupported snapshot version {} (expected {}). Remove stale snapshots and restart.",
+                snapshot.version,
+                SNAPSHOT_VERSION
+            );
+        }
 
         snapshot.validate_and_normalize()?;
-        if snapshot.distance.is_none() {
-            let assumed = crate::config::DistanceMetric::default();
-            warn!(
-                snapshot = %path.display(),
-                version = snapshot.version,
-                timestamp = snapshot.timestamp,
-                assumed_distance = ?assumed,
-                "Snapshot missing distance metric; assuming default. Verify metric to avoid incorrect search results."
-            );
-            snapshot.distance = Some(assumed);
-        }
-        if snapshot.ann_search_mode.is_none() {
-            let assumed = crate::config::AnnSearchMode::Fp32Strict;
-            warn!(
-                snapshot = %path.display(),
-                version = snapshot.version,
-                timestamp = snapshot.timestamp,
-                assumed_ann_search_mode = ?assumed,
-                "Snapshot missing ann_search_mode; assuming fp32_strict."
-            );
-            snapshot.ann_search_mode = Some(assumed);
-        }
-        if snapshot.quantized_rerank_multiplier.is_none() {
-            warn!(
-                snapshot = %path.display(),
-                version = snapshot.version,
-                timestamp = snapshot.timestamp,
-                assumed_quantized_rerank_multiplier = 8usize,
-                "Snapshot missing quantized_rerank_multiplier; assuming 8."
-            );
-            snapshot.quantized_rerank_multiplier = Some(8);
-        }
-
         Ok(snapshot)
     }
 
@@ -945,15 +851,6 @@ impl Snapshot {
             }
         }
 
-        if let Some(multiplier) = self.quantized_rerank_multiplier {
-            if !(1..=64).contains(&multiplier) {
-                bail!(
-                    "Snapshot quantized_rerank_multiplier must be in [1, 64], found {}",
-                    multiplier
-                );
-            }
-        }
-
         Self::validate_alignment(&self.documents, &self.metadata)?;
 
         Ok(())
@@ -992,42 +889,6 @@ impl Snapshot {
         }
 
         Ok(())
-    }
-
-    fn from_legacy(legacy: LegacySnapshotV1) -> Self {
-        let metadata = legacy
-            .documents
-            .iter()
-            .map(|(doc_id, _)| (*doc_id, HashMap::new()))
-            .collect();
-
-        Self {
-            version: 3,
-            timestamp: legacy.timestamp,
-            doc_count: legacy.documents.len(),
-            dimension: legacy.dimension,
-            documents: legacy.documents,
-            metadata,
-            distance: None,
-            ann_search_mode: None,
-            quantized_rerank_multiplier: None,
-            last_wal_seq: 0,
-        }
-    }
-
-    fn from_legacy_v2(legacy: LegacySnapshotV2) -> Self {
-        Self {
-            version: 3,
-            timestamp: legacy.timestamp,
-            doc_count: legacy.documents.len(),
-            dimension: legacy.dimension,
-            documents: legacy.documents,
-            metadata: legacy.metadata,
-            distance: None,
-            ann_search_mode: None,
-            quantized_rerank_multiplier: None,
-            last_wal_seq: 0,
-        }
     }
 }
 
@@ -1172,6 +1033,32 @@ mod tests {
         assert_eq!(loaded.doc_count, 2);
         assert_eq!(loaded.documents.len(), 2);
         assert_eq!(loaded.documents[0].0, 1);
+    }
+
+    #[test]
+    fn test_snapshot_rejects_unsupported_version() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("unsupported.snapshot");
+
+        let documents = vec![(1, vec![0.1, 0.2])];
+        let metadata = vec![(1, HashMap::new())];
+        let mut snapshot = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            documents,
+            metadata,
+            11,
+        )
+        .unwrap();
+        snapshot.version = SNAPSHOT_VERSION - 1;
+        snapshot.save(&snapshot_path).unwrap();
+
+        let err = Snapshot::load(&snapshot_path).unwrap_err().to_string();
+        assert!(
+            err.contains("Unsupported snapshot version"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]

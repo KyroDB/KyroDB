@@ -17,10 +17,45 @@ fn embedding_for(seed: u64, dim: usize) -> Vec<f32> {
     out
 }
 
+struct MixedWorkloadProfile {
+    initial_docs: u64,
+    search_rounds: usize,
+    queries_per_round: usize,
+    write_ops: u64,
+    ef_search: usize,
+    write_lock_timeout: Duration,
+    overall_timeout: Duration,
+}
+
+fn mixed_workload_profile() -> MixedWorkloadProfile {
+    match std::env::var("KYRODB_SANITIZER").as_deref() {
+        // Thread sanitizer is significantly slower; keep the workload concurrent but bounded.
+        Ok("thread") => MixedWorkloadProfile {
+            initial_docs: 1_200,
+            search_rounds: 72,
+            queries_per_round: 16,
+            write_ops: 220,
+            ef_search: 96,
+            write_lock_timeout: Duration::from_secs(6),
+            overall_timeout: Duration::from_secs(360),
+        },
+        _ => MixedWorkloadProfile {
+            initial_docs: 3_000,
+            search_rounds: 150,
+            queries_per_round: 32,
+            write_ops: 400,
+            ef_search: 128,
+            write_lock_timeout: Duration::from_secs(2),
+            overall_timeout: Duration::from_secs(90),
+        },
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_bulk_search_and_writes_complete_without_deadlock() {
     let temp_dir = TempDir::new().unwrap();
     let dim = 32usize;
+    let profile = mixed_workload_profile();
 
     let config = TieredEngineConfig {
         data_dir: Some(temp_dir.path().to_string_lossy().to_string()),
@@ -38,7 +73,7 @@ async fn mixed_bulk_search_and_writes_complete_without_deadlock() {
     )
     .unwrap();
 
-    for doc_id in 0..3000u64 {
+    for doc_id in 0..profile.initial_docs {
         let mut metadata = HashMap::new();
         metadata.insert("seed".to_string(), doc_id.to_string());
         engine
@@ -50,10 +85,10 @@ async fn mixed_bulk_search_and_writes_complete_without_deadlock() {
 
     let search_engine = Arc::clone(&engine);
     let search_task = tokio::spawn(async move {
-        for round in 0..150usize {
-            let mut queries = Vec::with_capacity(32);
-            for q in 0..32usize {
-                let id = ((round * 32 + q) % 3000) as u64;
+        for round in 0..profile.search_rounds {
+            let mut queries = Vec::with_capacity(profile.queries_per_round);
+            for q in 0..profile.queries_per_round {
+                let id = ((round * profile.queries_per_round + q) as u64) % profile.initial_docs;
                 queries.push(embedding_for(id, dim));
             }
 
@@ -62,7 +97,7 @@ async fn mixed_bulk_search_and_writes_complete_without_deadlock() {
                 .knn_search_batch_with_ef_detailed_scoped(
                     &queries,
                     10,
-                    Some(128),
+                    Some(profile.ef_search),
                     u64::from((round % 13) as u32),
                 )
                 .unwrap();
@@ -75,12 +110,12 @@ async fn mixed_bulk_search_and_writes_complete_without_deadlock() {
 
     let write_engine = Arc::clone(&engine);
     let write_task = tokio::spawn(async move {
-        for i in 0..400u64 {
+        for i in 0..profile.write_ops {
             let mut metadata = HashMap::new();
             metadata.insert("writer".to_string(), "true".to_string());
             metadata.insert("seq".to_string(), i.to_string());
 
-            let guard = tokio::time::timeout(Duration::from_secs(2), write_engine.write())
+            let guard = tokio::time::timeout(profile.write_lock_timeout, write_engine.write())
                 .await
                 .expect("timed out acquiring write lock under mixed workload");
             guard
@@ -94,7 +129,7 @@ async fn mixed_bulk_search_and_writes_complete_without_deadlock() {
         }
     });
 
-    tokio::time::timeout(Duration::from_secs(90), async {
+    tokio::time::timeout(profile.overall_timeout, async {
         search_task.await.unwrap();
         write_task.await.unwrap();
     })

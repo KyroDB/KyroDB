@@ -59,7 +59,6 @@ pub mod adaptive_oversampling;
 
 // ANN backend abstraction (internal)
 pub(crate) mod ann_backend;
-pub(crate) mod ann_quant;
 
 // SIMD-accelerated vector math (runtime-dispatched, safe fallback)
 pub(crate) mod simd;
@@ -197,7 +196,7 @@ pub use metrics::{ErrorCategory, HealthStatus, MetricsCollector, SloStatus, SloT
 
 // Configuration components
 pub use config::{
-    AnnSearchMode, AuthConfig, CacheConfig, CacheStrategy as ConfigCacheStrategy, DistanceMetric,
+    AuthConfig, CacheConfig, CacheStrategy as ConfigCacheStrategy, DistanceMetric,
     FsyncPolicy as ConfigFsyncPolicy, HnswConfig, KyroDbConfig, LogFormat, LogLevel, LoggingConfig,
     PersistenceConfig, RateLimitConfig, ServerConfig, SloConfig,
 };

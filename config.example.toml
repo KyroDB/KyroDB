@@ -138,15 +138,6 @@ distance = "cosine"
 # Disable L2-normalization checks for inner-product vectors (performance opt-out)
 disable_normalization_check = false
 
-# ANN search compute mode:
-# - "fp32_strict": full-precision traversal
-# - "sq8_rerank": SQ8 approximate traversal + fp32 rerank
-ann_search_mode = "fp32_strict"
-
-# Candidate expansion factor before fp32 rerank in quantized modes.
-# Effective rerank candidates = k * quantized_rerank_multiplier.
-quantized_rerank_multiplier = 8
-
 # Persistence Configuration (WAL + Snapshots)
 [persistence]
 # Data directory for WAL and snapshots

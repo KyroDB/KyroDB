@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use crate::ann_backend::{create_default_backend, AnnBackend};
-use crate::config::{AnnSearchMode, DistanceMetric};
+use crate::config::DistanceMetric;
 
 const NORMALIZATION_NORM_SQ_MIN: f32 = 0.98;
 const NORMALIZATION_NORM_SQ_MAX: f32 = 1.02;
@@ -42,14 +42,11 @@ pub struct HnswVectorIndex {
     m: usize,
     ef_construction: usize,
     disable_normalization_check: bool,
-    ann_search_mode: AnnSearchMode,
-    quantized_rerank_multiplier: usize,
 }
 
 impl HnswVectorIndex {
     pub const DEFAULT_M: usize = 16;
     pub const DEFAULT_EF_CONSTRUCTION: usize = 200;
-    pub const DEFAULT_QUANTIZED_RERANK_MULTIPLIER: usize = 8;
 
     fn compute_max_layer(max_elements: usize, m: usize) -> usize {
         let m_for_layers = m.max(2) as f64;
@@ -104,29 +101,6 @@ impl HnswVectorIndex {
         ef_construction: usize,
         disable_normalization_check: bool,
     ) -> Result<Self> {
-        Self::new_with_params_and_search_mode(
-            dimension,
-            max_elements,
-            distance,
-            m,
-            ef_construction,
-            disable_normalization_check,
-            AnnSearchMode::Fp32Strict,
-            Self::DEFAULT_QUANTIZED_RERANK_MULTIPLIER,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_params_and_search_mode(
-        dimension: usize,
-        max_elements: usize,
-        distance: DistanceMetric,
-        m: usize,
-        ef_construction: usize,
-        disable_normalization_check: bool,
-        ann_search_mode: AnnSearchMode,
-        quantized_rerank_multiplier: usize,
-    ) -> Result<Self> {
         if dimension == 0 {
             anyhow::bail!("dimension must be > 0");
         }
@@ -139,12 +113,6 @@ impl HnswVectorIndex {
         if ef_construction == 0 {
             anyhow::bail!("HNSW ef_construction must be > 0");
         }
-        if !(1..=64).contains(&quantized_rerank_multiplier) {
-            anyhow::bail!(
-                "quantized_rerank_multiplier must be in [1, 64], got {}",
-                quantized_rerank_multiplier
-            );
-        }
 
         // Calculate max_layer using HNSW scaling: O(log_M(N)).
         // This avoids over-allocating upper graph layers for high-M indexes.
@@ -152,15 +120,7 @@ impl HnswVectorIndex {
 
         // KyroDB default ANN backend. Isolated behind a trait so we can replace
         // the implementation without changing higher-level engine behavior.
-        let backend = create_default_backend(
-            distance,
-            m,
-            max_elements,
-            max_layer,
-            ef_construction,
-            ann_search_mode,
-            quantized_rerank_multiplier,
-        );
+        let backend = create_default_backend(distance, m, max_elements, max_layer, ef_construction);
         let backend_name = backend.name();
 
         Ok(Self {
@@ -173,8 +133,6 @@ impl HnswVectorIndex {
             m,
             ef_construction,
             disable_normalization_check,
-            ann_search_mode,
-            quantized_rerank_multiplier,
         })
     }
 
@@ -421,14 +379,6 @@ impl HnswVectorIndex {
 
     pub fn backend_name(&self) -> &'static str {
         self.backend_name
-    }
-
-    pub fn ann_search_mode(&self) -> AnnSearchMode {
-        self.ann_search_mode
-    }
-
-    pub fn quantized_rerank_multiplier(&self) -> usize {
-        self.quantized_rerank_multiplier
     }
 
     /// Estimate backend memory usage for the active ANN engine layout.

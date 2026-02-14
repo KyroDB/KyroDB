@@ -27,8 +27,6 @@ class Candidate:
     dataset: str
     source_json: str
     ann_backend: str
-    ann_search_mode: str
-    quantized_rerank_multiplier: int
     distance: str
     k: int
     m: int
@@ -122,10 +120,6 @@ def load_candidates(paths: Iterable[Path]) -> tuple[List[Candidate], List[Dict[s
                         dataset=str(dataset),
                         source_json=str(path),
                         ann_backend=str(config.get("ann_backend", "unknown")),
-                        ann_search_mode=str(config.get("ann_search_mode", "unknown")),
-                        quantized_rerank_multiplier=int(
-                            config.get("quantized_rerank_multiplier", 0)
-                        ),
                         distance=str(config["distance"]),
                         k=int(config["k"]),
                         m=int(config["m"]),

@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use kyrodb_engine::config::{AnnSearchMode, DistanceMetric};
+use kyrodb_engine::config::DistanceMetric;
 use kyrodb_engine::hnsw_index::{HnswVectorIndex, SearchResult};
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const ANN_BIN_MAGIC: &[u8; 8] = b"KYROANN1";
 
@@ -23,21 +23,6 @@ impl From<DistanceArg> for DistanceMetric {
             DistanceArg::Cosine => DistanceMetric::Cosine,
             DistanceArg::Euclidean => DistanceMetric::Euclidean,
             DistanceArg::InnerProduct => DistanceMetric::InnerProduct,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum AnnSearchModeArg {
-    Fp32Strict,
-    Sq8Rerank,
-}
-
-impl From<AnnSearchModeArg> for AnnSearchMode {
-    fn from(value: AnnSearchModeArg) -> Self {
-        match value {
-            AnnSearchModeArg::Fp32Strict => AnnSearchMode::Fp32Strict,
-            AnnSearchModeArg::Sq8Rerank => AnnSearchMode::Sq8Rerank,
         }
     }
 }
@@ -89,12 +74,6 @@ struct Args {
     #[arg(long, default_value_t = false)]
     disable_normalization_check: bool,
 
-    #[arg(long, value_enum, default_value_t = AnnSearchModeArg::Fp32Strict)]
-    ann_search_mode: AnnSearchModeArg,
-
-    #[arg(long, default_value_t = 8)]
-    quantized_rerank_multiplier: usize,
-
     #[arg(long, value_name = "FILE")]
     output_json: Option<PathBuf>,
 }
@@ -133,8 +112,6 @@ struct DatasetSummary {
 #[derive(Debug, Serialize)]
 struct RunConfig {
     ann_backend: String,
-    ann_search_mode: String,
-    quantized_rerank_multiplier: usize,
     distance: String,
     k: usize,
     m: usize,
@@ -249,11 +226,9 @@ fn main() -> Result<()> {
     }
 
     eprintln!(
-        "inproc config: dataset={} distance={:?} mode={:?} rerank_mult={} train={} queries={} dim={} k={} m={} ef_construction={} ef_search={:?}",
+        "inproc config: dataset={} distance={:?} train={} queries={} dim={} k={} m={} ef_construction={} ef_search={:?}",
         dataset_name,
         distance,
-        args.ann_search_mode,
-        args.quantized_rerank_multiplier,
         dataset.train_rows,
         dataset.test_rows,
         dataset.dimension,
@@ -263,16 +238,13 @@ fn main() -> Result<()> {
         args.ef_search
     );
 
-    let ann_search_mode: AnnSearchMode = args.ann_search_mode.into();
-    let mut index = HnswVectorIndex::new_with_params_and_search_mode(
+    let mut index = HnswVectorIndex::new_with_params(
         dataset.dimension,
         dataset.train_rows,
         distance,
         args.m,
         args.ef_construction,
         args.disable_normalization_check,
-        ann_search_mode,
-        args.quantized_rerank_multiplier,
     )
     .context("failed to create HNSW index")?;
 
@@ -335,8 +307,6 @@ fn main() -> Result<()> {
         },
         config: RunConfig {
             ann_backend: index.backend_name().to_string(),
-            ann_search_mode: format!("{:?}", ann_search_mode).to_lowercase(),
-            quantized_rerank_multiplier: args.quantized_rerank_multiplier,
             distance: format!("{:?}", distance).to_lowercase(),
             k: args.k,
             m: args.m,
@@ -577,6 +547,10 @@ fn run_sweep(
     repetitions: usize,
     warmup_queries: usize,
 ) -> Result<SweepResult> {
+    let prepared_ground_truth: Vec<Option<Vec<u32>>> = (0..dataset.test_rows)
+        .map(|q_idx| prepare_ground_truth_row(dataset.neighbors_row(q_idx), k, dataset.train_rows))
+        .collect();
+
     let warmup_count = warmup_queries.min(dataset.test_rows);
     for q_idx in 0..warmup_count {
         let _ = index.knn_search_with_ef(dataset.test_row(q_idx), k, Some(ef_search))?;
@@ -586,26 +560,22 @@ fn run_sweep(
 
     for _ in 0..repetitions {
         let mut latencies_ns = Vec::with_capacity(dataset.test_rows);
-        let mut query_results = Vec::with_capacity(dataset.test_rows);
-        let search_start = Instant::now();
-
-        for q_idx in 0..dataset.test_rows {
-            let query = dataset.test_row(q_idx);
-            let start = Instant::now();
-            let results = index.knn_search_with_ef(query, k, Some(ef_search))?;
-            latencies_ns.push(start.elapsed().as_nanos() as u64);
-            query_results.push(results);
-        }
-        let search_elapsed = search_start.elapsed();
-
-        let evaluation_start = Instant::now();
+        let mut total_search_ns: u128 = 0;
+        let mut evaluation_elapsed = Duration::ZERO;
         let mut recall_sum = 0.0;
         let mut recall_count = 0usize;
         let mut filtered_ground_truth_queries = 0usize;
 
-        for (q_idx, results) in query_results.iter().enumerate() {
-            let gt_row = dataset.neighbors_row(q_idx);
-            match recall_at_k(results, gt_row, k, dataset.train_rows) {
+        for (q_idx, prepared_gt) in prepared_ground_truth.iter().enumerate() {
+            let query = dataset.test_row(q_idx);
+            let start = Instant::now();
+            let results = index.knn_search_with_ef(query, k, Some(ef_search))?;
+            let elapsed_ns = start.elapsed().as_nanos();
+            total_search_ns += elapsed_ns;
+            latencies_ns.push(elapsed_ns as u64);
+
+            let eval_start = Instant::now();
+            match recall_at_k_prepared(&results, prepared_gt.as_deref()) {
                 Some(r) => {
                     recall_sum += r;
                     recall_count += 1;
@@ -614,10 +584,10 @@ fn run_sweep(
                     filtered_ground_truth_queries += 1;
                 }
             }
+            evaluation_elapsed += eval_start.elapsed();
         }
-        let evaluation_elapsed = evaluation_start.elapsed();
 
-        let search_elapsed_secs = search_elapsed.as_secs_f64();
+        let search_elapsed_secs = total_search_ns as f64 / 1_000_000_000.0;
         let end_to_end_elapsed_secs = search_elapsed_secs + evaluation_elapsed.as_secs_f64();
         let measured = dataset.test_rows;
         let qps_search = if search_elapsed_secs > 0.0 {
@@ -702,12 +672,11 @@ fn run_sweep(
     })
 }
 
-fn recall_at_k(
-    results: &[SearchResult],
+fn prepare_ground_truth_row(
     ground_truth: &[u32],
     k: usize,
     max_train_rows: usize,
-) -> Option<f64> {
+) -> Option<Vec<u32>> {
     let mut gt: Vec<u32> = Vec::with_capacity(k);
     for &id in ground_truth {
         if (id as usize) < max_train_rows {
@@ -723,9 +692,19 @@ fn recall_at_k(
     }
 
     gt.sort_unstable();
+    Some(gt)
+}
 
+fn recall_at_k_prepared(
+    results: &[SearchResult],
+    prepared_ground_truth: Option<&[u32]>,
+) -> Option<f64> {
+    let gt = prepared_ground_truth?;
     let mut hits = 0usize;
-    for result in results.iter().take(k) {
+    // Evaluate all returned top-k candidates. Ground truth may contain fewer than k entries
+    // after train-row filtering (e.g., max_train truncation), so limiting by gt.len() would
+    // under-count valid hits ranked after that prefix.
+    for result in results {
         let id_u32 = match u32::try_from(result.doc_id) {
             Ok(v) => v,
             Err(_) => continue,
@@ -734,7 +713,6 @@ fn recall_at_k(
             hits += 1;
         }
     }
-
     Some(hits as f64 / gt.len() as f64)
 }
 
@@ -849,5 +827,39 @@ mod tests {
 
         assert_eq!(sweep.aggregate.qps_mean, rep.qps_search);
         assert_eq!(sweep.aggregate.end_to_end_qps_mean, rep.qps_end_to_end);
+    }
+
+    #[test]
+    fn recall_prepared_counts_hits_across_all_returned_top_k_results() {
+        let results = vec![
+            SearchResult {
+                doc_id: 10,
+                distance: 0.1,
+            },
+            SearchResult {
+                doc_id: 11,
+                distance: 0.2,
+            },
+            SearchResult {
+                doc_id: 12,
+                distance: 0.3,
+            },
+            SearchResult {
+                doc_id: 13,
+                distance: 0.4,
+            },
+            SearchResult {
+                doc_id: 14,
+                distance: 0.5,
+            },
+        ];
+        // Prepared GT shorter than k (common with max_train truncation).
+        let gt = vec![13_u32, 14_u32];
+
+        let recall = recall_at_k_prepared(&results, Some(&gt)).expect("recall");
+        assert!(
+            (recall - 1.0).abs() < f64::EPSILON,
+            "expected full recall when both GT ids appear in top-k"
+        );
     }
 }

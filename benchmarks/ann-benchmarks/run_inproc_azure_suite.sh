@@ -15,6 +15,7 @@ DATASETS="${DEFAULT_DATASETS}"
 DATA_DIR="${REPO_ROOT}/benchmarks/data"
 OUT_ROOT="${REPO_ROOT}/target/ann_inproc"
 RUN_LABEL=""
+RUN_ID_OVERRIDE=""
 
 M_VALUES="${DEFAULT_M_VALUES}"
 EF_CONSTRUCTION_VALUES="${DEFAULT_EF_CONSTRUCTION_VALUES}"
@@ -26,8 +27,6 @@ REPETITIONS=3
 WARMUP_QUERIES=200
 MAX_TRAIN=0
 MAX_QUERIES=0
-ANN_SEARCH_MODE="fp32-strict"
-QUANTIZED_RERANK_MULTIPLIER=8
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 THREADS=""
@@ -36,7 +35,10 @@ SKIP_BUILD=0
 SKIP_DOWNLOAD=0
 FORCE_RECONVERT=0
 NO_SUMMARY=0
+NO_PLOTS=0
 CHECK_GATES=0
+ALLOW_MISSING_GATE_DATASETS=0
+RESUME=0
 
 usage() {
   cat <<'USAGE'
@@ -50,6 +52,7 @@ Options:
   --data-dir PATH             Dataset directory (default: benchmarks/data)
   --out-root PATH             Output root (default: target/ann_inproc)
   --run-label STRING          Label prefix for run directory name
+  --run-id STRING             Fixed run directory id (no timestamp suffix)
   --m-values CSV              HNSW M sweep (default: 24,32,40,48,56,64,72,80)
   --ef-construction-values CSV
                               HNSW ef_construction sweep (default: 200,400,600,800,1000,1200,1600)
@@ -60,16 +63,17 @@ Options:
   --warmup-queries INT        Warmup queries per sweep (default: 200)
   --max-train INT             Optional train truncation at benchmark-time (default: 0 = full)
   --max-queries INT           Optional query truncation at benchmark-time (default: 0 = full)
-  --ann-search-mode MODE      ANN search mode: fp32-strict|sq8-rerank (default: fp32-strict)
-  --quantized-rerank-multiplier INT
-                              Candidate expansion factor before fp32 rerank in quantized modes (default: 8)
   --threads INT               Export RAYON_NUM_THREADS for run reproducibility
   --python BIN                Python executable (default: python3 or PYTHON_BIN env)
   --skip-build                Skip cargo build
   --skip-download             Do not download missing HDF5 datasets
   --force-reconvert           Re-run HDF5 -> ANNBIN conversion even if ANNBIN exists
+  --resume                    Reuse existing run dir and skip completed shard JSON outputs
   --no-summary                Skip summary generation
+  --no-plots                  Skip plot generation from summary/candidate outputs
   --check-gates              Run acceptance-gate validation on summary outputs
+  --allow-missing-gate-datasets
+                              Allow gate checks to pass when some datasets/targets are absent
   -h, --help                  Show help
 USAGE
 }
@@ -137,12 +141,19 @@ require_arg() {
   fi
 }
 
+is_valid_json_file() {
+  local path="$1"
+  "${PYTHON_BIN}" -c 'import json,sys; json.load(open(sys.argv[1], "r", encoding="utf-8"))' \
+    "$path" >/dev/null 2>&1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --datasets) require_arg "$1" "${2-}"; DATASETS="$2"; shift 2 ;;
     --data-dir) require_arg "$1" "${2-}"; DATA_DIR="$2"; shift 2 ;;
     --out-root) require_arg "$1" "${2-}"; OUT_ROOT="$2"; shift 2 ;;
     --run-label) require_arg "$1" "${2-}"; RUN_LABEL="$2"; shift 2 ;;
+    --run-id) require_arg "$1" "${2-}"; RUN_ID_OVERRIDE="$2"; shift 2 ;;
     --m-values) require_arg "$1" "${2-}"; M_VALUES="$2"; shift 2 ;;
     --ef-construction-values) require_arg "$1" "${2-}"; EF_CONSTRUCTION_VALUES="$2"; shift 2 ;;
     --ef-search-values) require_arg "$1" "${2-}"; EF_SEARCH_VALUES="$2"; shift 2 ;;
@@ -152,15 +163,16 @@ while [[ $# -gt 0 ]]; do
     --warmup-queries) require_arg "$1" "${2-}"; WARMUP_QUERIES="$2"; shift 2 ;;
     --max-train) require_arg "$1" "${2-}"; MAX_TRAIN="$2"; shift 2 ;;
     --max-queries) require_arg "$1" "${2-}"; MAX_QUERIES="$2"; shift 2 ;;
-    --ann-search-mode) require_arg "$1" "${2-}"; ANN_SEARCH_MODE="$2"; shift 2 ;;
-    --quantized-rerank-multiplier) require_arg "$1" "${2-}"; QUANTIZED_RERANK_MULTIPLIER="$2"; shift 2 ;;
     --threads) require_arg "$1" "${2-}"; THREADS="$2"; shift 2 ;;
     --python) require_arg "$1" "${2-}"; PYTHON_BIN="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-download) SKIP_DOWNLOAD=1; shift ;;
     --force-reconvert) FORCE_RECONVERT=1; shift ;;
+    --resume) RESUME=1; shift ;;
     --no-summary) NO_SUMMARY=1; shift ;;
+    --no-plots) NO_PLOTS=1; shift ;;
     --check-gates) CHECK_GATES=1; shift ;;
+    --allow-missing-gate-datasets) ALLOW_MISSING_GATE_DATASETS=1; shift ;;
     -h|--help)
       usage
       exit 0
@@ -181,6 +193,7 @@ BENCH_BIN="${REPO_ROOT}/target/release/ann_inproc_bench"
 CONVERTER="${REPO_ROOT}/benchmarks/ann-benchmarks/export_ann_hdf5_to_annbin.py"
 SUMMARIZER="${REPO_ROOT}/benchmarks/ann-benchmarks/summarize_inproc_results.py"
 GATE_CHECKER="${REPO_ROOT}/benchmarks/ann-benchmarks/check_frontier_gates.py"
+PLOTTER="${REPO_ROOT}/benchmarks/ann-benchmarks/render_inproc_plots.py"
 
 if [[ ! -f "${CONVERTER}" ]]; then
   echo "missing converter script: ${CONVERTER}" >&2
@@ -195,20 +208,6 @@ fi
 if [[ ! -x "${BENCH_BIN}" ]]; then
   echo "benchmark binary not found: ${BENCH_BIN}" >&2
   exit 1
-fi
-
-BENCH_HELP="$("${BENCH_BIN}" --help 2>&1 || true)"
-BENCH_SUPPORTS_ANN_MODE=0
-if printf '%s\n' "${BENCH_HELP}" | grep -q -- "--ann-search-mode"; then
-  BENCH_SUPPORTS_ANN_MODE=1
-fi
-
-if [[ "${BENCH_SUPPORTS_ANN_MODE}" -eq 0 ]]; then
-  if [[ "${ANN_SEARCH_MODE}" != "fp32-strict" || "${QUANTIZED_RERANK_MULTIPLIER}" != "8" ]]; then
-    echo "selected ann-search-mode/quantized-rerank-multiplier require a newer ann_inproc_bench binary" >&2
-    echo "rebuild without --skip-build, or use defaults: --ann-search-mode fp32-strict --quantized-rerank-multiplier 8" >&2
-    exit 1
-  fi
 fi
 
 if [[ -n "${THREADS}" ]]; then
@@ -230,20 +229,33 @@ for value in "${M_LIST[@]}" "${EFC_LIST[@]}"; do
 done
 
 if [[ ! "${K}" =~ ^[0-9]+$ ]] || [[ ! "${REPETITIONS}" =~ ^[0-9]+$ ]] || [[ ! "${WARMUP_QUERIES}" =~ ^[0-9]+$ ]] || [[ ! "${MAX_TRAIN}" =~ ^[0-9]+$ ]] || [[ ! "${MAX_QUERIES}" =~ ^[0-9]+$ ]]; then
-  echo "k/repetitions/warmup-queries/max-train/max-queries must be integers >= 0" >&2
+  echo "k/repetitions/warmup-queries/max-train/max-queries must be integers" >&2
   exit 1
 fi
-if [[ ! "${QUANTIZED_RERANK_MULTIPLIER}" =~ ^[0-9]+$ ]]; then
-  echo "quantized-rerank-multiplier must be an integer >= 0" >&2
+if [[ -n "${THREADS}" ]] && [[ ! "${THREADS}" =~ ^[0-9]+$ ]]; then
+  echo "threads must be an integer >= 1" >&2
   exit 1
 fi
-if [[ "${ANN_SEARCH_MODE}" != "fp32-strict" && "${ANN_SEARCH_MODE}" != "sq8-rerank" ]]; then
-  echo "ann-search-mode must be one of: fp32-strict, sq8-rerank" >&2
+if [[ "${K}" -lt 1 ]] || [[ "${REPETITIONS}" -lt 1 ]]; then
+  echo "k and repetitions must be >= 1" >&2
   exit 1
 fi
-
+if [[ "${WARMUP_QUERIES}" -lt 0 ]] || [[ "${MAX_TRAIN}" -lt 0 ]] || [[ "${MAX_QUERIES}" -lt 0 ]]; then
+  echo "warmup-queries/max-train/max-queries must be >= 0" >&2
+  exit 1
+fi
+if [[ -n "${THREADS}" ]] && [[ "${THREADS}" -lt 1 ]]; then
+  echo "threads must be >= 1" >&2
+  exit 1
+fi
+if [[ "${RESUME}" -eq 1 ]] && [[ -z "${RUN_ID_OVERRIDE}" ]]; then
+  echo "--resume requires --run-id so the script can target an existing run directory" >&2
+  exit 1
+fi
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
-if [[ -n "${RUN_LABEL}" ]]; then
+if [[ -n "${RUN_ID_OVERRIDE}" ]]; then
+  RUN_ID="$(echo "${RUN_ID_OVERRIDE}" | tr -cs '[:alnum:]_.-' '_')"
+elif [[ -n "${RUN_LABEL}" ]]; then
   SAFE_LABEL="$(echo "${RUN_LABEL}" | tr -cs '[:alnum:]_.-' '_')"
   RUN_ID="${SAFE_LABEL}_${RUN_TS}"
 else
@@ -255,52 +267,65 @@ RAW_DIR="${RUN_DIR}/raw"
 LOG_DIR="${RUN_DIR}/logs"
 SUMMARY_DIR="${RUN_DIR}/summary"
 
+if [[ -d "${RUN_DIR}" ]] && [[ "${RESUME}" -eq 0 ]]; then
+  echo "run directory already exists (use --resume to continue): ${RUN_DIR}" >&2
+  exit 1
+fi
+
 mkdir -p "${DATA_DIR}" "${RAW_DIR}" "${LOG_DIR}" "${SUMMARY_DIR}"
 
 MANIFEST="${RUN_DIR}/manifest.txt"
-{
-  echo "run_id=${RUN_ID}"
-  echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "repo_root=${REPO_ROOT}"
-  echo "datasets=${DATASETS}"
-  echo "m_values=${M_VALUES}"
-  echo "ef_construction_values=${EF_CONSTRUCTION_VALUES}"
-  echo "ef_search_values=${EF_SEARCH_VALUES}"
-  echo "recall_targets=${RECALL_TARGETS}"
-  echo "k=${K}"
-  echo "repetitions=${REPETITIONS}"
-  echo "warmup_queries=${WARMUP_QUERIES}"
-  echo "max_train=${MAX_TRAIN}"
-  echo "max_queries=${MAX_QUERIES}"
-  echo "ann_search_mode=${ANN_SEARCH_MODE}"
-  echo "quantized_rerank_multiplier=${QUANTIZED_RERANK_MULTIPLIER}"
-  echo "bench_supports_ann_mode_flags=${BENCH_SUPPORTS_ANN_MODE}"
-  echo "metrics_schema=v2"
-  echo "qps_primary_metric=search_only"
-  echo "qps_end_to_end_metric=end_to_end_qps_mean"
-  echo "ann_backend_expected=kyro_single_graph"
-  echo "python_bin=${PYTHON_BIN}"
-  echo "threads=${THREADS:-default}"
-  echo "host=$(hostname)"
-  echo "kernel=$(uname -a)"
-  echo "rustc=$(rustc -V 2>/dev/null || true)"
-  echo "cargo=$(cargo -V 2>/dev/null || true)"
-  echo "python=$(${PYTHON_BIN} --version 2>&1 || true)"
-  echo "git_commit=$(git rev-parse HEAD 2>/dev/null || true)"
-  echo "git_short=$(git rev-parse --short HEAD 2>/dev/null || true)"
-  echo "git_status_short="
-  git status --short 2>/dev/null || true
-  if command -v lscpu >/dev/null 2>&1; then
-    echo "lscpu="
-    lscpu
-  fi
-} >"${MANIFEST}"
+if [[ "${RESUME}" -eq 1 ]] && [[ -f "${MANIFEST}" ]]; then
+  {
+    echo "resumed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "resumed_by=run_inproc_azure_suite.sh"
+  } >>"${MANIFEST}"
+else
+  {
+    echo "run_id=${RUN_ID}"
+    echo "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "repo_root=${REPO_ROOT}"
+    echo "datasets=${DATASETS}"
+    echo "m_values=${M_VALUES}"
+    echo "ef_construction_values=${EF_CONSTRUCTION_VALUES}"
+    echo "ef_search_values=${EF_SEARCH_VALUES}"
+    echo "recall_targets=${RECALL_TARGETS}"
+    echo "k=${K}"
+    echo "repetitions=${REPETITIONS}"
+    echo "warmup_queries=${WARMUP_QUERIES}"
+    echo "max_train=${MAX_TRAIN}"
+    echo "max_queries=${MAX_QUERIES}"
+    echo "metrics_schema=v2"
+    echo "qps_primary_metric=search_only"
+    echo "qps_end_to_end_metric=end_to_end_qps_mean"
+    echo "ann_backend_expected=kyro_single_graph"
+    echo "python_bin=${PYTHON_BIN}"
+    echo "threads=${THREADS:-default}"
+    echo "run_id_override=${RUN_ID_OVERRIDE:-none}"
+    echo "resume=${RESUME}"
+    echo "no_plots=${NO_PLOTS}"
+    echo "host=$(hostname)"
+    echo "kernel=$(uname -a)"
+    echo "rustc=$(rustc -V 2>/dev/null || true)"
+    echo "cargo=$(cargo -V 2>/dev/null || true)"
+    echo "python=$(${PYTHON_BIN} --version 2>&1 || true)"
+    echo "git_commit=$(git rev-parse HEAD 2>/dev/null || true)"
+    echo "git_short=$(git rev-parse --short HEAD 2>/dev/null || true)"
+    echo "git_status_short="
+    git status --short 2>/dev/null || true
+    if command -v lscpu >/dev/null 2>&1; then
+      echo "lscpu="
+      lscpu
+    fi
+  } >"${MANIFEST}"
+fi
 
 echo "[run] output root: ${RUN_DIR}"
 echo "[run] manifest: ${MANIFEST}"
 
 TOTAL_RUNS=$(( ${#DATASET_LIST[@]} * ${#M_LIST[@]} * ${#EFC_LIST[@]} ))
 RUN_IDX=0
+SKIPPED_RUNS=0
 
 for dataset in "${DATASET_LIST[@]}"; do
   url="$(dataset_url "${dataset}")"
@@ -316,7 +341,9 @@ for dataset in "${DATASET_LIST[@]}"; do
     fi
   elif [[ ! -f "${hdf5_path}" ]]; then
     echo "[data] downloading ${dataset} -> ${hdf5_path}"
-    curl -fL --retry 5 --retry-delay 2 --retry-all-errors "${url}" -o "${hdf5_path}"
+    hdf5_tmp="${hdf5_path}.tmp"
+    curl -fL --retry 5 --retry-delay 2 --retry-all-errors "${url}" -o "${hdf5_tmp}"
+    mv "${hdf5_tmp}" "${hdf5_path}"
   else
     echo "[data] reusing ${hdf5_path}"
   fi
@@ -331,14 +358,25 @@ for dataset in "${DATASET_LIST[@]}"; do
   for m in "${M_LIST[@]}"; do
     for efc in "${EFC_LIST[@]}"; do
       RUN_IDX=$((RUN_IDX + 1))
-      mode_tag="${ANN_SEARCH_MODE//-/_}"
-      run_key="${dataset}.mode${mode_tag}.m${m}.efc${efc}"
+      run_key="${dataset}.m${m}.efc${efc}"
       result_json="${RAW_DIR}/${run_key}.json"
       stdout_log="${LOG_DIR}/${run_key}.stdout.log"
       stderr_log="${LOG_DIR}/${run_key}.stderr.log"
 
+      if [[ "${RESUME}" -eq 1 ]] && [[ -s "${result_json}" ]]; then
+        if is_valid_json_file "${result_json}"; then
+          SKIPPED_RUNS=$((SKIPPED_RUNS + 1))
+          echo "[skip ${RUN_IDX}/${TOTAL_RUNS}] ${run_key} (existing ${result_json})"
+          continue
+        fi
+        echo "[resume] removing invalid JSON output and rerunning: ${result_json}" >&2
+        rm -f "${result_json}"
+      fi
+
       echo "[bench ${RUN_IDX}/${TOTAL_RUNS}] ${run_key}"
       start_s="$(date +%s)"
+      result_json_tmp="${result_json}.tmp"
+      rm -f "${result_json_tmp}"
       bench_cmd=(
         "${BENCH_BIN}"
         --dataset-annbin "${annbin_path}" \
@@ -352,13 +390,14 @@ for dataset in "${DATASET_LIST[@]}"; do
         --warmup-queries "${WARMUP_QUERIES}" \
         --max-train "${MAX_TRAIN}" \
         --max-queries "${MAX_QUERIES}" \
-        --output-json "${result_json}"
+        --output-json "${result_json_tmp}"
       )
-      if [[ "${BENCH_SUPPORTS_ANN_MODE}" -eq 1 ]]; then
-        bench_cmd+=(--ann-search-mode "${ANN_SEARCH_MODE}")
-        bench_cmd+=(--quantized-rerank-multiplier "${QUANTIZED_RERANK_MULTIPLIER}")
+      if ! "${bench_cmd[@]}" >"${stdout_log}" 2>"${stderr_log}"; then
+        rm -f "${result_json_tmp}"
+        echo "[fail] ${run_key}" >&2
+        exit 1
       fi
-      "${bench_cmd[@]}" >"${stdout_log}" 2>"${stderr_log}"
+      mv "${result_json_tmp}" "${result_json}"
       end_s="$(date +%s)"
       elapsed_s=$((end_s - start_s))
       echo "[ok] ${run_key} (${elapsed_s}s)"
@@ -388,11 +427,31 @@ if [[ "${NO_SUMMARY}" -eq 0 ]]; then
       exit 1
     fi
     echo "[gates] validating frontier acceptance gates"
-    "${PYTHON_BIN}" "${GATE_CHECKER}" \
-      --summary-json "${summary_json}" \
-      --candidates-csv "${summary_csv}" \
-      --log-glob "${LOG_DIR}/*.stderr.log" \
+    gate_args=(
+      --summary-json "${summary_json}"
+      --candidates-csv "${summary_csv}"
+      --log-glob "${LOG_DIR}/*.stderr.log"
       --log-glob "${LOG_DIR}/*.stdout.log"
+    )
+    if [[ "${ALLOW_MISSING_GATE_DATASETS}" -eq 1 ]]; then
+      gate_args+=(--allow-missing-datasets)
+    fi
+    "${PYTHON_BIN}" "${GATE_CHECKER}" "${gate_args[@]}"
+  fi
+
+  if [[ "${NO_PLOTS}" -eq 0 ]]; then
+    if [[ -f "${PLOTTER}" ]]; then
+      plot_dir="${RUN_DIR}/plots"
+      if ! "${PYTHON_BIN}" "${PLOTTER}" \
+        --summary-json "${summary_json}" \
+        --candidates-csv "${summary_csv}" \
+        --output-dir "${plot_dir}" \
+        --recall-targets "${RECALL_TARGETS}"; then
+        echo "warning: plot generation failed for ${RUN_DIR}" >&2
+      fi
+    else
+      echo "warning: plot script missing (${PLOTTER}); skipping plot generation" >&2
+    fi
   fi
 elif [[ "${CHECK_GATES}" -eq 1 ]]; then
   echo "--check-gates requires summary output; remove --no-summary" >&2
@@ -401,6 +460,10 @@ fi
 
 {
   echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "skipped_runs=${SKIPPED_RUNS}"
+  if [[ -n "${plot_dir:-}" ]]; then
+    echo "plots_dir=${plot_dir}"
+  fi
   echo "run_dir=${RUN_DIR}"
 } >>"${MANIFEST}"
 

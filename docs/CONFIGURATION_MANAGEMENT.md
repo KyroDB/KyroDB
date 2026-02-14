@@ -135,17 +135,11 @@ hnsw:
   dimension: 768
   distance: cosine
   disable_normalization_check: false
-  ann_search_mode: fp32_strict
-  quantized_rerank_multiplier: 8
 ```
 
 Notes:
 
-- `ann_search_mode` controls cold-tier ANN traversal mode:
-  - `fp32_strict` for strict full-precision scoring
-  - `sq8_rerank` for SQ8 approximate traversal with fp32 rerank
-- `quantized_rerank_multiplier` applies in quantized modes only, where rerank candidate count is `k * quantized_rerank_multiplier`.
-- Validation enforces `hnsw.m` in `[5, 128]` and `hnsw.quantized_rerank_multiplier` in `[1, 64]`.
+- Validation enforces `hnsw.m` in `[5, 128]`.
 
 ### Persistence (used)
 
