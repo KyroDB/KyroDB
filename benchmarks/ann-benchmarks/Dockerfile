@@ -1,12 +1,6 @@
 ### KyroDB ANN-Benchmarks Dockerfile
-#
-# This file is intended to be copied into the upstream ann-benchmarks repo at:
+# This file is intended to be copied into:
 #   ann_benchmarks/algorithms/kyrodb/Dockerfile
-#
-# It builds `kyrodb_server` and installs the minimal Python deps needed by the
-# KyroDB algorithm wrapper. The ann-benchmarks base image provides:
-# - `ENTRYPOINT ["python", "-u", "run_algorithm.py"]`
-# - Python requirements for the runner.
 
 # ============================================================================
 # Stage 1: Build KyroDB Server (from KyroDB git repo)
@@ -31,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install grpcio-tools for protobuf generation (pin versions for reproducibility).
 RUN pip3 install --no-cache-dir --break-system-packages \
     grpcio-tools==1.60.2 \
-    protobuf==4.28.2
+    protobuf==4.25.8
 
 WORKDIR /src
 
@@ -64,7 +58,7 @@ RUN sed -i 's/^import kyrodb_pb2 as /from . import kyrodb_pb2 as /' /src/stubs/k
 # ============================================================================
 # Stage 2: Runtime (inherits ann-benchmarks entrypoint)
 # ============================================================================
-FROM ann-benchmarks:2024.12
+FROM ann-benchmarks
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
@@ -72,17 +66,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # KyroDB wrapper uses gRPC and generated protobuf stubs.
-RUN pip install --no-cache-dir --break-system-packages \
+RUN pip install --no-cache-dir \
     grpcio==1.60.2 \
-    protobuf==4.28.2
+    protobuf==4.25.8
 
-# Copy algorithm files from the Docker build context.
-#
-# Important: ann-benchmarks' `install.py` may set the Docker build context to
-# `ann_benchmarks/algorithms/kyrodb/` (the algorithm folder itself). In that
-# case, paths like `ann_benchmarks/algorithms/kyrodb/...` do not exist within
-# the build context and the build fails.
-COPY . /home/app/ann_benchmarks/algorithms/kyrodb
+# `install.py` builds from repository root, so copy only this algorithm folder.
+COPY ann_benchmarks/algorithms/kyrodb /home/app/ann_benchmarks/algorithms/kyrodb
 
 # Copy generated protobuf stubs
 COPY --from=builder /src/stubs/kyrodb_pb2.py /home/app/ann_benchmarks/algorithms/kyrodb/
@@ -91,10 +80,6 @@ RUN touch /home/app/ann_benchmarks/algorithms/kyrodb/__init__.py
 
 # Copy KyroDB server binary
 COPY --from=builder /src/kyrodb/target/release/kyrodb_server /usr/local/bin/kyrodb_server
-
-# Safety net: ensure the algorithm folder itself is importable as a top-level
-# module so any remaining absolute imports resolve.
-ENV PYTHONPATH=/home/app/ann_benchmarks/algorithms/kyrodb:${PYTHONPATH}
 
 ENV KYRODB_HOST=127.0.0.1
 ENV KYRODB_PORT=50051

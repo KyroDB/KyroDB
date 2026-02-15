@@ -1,3 +1,1 @@
-from .module import KyroDB
-
-__all__ = ["KyroDB"]
+"""KyroDB ann-benchmarks algorithm package."""

@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -65,6 +65,9 @@ class KyroDB(BaseANN):
         self._server_stderr = None
         self._server_stdout_path: Optional[str] = None
         self._server_stderr_path: Optional[str] = None
+        self._batch_results: List[List[int]] = []
+        self._batch_latencies: List[float] = []
+        self.name = "KyroDB"
 
         self._logger = logging.getLogger(__name__)
 
@@ -267,23 +270,11 @@ class KyroDB(BaseANN):
     def set_query_arguments(self, ef_search: Optional[int] = None, **kwargs) -> None:
         if ef_search is not None:
             self.ef_search = int(ef_search)
-            return
-        if kwargs.get("args") and len(kwargs["args"]) > 0:
+        elif kwargs.get("args") and len(kwargs["args"]) > 0:
             self.ef_search = int(kwargs["args"][0])
+        self.name = f"KyroDB(M={self.M}, efConstruction={self.ef_construction}, efSearch={self.ef_search})"
 
-    def _score_to_distance(self, score: float) -> float:
-        metric = self.metric.lower()
-        if metric in ("angular", "cosine"):
-            return 1.0 - score
-        if metric in ("euclidean", "l2"):
-            if score <= 0.0:
-                return float("inf")
-            return (1.0 / score) - 1.0
-        if metric in ("inner_product", "inner-product", "innerproduct"):
-            return 1.0 - score
-        return 1.0 - score
-
-    def query(self, q: np.ndarray, k: int) -> List[Tuple[int, float]]:
+    def query(self, q: np.ndarray, k: int) -> List[int]:
         self._connect()
         assert self._stub is not None
 
@@ -299,9 +290,9 @@ class KyroDB(BaseANN):
 
         resp = self._stub.Search(req)
         # ann-benchmarks expects 0-indexed dataset row ids; KyroDB uses doc_ids starting at 1.
-        return [(int(r.doc_id) - 1, float(self._score_to_distance(r.score))) for r in resp.results]
+        return [int(r.doc_id) - 1 for r in resp.results]
 
-    def batch_query(self, X: np.ndarray, k: int) -> List[List[Tuple[int, float]]]:
+    def batch_query(self, X: np.ndarray, k: int) -> None:
         self._connect()
         assert self._stub is not None
 
@@ -317,19 +308,27 @@ class KyroDB(BaseANN):
                     ef_search=int(self.ef_search),
                 )
 
-        out: List[List[Tuple[int, float]]] = []
+        start = time.time()
+        out: List[List[int]] = []
         for resp in self._stub.BulkSearch(gen()):
-            out.append(
-                [(int(r.doc_id) - 1, float(self._score_to_distance(r.score))) for r in resp.results]
-            )
-        return out
+            out.append([int(r.doc_id) - 1 for r in resp.results])
+        total = time.time() - start
+        per_query = total / float(len(query_vectors)) if len(query_vectors) > 0 else 0.0
+        self._batch_results = out
+        self._batch_latencies = [per_query] * len(out)
+
+    def get_batch_results(self) -> List[List[int]]:
+        return self._batch_results
+
+    def get_batch_latencies(self) -> List[float]:
+        return self._batch_latencies
 
     def get_memory_usage(self) -> float:
         try:
             self._connect()
             assert self._stub is not None
             resp = self._stub.Metrics(kyrodb_pb2.MetricsRequest())
-            return float(resp.memory_usage_bytes) / (1024.0 * 1024.0)
+            return float(resp.memory_usage_bytes) / 1024.0
         except Exception:
             return 0.0
 
@@ -373,3 +372,6 @@ class KyroDB(BaseANN):
 
     def done(self) -> None:
         self._cleanup_server()
+
+    def __str__(self) -> str:
+        return self.name
