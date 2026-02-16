@@ -309,6 +309,7 @@ message AndFilter {
 }
 
 message OrFilter {
+  // Keep tag number stable once assigned; renumbering breaks protobuf wire compatibility.
   repeated MetadataFilter filters = 2;
 }
 
