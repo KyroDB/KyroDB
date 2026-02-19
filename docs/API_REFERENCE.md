@@ -1,13 +1,63 @@
 # API Reference
 
-KyroDB provides two interfaces:
+KyroDB usage is split into:
 
-1. **gRPC API** (primary) - Vector operations, high performance
-2. **HTTP observability endpoints** - Monitoring and health checks
+1. **Client SDK API (recommended)** - application integration path
+2. **gRPC protocol API** - low-level transport contract
+3. **HTTP observability endpoints** - health, metrics, readiness, SLO, usage
 
-## gRPC API (Vector Operations)
+## SDK API (Recommended)
 
-All vector operations use gRPC for performance and efficiency. 
+Use the official Python SDK (`kyrodb`) for production application code.
+
+Install:
+
+```bash
+python -m pip install kyrodb
+```
+
+Primary client classes:
+
+- `KyroDBClient` (sync)
+- `AsyncKyroDBClient` (async)
+
+Primary methods:
+
+- Writes: `insert`, `bulk_insert`, `bulk_load_hnsw`, `delete`, `batch_delete_ids`, `update_metadata`
+- Reads: `query`, `search`, `bulk_search`, `bulk_query`
+- Admin: `health`, `metrics`, `flush_hot_tier`, `create_snapshot`, `get_config`
+
+Example:
+
+```python
+from kyrodb import KyroDBClient, exact
+
+with KyroDBClient(target="127.0.0.1:50051", api_key="dev_local_key") as client:
+    client.insert(
+        doc_id=1,
+        embedding=[0.0] * 768,
+        metadata={"tenant": "acme", "tier": "pro"},
+        namespace="default",
+    )
+
+    result = client.search(
+        query_embedding=[0.0] * 768,
+        k=10,
+        namespace="default",
+        filter=exact("tenant", "acme"),
+    )
+    print(result.total_found)
+```
+
+SDK details:
+
+- `kyrodb-python/README.md`
+- `kyrodb-python/docs/api-reference.md`
+- `kyrodb-python/docs/operations.md`
+
+## gRPC API (Protocol Contract)
+
+All vector operations are implemented over gRPC.
 
 ### Protocol Details
 
@@ -70,41 +120,36 @@ message SearchRequest {
 }
 ```
 
-### Example: Python Client
+### Example: Low-Level Python gRPC Client
 
 ```python
 import grpc
 from kyrodb_pb2 import InsertRequest, SearchRequest
 from kyrodb_pb2_grpc import KyroDBServiceStub
 
-# Connect to server
-# WARNING: grpc.insecure_channel is for local development and testing ONLY.
-# It transmits data in plaintext with no authentication or encryption.
-# For production, use grpc.secure_channel with TLS credentials:
-#   credentials = grpc.ssl_channel_credentials(root_cert, private_key, cert_chain)
-#   channel = grpc.secure_channel('host:port', credentials)
-channel = grpc.insecure_channel('127.0.0.1:50051')
+channel = grpc.insecure_channel("127.0.0.1:50051")
 stub = KyroDBServiceStub(channel)
 
-# Insert a vector
-response = stub.Insert(InsertRequest(
-    doc_id=1,
-    embedding=[0.1, 0.2, 0.3, 0.4]
-))
-if not response.success:
-  raise RuntimeError(response.error)
-print(f"Insert OK (tier={response.tier}, inserted_at={response.inserted_at})")
+insert = stub.Insert(
+    InsertRequest(
+        doc_id=1,
+        embedding=[0.1, 0.2, 0.3, 0.4],
+        namespace="default",
+    )
+)
+if not insert.success:
+    raise RuntimeError(insert.error)
 
-# Search for similar vectors
-results = stub.Search(SearchRequest(
-  query_embedding=[0.1, 0.2, 0.3, 0.4],
-  k=10,
-  min_score=-1.0,
-  include_embeddings=False
-))
-
-for result in results.results:
-    print(f"doc_id: {result.doc_id}, score: {result.score}")
+search = stub.Search(
+    SearchRequest(
+        query_embedding=[0.1, 0.2, 0.3, 0.4],
+        k=10,
+        namespace="default",
+        include_embeddings=False,
+    )
+)
+for hit in search.results:
+    print(hit.doc_id, hit.score)
 
 channel.close()
 ```

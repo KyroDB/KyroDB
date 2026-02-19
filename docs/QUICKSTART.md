@@ -5,6 +5,7 @@ Get KyroDB running in 5 minutes.
 ## Prerequisites
 
 - **Rust (stable)**: [Install Rust](https://rustup.rs/)
+- **Python 3.10+** (for official SDK usage)
 - **4GB RAM minimum**
 - **Linux or macOS** (Windows untested)
 
@@ -45,69 +46,66 @@ gRPC server listening on 127.0.0.1:50051
 HTTP observability on http://127.0.0.1:51051 (default = gRPC port + 1000)
 ```
 
-## 3. Insert Your First Vector
+## 3. Insert and Search with the Official Python SDK
 
-KyroDB uses **gRPC** for all vector operations. Here is a minimal Python example that inserts one vector using the `Insert(InsertRequest) → InsertResponse` RPC.
+KyroDB’s recommended client path is the official SDK (`kyrodb`).
 
-```bash
-# Install Python gRPC tooling
-python -m pip install --upgrade grpcio grpcio-tools
-
-# Generate Python stubs from the repo proto
-python -m grpc_tools.protoc \
-  -Iengine/proto \
-  --python_out=. \
-  --grpc_python_out=. \
-  engine/proto/kyrodb.proto
-```
-
-Save the Python snippet below as `quickstart.py` in the KyroDB repository root (the same directory where `kyrodb_pb2.py` and `kyrodb_pb2_grpc.py` were generated), then run:
+Install:
 
 ```bash
-python quickstart.py
+python -m pip install --upgrade kyrodb
 ```
+
+Save as `quickstart_sdk.py`:
 
 ```python
-import grpc
-
-import kyrodb_pb2
-import kyrodb_pb2_grpc
+from kyrodb import KyroDBClient
 
 
 def main() -> None:
-  with grpc.insecure_channel("127.0.0.1:50051") as channel:
-    stub = kyrodb_pb2_grpc.KyroDBServiceStub(channel)
+    # For local development this target can run without TLS.
+    # For non-loopback targets, configure TLS and API key auth.
+    with KyroDBClient(target="127.0.0.1:50051", api_key="dev_local_key") as client:
+        client.wait_for_ready(timeout_s=5.0)
 
-    # The server's embedding dimension must match the request embedding length.
-    # Default config uses 768, so we build a simple 768-dim vector.
-    embedding = [0.0] * 768
-    embedding[0] = 0.1
-    embedding[1] = 0.2
+        embedding = [0.0] * 768
+        embedding[0] = 0.1
+        embedding[1] = 0.2
 
-    try:
-      resp = stub.Insert(
-        kyrodb_pb2.InsertRequest(
-          doc_id=1,
-          embedding=embedding,
-          metadata={"source": "quickstart"},
-          namespace="default",
+        ack = client.insert(
+            doc_id=1,
+            embedding=embedding,
+            metadata={"source": "quickstart"},
+            namespace="default",
         )
-      )
-      print(resp)
-    except grpc.RpcError as e:
-      print(f"gRPC error: code={e.code()} details={e.details()}")
-      raise SystemExit(1)
+        print("insert:", ack.success, ack.tier)
+
+        result = client.search(
+            query_embedding=embedding,
+            k=10,
+            namespace="default",
+        )
+        print("search total_found:", result.total_found)
+        for hit in result.results:
+            print("doc_id:", hit.doc_id, "score:", hit.score)
 
 
 if __name__ == "__main__":
-  main()
+    main()
 ```
 
-For advanced usage and all RPCs, see [engine/proto/kyrodb.proto](../engine/proto/kyrodb.proto) and [API Reference](API_REFERENCE.md).
+Run:
 
-## 4. Search for Similar Vectors
+```bash
+python quickstart_sdk.py
+```
 
-Vector search operations use gRPC. See the [API Reference](API_REFERENCE.md#search) for required fields and examples.
+For full SDK coverage, see `kyrodb-python/README.md` and `kyrodb-python/docs/api-reference.md`.
+
+## 4. Low-Level gRPC (Optional)
+
+Use raw protobuf/gRPC only for custom non-SDK clients or protocol-level testing.
+Service and message definitions live in `engine/proto/kyrodb.proto`.
 
 ## 5. Check System Health
 
