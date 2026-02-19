@@ -64,69 +64,23 @@ Notes:
 - Sanitizer support is platform/toolchain dependent.
 - Keep logs as release-blocking evidence.
 
-## Gate 4: ANN FP32 Campaign
+## Gate 4: Official ANN-Benchmarks Campaign
 
-Run the reproducible ANN-team FP32 matrix with deterministic run IDs:
-
-```bash
-BENCH_ROOT=target/ann_parity
-DATA_DIR="$BENCH_ROOT/data"
-OUT_ROOT="$BENCH_ROOT/out"
-
-bash benchmarks/ann-benchmarks/run_inproc_parallel_matrix.sh \
-  --run-id ann_team_release_candidate_fp32_hard \
-  --run-label ann_team_fp32_hard \
-  --data-dir "$DATA_DIR" \
-  --out-root "$OUT_ROOT" \
-  --datasets glove-100-angular,gist-960-euclidean \
-  --m-values 48,56 \
-  --ef-construction-values 800,1200 \
-  --ef-search-values 256,384,512,768,1024,1536,2048,2560 \
-  --recall-targets 0.95,0.99 \
-  --k 10 \
-  --repetitions 2 \
-  --warmup-queries 100 \
-  --max-queries 5000 \
-  --parallel-configs 16 \
-  --threads-per-job 2 \
-  --resume \
-  --check-gates \
-  --allow-missing-gate-datasets
-
-bash benchmarks/ann-benchmarks/run_inproc_parallel_matrix.sh \
-  --run-id ann_team_release_candidate_fp32_guard \
-  --run-label ann_team_fp32_guard \
-  --data-dir "$DATA_DIR" \
-  --out-root "$OUT_ROOT" \
-  --datasets sift-128-euclidean,mnist-784-euclidean \
-  --m-values 56 \
-  --ef-construction-values 800 \
-  --ef-search-values 64,128,192,256,384,512,768,1024 \
-  --recall-targets 0.95,0.99 \
-  --k 10 \
-  --repetitions 2 \
-  --warmup-queries 100 \
-  --max-queries 5000 \
-  --parallel-configs 16 \
-  --threads-per-job 2 \
-  --resume \
-  --skip-build \
-  --check-gates \
-  --allow-missing-gate-datasets
-```
-
-Package artifacts:
+Run the campaign through upstream ann-benchmarks using the KyroDB adapter:
 
 ```bash
-bash benchmarks/ann-benchmarks/package_evidence_bundle.sh \
-  --out-root target/ann_parity/out \
-  --run-ids ann_team_release_candidate_fp32_hard,ann_team_release_candidate_fp32_guard \
-  --output-dir target/ann_parity
+bash benchmarks/ann-benchmarks/run_annbenchmarks_adapter.sh \
+  --ann-root /path/to/ann-benchmarks \
+  --datasets sift-128-euclidean,glove-100-angular,gist-960-euclidean,mnist-784-euclidean \
+  --kyrodb-ref <COMMIT_SHA> \
+  --sdk-version 0.1.0 \
+  --plot
 ```
 
 Artifacts:
-- per-run manifests/raw/summary/plots under `target/ann_parity/out/<run_id>/`
-- final tarball + checksum + manifest under `target/ann_parity/`
+- ann-benchmarks result JSON and generated plots for each dataset
+- staged adapter files under `ann_benchmarks/algorithms/kyrodb/`
+- pinned code references: core commit (`--kyrodb-ref`) and SDK version (`--sdk-version`)
 
 ## Evidence Package Rule
 

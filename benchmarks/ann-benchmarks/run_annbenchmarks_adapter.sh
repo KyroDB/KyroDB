@@ -14,7 +14,7 @@ Required:
 Options:
   --datasets CSV                       Datasets to run (default: sift-128-euclidean)
   --kyrodb-git URL                     KyroDB git URL used for Docker build
-  --kyrodb-ref REF                     KyroDB git ref/commit (default: current commit)
+  --kyrodb-ref REF                     KyroDB git ref/commit (default: benchmark)
   --sdk-version VERSION                kyrodb pip version for adapter image (default: 0.1.0)
   --algorithm NAME                     Algorithm name in ann-benchmarks (default: kyrodb)
   --python BIN                         Python executable (default: python3)
@@ -68,7 +68,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 ANN_ROOT=""
 DATASETS="sift-128-euclidean"
 KYRODB_GIT="https://github.com/KyroDB/KyroDB.git"
-KYRODB_REF=""
+KYRODB_REF="benchmark"
 SDK_VERSION="0.1.0"
 ALGORITHM="kyrodb"
 PYTHON_BIN="python3"
@@ -101,14 +101,14 @@ if [[ -z "${ANN_ROOT}" ]]; then
   exit 1
 fi
 
+if [[ ! -d "${ANN_ROOT}" ]]; then
+  echo "ann-benchmarks root does not exist: ${ANN_ROOT}" >&2
+  exit 1
+fi
+
 require_cmd "${PYTHON_BIN}"
 require_cmd cp
 require_cmd mkdir
-
-if [[ -z "${KYRODB_REF}" ]]; then
-  require_cmd git
-  KYRODB_REF="$(git -C "${REPO_ROOT}" rev-parse --short=12 HEAD)"
-fi
 
 ANN_ROOT="$(cd "${ANN_ROOT}" && pwd)"
 if [[ ! -f "${ANN_ROOT}/install.py" ]] || [[ ! -f "${ANN_ROOT}/run.py" ]]; then
@@ -126,7 +126,6 @@ mkdir -p "${ALG_DIR}"
 cp "${REPO_ROOT}/benchmarks/ann-benchmarks/Dockerfile" "${ALG_DIR}/Dockerfile"
 cp "${REPO_ROOT}/benchmarks/ann-benchmarks/module.py" "${ALG_DIR}/module.py"
 cp "${REPO_ROOT}/benchmarks/ann-benchmarks/config.yml" "${ALG_DIR}/config.yml"
-cp "${REPO_ROOT}/benchmarks/ann-benchmarks/__init__.py" "${ALG_DIR}/__init__.py"
 
 echo "[adapter] staged files into ${ALG_DIR}"
 

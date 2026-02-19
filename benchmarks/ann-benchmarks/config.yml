@@ -12,7 +12,7 @@ float:
   any:
     - name: kyrodb
       docker_tag: ann-benchmarks-kyrodb
-      module: ann_benchmarks.algorithms.kyrodb
+      module: ann_benchmarks.algorithms.kyrodb.module
       constructor: KyroDB
       disabled: false
       base_args: ['@metric']
@@ -21,29 +21,44 @@ float:
           args:
             M: 12
             ef_construction: 500
-          query_args: [[4, 8, 10, 20, 40, 80, 120, 200, 400, 600, 800, 1200, 1600, 2048, 3072]]
+          query_args: &ef_search_sweep
+            - [4]
+            - [8]
+            - [10]
+            - [20]
+            - [40]
+            - [80]
+            - [120]
+            - [200]
+            - [400]
+            - [600]
+            - [800]
+            - [1200]
+            - [1600]
+            - [2048]
+            - [3072]
         M-16:
           args:
             M: 16
             ef_construction: 500
-          query_args: [[4, 8, 10, 20, 40, 80, 120, 200, 400, 600, 800, 1200, 1600, 2048, 3072]]
+          query_args: *ef_search_sweep
         M-24:
           args:
             M: 24
             ef_construction: 500
-          query_args: [[4, 8, 10, 20, 40, 80, 120, 200, 400, 600, 800, 1200, 1600, 2048, 3072]]
+          query_args: *ef_search_sweep
         M-36:
           args:
             M: 36
             ef_construction: 500
-          query_args: [[4, 8, 10, 20, 40, 80, 120, 200, 400, 600, 800, 1200, 1600, 2048, 3072]]
+          query_args: *ef_search_sweep
         M-48:
           args:
             M: 48
             ef_construction: 500
-          query_args: [[4, 8, 10, 20, 40, 80, 120, 200, 400, 600, 800, 1200, 1600, 2048, 3072]]
+          query_args: *ef_search_sweep
         M-64:
           args:
             M: 64
             ef_construction: 500
-          query_args: [[4, 8, 10, 20, 40, 80, 120, 200, 400, 600, 800, 1200, 1600, 2048, 3072]]
+          query_args: *ef_search_sweep

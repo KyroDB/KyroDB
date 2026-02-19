@@ -25,7 +25,7 @@ from kyrodb.errors import KyroDBError
 
 try:
     from ..base.module import BaseANN
-except Exception:  # pragma: no cover - allows standalone import tests
+except ImportError:  # pragma: no cover - allows standalone import tests
     class BaseANN:  # type: ignore
         pass
 
@@ -86,8 +86,18 @@ class KyroDB(BaseANN):
         )
 
     def _start_server_if_needed(self, dimension: int, max_elements: int) -> None:
-        if self._server_proc is not None and self._client is not None:
-            return
+        if self._server_proc is not None:
+            if self._client is not None and self._server_proc.poll() is None:
+                return
+            # Partial initialization or dead process from a previous attempt.
+            self._cleanup_server()
+        elif self._client is not None:
+            # Defensive cleanup for impossible partial state.
+            self._cleanup_server()
+
+        server_bin = shutil.which("kyrodb_server")
+        if server_bin is None:
+            raise RuntimeError("kyrodb_server binary not found in PATH")
 
         if self._data_dir is None:
             self._data_dir = tempfile.mkdtemp(prefix="kyrodb_annb_")
@@ -136,7 +146,7 @@ class KyroDB(BaseANN):
         try:
             self._server_stderr = open(self._server_stderr_path, "wb")
             self._server_proc = subprocess.Popen(
-                ["kyrodb_server"],
+                [server_bin],
                 env=env,
                 stdout=self._server_stdout,
                 stderr=self._server_stderr,

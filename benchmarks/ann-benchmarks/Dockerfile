@@ -5,9 +5,10 @@
 # ==========================================================================
 # Stage 1: Build kyrodb_server from KyroDB core repository
 # ==========================================================================
-FROM rust:1.86-bookworm AS builder
+ARG RUST_VERSION=1.93.0
+FROM rust:${RUST_VERSION}-bookworm AS builder
 
-ARG KYRODB_GIT=https://github.com/vatskishan03/KyroDB.git
+ARG KYRODB_GIT=https://github.com/KyroDB/KyroDB.git
 ARG KYRODB_REF=
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,7 +28,7 @@ RUN git clone "$KYRODB_GIT" /src/kyrodb \
        fi
 
 WORKDIR /src/kyrodb
-RUN cargo build --release --locked --bin kyrodb_server
+RUN cargo build --release --locked -p kyrodb-engine --bin kyrodb_server
 
 # ==========================================================================
 # Stage 2: ann-benchmarks runtime
@@ -45,7 +46,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m pip install --no-cache-dir "kyrodb==${KYRODB_SDK_VERSION}"
 
 COPY ann_benchmarks/algorithms/kyrodb /home/app/ann_benchmarks/algorithms/kyrodb
-RUN touch /home/app/ann_benchmarks/algorithms/kyrodb/__init__.py
 
 COPY --from=builder /src/kyrodb/target/release/kyrodb_server /usr/local/bin/kyrodb_server
 
