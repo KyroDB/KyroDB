@@ -28,6 +28,8 @@ RUN git clone "$KYRODB_GIT" /src/kyrodb \
        fi
 
 WORKDIR /src/kyrodb
+# Use a reproducible CPU target to avoid host-specific binaries.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release --locked -p kyrodb-engine --bin kyrodb_server
 
 # ==========================================================================

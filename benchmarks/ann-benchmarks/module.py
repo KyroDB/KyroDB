@@ -124,7 +124,9 @@ class KyroDB(BaseANN):
         env.setdefault("KYRODB__CACHE__ENABLE_TRAINING_TASK", "false")
         env.setdefault("KYRODB__CACHE__AUTO_TUNE_THRESHOLD", "false")
 
-        threads = env.get("KYRODB_BENCH_THREADS", "1")
+        # Maximize parallel index construction. ann-benchmarks evaluates queries sequentially,
+        # but building the HNSW index on 1 core is unnecessarily slow. Default to all cores.
+        threads = env.get("KYRODB_BENCH_THREADS", str(os.cpu_count() or 1))
         env.setdefault("TOKIO_WORKER_THREADS", threads)
         env.setdefault("RAYON_NUM_THREADS", threads)
         env.setdefault("OMP_NUM_THREADS", threads)
@@ -235,11 +237,26 @@ class KyroDB(BaseANN):
         if not flush_result.success:
             raise RuntimeError(f"FlushHotTier failed: {flush_result.error}")
 
-    def set_query_arguments(self, ef_search: Optional[int] = None, **kwargs: Any) -> None:
-        if ef_search is not None:
-            self.ef_search = int(ef_search)
-        elif kwargs.get("args") and len(kwargs["args"]) > 0:
-            self.ef_search = int(kwargs["args"][0])
+    def set_query_arguments(self, *args: Any, **kwargs: Any) -> None:
+        candidate: Any = None
+        if kwargs.get("ef_search") is not None:
+            candidate = kwargs.get("ef_search")
+        elif args:
+            # ann-benchmarks adapters can pass positional query args in multiple shapes:
+            # - scalar value (e.g., 200)
+            # - single-element list/tuple (e.g., [200])
+            # - expanded tuple where first value is ef_search
+            candidate = args[0]
+        elif kwargs.get("args"):
+            candidate = kwargs["args"][0]
+
+        if isinstance(candidate, (list, tuple)):
+            if len(candidate) == 0:
+                raise ValueError("ef_search query argument cannot be empty")
+            candidate = candidate[0]
+
+        if candidate is not None:
+            self.ef_search = int(candidate)
         self.name = f"KyroDB(M={self.M}, efConstruction={self.ef_construction}, efSearch={self.ef_search})"
 
     def query(self, q: np.ndarray, k: int) -> list[int]:
