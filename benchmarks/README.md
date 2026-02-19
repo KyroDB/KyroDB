@@ -6,6 +6,8 @@ This directory contains the ANN-focused benchmarking path:
 - True in-process Rust benchmark binary (`engine/src/bin/ann_inproc_bench.rs`)
 - Dataset converter helper (`benchmarks/ann-benchmarks/export_ann_hdf5_to_annbin.py`)
 
+Adapter-specific guide: `benchmarks/ann-benchmarks/README.md`
+
 ## Scope
 
 This workflow targets ANN-style evaluation (recall/throughput/latency trade-offs), not full production database E2E behavior.
@@ -21,6 +23,7 @@ The submission adapter is hardened to minimize non-ANN effects:
 - durability disabled for benchmark speed
 - cache/predictor effects minimized
 - angular vectors normalized
+- RPC path goes through the released `kyrodb` Python SDK
 
 ## Install into ann-benchmarks
 
@@ -35,18 +38,32 @@ cp /path/to/KyroDB/benchmarks/ann-benchmarks/__init__.py ann_benchmarks/algorith
 cp /path/to/KyroDB/benchmarks/ann-benchmarks/config.yml ann_benchmarks/algorithms/kyrodb/config.yml
 ```
 
+Or use the wrapper for staging/build/run in one flow:
+
+```bash
+bash benchmarks/ann-benchmarks/run_annbenchmarks_adapter.sh \
+  --ann-root /path/to/ann-benchmarks \
+  --datasets sift-128-euclidean \
+  --kyrodb-ref <COMMIT_SHA> \
+  --sdk-version 0.1.0
+```
+
 ## Build algorithm image
 
 ```bash
 python install.py --algorithm kyrodb \
-  --build-arg KYRODB_GIT=https://github.com/vatskishan03/KyroDB.git KYRODB_REF=main
+  --build-arg KYRODB_GIT=https://github.com/KyroDB/KyroDB.git \
+  KYRODB_REF=main \
+  KYRODB_SDK_VERSION=0.1.0
 ```
 
 Use an immutable commit for publication runs:
 
 ```bash
 python install.py --algorithm kyrodb \
-  --build-arg KYRODB_GIT=https://github.com/vatskishan03/KyroDB.git KYRODB_REF=<COMMIT_SHA>
+  --build-arg KYRODB_GIT=https://github.com/KyroDB/KyroDB.git \
+  KYRODB_REF=<COMMIT_SHA> \
+  KYRODB_SDK_VERSION=0.1.0
 ```
 
 ## Run benchmark datasets
