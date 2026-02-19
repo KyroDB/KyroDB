@@ -125,6 +125,7 @@ mkdir -p "${ALG_DIR}"
 
 cp "${REPO_ROOT}/benchmarks/ann-benchmarks/Dockerfile" "${ALG_DIR}/Dockerfile"
 cp "${REPO_ROOT}/benchmarks/ann-benchmarks/module.py" "${ALG_DIR}/module.py"
+cp "${REPO_ROOT}/benchmarks/ann-benchmarks/__init__.py" "${ALG_DIR}/__init__.py"
 cp "${REPO_ROOT}/benchmarks/ann-benchmarks/config.yml" "${ALG_DIR}/config.yml"
 
 echo "[adapter] staged files into ${ALG_DIR}"

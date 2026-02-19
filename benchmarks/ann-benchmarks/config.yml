@@ -15,28 +15,32 @@ float:
       module: ann_benchmarks.algorithms.kyrodb.module
       constructor: KyroDB
       disabled: false
-      base_args: ['@metric']
+      base_args: ["@metric"]
       run_groups:
         M-12:
           args:
             M: 12
             ef_construction: 500
-          query_args: &ef_search_sweep
-            - [4]
-            - [8]
-            - [10]
-            - [20]
-            - [40]
-            - [80]
-            - [120]
-            - [200]
-            - [400]
-            - [600]
-            - [800]
-            - [1200]
-            - [1600]
-            - [2048]
-            - [3072]
+          query_args:
+            &ef_search_sweep [
+              [
+                4,
+                8,
+                10,
+                20,
+                40,
+                80,
+                120,
+                200,
+                400,
+                600,
+                800,
+                1200,
+                1600,
+                2048,
+                3072,
+              ],
+            ]
         M-16:
           args:
             M: 16
