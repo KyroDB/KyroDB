@@ -59,8 +59,3 @@ float:
             M: 48
             ef_construction: 500
           query_args: *ef_search_sweep
-        M-64:
-          args:
-            M: 64
-            ef_construction: 500
-          query_args: *ef_search_sweep

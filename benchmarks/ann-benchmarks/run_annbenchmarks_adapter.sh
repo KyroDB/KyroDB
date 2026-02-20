@@ -147,6 +147,12 @@ fi
 for dataset in "${DATASET_LIST[@]}"; do
   echo "[adapter] running dataset ${dataset}"
   "${PYTHON_BIN}" run.py --algorithm "${ALGORITHM}" --dataset "${dataset}"
+  
+  # Docker writes result files as root; fix permissions so we can read and plot them
+  if [ -d "results/" ]; then
+    sudo chown -R $(id -u):$(id -g) results/ || true
+  fi
+
   if [[ "${RUN_PLOTS}" -eq 1 ]]; then
     echo "[adapter] plotting dataset ${dataset}"
     "${PYTHON_BIN}" plot.py --dataset "${dataset}"
