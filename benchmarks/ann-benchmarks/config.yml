@@ -12,7 +12,7 @@ float:
   any:
     - name: kyrodb
       docker_tag: ann-benchmarks-kyrodb
-      module: ann_benchmarks.algorithms.kyrodb.module
+      module: ann_benchmarks.algorithms.kyrodb
       constructor: KyroDB
       disabled: false
       base_args: ["@metric"]
@@ -23,23 +23,21 @@ float:
             ef_construction: 500
           query_args:
             &ef_search_sweep [
-              [
-                4,
-                8,
-                10,
-                20,
-                40,
-                80,
-                120,
-                200,
-                400,
-                600,
-                800,
-                1200,
-                1600,
-                2048,
-                3072,
-              ],
+              [4],
+              [8],
+              [10],
+              [20],
+              [40],
+              [80],
+              [120],
+              [200],
+              [400],
+              [600],
+              [800],
+              [1200],
+              [1600],
+              [2048],
+              [3072],
             ]
         M-16:
           args:
