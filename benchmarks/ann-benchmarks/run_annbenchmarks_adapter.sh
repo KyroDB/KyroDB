@@ -62,6 +62,49 @@ require_cmd() {
   fi
 }
 
+validate_query_args_shape() {
+  local config_path="$1"
+  "${PYTHON_BIN}" - "${config_path}" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+path = pathlib.Path(sys.argv[1])
+data = yaml.safe_load(path.read_text())
+
+algorithms = data.get("float", {}).get("any", [])
+if len(algorithms) != 1:
+    raise SystemExit(f"expected exactly one algorithm entry in config, found {len(algorithms)}")
+
+run_groups = algorithms[0].get("run_groups", {})
+if not run_groups:
+    raise SystemExit("run_groups is empty in config.yml")
+
+group_counts = set()
+for group_name, group in run_groups.items():
+    query_args = group.get("query_args")
+    if not isinstance(query_args, list) or not query_args:
+        raise SystemExit(f"{group_name}: query_args must be a non-empty list")
+    for idx, arg in enumerate(query_args):
+        if not isinstance(arg, list) or len(arg) != 1:
+            raise SystemExit(
+                f"{group_name}: query_args[{idx}] must be single-element list, got {arg!r}"
+            )
+        value = arg[0]
+        if not isinstance(value, int) or value <= 0:
+            raise SystemExit(
+                f"{group_name}: query_args[{idx}] value must be positive integer, got {value!r}"
+            )
+    group_counts.add(len(query_args))
+
+if len(group_counts) != 1:
+    raise SystemExit(f"inconsistent query_args lengths across run_groups: {sorted(group_counts)}")
+
+print(next(iter(group_counts)))
+PY
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -109,6 +152,7 @@ fi
 require_cmd "${PYTHON_BIN}"
 require_cmd cp
 require_cmd mkdir
+require_cmd grep
 
 ANN_ROOT="$(cd "${ANN_ROOT}" && pwd)"
 if [[ ! -f "${ANN_ROOT}/install.py" ]] || [[ ! -f "${ANN_ROOT}/run.py" ]]; then
@@ -129,6 +173,8 @@ cp "${REPO_ROOT}/benchmarks/ann-benchmarks/__init__.py" "${ALG_DIR}/__init__.py"
 cp "${REPO_ROOT}/benchmarks/ann-benchmarks/config.yml" "${ALG_DIR}/config.yml"
 
 echo "[adapter] staged files into ${ALG_DIR}"
+EXPECTED_QUERY_GROUPS="$(validate_query_args_shape "${ALG_DIR}/config.yml")"
+echo "[adapter] query sweep validated (${EXPECTED_QUERY_GROUPS} groups per run-group)"
 
 echo "[adapter] config: algorithm=${ALGORITHM} kyrodb_ref=${KYRODB_REF} sdk=${SDK_VERSION}"
 
@@ -145,9 +191,26 @@ else
 fi
 
 for dataset in "${DATASET_LIST[@]}"; do
+  RUN_LOG="${ANN_ROOT}/results/_kyrodb_logs/${ALGORITHM}_${dataset}_$(date -u +%Y%m%dT%H%M%SZ).log"
+  mkdir -p "$(dirname "${RUN_LOG}")"
   echo "[adapter] running dataset ${dataset}"
-  "${PYTHON_BIN}" run.py --algorithm "${ALGORITHM}" --dataset "${dataset}"
-  
+  if ! "${PYTHON_BIN}" run.py --algorithm "${ALGORITHM}" --dataset "${dataset}" 2>&1 | tee "${RUN_LOG}"; then
+    echo "[adapter] run failed for dataset ${dataset}; see ${RUN_LOG}" >&2
+    exit 1
+  fi
+
+  if [[ "${EXPECTED_QUERY_GROUPS}" -gt 1 ]] && grep -q "Running query argument group 1 of 1" "${RUN_LOG}"; then
+    echo "[adapter] invalid sweep detected (1 of 1) for dataset ${dataset}; expected ${EXPECTED_QUERY_GROUPS}" >&2
+    echo "[adapter] refusing to accept invalid benchmark output; see ${RUN_LOG}" >&2
+    exit 1
+  fi
+
+  if ! grep -q "Running query argument group ${EXPECTED_QUERY_GROUPS} of ${EXPECTED_QUERY_GROUPS}" "${RUN_LOG}"; then
+    echo "[adapter] incomplete sweep detected for dataset ${dataset}; expected ${EXPECTED_QUERY_GROUPS} groups" >&2
+    echo "[adapter] see ${RUN_LOG}" >&2
+    exit 1
+  fi
+
   # Docker writes result files as root; fix permissions so we can read and plot them
   if [ -d "results/" ]; then
     sudo chown -R $(id -u):$(id -g) results/ || true

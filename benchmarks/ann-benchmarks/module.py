@@ -1,11 +1,4 @@
-"""KyroDB ANN-Benchmarks adapter.
-
-This file is copied into upstream ann-benchmarks at:
-  ann_benchmarks/algorithms/kyrodb/module.py
-
-The adapter starts a local `kyrodb_server` inside the benchmark container and
-uses the released `kyrodb` Python SDK for all RPC interactions.
-"""
+"""KyroDB ANN-Benchmarks adapter (server-mode, official single-query path)."""
 
 from __future__ import annotations
 
@@ -15,19 +8,79 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Any, Optional
 
 import grpc
 import numpy as np
-from kyrodb import InsertItem, KyroDBClient, SearchQuery
-from kyrodb.errors import KyroDBError
+from kyrodb import InsertItem, KyroDBClient
+
+try:
+    from kyrodb._generated import kyrodb_pb2 as pb2
+    from kyrodb._generated import kyrodb_pb2_grpc as pb2_grpc
+except Exception:  # pragma: no cover - depends on installed SDK layout
+    pb2 = None
+    pb2_grpc = None
 
 try:
     from ..base.module import BaseANN
 except ImportError:  # pragma: no cover - allows standalone import tests
     class BaseANN:  # type: ignore
         pass
+
+
+def _available_cores() -> int:
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, NotImplementedError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+class _RawGrpcClient:
+    """Thin ANN benchmark client path to minimize Python-side overhead."""
+
+    def __init__(self, target: str) -> None:
+        assert pb2_grpc is not None
+        self._channel = grpc.insecure_channel(
+            target,
+            options=[
+                ("grpc.keepalive_time_ms", 30000),
+                ("grpc.keepalive_timeout_ms", 10000),
+                ("grpc.keepalive_permit_without_calls", 1),
+            ],
+        )
+        self._stub = pb2_grpc.KyroDBServiceStub(self._channel)
+
+    def wait_for_ready(self, timeout_s: float) -> None:
+        grpc.channel_ready_future(self._channel).result(timeout=timeout_s)
+
+    def close(self) -> None:
+        self._channel.close()
+
+    def bulk_load_hnsw(self, vectors: np.ndarray, timeout_s: float | None) -> Any:
+        assert pb2 is not None
+
+        def req_stream() -> Iterator[Any]:
+            for index, vec in enumerate(vectors, start=1):
+                yield pb2.InsertRequest(
+                    doc_id=index,
+                    embedding=vec.tolist(),
+                )
+
+        return self._stub.BulkLoadHnsw(req_stream(), timeout=timeout_s)
+
+    def search(self, query_vector: np.ndarray, k: int, ef_search: int, timeout_s: float | None) -> Any:
+        assert pb2 is not None
+        request = pb2.SearchRequest(
+            query_embedding=query_vector.tolist(),
+            k=int(k),
+            ef_search=int(ef_search),
+        )
+        return self._stub.Search(request, timeout=timeout_s)
+
+    def metrics(self, timeout_s: float) -> Any:
+        assert pb2 is not None
+        return self._stub.Metrics(pb2.MetricsRequest(), timeout=timeout_s)
 
 
 class KyroDB(BaseANN):
@@ -44,6 +97,7 @@ class KyroDB(BaseANN):
         self.target = f"{self.host}:{self.port}"
 
         self._client: Optional[KyroDBClient] = None
+        self._raw_client: Optional[_RawGrpcClient] = None
         self._server_proc: Optional[subprocess.Popen[bytes]] = None
         self._data_dir: Optional[str] = None
         self._server_stdout = None
@@ -51,8 +105,6 @@ class KyroDB(BaseANN):
         self._server_stdout_path: Optional[str] = None
         self._server_stderr_path: Optional[str] = None
 
-        self._batch_results: list[list[int]] = []
-        self._batch_latencies: list[float] = []
         self.name = "KyroDB"
 
         self._logger = logging.getLogger(__name__)
@@ -87,11 +139,12 @@ class KyroDB(BaseANN):
 
     def _start_server_if_needed(self, dimension: int, max_elements: int) -> None:
         if self._server_proc is not None:
-            if self._client is not None and self._server_proc.poll() is None:
+            has_client = self._raw_client is not None or self._client is not None
+            if has_client and self._server_proc.poll() is None:
                 return
             # Partial initialization or dead process from a previous attempt.
             self._cleanup_server()
-        elif self._client is not None:
+        elif self._raw_client is not None or self._client is not None:
             # Defensive cleanup for impossible partial state.
             self._cleanup_server()
 
@@ -124,9 +177,8 @@ class KyroDB(BaseANN):
         env.setdefault("KYRODB__CACHE__ENABLE_TRAINING_TASK", "false")
         env.setdefault("KYRODB__CACHE__AUTO_TUNE_THRESHOLD", "false")
 
-        # Maximize parallel index construction. ann-benchmarks evaluates queries sequentially,
-        # but building the HNSW index on 1 core is unnecessarily slow. Default to all cores.
-        threads = env.get("KYRODB_BENCH_THREADS", str(os.cpu_count() or 1))
+        # Respect container CPU affinity to avoid oversubscription in single-core official runs.
+        threads = env.get("KYRODB_BENCH_THREADS", str(_available_cores()))
         env.setdefault("TOKIO_WORKER_THREADS", threads)
         env.setdefault("RAYON_NUM_THREADS", threads)
         env.setdefault("OMP_NUM_THREADS", threads)
@@ -153,8 +205,15 @@ class KyroDB(BaseANN):
                 stdout=self._server_stdout,
                 stderr=self._server_stderr,
             )
-            self._client = KyroDBClient(target=self.target, default_timeout_s=30.0)
-            self._client.wait_for_ready(timeout_s=30.0)
+            use_sdk_path = os.environ.get("KYRODB_BENCH_USE_SDK", "").lower() in {"1", "true", "yes"}
+            if not use_sdk_path and pb2 is not None and pb2_grpc is not None:
+                self._raw_client = _RawGrpcClient(target=self.target)
+                self._raw_client.wait_for_ready(timeout_s=30.0)
+                self._logger.info("Using thin gRPC benchmark client path")
+            else:
+                self._client = KyroDBClient(target=self.target, default_timeout_s=30.0)
+                self._client.wait_for_ready(timeout_s=30.0)
+                self._logger.info("Using KyroDB SDK benchmark client path")
         except Exception as exc:
             stderr_tail = self._read_stderr_tail()
             self._cleanup_server()
@@ -177,7 +236,7 @@ class KyroDB(BaseANN):
             return None
 
     @staticmethod
-    def _insert_items(vectors: np.ndarray) -> Iterator[InsertItem]:
+    def _insert_items(vectors: Iterable[np.ndarray]) -> Iterator[InsertItem]:
         for i, vec in enumerate(vectors):
             yield InsertItem.from_parts(doc_id=i + 1, embedding=vec)
 
@@ -190,10 +249,23 @@ class KyroDB(BaseANN):
             index_vectors = self._normalize_rows(index_vectors)
 
         self._start_server_if_needed(int(index_vectors.shape[1]), int(len(index_vectors)))
-        assert self._client is not None
-
         start = time.time()
         try:
+            if self._raw_client is not None:
+                bulk_result = self._raw_client.bulk_load_hnsw(index_vectors, timeout_s=None)
+                if not bulk_result.success:
+                    raise RuntimeError(bulk_result.error or "BulkLoadHnsw returned success=false")
+                self._logger.info(
+                    "BulkLoadHnsw complete: n=%d dim=%d seconds=%.2f rate=%.0f vec/s",
+                    len(index_vectors),
+                    index_vectors.shape[1],
+                    time.time() - start,
+                    float(bulk_result.avg_insert_rate),
+                )
+                return
+
+            if self._client is None:
+                raise RuntimeError("benchmark client is not initialized")
             bulk_result = self._client.bulk_load_hnsw(
                 self._insert_items(index_vectors),
                 timeout_s=None,
@@ -210,32 +282,11 @@ class KyroDB(BaseANN):
                 bulk_result.avg_insert_rate,
             )
             return
-        except KyroDBError as exc:
-            if exc.code != grpc.StatusCode.UNIMPLEMENTED:
-                raise
-            self._logger.info("BulkLoadHnsw unavailable; falling back to BulkInsert+Flush")
         except Exception as exc:
-            self._logger.info("BulkLoadHnsw failed (%s); falling back to BulkInsert+Flush", exc)
-
-        insert_start = time.time()
-        insert_ack = self._client.bulk_insert(
-            self._insert_items(index_vectors),
-            timeout_s=None,
-        )
-        if not insert_ack.success:
-            raise RuntimeError(f"BulkInsert failed: {insert_ack.error}")
-
-        elapsed = time.time() - insert_start
-        self._logger.info(
-            "BulkInsert complete: n=%d dim=%d seconds=%.2f",
-            len(index_vectors),
-            index_vectors.shape[1],
-            elapsed,
-        )
-
-        flush_result = self._client.flush_hot_tier(force=True, timeout_s=None)
-        if not flush_result.success:
-            raise RuntimeError(f"FlushHotTier failed: {flush_result.error}")
+            stderr_tail = self._read_stderr_tail()
+            if stderr_tail:
+                self._logger.error("KyroDB server stderr tail:\n%s", stderr_tail)
+            raise RuntimeError(f"BulkLoadHnsw failed: {exc}") from exc
 
     def set_query_arguments(self, *args: Any, **kwargs: Any) -> None:
         candidate: Any = None
@@ -260,12 +311,23 @@ class KyroDB(BaseANN):
         self.name = f"KyroDB(M={self.M}, efConstruction={self.ef_construction}, efSearch={self.ef_search})"
 
     def query(self, q: np.ndarray, k: int) -> list[int]:
-        assert self._client is not None
-
-        query_vec = np.asarray(q, dtype=np.float32)
+        query_vec = np.asarray(q, dtype=np.float32, order="C")
         if self._needs_unit_norm():
             query_vec = self._normalize_vector(query_vec)
 
+        if self._raw_client is not None:
+            response = self._raw_client.search(
+                query_vector=query_vec,
+                k=int(k),
+                ef_search=int(self.ef_search),
+                timeout_s=None,
+            )
+            if response.error:
+                raise RuntimeError(f"Search failed: {response.error}")
+            return [int(hit.doc_id) - 1 for hit in response.results]
+
+        if self._client is None:
+            raise RuntimeError("benchmark client is not initialized")
         response = self._client.search(
             query_embedding=query_vec,
             k=int(k),
@@ -274,46 +336,26 @@ class KyroDB(BaseANN):
         )
         return [int(hit.doc_id) - 1 for hit in response.results]
 
-    def batch_query(self, X: np.ndarray, k: int) -> None:
-        assert self._client is not None
-
-        query_vectors = np.asarray(X, dtype=np.float32)
-        if self._needs_unit_norm():
-            query_vectors = self._normalize_rows(query_vectors)
-
-        def query_stream() -> Iterator[SearchQuery]:
-            for q in query_vectors:
-                yield SearchQuery.from_parts(
-                    query_embedding=q,
-                    k=int(k),
-                    ef_search=int(self.ef_search),
-                )
-
-        start = time.time()
-        out: list[list[int]] = []
-        for response in self._client.bulk_search(query_stream(), timeout_s=None):
-            out.append([int(hit.doc_id) - 1 for hit in response.results])
-        total = time.time() - start
-
-        per_query = total / float(len(query_vectors)) if len(query_vectors) > 0 else 0.0
-        self._batch_results = out
-        self._batch_latencies = [per_query] * len(out)
-
-    def get_batch_results(self) -> list[list[int]]:
-        return self._batch_results
-
-    def get_batch_latencies(self) -> list[float]:
-        return self._batch_latencies
-
     def get_memory_usage(self) -> float:
         try:
-            assert self._client is not None
-            metrics = self._client.metrics(timeout_s=5.0)
-            return float(metrics.memory_usage_bytes) / 1024.0
-        except Exception:
+            if self._raw_client is not None:
+                metrics = self._raw_client.metrics(timeout_s=5.0)
+                return float(metrics.memory_usage_bytes) / 1024.0
+            if self._client is not None:
+                metrics = self._client.metrics(timeout_s=5.0)
+                return float(metrics.memory_usage_bytes) / 1024.0
+            return 0.0
+        except Exception as exc:
+            self._logger.warning("Failed to query metrics: %s", exc)
             return 0.0
 
     def _cleanup_server(self) -> None:
+        try:
+            if self._raw_client is not None:
+                self._raw_client.close()
+        finally:
+            self._raw_client = None
+
         try:
             if self._client is not None:
                 self._client.close()
