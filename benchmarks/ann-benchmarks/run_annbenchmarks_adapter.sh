@@ -86,17 +86,21 @@ for group_name, group in run_groups.items():
     query_args = group.get("query_args")
     if not isinstance(query_args, list) or not query_args:
         raise SystemExit(f"{group_name}: query_args must be a non-empty list")
-    for idx, arg in enumerate(query_args):
-        if not isinstance(arg, list) or len(arg) != 1:
-            raise SystemExit(
-                f"{group_name}: query_args[{idx}] must be single-element list, got {arg!r}"
-            )
-        value = arg[0]
+    if len(query_args) != 1:
+        raise SystemExit(
+            f"{group_name}: query_args must contain exactly one argument axis (ef_search), got {len(query_args)}"
+        )
+
+    ef_search_values = query_args[0]
+    if not isinstance(ef_search_values, list) or not ef_search_values:
+        raise SystemExit(f"{group_name}: query_args[0] must be a non-empty list of ef_search values")
+
+    for idx, value in enumerate(ef_search_values):
         if not isinstance(value, int) or value <= 0:
             raise SystemExit(
-                f"{group_name}: query_args[{idx}] value must be positive integer, got {value!r}"
+                f"{group_name}: query_args[0][{idx}] must be positive integer, got {value!r}"
             )
-    group_counts.add(len(query_args))
+    group_counts.add(len(ef_search_values))
 
 if len(group_counts) != 1:
     raise SystemExit(f"inconsistent query_args lengths across run_groups: {sorted(group_counts)}")

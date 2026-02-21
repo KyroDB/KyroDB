@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -93,7 +94,7 @@ class KyroDB(BaseANN):
         self.ef_search = int(params.get("ef_search", 50))
 
         self.host = os.environ.get("KYRODB_HOST", "127.0.0.1")
-        self.port = int(os.environ.get("KYRODB_PORT", "50051"))
+        self.port, self.http_port = self._resolve_ports()
         self.target = f"{self.host}:{self.port}"
 
         self._client: Optional[KyroDBClient] = None
@@ -108,6 +109,35 @@ class KyroDB(BaseANN):
         self.name = "KyroDB"
 
         self._logger = logging.getLogger(__name__)
+
+    def _resolve_ports(self) -> tuple[int, int]:
+        forced_port = os.environ.get("KYRODB_PORT")
+        forced_http_port = os.environ.get("KYRODB_HTTP_PORT")
+        if forced_port is not None:
+            grpc_port = int(forced_port)
+            http_port = int(forced_http_port) if forced_http_port is not None else grpc_port + 1000
+            return grpc_port, http_port
+
+        # Use an isolated high-port pair to avoid cross-run collisions with stale servers.
+        low = 20000
+        high = 59000
+        span = high - low
+        start = low + (os.getpid() % span)
+        for offset in range(span):
+            grpc_port = low + ((start - low + offset) % span)
+            http_port = grpc_port + 1000
+            if self._port_is_available(grpc_port) and self._port_is_available(http_port):
+                return grpc_port, http_port
+
+        raise RuntimeError("failed to allocate free benchmark ports for kyrodb_server")
+
+    def _port_is_available(self, port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((self.host, port))
+            except OSError:
+                return False
+        return True
 
     def _needs_unit_norm(self) -> bool:
         return self.metric.lower() in ("angular", "cosine")
@@ -183,7 +213,7 @@ class KyroDB(BaseANN):
         env.setdefault("RAYON_NUM_THREADS", threads)
         env.setdefault("OMP_NUM_THREADS", threads)
 
-        env["KYRODB__SERVER__HTTP_PORT"] = str(self.port + 1000)
+        env["KYRODB__SERVER__HTTP_PORT"] = str(self.http_port)
         env.setdefault("RUST_LOG", "warn")
         env.setdefault("KYRODB__LOGGING__LEVEL", "warn")
 
