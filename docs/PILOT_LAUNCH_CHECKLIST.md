@@ -62,5 +62,6 @@ Go only if all critical checklist sections pass:
 - Security baseline
 - Tenant isolation
 - Recovery drills
+- Performance readiness
 - SLO behavior under pilot traffic
 - Metering visibility for paid conversion

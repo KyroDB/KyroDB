@@ -571,7 +571,20 @@ impl Default for EnvironmentConfig {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host.trim(), "127.0.0.1" | "::1" | "localhost")
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed);
+
+    let without_zone = unbracketed.split('%').next().unwrap_or(unbracketed);
+    let normalized = without_zone.trim().to_ascii_lowercase();
+
+    normalized == "::1" || normalized == "localhost" || normalized.starts_with("127.")
 }
 
 // ============================================================================
@@ -1044,6 +1057,17 @@ mod tests {
         let mut config = KyroDbConfig::default();
         config.cache.capacity = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_is_loopback_host_normalized_variants() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.42.0.99"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host(" [::1] "));
+        assert!(is_loopback_host("::1%lo0"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("example.com"));
     }
 
     #[test]

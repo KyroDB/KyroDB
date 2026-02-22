@@ -17,6 +17,7 @@ require_cmd rustc
 require_cmd awk
 require_cmd date
 require_cmd tee
+require_cmd find
 
 SANITIZERS_CSV="${SANITIZERS_CSV:-address,thread}"
 TARGET_TRIPLE="${TARGET_TRIPLE:-$(rustc -vV | awk '/^host:/ {print $2}')}"
@@ -65,6 +66,11 @@ if [[ "$HAS_STD_WORKAROUND" != "0" && "$HAS_STD_WORKAROUND" != "1" ]]; then
   exit 1
 fi
 
+if [[ "$CONTINUE_ON_ERROR" != "0" && "$CONTINUE_ON_ERROR" != "1" ]]; then
+  echo "error: CONTINUE_ON_ERROR must be 0 or 1 (got '$CONTINUE_ON_ERROR')" >&2
+  exit 1
+fi
+
 if ([[ "$BUILD_STD" == "1" ]] || [[ "$SANITIZERS_CSV" == *thread* ]]) && ! rustup component list --toolchain "$NIGHTLY_TOOLCHAIN" | grep -q '^rust-src.*installed'; then
   echo "error: rust-src component is required for sanitizer builds with -Zbuild-std." >&2
   echo "run: rustup component add rust-src --toolchain $NIGHTLY_TOOLCHAIN" >&2
@@ -82,7 +88,9 @@ run_one() {
   local dyld_insert_libs="${DYLD_INSERT_LIBRARIES:-}"
   local host_os
   local runtime_name=""
+  local runtime_glob=""
   local runtime_path=""
+  local runtime_dir=""
   local -a cargo_args=(
     +"$NIGHTLY_TOOLCHAIN"
     test
@@ -138,18 +146,26 @@ run_one() {
     case "$sanitizer" in
       address|leak)
         runtime_name="librustc-nightly_rt.asan.dylib"
+        runtime_glob="*_rt.*asan*.dylib"
         ;;
       thread)
         runtime_name="librustc-nightly_rt.tsan.dylib"
+        runtime_glob="*_rt.*tsan*.dylib"
         ;;
       *)
         runtime_name=""
         ;;
     esac
     if [[ -n "$runtime_name" ]]; then
-      runtime_path="$(rustc +"$NIGHTLY_TOOLCHAIN" --print sysroot)/lib/rustlib/${TARGET_TRIPLE}/lib/${runtime_name}"
+      runtime_dir="$(rustc +"$NIGHTLY_TOOLCHAIN" --print sysroot)/lib/rustlib/${TARGET_TRIPLE}/lib"
+      runtime_path="${runtime_dir}/${runtime_name}"
+      if [[ ! -f "$runtime_path" && -n "$runtime_glob" ]]; then
+        runtime_path="$(find "$runtime_dir" -maxdepth 1 -type f -name "$runtime_glob" | LC_ALL=C sort | head -n 1 || true)"
+      fi
       if [[ -f "$runtime_path" ]]; then
         dyld_insert_libs="${runtime_path}${dyld_insert_libs:+:${dyld_insert_libs}}"
+      else
+        runtime_name=""
       fi
     fi
   fi
@@ -174,16 +190,28 @@ run_one() {
   fi
   echo "${sanitizer},${status},${log_file}" >>"$SUMMARY_FILE"
 
-  if [[ "$status" != "ok" && "$CONTINUE_ON_ERROR" != "1" ]]; then
+  if [[ "$status" != "ok" ]]; then
     return 1
   fi
   return 0
 }
 
 IFS=',' read -r -a sanitizers <<<"$SANITIZERS_CSV"
+FAILED=0
 for sanitizer in "${sanitizers[@]}"; do
-  run_one "$sanitizer"
+  if ! run_one "$sanitizer"; then
+    FAILED=1
+    if [[ "$CONTINUE_ON_ERROR" != "1" ]]; then
+      echo "[done] sanitizer summary: $SUMMARY_FILE"
+      cat "$SUMMARY_FILE"
+      exit 1
+    fi
+  fi
 done
 
 echo "[done] sanitizer summary: $SUMMARY_FILE"
 cat "$SUMMARY_FILE"
+
+if [[ "$FAILED" -ne 0 ]]; then
+  exit 1
+fi

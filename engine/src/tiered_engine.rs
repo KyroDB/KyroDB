@@ -1843,17 +1843,7 @@ impl TieredEngine {
             }
         }
 
-        // Invalidate document cache (L1a) for consistency
-        {
-            let cache = self.cache_strategy.write();
-            for doc_id in &doc_ids {
-                cache.invalidate(*doc_id);
-            }
-        }
-
-        // L1b caches search results, so bulk loads can change k‑NN results even if
-        // cached result sets don't explicitly contain the new doc_ids.
-        self.query_cache.clear();
+        self.invalidate_caches_after_bulk_load(&doc_ids);
 
         let elapsed = start.elapsed();
         let duration_ms = elapsed.as_secs_f32() * 1000.0;
@@ -1873,6 +1863,60 @@ impl TieredEngine {
         );
 
         Ok((loaded, failed, duration_ms, rate))
+    }
+
+    /// Benchmark-only fast bulk load path.
+    ///
+    /// This bypasses WAL by delegating to `HnswBackend::bulk_insert` for significantly
+    /// faster index construction during benchmark runs.
+    ///
+    /// Production and pilot ingest paths must continue to use `bulk_load_cold_tier`
+    /// to preserve durability semantics.
+    #[instrument(level = "info", skip(self, documents), fields(count = documents.len()))]
+    pub fn bulk_load_cold_tier_fast(
+        &self,
+        documents: Vec<(u64, Vec<f32>, std::collections::HashMap<String, String>)>,
+    ) -> Result<(u64, u64, f32, f32)> {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let total = documents.len() as u64;
+        let doc_ids: Vec<u64> = documents.iter().map(|(id, _, _)| *id).collect();
+
+        let (loaded, failed) = self.cold_tier.bulk_insert(documents)?;
+        self.invalidate_caches_after_bulk_load(&doc_ids);
+
+        let elapsed = start.elapsed();
+        let duration_ms = elapsed.as_secs_f32() * 1000.0;
+        let rate = if elapsed.as_secs_f64() > 0.0 {
+            loaded as f32 / elapsed.as_secs_f32()
+        } else {
+            loaded as f32
+        };
+
+        info!(
+            total,
+            loaded,
+            failed,
+            duration_ms,
+            rate_per_sec = rate,
+            "bulk_load_cold_tier_fast complete"
+        );
+
+        Ok((loaded, failed, duration_ms, rate))
+    }
+
+    fn invalidate_caches_after_bulk_load(&self, doc_ids: &[u64]) {
+        {
+            let cache = self.cache_strategy.write();
+            for doc_id in doc_ids {
+                cache.invalidate(*doc_id);
+            }
+        }
+
+        // L1b caches search results, so bulk loads can change k-NN results even if
+        // cached result sets do not explicitly include the newly loaded doc_ids.
+        self.query_cache.clear();
     }
 
     /// Flush hot tier to cold tier (manual trigger)

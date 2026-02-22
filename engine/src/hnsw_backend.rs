@@ -1539,8 +1539,6 @@ impl HnswBackend {
         }
 
         let start = Instant::now();
-        let total = documents.len();
-
         // Get expected dimension from first vector or from index
         let expected_dim = if let Some((_, ref emb, _)) = documents.first() {
             emb.len()
@@ -1576,18 +1574,16 @@ impl HnswBackend {
         let mut store = self.doc_store.write();
         let distance = index.distance_metric();
 
-        // Pre-allocate capacity for new inserts
-        store.embeddings.reserve(documents.len());
-        store.metadata.reserve(documents.len());
-        store.internal_to_external.reserve(documents.len());
-
-        let mut loaded = 0u64;
         let mut failed = 0u64;
-        let log_interval = std::cmp::max(total / 20, 10000); // Log every 5% or 10K
         let mut seen_ids = std::collections::HashSet::with_capacity(documents.len());
         let mut meta_updates: Vec<(u64, HashMap<String, String>)> = Vec::new();
 
-        for (i, (doc_id, embedding, metadata)) in documents.into_iter().enumerate() {
+        // Phase 1: Validate and normalize. Do not mutate doc_store yet.
+        // This guarantees atomic visibility when batch index insertion fails.
+        let mut normalized_docs: Vec<(u64, Vec<f32>, HashMap<String, String>)> =
+            Vec::with_capacity(documents.len());
+
+        for (doc_id, embedding, metadata) in documents {
             if !seen_ids.insert(doc_id) {
                 if failed < 10 {
                     tracing::warn!(doc_id, "bulk_insert: duplicate doc_id within batch");
@@ -1604,7 +1600,6 @@ impl HnswBackend {
                 continue;
             }
 
-            let internal_id = store.embeddings.len();
             let mut embedding = embedding;
             if let Err(e) = normalize_in_place_if_needed(distance, &mut embedding) {
                 if failed < 10 {
@@ -1613,40 +1608,39 @@ impl HnswBackend {
                 failed += 1;
                 continue;
             }
-            match index.add_vector(internal_id as u64, &embedding) {
-                Ok(_) => {
-                    let metadata_for_index = metadata.clone();
-                    store.embeddings.push(embedding);
-                    store.metadata.push(metadata);
-                    store.internal_to_external.push(Some(doc_id));
-                    store.external_to_internal.insert(doc_id, internal_id);
-                    meta_updates.push((internal_id as u64, metadata_for_index));
-                    loaded += 1;
-                }
-                Err(e) => {
-                    if failed < 10 {
-                        tracing::warn!(doc_id, error = %e, "bulk_insert: failed to add vector");
-                    }
-                    failed += 1;
-                }
-            }
 
-            // Progress logging
-            if (i + 1) % log_interval == 0 {
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = (i + 1) as f64 / elapsed;
-                info!(
-                    progress = i + 1,
-                    total,
-                    rate_per_sec = rate as u64,
-                    "bulk_insert progress"
-                );
-            }
+            normalized_docs.push((doc_id, embedding, metadata));
         }
 
-        if loaded > 0 {
-            index.complete_sequential_inserts();
+        // Phase 2: Insert all validated vectors into the HNSW index in one batch.
+        // parallel_insert_batch uses Rayon for batches >= 100 vectors.
+        let base_internal_id = store.embeddings.len();
+        if !normalized_docs.is_empty() {
+            let batch_refs: Vec<(&[f32], usize)> = normalized_docs
+                .iter()
+                .enumerate()
+                .map(|(offset, (_, emb, _))| (emb.as_slice(), base_internal_id + offset))
+                .collect();
+            index.parallel_insert_batch(&batch_refs)?;
         }
+
+        // Phase 3: Commit doc_store mappings only after successful index insertion.
+        store.embeddings.reserve(normalized_docs.len());
+        store.metadata.reserve(normalized_docs.len());
+        store.internal_to_external.reserve(normalized_docs.len());
+
+        for (offset, (doc_id, embedding, metadata)) in normalized_docs.into_iter().enumerate() {
+            let internal_id = base_internal_id + offset;
+            let metadata_for_index = metadata.clone();
+
+            store.embeddings.push(embedding);
+            store.metadata.push(metadata);
+            store.internal_to_external.push(Some(doc_id));
+            store.external_to_internal.insert(doc_id, internal_id);
+            meta_updates.push((internal_id as u64, metadata_for_index));
+        }
+
+        let loaded = meta_updates.len() as u64;
 
         drop(store);
         drop(index);
@@ -2899,6 +2893,36 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_bulk_insert_rolls_back_store_on_batch_insert_error() {
+        let backend =
+            HnswBackend::new(2, DistanceMetric::Cosine, Vec::new(), Vec::new(), 1).unwrap();
+
+        let docs = vec![
+            (1u64, normalize(vec![1.0, 0.0]), HashMap::new()),
+            (2u64, normalize(vec![0.0, 1.0]), HashMap::new()),
+        ];
+
+        let err = backend
+            .bulk_insert(docs)
+            .expect_err("batch should fail when exceeding index capacity");
+        assert!(
+            err.to_string().contains("exceed capacity"),
+            "unexpected error: {}",
+            err
+        );
+
+        assert_eq!(
+            backend.len(),
+            0,
+            "doc-store mappings must not be committed when batch insert fails"
+        );
+        assert!(backend.fetch_document(1).is_none());
+        assert!(backend.fetch_document(2).is_none());
+        assert!(backend.fetch_metadata(1).is_none());
+        assert!(backend.fetch_metadata(2).is_none());
     }
 
     #[test]

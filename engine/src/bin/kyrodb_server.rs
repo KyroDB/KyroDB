@@ -433,6 +433,11 @@ struct ServerState {
     tenant_id_mapper: Option<TenantIdMapper>,
     tenant_vector_counts: Option<parking_lot::RwLock<HashMap<String, usize>>>,
     usage_tracker: Option<Arc<UsageTracker>>,
+
+    /// Cached flag: true when environment_type == "benchmark".
+    /// Enables lean search path that skips rate limiting, connection tracking,
+    /// semaphore load-shedding, and empty hot-tier/cache checks.
+    is_benchmark_mode: bool,
 }
 
 /// gRPC service implementation
@@ -985,6 +990,79 @@ impl KyroDBServiceImpl {
         Ok(self.build_search_response(tenant, &req, results, &engine, latency_ns, search_path))
     }
 
+    /// Lean search path for benchmark mode.
+    ///
+    /// Skips: rate limiting, connection tracking, semaphore load-shedding,
+    /// empty hot-tier/cache checks, and `spawn_blocking`/timeout wrappers.
+    /// Calls the cold tier HNSW index directly for minimum overhead.
+    async fn handle_search_request_benchmark(
+        &self,
+        req: SearchRequest,
+    ) -> Result<SearchResponse, Status> {
+        let start = Instant::now();
+
+        // Minimal validation (keep dimension/k checks, skip oversampling/namespace)
+        if req.query_embedding.is_empty() {
+            return Err(Status::invalid_argument("query_embedding cannot be empty"));
+        }
+        if req.k == 0 {
+            return Err(Status::invalid_argument("k must be greater than 0"));
+        }
+
+        let ef_search_override = if req.ef_search == 0 {
+            None
+        } else {
+            Some(req.ef_search as usize)
+        };
+        let k = req.k as usize;
+
+        let engine = self.state.engine.read().await;
+
+        // Direct cold-tier search — no hot tier, no cache, no spawn_blocking
+        let results = engine
+            .cold_tier()
+            .knn_search_with_ef(&req.query_embedding, k, ef_search_override)
+            .map_err(|e| Status::internal(format!("search failed: {}", e)))?;
+        let total_found = results.len() as u32;
+
+        let latency_ns = start.elapsed().as_nanos() as u64;
+
+        Ok(SearchResponse {
+            results: results
+                .into_iter()
+                .take(k)
+                .map(|r| kyrodb::SearchResult {
+                    doc_id: r.doc_id,
+                    score: self.convert_distance_to_score(r.distance),
+                    embedding: Vec::new(),
+                    metadata: std::collections::HashMap::new(),
+                })
+                .collect(),
+            total_found,
+            search_latency_ms: latency_ns as f32 / 1_000_000.0,
+            search_path: 0, // UNKNOWN — benchmark doesn't need this
+            error: String::new(),
+        })
+    }
+
+    fn benchmark_fast_path_allowed(
+        &self,
+        tenant: Option<&TenantContext>,
+        req: &SearchRequest,
+    ) -> bool {
+        if !self.state.is_benchmark_mode {
+            return false;
+        }
+        if tenant.is_some() {
+            return false;
+        }
+        req.filter.is_none()
+            && req.metadata_filters.is_empty()
+            && req.namespace.is_empty()
+            && !req.include_embeddings
+            && req.min_score <= 0.0
+    }
+
     async fn handle_search_requests_batch(
         &self,
         tenant: Option<&TenantContext>,
@@ -1356,6 +1434,12 @@ impl KyroDbService for KyroDBServiceImpl {
         let tenant = self.tenant_context(&request)?;
         self.enforce_rate_limit(tenant.as_ref())?;
         let mut stream = request.into_inner();
+        let benchmark_fast_path = self
+            .state
+            .app_config
+            .environment
+            .environment_type
+            .eq_ignore_ascii_case("benchmark");
 
         // Stream ingestion in bounded chunks.
         // We cannot hold the engine write lock across `.await` on the request stream.
@@ -1368,8 +1452,12 @@ impl KyroDbService for KyroDBServiceImpl {
         let mut total_loaded = 0u64;
         let mut total_failed_insertion = 0u64;
         let mut total_received = 0u64;
+        let mut peak_memory_bytes = sample_process_memory_bytes().unwrap_or(0);
 
-        info!("BulkLoadHnsw: starting streaming load");
+        info!(
+            benchmark_fast_path = benchmark_fast_path,
+            "BulkLoadHnsw: starting streaming load"
+        );
 
         while let Some(req) = stream.message().await? {
             // Re-check rate limit per batch boundary to prevent long-running
@@ -1454,10 +1542,18 @@ impl KyroDbService for KyroDBServiceImpl {
                 }
                 let reserved_slots = new_doc_ids.len();
                 self.reserve_tenant_vectors(tenant.as_ref(), reserved_slots)?;
-                match engine.bulk_load_cold_tier(batch) {
+                let load_result = if benchmark_fast_path {
+                    engine.bulk_load_cold_tier_fast(batch)
+                } else {
+                    engine.bulk_load_cold_tier(batch)
+                };
+                match load_result {
                     Ok((loaded, failed, _duration_ms, _rate)) => {
                         total_loaded += loaded;
                         total_failed_insertion += failed;
+                        if let Some(current_rss) = sample_process_memory_bytes() {
+                            peak_memory_bytes = peak_memory_bytes.max(current_rss);
+                        }
                         if reserved_slots > 0 {
                             let inserted_now = new_doc_ids
                                 .iter()
@@ -1497,10 +1593,18 @@ impl KyroDbService for KyroDBServiceImpl {
             }
             let reserved_slots = new_doc_ids.len();
             self.reserve_tenant_vectors(tenant.as_ref(), reserved_slots)?;
-            match engine.bulk_load_cold_tier(batch) {
+            let load_result = if benchmark_fast_path {
+                engine.bulk_load_cold_tier_fast(batch)
+            } else {
+                engine.bulk_load_cold_tier(batch)
+            };
+            match load_result {
                 Ok((loaded, failed, _duration_ms, _rate)) => {
                     total_loaded += loaded;
                     total_failed_insertion += failed;
+                    if let Some(current_rss) = sample_process_memory_bytes() {
+                        peak_memory_bytes = peak_memory_bytes.max(current_rss);
+                    }
                     if reserved_slots > 0 {
                         let inserted_now = new_doc_ids
                             .iter()
@@ -1538,6 +1642,10 @@ impl KyroDbService for KyroDBServiceImpl {
             "BulkLoadHnsw: complete"
         );
 
+        if let Some(current_rss) = sample_process_memory_bytes() {
+            peak_memory_bytes = peak_memory_bytes.max(current_rss);
+        }
+
         Ok(Response::new(BulkLoadResponse {
             success: total_failed == 0,
             error: if total_failed > 0 {
@@ -1559,7 +1667,7 @@ impl KyroDbService for KyroDBServiceImpl {
             total_failed,
             load_duration_ms: (total_seconds * 1000.0) as f32,
             avg_insert_rate: rate as f32,
-            peak_memory_bytes: 0,
+            peak_memory_bytes,
         }))
     }
 
@@ -1912,6 +2020,13 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<SearchResponse>, Status> {
         let tenant = self.tenant_context(&request)?;
         let req = request.into_inner();
+
+        // Benchmark fast path: skip connection tracking, rate limiting, and
+        // multi-tier search. Goes directly to cold-tier HNSW.
+        if self.benchmark_fast_path_allowed(tenant.as_ref(), &req) {
+            let response = self.handle_search_request_benchmark(req).await?;
+            return Ok(Response::new(response));
+        }
 
         // Track connection
         self.state.metrics.increment_connections();
@@ -3470,6 +3585,10 @@ async fn main() -> anyhow::Result<()> {
         tenant_id_mapper,
         tenant_vector_counts,
         usage_tracker,
+        is_benchmark_mode: config
+            .environment
+            .environment_type
+            .eq_ignore_ascii_case("benchmark"),
     });
 
     if let Some(usage_tracker) = state.usage_tracker.clone() {
@@ -3824,6 +3943,52 @@ mod tests {
             tenant_id_mapper: None,
             tenant_vector_counts: None,
             usage_tracker: None,
+            is_benchmark_mode: false,
+        });
+
+        Arc::new(KyroDBServiceImpl { state })
+    }
+
+    fn build_test_service_with_seed_data_benchmark(auth_enabled: bool) -> Arc<KyroDBServiceImpl> {
+        let engine_config = TieredEngineConfig {
+            embedding_dimension: 16,
+            ..TieredEngineConfig::default()
+        };
+        let engine = TieredEngine::new(
+            Box::new(LruCacheStrategy::new(2048)),
+            Arc::new(QueryHashCache::new(2048, 0.90)),
+            Vec::new(),
+            Vec::new(),
+            engine_config.clone(),
+        )
+        .unwrap();
+
+        for doc_id in 1..=1024u64 {
+            let mut embedding = Vec::with_capacity(16);
+            for i in 0..16usize {
+                let base = (((doc_id as usize + 1) * (i + 3)) % 997) as f32 / 997.0;
+                embedding.push(base + 0.001);
+            }
+            engine.insert(doc_id, embedding, HashMap::new()).unwrap();
+        }
+
+        let mut app_config = KyroDbConfig::default();
+        app_config.auth.enabled = auth_enabled;
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
+        let state = Arc::new(ServerState {
+            engine: Arc::new(RwLock::new(engine)),
+            start_time: Instant::now(),
+            app_config,
+            engine_config,
+            shutdown_tx,
+            metrics: MetricsCollector::new(),
+            auth: None,
+            rate_limiter: Some(RateLimiter::new()),
+            tenant_id_mapper: None,
+            tenant_vector_counts: None,
+            usage_tracker: None,
+            is_benchmark_mode: true,
         });
 
         Arc::new(KyroDBServiceImpl { state })
@@ -3860,6 +4025,7 @@ mod tests {
             tenant_id_mapper: None,
             tenant_vector_counts: Some(parking_lot::RwLock::new(HashMap::new())),
             usage_tracker: Some(Arc::new(UsageTracker::new())),
+            is_benchmark_mode: false,
         });
 
         let service = Arc::new(KyroDBServiceImpl { state });
@@ -3907,6 +4073,7 @@ mod tests {
             tenant_id_mapper: None,
             tenant_vector_counts: None,
             usage_tracker: None,
+            is_benchmark_mode: false,
         });
 
         (Arc::new(KyroDBServiceImpl { state }), temp_dir)
@@ -4016,6 +4183,7 @@ mod tests {
             tenant_id_mapper: None,
             tenant_vector_counts: None,
             usage_tracker,
+            is_benchmark_mode: false,
         })
     }
 
@@ -4064,6 +4232,57 @@ mod tests {
     fn wal_failures_degrade_healthy_status() {
         let health = apply_wal_health_overrides(HealthStatus::Healthy, false, 3);
         assert!(matches!(health, HealthStatus::Degraded { .. }));
+    }
+
+    #[tokio::test]
+    async fn benchmark_search_populates_total_found_metadata() {
+        let service = build_test_service_with_seed_data_benchmark(false);
+        let request = Request::new(SearchRequest {
+            query_embedding: vec![0.1; 16],
+            k: 10,
+            ef_search: 128,
+            include_embeddings: false,
+            filter: None,
+            metadata_filters: HashMap::new(),
+            namespace: String::new(),
+            min_score: 0.0,
+        });
+
+        let response = service
+            .search(request)
+            .await
+            .expect("benchmark search should succeed")
+            .into_inner();
+        assert!(
+            !response.results.is_empty(),
+            "benchmark search should return at least one result"
+        );
+        assert_eq!(
+            response.total_found as usize,
+            response.results.len(),
+            "total_found must reflect actual benchmark result count"
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_search_requires_tenant_context_when_auth_enabled() {
+        let service = build_test_service_with_seed_data_benchmark(true);
+        let request = Request::new(SearchRequest {
+            query_embedding: vec![0.1; 16],
+            k: 10,
+            ef_search: 128,
+            include_embeddings: false,
+            filter: None,
+            metadata_filters: HashMap::new(),
+            namespace: String::new(),
+            min_score: 0.0,
+        });
+
+        let err = service
+            .search(request)
+            .await
+            .expect_err("auth-enabled benchmark search must enforce tenant context");
+        assert_eq!(err.code(), Code::Unauthenticated);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

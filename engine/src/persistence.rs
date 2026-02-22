@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, BufWriter, Cursor, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -693,17 +693,21 @@ impl Snapshot {
             );
         }
 
-        // Deserialize
-        let mut snapshot: Snapshot =
-            bincode::deserialize(&snapshot_bytes).context("Failed to deserialize snapshot")?;
-
-        if snapshot.version != SNAPSHOT_VERSION {
+        // Decode version first so legacy snapshot layouts fail with a clear migration/version
+        // error instead of an opaque bincode struct-deserialization error.
+        let snapshot_version: u32 = bincode::deserialize_from(&mut Cursor::new(&snapshot_bytes))
+            .context("Failed to read snapshot version header")?;
+        if snapshot_version != SNAPSHOT_VERSION {
             bail!(
                 "Unsupported snapshot version {} (expected {}). Remove stale snapshots and restart.",
-                snapshot.version,
+                snapshot_version,
                 SNAPSHOT_VERSION
             );
         }
+
+        // Deserialize full payload only after version guard.
+        let mut snapshot: Snapshot =
+            bincode::deserialize(&snapshot_bytes).context("Failed to deserialize snapshot")?;
 
         snapshot.validate_and_normalize()?;
         Ok(snapshot)
@@ -1052,6 +1056,53 @@ mod tests {
         .unwrap();
         snapshot.version = SNAPSHOT_VERSION - 1;
         snapshot.save(&snapshot_path).unwrap();
+
+        let err = Snapshot::load(&snapshot_path).unwrap_err().to_string();
+        assert!(
+            err.contains("Unsupported snapshot version"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_snapshot_rejects_legacy_layout_with_clear_version_error() {
+        #[derive(Serialize)]
+        struct LegacySnapshotV3 {
+            version: u32,
+            timestamp: u64,
+            doc_count: usize,
+            dimension: usize,
+            documents: Vec<(u64, Vec<f32>)>,
+            metadata: Vec<(u64, HashMap<String, String>)>,
+            last_wal_seq: u64,
+        }
+
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("legacy_v3.snapshot");
+
+        let legacy = LegacySnapshotV3 {
+            version: SNAPSHOT_VERSION - 1,
+            timestamp: 123,
+            doc_count: 1,
+            dimension: 2,
+            documents: vec![(1, vec![0.1, 0.2])],
+            metadata: vec![(1, HashMap::new())],
+            last_wal_seq: 10,
+        };
+        let snapshot_bytes = bincode::serialize(&legacy).unwrap();
+
+        let file = File::create(&snapshot_path).unwrap();
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&SNAPSHOT_MAGIC.to_le_bytes()).unwrap();
+        writer
+            .write_all(&(snapshot_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        writer.write_all(&snapshot_bytes).unwrap();
+        writer
+            .write_all(&crc32fast::hash(&snapshot_bytes).to_le_bytes())
+            .unwrap();
+        writer.flush().unwrap();
 
         let err = Snapshot::load(&snapshot_path).unwrap_err().to_string();
         assert!(

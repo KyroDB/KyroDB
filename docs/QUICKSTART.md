@@ -64,8 +64,9 @@ from kyrodb import KyroDBClient
 
 def main() -> None:
     # For local development this target can run without TLS.
-    # For non-loopback targets, configure TLS and API key auth.
-    with KyroDBClient(target="127.0.0.1:50051", api_key="dev_local_key") as client:
+    # For non-loopback targets, configure TLS.
+    # If auth.enabled=true on the server, also provide api_key="...".
+    with KyroDBClient(target="127.0.0.1:50051") as client:
         client.wait_for_ready(timeout_s=5.0)
 
         embedding = [0.0] * 768

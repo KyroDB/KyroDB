@@ -1,10 +1,3 @@
-### KyroDB ANN-Benchmarks Dockerfile
-# This file is intended to be copied into:
-#   ann_benchmarks/algorithms/kyrodb/Dockerfile
-
-# ==========================================================================
-# Stage 1: Build kyrodb_server from KyroDB core repository
-# ==========================================================================
 ARG RUST_VERSION=1.93.0
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
@@ -32,12 +25,8 @@ WORKDIR /src/kyrodb
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release --locked -p kyrodb-engine --bin kyrodb_server
 
-# ==========================================================================
-# Stage 2: ann-benchmarks runtime
-# ==========================================================================
 FROM ann-benchmarks
 
-# Pin SDK version used by the benchmark adapter for reproducibility.
 ARG KYRODB_SDK_VERSION=0.1.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

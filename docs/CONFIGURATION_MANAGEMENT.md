@@ -82,6 +82,7 @@ TLS example for non-loopback gRPC host:
 ```yaml
 server:
   host: "0.0.0.0"
+  http_host: "127.0.0.1"
   port: 50051
   tls:
     enabled: true

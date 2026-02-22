@@ -1,5 +1,3 @@
-"""KyroDB ANN-Benchmarks adapter (server-mode, official single-query path)."""
-
 from __future__ import annotations
 
 import logging
@@ -63,20 +61,16 @@ class _RawGrpcClient:
 
         def req_stream() -> Iterator[Any]:
             for index, vec in enumerate(vectors, start=1):
-                yield pb2.InsertRequest(
-                    doc_id=index,
-                    embedding=vec.tolist(),
-                )
+                request = pb2.InsertRequest(doc_id=index)
+                request.embedding.extend(vec)
+                yield request
 
         return self._stub.BulkLoadHnsw(req_stream(), timeout=timeout_s)
 
     def search(self, query_vector: np.ndarray, k: int, ef_search: int, timeout_s: float | None) -> Any:
         assert pb2 is not None
-        request = pb2.SearchRequest(
-            query_embedding=query_vector.tolist(),
-            k=int(k),
-            ef_search=int(ef_search),
-        )
+        request = pb2.SearchRequest(k=int(k), ef_search=int(ef_search))
+        request.query_embedding.extend(query_vector)
         return self._stub.Search(request, timeout=timeout_s)
 
     def metrics(self, timeout_s: float) -> Any:
@@ -105,6 +99,7 @@ class KyroDB(BaseANN):
         self._server_stderr = None
         self._server_stdout_path: Optional[str] = None
         self._server_stderr_path: Optional[str] = None
+        self._last_memory_kb: float = 0.0
 
         self.name = "KyroDB"
 
@@ -265,6 +260,38 @@ class KyroDB(BaseANN):
         except Exception:
             return None
 
+    def _sample_server_rss_kb(self) -> Optional[float]:
+        if self._server_proc is None:
+            return None
+        pid = self._server_proc.pid
+
+        status_path = f"/proc/{pid}/status"
+        try:
+            with open(status_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            return float(parts[1])
+        except Exception:
+            pass
+
+        statm_path = f"/proc/{pid}/statm"
+        try:
+            with open(statm_path, "r", encoding="utf-8") as handle:
+                parts = handle.read().split()
+            if len(parts) >= 2:
+                rss_pages = int(parts[1])
+                page_size = os.sysconf("SC_PAGESIZE")
+                return float(rss_pages * page_size) / 1024.0
+        except Exception:
+            return None
+
+    def _remember_memory_sample(self) -> None:
+        rss_kb = self._sample_server_rss_kb()
+        if rss_kb is not None and rss_kb > 0.0:
+            self._last_memory_kb = max(self._last_memory_kb, rss_kb)
+
     @staticmethod
     def _insert_items(vectors: Iterable[np.ndarray]) -> Iterator[InsertItem]:
         for i, vec in enumerate(vectors):
@@ -283,34 +310,30 @@ class KyroDB(BaseANN):
         try:
             if self._raw_client is not None:
                 bulk_result = self._raw_client.bulk_load_hnsw(index_vectors, timeout_s=None)
-                if not bulk_result.success:
-                    raise RuntimeError(bulk_result.error or "BulkLoadHnsw returned success=false")
-                self._logger.info(
-                    "BulkLoadHnsw complete: n=%d dim=%d seconds=%.2f rate=%.0f vec/s",
-                    len(index_vectors),
-                    index_vectors.shape[1],
-                    time.time() - start,
-                    float(bulk_result.avg_insert_rate),
+            else:
+                if self._client is None:
+                    raise RuntimeError("benchmark client is not initialized")
+                bulk_result = self._client.bulk_load_hnsw(
+                    self._insert_items(index_vectors),
+                    timeout_s=None,
                 )
-                return
 
-            if self._client is None:
-                raise RuntimeError("benchmark client is not initialized")
-            bulk_result = self._client.bulk_load_hnsw(
-                self._insert_items(index_vectors),
-                timeout_s=None,
-            )
             if not bulk_result.success:
                 raise RuntimeError(bulk_result.error or "BulkLoadHnsw returned success=false")
 
             elapsed = time.time() - start
+            peak_memory_bytes = getattr(bulk_result, "peak_memory_bytes", 0)
+            avg_insert_rate = float(getattr(bulk_result, "avg_insert_rate", 0))
+            if peak_memory_bytes:
+                self._last_memory_kb = max(self._last_memory_kb, float(peak_memory_bytes) / 1024.0)
             self._logger.info(
                 "BulkLoadHnsw complete: n=%d dim=%d seconds=%.2f rate=%.0f vec/s",
                 len(index_vectors),
                 index_vectors.shape[1],
                 elapsed,
-                bulk_result.avg_insert_rate,
+                avg_insert_rate,
             )
+            self._remember_memory_sample()
             return
         except Exception as exc:
             stderr_tail = self._read_stderr_tail()
@@ -364,22 +387,45 @@ class KyroDB(BaseANN):
             ef_search=int(self.ef_search),
             timeout_s=None,
         )
+        if response.error:
+            raise RuntimeError(f"Search failed: {response.error}")
         return [int(hit.doc_id) - 1 for hit in response.results]
 
     def get_memory_usage(self) -> float:
+        self._remember_memory_sample()
+
         try:
             if self._raw_client is not None:
                 metrics = self._raw_client.metrics(timeout_s=5.0)
-                return float(metrics.memory_usage_bytes) / 1024.0
+                if getattr(metrics, "memory_usage_bytes", 0):
+                    memory_kb = float(metrics.memory_usage_bytes) / 1024.0
+                    if memory_kb > 0.0:
+                        self._last_memory_kb = max(self._last_memory_kb, memory_kb)
+                        return memory_kb
             if self._client is not None:
                 metrics = self._client.metrics(timeout_s=5.0)
-                return float(metrics.memory_usage_bytes) / 1024.0
-            return 0.0
+                if getattr(metrics, "memory_usage_bytes", 0):
+                    memory_kb = float(metrics.memory_usage_bytes) / 1024.0
+                    if memory_kb > 0.0:
+                        self._last_memory_kb = max(self._last_memory_kb, memory_kb)
+                        return memory_kb
         except Exception as exc:
             self._logger.warning("Failed to query metrics: %s", exc)
-            return 0.0
+
+        rss_kb = self._sample_server_rss_kb()
+        if rss_kb is not None and rss_kb > 0.0:
+            self._last_memory_kb = max(self._last_memory_kb, rss_kb)
+            return rss_kb
+
+        if self._last_memory_kb > 0.0:
+            return self._last_memory_kb
+
+        self._logger.warning("Unable to sample benchmark memory usage; returning 0 KB")
+        return 0.0
 
     def _cleanup_server(self) -> None:
+        self._remember_memory_sample()
+
         try:
             if self._raw_client is not None:
                 self._raw_client.close()

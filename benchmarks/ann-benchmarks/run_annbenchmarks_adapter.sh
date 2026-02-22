@@ -67,6 +67,7 @@ validate_query_args_shape() {
   "${PYTHON_BIN}" - "${config_path}" <<'PY'
 import pathlib
 import sys
+from typing import List
 
 import yaml
 
@@ -81,7 +82,7 @@ run_groups = algorithms[0].get("run_groups", {})
 if not run_groups:
     raise SystemExit("run_groups is empty in config.yml")
 
-group_counts = set()
+group_counts: List[int] = []
 for group_name, group in run_groups.items():
     query_args = group.get("query_args")
     if not isinstance(query_args, list) or not query_args:
@@ -100,12 +101,17 @@ for group_name, group in run_groups.items():
             raise SystemExit(
                 f"{group_name}: query_args[0][{idx}] must be positive integer, got {value!r}"
             )
-    group_counts.add(len(ef_search_values))
+        if idx > 0 and value <= ef_search_values[idx - 1]:
+            raise SystemExit(
+                f"{group_name}: query_args[0] must be strictly increasing; "
+                f"got {ef_search_values[idx - 1]} then {value}"
+            )
+    group_counts.append(len(ef_search_values))
 
-if len(group_counts) != 1:
-    raise SystemExit(f"inconsistent query_args lengths across run_groups: {sorted(group_counts)}")
-
-print(next(iter(group_counts)))
+total_groups = sum(group_counts)
+min_groups = min(group_counts)
+max_groups = max(group_counts)
+print(f"{total_groups} {len(run_groups)} {min_groups} {max_groups}")
 PY
 }
 
@@ -156,7 +162,6 @@ fi
 require_cmd "${PYTHON_BIN}"
 require_cmd cp
 require_cmd mkdir
-require_cmd grep
 
 ANN_ROOT="$(cd "${ANN_ROOT}" && pwd)"
 if [[ ! -f "${ANN_ROOT}/install.py" ]] || [[ ! -f "${ANN_ROOT}/run.py" ]]; then
@@ -177,8 +182,8 @@ cp "${REPO_ROOT}/benchmarks/ann-benchmarks/__init__.py" "${ALG_DIR}/__init__.py"
 cp "${REPO_ROOT}/benchmarks/ann-benchmarks/config.yml" "${ALG_DIR}/config.yml"
 
 echo "[adapter] staged files into ${ALG_DIR}"
-EXPECTED_QUERY_GROUPS="$(validate_query_args_shape "${ALG_DIR}/config.yml")"
-echo "[adapter] query sweep validated (${EXPECTED_QUERY_GROUPS} groups per run-group)"
+read -r EXPECTED_TOTAL_GROUPS RUN_GROUP_COUNT MIN_GROUP_COUNT MAX_GROUP_COUNT <<<"$(validate_query_args_shape "${ALG_DIR}/config.yml")"
+echo "[adapter] query sweep validated (${RUN_GROUP_COUNT} run-groups; per-group=${MIN_GROUP_COUNT}..${MAX_GROUP_COUNT}; total expected groups=${EXPECTED_TOTAL_GROUPS})"
 
 echo "[adapter] config: algorithm=${ALGORITHM} kyrodb_ref=${KYRODB_REF} sdk=${SDK_VERSION}"
 
@@ -195,29 +200,42 @@ else
 fi
 
 for dataset in "${DATASET_LIST[@]}"; do
+  RESULT_DATASET_DIR="${ANN_ROOT}/results/${dataset}"
+  if [[ -d "${RESULT_DATASET_DIR}" ]]; then
+    echo "[adapter] removing stale results for dataset ${dataset}: ${RESULT_DATASET_DIR}"
+    rm -rf "${RESULT_DATASET_DIR}"
+  fi
+
   RUN_LOG="${ANN_ROOT}/results/_kyrodb_logs/${ALGORITHM}_${dataset}_$(date -u +%Y%m%dT%H%M%SZ).log"
   mkdir -p "$(dirname "${RUN_LOG}")"
   echo "[adapter] running dataset ${dataset}"
-  if ! "${PYTHON_BIN}" run.py --algorithm "${ALGORITHM}" --dataset "${dataset}" 2>&1 | tee "${RUN_LOG}"; then
+  if ! "${PYTHON_BIN}" run.py --force --algorithm "${ALGORITHM}" --dataset "${dataset}" 2>&1 | tee "${RUN_LOG}"; then
     echo "[adapter] run failed for dataset ${dataset}; see ${RUN_LOG}" >&2
     exit 1
   fi
 
-  if [[ "${EXPECTED_QUERY_GROUPS}" -gt 1 ]] && grep -q "Running query argument group 1 of 1" "${RUN_LOG}"; then
-    echo "[adapter] invalid sweep detected (1 of 1) for dataset ${dataset}; expected ${EXPECTED_QUERY_GROUPS}" >&2
-    echo "[adapter] refusing to accept invalid benchmark output; see ${RUN_LOG}" >&2
+  RESULT_DIR="${ANN_ROOT}/results/${dataset}/10/${ALGORITHM}"
+  if [[ ! -d "${RESULT_DIR}" ]]; then
+    echo "[adapter] missing results directory for dataset ${dataset}: ${RESULT_DIR}" >&2
+    echo "[adapter] see ${RUN_LOG}" >&2
     exit 1
   fi
 
-  if ! grep -q "Running query argument group ${EXPECTED_QUERY_GROUPS} of ${EXPECTED_QUERY_GROUPS}" "${RUN_LOG}"; then
-    echo "[adapter] incomplete sweep detected for dataset ${dataset}; expected ${EXPECTED_QUERY_GROUPS} groups" >&2
+  RESULT_COUNT="$(find "${RESULT_DIR}" -type f -name '*.hdf5' | wc -l | tr -d '[:space:]')"
+  EXPECTED_MIN_RESULTS="${EXPECTED_TOTAL_GROUPS}"
+  if [[ "${RESULT_COUNT}" -lt "${EXPECTED_MIN_RESULTS}" ]]; then
+    echo "[adapter] incomplete sweep detected for dataset ${dataset}; expected at least ${EXPECTED_MIN_RESULTS} result files, found ${RESULT_COUNT}" >&2
     echo "[adapter] see ${RUN_LOG}" >&2
     exit 1
   fi
 
   # Docker writes result files as root; fix permissions so we can read and plot them
   if [ -d "results/" ]; then
-    sudo chown -R $(id -u):$(id -g) results/ || true
+    chown -R "$(id -u):$(id -g)" results/ 2>/dev/null || {
+      if command -v sudo >/dev/null 2>&1; then
+        sudo chown -R "$(id -u):$(id -g)" results/ || true
+      fi
+    }
   fi
 
   if [[ "${RUN_PLOTS}" -eq 1 ]]; then

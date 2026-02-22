@@ -21,11 +21,11 @@ curl http://localhost:51051/metrics
 ```yaml
 # prometheus.yml
 scrape_configs:
-  - job_name: "kyrodb"
-    static_configs:
-      - targets: ["localhost:51051"]
-    metrics_path: "/metrics"
-    scrape_interval: 15s
+    - job_name: "kyrodb"
+      static_configs:
+          - targets: ["localhost:51051"]
+      metrics_path: "/metrics"
+      scrape_interval: 15s
 ```
 
 ## Key metrics
@@ -85,25 +85,25 @@ curl http://localhost:51051/health
 Healthy response:
 
 ```json
-{"status":"healthy","uptime_seconds":3600}
+{ "status": "healthy", "uptime_seconds": 3600 }
 ```
 
 Unhealthy response (example):
 
 ```json
-{"status":"unhealthy","reason":"P99 latency 1500000ns exceeds SLO","uptime_seconds":3600}
+{ "status": "unhealthy", "reason": "P99 latency 1500000ns exceeds SLO", "uptime_seconds": 3600 }
 ```
 
 K8s configuration:
 
 ```yaml
 livenessProbe:
-  httpGet:
-    path: /health
-    port: 51051
-  initialDelaySeconds: 10
-  periodSeconds: 10
-  failureThreshold: 3
+    httpGet:
+        path: /health
+        port: 51051
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    failureThreshold: 3
 ```
 
 ### Readiness
@@ -113,7 +113,7 @@ curl http://localhost:51051/ready
 ```
 
 ```json
-{"ready":true,"status":"ready"}
+{ "ready": true, "status": "ready" }
 ```
 
 > Both `ready` (boolean) and `status` (string) are intentionally present: `ready` is the canonical programmatic field for automated health checks (K8s probes, load balancers), while `status` provides a human-readable label useful in dashboards and logs. Consumers should key on the `ready` boolean for readiness decisions.
@@ -122,12 +122,12 @@ K8s configuration:
 
 ```yaml
 readinessProbe:
-  httpGet:
-    path: /ready
-    port: 51051
-  initialDelaySeconds: 5
-  periodSeconds: 5
-  failureThreshold: 2
+    httpGet:
+        path: /ready
+        port: 51051
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    failureThreshold: 2
 ```
 
 ### SLO status
@@ -140,24 +140,24 @@ Example response:
 
 ```json
 {
-  "current_metrics": {
-    "availability": 1.0,
-    "cache_hit_rate": 0.85,
-    "error_rate": 0.0,
-    "p99_latency_ns": 250000
-  },
-  "slo_breaches": {
-    "availability": false,
-    "cache_hit_rate": false,
-    "error_rate": false,
-    "p99_latency": false
-  },
-  "slo_thresholds": {
-    "max_error_rate": 0.001,
-    "min_availability": 0.999,
-    "min_cache_hit_rate": 0.7,
-    "p99_latency_ns": 10000000
-  }
+    "current_metrics": {
+        "availability": 1.0,
+        "cache_hit_rate": 0.85,
+        "error_rate": 0.0,
+        "p99_latency_ns": 250000
+    },
+    "slo_breaches": {
+        "availability": false,
+        "cache_hit_rate": false,
+        "error_rate": false,
+        "p99_latency": false
+    },
+    "slo_thresholds": {
+        "max_error_rate": 0.001,
+        "min_availability": 0.999,
+        "min_cache_hit_rate": 0.7,
+        "p99_latency_ns": 10000000
+    }
 }
 ```
 
@@ -183,69 +183,44 @@ curl -H "authorization: Bearer <API_KEY>" http://localhost:51051/usage
 
 Example response:
 
-```json
-{
-  "generated_at": 1736210042,
-  "totals": {
-    "query_count": 15420,
-    "vector_count": 1200000,
-    "storage_bytes": 1048576000,
-    "billable_events": 16680
-  },
-  "tenants": [
-    {
-      "tenant_id": "tenant-abc123",
-      "query_count": 15420,
-      "insert_count": 1300,
-      "delete_count": 40,
-      "vector_count": 1200000,
-      "storage_bytes": 1048576000,
-      "storage_mb": 1000.0,
-      "storage_gb": 0.9765625,
-      "billable_events": 16680
-    }
-  ]
-}
-```
-
 ## Prometheus alerts
 
 ```yaml
 # alerts.yml
 groups:
-- name: kyrodb_slo
-  rules:
-  - alert: KyroDBHighLatency
-    expr: kyrodb_query_latency_ns{percentile="99"} > 10000000
-    for: 5m
-    labels:
-      severity: warning
-    annotations:
-      summary: "P99 latency {{ $value | humanizeDuration }} exceeds 10ms SLO"
+    - name: kyrodb_slo
+      rules:
+          - alert: KyroDBHighLatency
+            expr: kyrodb_query_latency_ns{percentile="99"} > 10000000
+            for: 5m
+            labels:
+                severity: warning
+            annotations:
+                summary: "P99 latency {{ $value | humanizeDuration }} exceeds 10ms SLO"
 
-  - alert: KyroDBLowCacheHit
-    expr: kyrodb_cache_hit_rate < 0.70
-    for: 10m
-    labels:
-      severity: warning
-    annotations:
-      summary: "Cache hit rate {{ $value | humanizePercentage }} below 70%"
+          - alert: KyroDBLowCacheHit
+            expr: kyrodb_cache_hit_rate < 0.70
+            for: 10m
+            labels:
+                severity: warning
+            annotations:
+                summary: "Cache hit rate {{ $value | humanizePercentage }} below 70%"
 
-  - alert: KyroDBHighErrors
-    expr: rate(kyrodb_queries_failed[5m]) / rate(kyrodb_queries_total[5m]) > 0.001
-    for: 5m
-    labels:
-      severity: critical
-    annotations:
-      summary: "Error rate {{ $value | humanizePercentage }} exceeds 0.1%"
+          - alert: KyroDBHighErrors
+            expr: rate(kyrodb_queries_failed[5m]) / rate(kyrodb_queries_total[5m]) > 0.001
+            for: 5m
+            labels:
+                severity: critical
+            annotations:
+                summary: "Error rate {{ $value | humanizePercentage }} exceeds 0.1%"
 
-  - alert: KyroDBNotReady
-    expr: kyrodb_ready == 0
-    for: 2m
-    labels:
-      severity: critical
-    annotations:
-      summary: "Server not ready for 2+ minutes"
+          - alert: KyroDBNotReady
+            expr: kyrodb_ready == 0
+            for: 2m
+            labels:
+                severity: critical
+            annotations:
+                summary: "Server not ready for 2+ minutes"
 ```
 
 ## Grafana panels (examples)
@@ -254,11 +229,14 @@ groups:
 
 ```json
 {
-  "title": "Query Performance",
-  "targets": [
-    {"expr": "rate(kyrodb_queries_total[1m])", "legendFormat": "QPS"},
-    {"expr": "kyrodb_query_latency_ns{percentile=\"99\"} / 1000000", "legendFormat": "P99 (ms)"}
-  ]
+    "title": "Query Performance",
+    "targets": [
+        { "expr": "rate(kyrodb_queries_total[1m])", "legendFormat": "QPS" },
+        {
+            "expr": "kyrodb_query_latency_ns{percentile=\"99\"} / 1000000",
+            "legendFormat": "P99 (ms)"
+        }
+    ]
 }
 ```
 
@@ -266,11 +244,11 @@ groups:
 
 ```json
 {
-  "title": "Cache Performance",
-  "targets": [
-    {"expr": "kyrodb_cache_hit_rate * 100", "legendFormat": "Hit Rate %"},
-    {"expr": "rate(kyrodb_cache_evictions_total[1m])", "legendFormat": "Evictions/min"}
-  ]
+    "title": "Cache Performance",
+    "targets": [
+        { "expr": "kyrodb_cache_hit_rate * 100", "legendFormat": "Hit Rate %" },
+        { "expr": "rate(kyrodb_cache_evictions_total[1m])", "legendFormat": "Evictions/min" }
+    ]
 }
 ```
 
@@ -289,12 +267,12 @@ Edit the `logging:` block in that file to switch formats (e.g., `format: json`).
 
 ```yaml
 logging:
-  level: info
-  format: json
-  file: null
-  rotation: true
-  max_file_size_bytes: 104857600
-  max_files: 10
+    level: info
+    format: json
+    file: null
+    rotation: true
+    max_file_size_bytes: 104857600
+    max_files: 10
 ```
 
 You can override module levels via `RUST_LOG`:
