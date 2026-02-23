@@ -41,6 +41,5 @@ COPY ann_benchmarks/algorithms/kyrodb /home/app/ann_benchmarks/algorithms/kyrodb
 COPY --from=builder /src/kyrodb/target/release/kyrodb_server /usr/local/bin/kyrodb_server
 
 ENV KYRODB_HOST=127.0.0.1
-ENV KYRODB_PORT=50051
 
 EXPOSE 50051 51051

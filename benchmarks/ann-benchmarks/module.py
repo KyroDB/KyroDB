@@ -117,7 +117,8 @@ class KyroDB(BaseANN):
         low = 20000
         high = 59000
         span = high - low
-        start = low + (os.getpid() % span)
+        host_fingerprint = sum(ord(ch) for ch in socket.gethostname())
+        start = low + ((os.getpid() + host_fingerprint) % span)
         for offset in range(span):
             grpc_port = low + ((start - low + offset) % span)
             http_port = grpc_port + 1000
