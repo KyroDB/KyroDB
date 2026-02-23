@@ -106,8 +106,10 @@ class KyroDB(BaseANN):
         self._logger = logging.getLogger(__name__)
 
     def _resolve_ports(self) -> tuple[int, int]:
-        forced_port = os.environ.get("KYRODB_PORT")
-        forced_http_port = os.environ.get("KYRODB_HTTP_PORT")
+        # Use benchmark-scoped overrides only. Do not honor generic KYRODB_PORT
+        # from ambient environment/image because it breaks parallel ANN workers.
+        forced_port = os.environ.get("KYRODB_BENCH_FORCE_PORT")
+        forced_http_port = os.environ.get("KYRODB_BENCH_FORCE_HTTP_PORT")
         if forced_port is not None:
             grpc_port = int(forced_port)
             http_port = int(forced_http_port) if forced_http_port is not None else grpc_port + 1000
