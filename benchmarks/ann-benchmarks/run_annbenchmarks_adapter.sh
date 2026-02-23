@@ -91,24 +91,28 @@ for group_name, group in run_groups.items():
     if not isinstance(query_args, list) or not query_args:
         raise SystemExit(f"{group_name}: query_args must be a non-empty list")
 
+    if len(query_args) != 1:
+        raise SystemExit(
+            f"{group_name}: query_args must contain exactly one axis list for ef_search sweep, got {len(query_args)}"
+        )
+
+    ef_search_values = query_args[0]
+    if not isinstance(ef_search_values, list) or not ef_search_values:
+        raise SystemExit(f"{group_name}: query_args[0] must be a non-empty list of ef_search values")
+
     prev_value = None
-    for idx, value_group in enumerate(query_args):
-        if not isinstance(value_group, list) or len(value_group) != 1:
-            raise SystemExit(
-                f"{group_name}: query_args[{idx}] must be a single-value list like [200], got {value_group!r}"
-            )
-        value = value_group[0]
+    for idx, value in enumerate(ef_search_values):
         if not isinstance(value, int) or value <= 0:
             raise SystemExit(
-                f"{group_name}: query_args[{idx}][0] must be positive integer, got {value!r}"
+                f"{group_name}: query_args[0][{idx}] must be positive integer, got {value!r}"
             )
         if prev_value is not None and value <= prev_value:
             raise SystemExit(
-                f"{group_name}: query_args must be strictly increasing by group; "
+                f"{group_name}: query_args[0] must be strictly increasing; "
                 f"got {prev_value} then {value}"
             )
         prev_value = value
-    group_counts.append(len(query_args))
+    group_counts.append(len(ef_search_values))
 
 total_groups = sum(group_counts)
 min_groups = min(group_counts)
