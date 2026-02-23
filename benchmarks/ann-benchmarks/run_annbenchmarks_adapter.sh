@@ -90,26 +90,25 @@ for group_name, group in run_groups.items():
     query_args = group.get("query_args")
     if not isinstance(query_args, list) or not query_args:
         raise SystemExit(f"{group_name}: query_args must be a non-empty list")
-    if len(query_args) != 1:
-        raise SystemExit(
-            f"{group_name}: query_args must contain exactly one argument axis (ef_search), got {len(query_args)}"
-        )
 
-    ef_search_values = query_args[0]
-    if not isinstance(ef_search_values, list) or not ef_search_values:
-        raise SystemExit(f"{group_name}: query_args[0] must be a non-empty list of ef_search values")
-
-    for idx, value in enumerate(ef_search_values):
+    prev_value = None
+    for idx, value_group in enumerate(query_args):
+        if not isinstance(value_group, list) or len(value_group) != 1:
+            raise SystemExit(
+                f"{group_name}: query_args[{idx}] must be a single-value list like [200], got {value_group!r}"
+            )
+        value = value_group[0]
         if not isinstance(value, int) or value <= 0:
             raise SystemExit(
-                f"{group_name}: query_args[0][{idx}] must be positive integer, got {value!r}"
+                f"{group_name}: query_args[{idx}][0] must be positive integer, got {value!r}"
             )
-        if idx > 0 and value <= ef_search_values[idx - 1]:
+        if prev_value is not None and value <= prev_value:
             raise SystemExit(
-                f"{group_name}: query_args[0] must be strictly increasing; "
-                f"got {ef_search_values[idx - 1]} then {value}"
+                f"{group_name}: query_args must be strictly increasing by group; "
+                f"got {prev_value} then {value}"
             )
-    group_counts.append(len(ef_search_values))
+        prev_value = value
+    group_counts.append(len(query_args))
 
 total_groups = sum(group_counts)
 min_groups = min(group_counts)
@@ -244,6 +243,12 @@ for dataset in "${DATASET_LIST[@]}"; do
   fi
   if ! "${PYTHON_BIN}" "${run_args[@]}" 2>&1 | tee "${RUN_LOG}"; then
     echo "[adapter] run failed for dataset ${dataset}; see ${RUN_LOG}" >&2
+    exit 1
+  fi
+
+  if [[ "${MIN_GROUP_COUNT}" -gt 1 ]] && grep -q "Running query argument group 1 of 1" "${RUN_LOG}"; then
+    echo "[adapter] invalid sweep detected (1 of 1) for dataset ${dataset}; expected ${MIN_GROUP_COUNT}+" >&2
+    echo "[adapter] refusing to accept invalid benchmark output; see ${RUN_LOG}" >&2
     exit 1
   fi
 

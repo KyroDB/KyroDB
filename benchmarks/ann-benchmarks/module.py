@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -105,7 +106,7 @@ class KyroDB(BaseANN):
 
         self._logger = logging.getLogger(__name__)
 
-    def _resolve_ports(self) -> tuple[int, int]:
+    def _resolve_ports(self, salt: int = 0) -> tuple[int, int]:
         # Use benchmark-scoped overrides only. Do not honor generic KYRODB_PORT
         # from ambient environment/image because it breaks parallel ANN workers.
         forced_port = os.environ.get("KYRODB_BENCH_FORCE_PORT")
@@ -119,8 +120,9 @@ class KyroDB(BaseANN):
         low = 20000
         high = 59000
         span = high - low
-        host_fingerprint = sum(ord(ch) for ch in socket.gethostname())
-        start = low + ((os.getpid() + host_fingerprint) % span)
+        entropy = f"{socket.gethostname()}:{os.getpid()}:{time.time_ns()}:{salt}".encode("utf-8")
+        seed = int.from_bytes(hashlib.blake2s(entropy, digest_size=8).digest(), "big")
+        start = low + (seed % span)
         for offset in range(span):
             grpc_port = low + ((start - low + offset) % span)
             http_port = grpc_port + 1000
@@ -180,76 +182,115 @@ class KyroDB(BaseANN):
         if server_bin is None:
             raise RuntimeError("kyrodb_server binary not found in PATH")
 
-        if self._data_dir is None:
-            self._data_dir = tempfile.mkdtemp(prefix="kyrodb_annb_")
+        max_attempts = int(os.environ.get("KYRODB_BENCH_START_RETRIES", "8"))
+        max_attempts = max(1, max_attempts)
 
-        env = os.environ.copy()
-        env["KYRODB_PORT"] = str(self.port)
-        env["KYRODB_DATA_DIR"] = self._data_dir
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                self.port, self.http_port = self._resolve_ports(salt=attempt)
+                self.target = f"{self.host}:{self.port}"
 
-        env["KYRODB__HNSW__DIMENSION"] = str(int(dimension))
-        env["KYRODB__HNSW__DISTANCE"] = self._metric_to_distance()
-        env["KYRODB__HNSW__M"] = str(self.M)
-        env["KYRODB__HNSW__EF_CONSTRUCTION"] = str(self.ef_construction)
-        env["KYRODB__HNSW__MAX_ELEMENTS"] = str(int(max_elements))
+            if self._data_dir is None:
+                self._data_dir = tempfile.mkdtemp(prefix="kyrodb_annb_")
 
-        env.setdefault("KYRODB__ENVIRONMENT__TYPE", "benchmark")
-        env.setdefault("KYRODB__PERSISTENCE__SNAPSHOT_INTERVAL_MUTATIONS", "0")
-        env.setdefault("KYRODB__PERSISTENCE__FSYNC_POLICY", "none")
-        env.setdefault("KYRODB__PERSISTENCE__ALLOW_FRESH_START_ON_RECOVERY_FAILURE", "true")
+            env = os.environ.copy()
+            env["KYRODB_PORT"] = str(self.port)
+            env["KYRODB_DATA_DIR"] = self._data_dir
 
-        env.setdefault("KYRODB__CACHE__STRATEGY", "lru")
-        env.setdefault("KYRODB__CACHE__CAPACITY", "1")
-        env.setdefault("KYRODB__CACHE__MIN_TRAINING_SAMPLES", "1")
-        env.setdefault("KYRODB__CACHE__QUERY_CACHE_CAPACITY", "1")
-        env.setdefault("KYRODB__CACHE__ENABLE_TRAINING_TASK", "false")
-        env.setdefault("KYRODB__CACHE__AUTO_TUNE_THRESHOLD", "false")
+            env["KYRODB__HNSW__DIMENSION"] = str(int(dimension))
+            env["KYRODB__HNSW__DISTANCE"] = self._metric_to_distance()
+            env["KYRODB__HNSW__M"] = str(self.M)
+            env["KYRODB__HNSW__EF_CONSTRUCTION"] = str(self.ef_construction)
+            env["KYRODB__HNSW__MAX_ELEMENTS"] = str(int(max_elements))
 
-        # Respect container CPU affinity to avoid oversubscription in single-core official runs.
-        threads = env.get("KYRODB_BENCH_THREADS", str(_available_cores()))
-        env.setdefault("TOKIO_WORKER_THREADS", threads)
-        env.setdefault("RAYON_NUM_THREADS", threads)
-        env.setdefault("OMP_NUM_THREADS", threads)
+            env.setdefault("KYRODB__ENVIRONMENT__TYPE", "benchmark")
+            env.setdefault("KYRODB__PERSISTENCE__SNAPSHOT_INTERVAL_MUTATIONS", "0")
+            env.setdefault("KYRODB__PERSISTENCE__FSYNC_POLICY", "none")
+            env.setdefault("KYRODB__PERSISTENCE__ALLOW_FRESH_START_ON_RECOVERY_FAILURE", "true")
 
-        env["KYRODB__SERVER__HTTP_PORT"] = str(self.http_port)
-        env.setdefault("RUST_LOG", "warn")
-        env.setdefault("KYRODB__LOGGING__LEVEL", "warn")
+            env.setdefault("KYRODB__CACHE__STRATEGY", "lru")
+            env.setdefault("KYRODB__CACHE__CAPACITY", "1")
+            env.setdefault("KYRODB__CACHE__MIN_TRAINING_SAMPLES", "1")
+            env.setdefault("KYRODB__CACHE__QUERY_CACHE_CAPACITY", "1")
+            env.setdefault("KYRODB__CACHE__ENABLE_TRAINING_TASK", "false")
+            env.setdefault("KYRODB__CACHE__AUTO_TUNE_THRESHOLD", "false")
 
-        self._logger.info(
-            "Starting kyrodb_server (target=%s dim=%s metric=%s)",
-            self.target,
-            dimension,
-            env["KYRODB__HNSW__DISTANCE"],
-        )
+            # Respect container CPU affinity to avoid oversubscription in single-core official runs.
+            threads = env.get("KYRODB_BENCH_THREADS", str(_available_cores()))
+            env.setdefault("TOKIO_WORKER_THREADS", threads)
+            env.setdefault("RAYON_NUM_THREADS", threads)
+            env.setdefault("OMP_NUM_THREADS", threads)
 
-        self._server_stdout_path = os.path.join(self._data_dir, "kyrodb_server.stdout.log")
-        self._server_stderr_path = os.path.join(self._data_dir, "kyrodb_server.stderr.log")
-        self._server_stdout = open(self._server_stdout_path, "wb")
-        try:
-            self._server_stderr = open(self._server_stderr_path, "wb")
-            self._server_proc = subprocess.Popen(
-                [server_bin],
-                env=env,
-                stdout=self._server_stdout,
-                stderr=self._server_stderr,
+            env["KYRODB__SERVER__HTTP_PORT"] = str(self.http_port)
+            env.setdefault("RUST_LOG", "warn")
+            env.setdefault("KYRODB__LOGGING__LEVEL", "warn")
+
+            self._logger.info(
+                "Starting kyrodb_server (attempt=%d/%d target=%s dim=%s metric=%s)",
+                attempt + 1,
+                max_attempts,
+                self.target,
+                dimension,
+                env["KYRODB__HNSW__DISTANCE"],
             )
-            use_sdk_path = os.environ.get("KYRODB_BENCH_USE_SDK", "").lower() in {"1", "true", "yes"}
-            if not use_sdk_path and pb2 is not None and pb2_grpc is not None:
-                self._raw_client = _RawGrpcClient(target=self.target)
-                self._raw_client.wait_for_ready(timeout_s=30.0)
-                self._logger.info("Using thin gRPC benchmark client path")
-            else:
-                self._client = KyroDBClient(target=self.target, default_timeout_s=30.0)
-                self._client.wait_for_ready(timeout_s=30.0)
-                self._logger.info("Using KyroDB SDK benchmark client path")
-        except Exception as exc:
-            stderr_tail = self._read_stderr_tail()
-            self._cleanup_server()
-            if stderr_tail:
-                raise RuntimeError(
-                    f"kyrodb_server failed to become ready: {exc}; stderr tail:\n{stderr_tail}"
-                ) from exc
-            raise RuntimeError(f"kyrodb_server failed to become ready: {exc}") from exc
+
+            self._server_stdout_path = os.path.join(self._data_dir, "kyrodb_server.stdout.log")
+            self._server_stderr_path = os.path.join(self._data_dir, "kyrodb_server.stderr.log")
+            self._server_stdout = open(self._server_stdout_path, "wb")
+            try:
+                self._server_stderr = open(self._server_stderr_path, "wb")
+                self._server_proc = subprocess.Popen(
+                    [server_bin],
+                    env=env,
+                    stdout=self._server_stdout,
+                    stderr=self._server_stderr,
+                )
+                use_sdk_path = os.environ.get("KYRODB_BENCH_USE_SDK", "").lower() in {"1", "true", "yes"}
+                if not use_sdk_path and pb2 is not None and pb2_grpc is not None:
+                    self._raw_client = _RawGrpcClient(target=self.target)
+                    self._raw_client.wait_for_ready(timeout_s=30.0)
+                    self._logger.info("Using thin gRPC benchmark client path")
+                else:
+                    self._client = KyroDBClient(target=self.target, default_timeout_s=30.0)
+                    self._client.wait_for_ready(timeout_s=30.0)
+                    self._logger.info("Using KyroDB SDK benchmark client path")
+
+                # Guard against false readiness by checking our spawned process is still alive.
+                time.sleep(0.05)
+                if self._server_proc.poll() is not None:
+                    raise RuntimeError("kyrodb_server exited right after readiness probe")
+                return
+            except Exception as exc:
+                stderr_tail = self._read_stderr_tail()
+                transient_error = self._is_transient_startup_error(exc, stderr_tail)
+                self._cleanup_server()
+                if transient_error and (attempt + 1) < max_attempts:
+                    self._logger.warning(
+                        "kyrodb_server startup failed on %s (attempt %d/%d): %s; retrying with new ports",
+                        self.target,
+                        attempt + 1,
+                        max_attempts,
+                        exc,
+                    )
+                    continue
+                if stderr_tail:
+                    raise RuntimeError(
+                        f"kyrodb_server failed to become ready: {exc}; stderr tail:\n{stderr_tail}"
+                    ) from exc
+                raise RuntimeError(f"kyrodb_server failed to become ready: {exc}") from exc
+
+    @staticmethod
+    def _is_transient_startup_error(exc: Exception, stderr_tail: Optional[str]) -> bool:
+        haystack = f"{exc}\n{stderr_tail or ''}".lower()
+        transient_markers = (
+            "address already in use",
+            "failed to connect to all addresses",
+            "connection refused",
+            "connection reset by peer",
+            "statuscode.unavailable",
+            "transport error",
+        )
+        return any(marker in haystack for marker in transient_markers)
 
     def _read_stderr_tail(self) -> Optional[str]:
         if self._server_stderr_path is None:
