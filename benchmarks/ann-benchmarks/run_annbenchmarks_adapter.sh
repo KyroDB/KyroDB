@@ -18,6 +18,9 @@ Options:
   --sdk-version VERSION                kyrodb pip version for adapter image (default: 0.1.0)
   --algorithm NAME                     Algorithm name in ann-benchmarks (default: kyrodb)
   --python BIN                         Python executable (default: python3)
+  --parallelism N                      Number of ann-benchmarks workers for run.py
+  --runs N                             Query runs per query-arg group (overrides run.py default)
+  --count N                            Top-k count passed to run.py (overrides default 10)
   --skip-install                       Skip `install.py` image build step
   --plot                               Run `plot.py` for each dataset after benchmark run
   -h, --help                           Show help
@@ -127,6 +130,9 @@ ALGORITHM="kyrodb"
 PYTHON_BIN="python3"
 SKIP_INSTALL=0
 RUN_PLOTS=0
+RUN_PARALLELISM=""
+RUNS=""
+COUNT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -137,6 +143,9 @@ while [[ $# -gt 0 ]]; do
     --sdk-version) require_arg "$1" "${2-}"; SDK_VERSION="$2"; shift 2 ;;
     --algorithm) require_arg "$1" "${2-}"; ALGORITHM="$2"; shift 2 ;;
     --python) require_arg "$1" "${2-}"; PYTHON_BIN="$2"; shift 2 ;;
+    --parallelism) require_arg "$1" "${2-}"; RUN_PARALLELISM="$2"; shift 2 ;;
+    --runs) require_arg "$1" "${2-}"; RUNS="$2"; shift 2 ;;
+    --count) require_arg "$1" "${2-}"; COUNT="$2"; shift 2 ;;
     --skip-install) SKIP_INSTALL=1; shift ;;
     --plot) RUN_PLOTS=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -158,6 +167,20 @@ if [[ ! -d "${ANN_ROOT}" ]]; then
   echo "ann-benchmarks root does not exist: ${ANN_ROOT}" >&2
   exit 1
 fi
+
+if [[ -n "${RUN_PARALLELISM}" ]] && ! [[ "${RUN_PARALLELISM}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--parallelism must be a positive integer (got: ${RUN_PARALLELISM})" >&2
+  exit 1
+fi
+if [[ -n "${RUNS}" ]] && ! [[ "${RUNS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--runs must be a positive integer (got: ${RUNS})" >&2
+  exit 1
+fi
+if [[ -n "${COUNT}" ]] && ! [[ "${COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--count must be a positive integer (got: ${COUNT})" >&2
+  exit 1
+fi
+RESULT_COUNT_DIR="${COUNT:-10}"
 
 require_cmd "${PYTHON_BIN}"
 require_cmd cp
@@ -209,12 +232,22 @@ for dataset in "${DATASET_LIST[@]}"; do
   RUN_LOG="${ANN_ROOT}/results/_kyrodb_logs/${ALGORITHM}_${dataset}_$(date -u +%Y%m%dT%H%M%SZ).log"
   mkdir -p "$(dirname "${RUN_LOG}")"
   echo "[adapter] running dataset ${dataset}"
-  if ! "${PYTHON_BIN}" run.py --force --algorithm "${ALGORITHM}" --dataset "${dataset}" 2>&1 | tee "${RUN_LOG}"; then
+  run_args=(run.py --force --algorithm "${ALGORITHM}" --dataset "${dataset}")
+  if [[ -n "${RUN_PARALLELISM}" ]]; then
+    run_args+=(--parallelism "${RUN_PARALLELISM}")
+  fi
+  if [[ -n "${RUNS}" ]]; then
+    run_args+=(--runs "${RUNS}")
+  fi
+  if [[ -n "${COUNT}" ]]; then
+    run_args+=(--count "${COUNT}")
+  fi
+  if ! "${PYTHON_BIN}" "${run_args[@]}" 2>&1 | tee "${RUN_LOG}"; then
     echo "[adapter] run failed for dataset ${dataset}; see ${RUN_LOG}" >&2
     exit 1
   fi
 
-  RESULT_DIR="${ANN_ROOT}/results/${dataset}/10/${ALGORITHM}"
+  RESULT_DIR="${ANN_ROOT}/results/${dataset}/${RESULT_COUNT_DIR}/${ALGORITHM}"
   if [[ ! -d "${RESULT_DIR}" ]]; then
     echo "[adapter] missing results directory for dataset ${dataset}: ${RESULT_DIR}" >&2
     echo "[adapter] see ${RUN_LOG}" >&2
