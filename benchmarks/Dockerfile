@@ -1,3 +1,4 @@
+ARG ANNB_BASE=ann-benchmarks:latest
 ARG RUST_VERSION=1.93.1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
@@ -26,7 +27,6 @@ WORKDIR /src/kyrodb
 ENV RUSTFLAGS="-C target-cpu=${RUST_CPU} ${RUSTFLAGS_EXTRA}"
 RUN cargo build --release --locked -p kyrodb-engine --lib --features ffi-bench
 
-ARG ANNB_BASE=ann-benchmarks:latest
 FROM ${ANNB_BASE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
