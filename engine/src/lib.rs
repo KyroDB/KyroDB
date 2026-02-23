@@ -112,6 +112,10 @@ pub mod metrics;
 // Configuration management: YAML/TOML parsing, env vars, validation
 pub mod config;
 
+// C FFI adapter for in-process benchmark embedding.
+#[cfg(feature = "ffi-bench")]
+mod ffi_ann;
+
 // Error recovery: Circuit breaker pattern for fault tolerance
 pub mod circuit_breaker;
 

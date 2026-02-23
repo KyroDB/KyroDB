@@ -13,6 +13,7 @@ categories = ["database-implementations", "machine-learning"]
 [lib]
 name = "kyrodb_engine"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "kyrodb_backup"
@@ -45,6 +46,8 @@ default = []
 hybrid-cache = []
 # Benchmarking: disable metrics for zero-overhead measurements
 bench-no-metrics = []
+# In-process ANN C-FFI adapter for ANN-Benchmarks integration
+ffi-bench = []
 # Memory profiling: jemalloc allocator with profiling support
 jemalloc-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 # CLI tools: Optional progress bars and table formatting

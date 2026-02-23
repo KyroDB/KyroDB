@@ -1,8 +1,10 @@
-ARG RUST_VERSION=1.93.0
+ARG RUST_VERSION=1.93.1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG KYRODB_GIT=https://github.com/KyroDB/KyroDB.git
 ARG KYRODB_REF=
+ARG RUST_CPU=x86-64-v3
+ARG RUSTFLAGS_EXTRA=""
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -21,25 +23,18 @@ RUN git clone "$KYRODB_GIT" /src/kyrodb \
        fi
 
 WORKDIR /src/kyrodb
-# Use a reproducible CPU target to avoid host-specific binaries.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
-RUN cargo build --release --locked -p kyrodb-engine --bin kyrodb_server
+ENV RUSTFLAGS="-C target-cpu=${RUST_CPU} ${RUSTFLAGS_EXTRA}"
+RUN cargo build --release --locked -p kyrodb-engine --lib --features ffi-bench
 
-FROM ann-benchmarks
-
-ARG KYRODB_SDK_VERSION=0.1.0
+ARG ANNB_BASE=ann-benchmarks:latest
+FROM ${ANNB_BASE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 \
+    libstdc++6 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --no-cache-dir "kyrodb==${KYRODB_SDK_VERSION}"
-
 COPY ann_benchmarks/algorithms/kyrodb /home/app/ann_benchmarks/algorithms/kyrodb
+COPY --from=builder /src/kyrodb/target/release/libkyrodb_engine.so /usr/local/lib/libkyrodb_engine.so
 
-COPY --from=builder /src/kyrodb/target/release/kyrodb_server /usr/local/bin/kyrodb_server
-
-ENV KYRODB_HOST=127.0.0.1
-
-EXPOSE 50051 51051
+ENV LD_LIBRARY_PATH=/usr/local/lib

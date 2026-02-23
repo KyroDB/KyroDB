@@ -296,7 +296,7 @@ persistence:
 Performance is workload-dependent. Use the included validation and ANN benchmark kit:
 
 - Cache validation + hit-rate/latency breakdown: [Two-Level Cache Architecture](TWO_LEVEL_CACHE_ARCHITECTURE.md)
-- ANN recall/QPS/latency workflow: `benchmarks/README.md`
+- ANN adapter workflow: `benchmarks/{module.py,config.yml,Dockerfile}`
 
 ---
 

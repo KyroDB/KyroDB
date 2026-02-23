@@ -158,8 +158,6 @@ Core docs:
 - [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) - metrics, probes, alerts
 - [docs/BACKUP_AND_RECOVERY.md](docs/BACKUP_AND_RECOVERY.md) - backup/restore policy
 - [docs/CONFIGURATION_MANAGEMENT.md](docs/CONFIGURATION_MANAGEMENT.md) - full config contract
-- [docs/PILOT_LAUNCH_CHECKLIST.md](docs/PILOT_LAUNCH_CHECKLIST.md) - pilot go/no-go gates
-- [docs/BENCHMARK_EVIDENCE_PACKAGE.md](docs/BENCHMARK_EVIDENCE_PACKAGE.md) - benchmark claim discipline
 - [docs/README.md](docs/README.md) - complete index
 
 ## Development
