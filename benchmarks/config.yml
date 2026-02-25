@@ -11,7 +11,6 @@ float:
           args:
             M: 16
             ef_construction: 200
-          query_args:
           query_args: [[4, 8, 10, 20, 40, 80, 120, 200, 300, 400, 600]]
         M-24:
           args:
@@ -27,4 +26,5 @@ float:
           args:
             M: 48
             ef_construction: 300
-          query_args: [[4, 8, 10, 20, 40, 80, 120, 200, 300, 400, 600, 800, 1200]]
+          query_args:
+            [[4, 8, 10, 20, 40, 80, 120, 200, 300, 400, 600, 800, 1200]]

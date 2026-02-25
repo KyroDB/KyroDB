@@ -140,14 +140,24 @@ class KyroDB(BaseANN):
     @staticmethod
     def _normalize_rows(arr: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-12)
+        # Replace zero-norm rows with a small sentinel so they normalize to
+        # a valid unit vector. ANN benchmark datasets like nytimes-256 contain
+        # zero vectors that are undefined under cosine similarity.
+        zero_mask = (norms < 1e-30).reshape(-1)
+        if np.any(zero_mask):
+            arr = arr.copy()
+            arr[zero_mask, 0] = 1e-12
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-30)
         return arr / norms
 
     @staticmethod
     def _normalize_vector(vec: np.ndarray) -> np.ndarray:
         norm = float(np.linalg.norm(vec))
-        if norm <= 1e-12:
-            return vec
+        if norm <= 1e-30:
+            out = np.zeros_like(vec)
+            out[0] = 1.0
+            return out
         return vec / norm
 
     def _destroy_handle(self) -> None:
