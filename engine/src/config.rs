@@ -327,6 +327,12 @@ pub struct PersistenceConfig {
     /// Enable automatic crash recovery on startup
     pub enable_recovery: bool,
 
+    /// Recovery strictness.
+    ///
+    /// - `strict`: fail startup if recovery evidence is incomplete/corrupted.
+    /// - `best_effort`: allow degraded startup with partial evidence (benchmark-only).
+    pub recovery_mode: RecoveryMode,
+
     /// If true, allow the server to start with a fresh empty database when recovery fails.
     ///
     /// This is dangerous in production because it can silently discard access to existing data
@@ -343,6 +349,7 @@ impl Default for PersistenceConfig {
             snapshot_interval_mutations: 10_000,
             max_wal_size_bytes: 100 * 1024 * 1024, // 100 MB
             enable_recovery: true,
+            recovery_mode: RecoveryMode::Strict,
             allow_fresh_start_on_recovery_failure: false,
         }
     }
@@ -357,6 +364,18 @@ pub enum FsyncPolicy {
     DataOnly,
     /// fsync data and metadata (safest, slowest)
     Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryMode {
+    /// Fail startup if required recovery evidence is missing/corrupted.
+    #[default]
+    Strict,
+    /// Continue with best-effort recovery when evidence is incomplete.
+    ///
+    /// This is benchmark-only and unsafe for production/pilot data integrity.
+    BestEffort,
 }
 
 // ============================================================================
@@ -528,6 +547,9 @@ pub struct TimeoutConfig {
 
     /// Cold tier timeout in milliseconds (default: 1000ms)
     pub cold_tier_ms: u64,
+
+    /// Maximum in-flight queries admitted by load shedding.
+    pub max_concurrent_queries: usize,
 }
 
 impl Default for TimeoutConfig {
@@ -536,6 +558,7 @@ impl Default for TimeoutConfig {
             cache_ms: 10,
             hot_tier_ms: 50,
             cold_tier_ms: 1000,
+            max_concurrent_queries: 1000,
         }
     }
 }
@@ -850,6 +873,28 @@ impl KyroDbConfig {
             );
         }
 
+        // Timeout and query-load-shedding validation
+        anyhow::ensure!(
+            self.timeouts.cache_ms > 0,
+            "timeouts.cache_ms must be > 0, got {}",
+            self.timeouts.cache_ms
+        );
+        anyhow::ensure!(
+            self.timeouts.hot_tier_ms > 0,
+            "timeouts.hot_tier_ms must be > 0, got {}",
+            self.timeouts.hot_tier_ms
+        );
+        anyhow::ensure!(
+            self.timeouts.cold_tier_ms > 0,
+            "timeouts.cold_tier_ms must be > 0, got {}",
+            self.timeouts.cold_tier_ms
+        );
+        anyhow::ensure!(
+            self.timeouts.max_concurrent_queries > 0,
+            "timeouts.max_concurrent_queries must be > 0, got {}",
+            self.timeouts.max_concurrent_queries
+        );
+
         // Environment-aware persistence safety check.
         // If the environment type is not "benchmark", reject configurations
         // that disable durability guarantees (these are only safe for benchmarks).
@@ -869,6 +914,15 @@ impl KyroDbConfig {
                      is only permitted when environment.type=\"benchmark\". Current environment type: \"{}\". \
                      Set a positive snapshot_interval_mutations for production safety, \
                      or set [environment] type = \"benchmark\" to acknowledge the risk.",
+                    self.environment.environment_type
+                );
+            }
+            if matches!(self.persistence.recovery_mode, RecoveryMode::BestEffort) {
+                anyhow::bail!(
+                    "Unsafe recovery configuration: persistence.recovery_mode=\"best_effort\" is only permitted \
+                     when environment.type=\"benchmark\". Current environment type: \"{}\". \
+                     Set recovery_mode to \"strict\" for production safety, or set [environment] type = \"benchmark\" \
+                     to acknowledge the risk.",
                     self.environment.environment_type
                 );
             }
@@ -1189,6 +1243,39 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "unknown environment types must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_best_effort_recovery_rejected_outside_benchmark() {
+        let mut config = KyroDbConfig::default();
+        config.persistence.recovery_mode = RecoveryMode::BestEffort;
+        assert!(
+            config.validate().is_err(),
+            "best_effort recovery must be rejected outside benchmark mode"
+        );
+    }
+
+    #[test]
+    fn test_best_effort_recovery_allowed_in_benchmark() {
+        let mut config = KyroDbConfig::default();
+        config.environment.environment_type = "benchmark".to_string();
+        config.persistence.recovery_mode = RecoveryMode::BestEffort;
+        config.persistence.fsync_policy = FsyncPolicy::None;
+        config.persistence.snapshot_interval_mutations = 0;
+        assert!(
+            config.validate().is_ok(),
+            "benchmark mode should allow best_effort recovery and unsafe persistence"
+        );
+    }
+
+    #[test]
+    fn test_timeouts_max_concurrent_queries_must_be_positive() {
+        let mut config = KyroDbConfig::default();
+        config.timeouts.max_concurrent_queries = 0;
+        assert!(
+            config.validate().is_err(),
+            "timeouts.max_concurrent_queries=0 should be rejected"
         );
     }
 

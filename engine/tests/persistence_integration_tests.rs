@@ -7,10 +7,10 @@
 //! - Durability guarantees with different fsync policies
 
 use kyrodb_engine::{
-    metrics::MetricsCollector, DistanceMetric, FsyncPolicy, HnswBackend, Manifest, Snapshot,
-    WalEntry, WalOp, WalReader, WalWriter,
+    hnsw_backend::RecoveryMode, metrics::MetricsCollector, DistanceMetric, FsyncPolicy,
+    HnswBackend, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, fs};
 use tempfile::TempDir;
 
 fn normalize(mut v: Vec<f32>) -> Vec<f32> {
@@ -418,4 +418,118 @@ fn test_fsync_policy_never() {
     .unwrap();
 
     assert_eq!(recovered.len(), 2);
+}
+
+#[test]
+fn test_strict_recovery_fails_when_snapshot_corrupt_and_wal_segment_missing() {
+    let dir = TempDir::new().unwrap();
+
+    let _backend = HnswBackend::with_persistence(
+        2,
+        DistanceMetric::Cosine,
+        vec![normalize(vec![1.0, 0.0])],
+        vec![HashMap::new(); 1],
+        100,
+        dir.path(),
+        FsyncPolicy::Always,
+        1000,
+        1024 * 1024,
+    )
+    .unwrap();
+    drop(_backend);
+
+    let manifest_path = dir.path().join("MANIFEST");
+    let manifest = Manifest::load(&manifest_path).unwrap();
+    let snapshot_name = manifest
+        .latest_snapshot
+        .clone()
+        .expect("baseline snapshot should exist");
+    let snapshot_path = dir.path().join(snapshot_name);
+    fs::write(&snapshot_path, b"CORRUPTED_SNAPSHOT").unwrap();
+
+    for wal in &manifest.wal_segments {
+        let wal_path = dir.path().join(wal);
+        if wal_path.exists() {
+            fs::remove_file(wal_path).unwrap();
+        }
+    }
+
+    let metrics = MetricsCollector::new();
+    let recovered = HnswBackend::recover_with_hnsw_params_and_mode(
+        2,
+        DistanceMetric::Cosine,
+        dir.path(),
+        100,
+        FsyncPolicy::Always,
+        1000,
+        1024 * 1024,
+        metrics,
+        16,
+        200,
+        false,
+        RecoveryMode::Strict,
+    );
+
+    assert!(
+        recovered.is_err(),
+        "strict recovery must fail when snapshot is corrupt and required WAL segments are missing"
+    );
+}
+
+#[test]
+fn test_best_effort_recovery_allows_snapshot_corrupt_and_missing_wal() {
+    let dir = TempDir::new().unwrap();
+
+    let _backend = HnswBackend::with_persistence(
+        2,
+        DistanceMetric::Cosine,
+        vec![normalize(vec![1.0, 0.0])],
+        vec![HashMap::new(); 1],
+        100,
+        dir.path(),
+        FsyncPolicy::Always,
+        1000,
+        1024 * 1024,
+    )
+    .unwrap();
+    drop(_backend);
+
+    let manifest_path = dir.path().join("MANIFEST");
+    let manifest = Manifest::load(&manifest_path).unwrap();
+    let snapshot_name = manifest
+        .latest_snapshot
+        .clone()
+        .expect("baseline snapshot should exist");
+    let snapshot_path = dir.path().join(snapshot_name);
+    fs::write(&snapshot_path, b"CORRUPTED_SNAPSHOT").unwrap();
+
+    for wal in &manifest.wal_segments {
+        let wal_path = dir.path().join(wal);
+        if wal_path.exists() {
+            fs::remove_file(wal_path).unwrap();
+        }
+    }
+
+    let metrics = MetricsCollector::new();
+    let recovered = HnswBackend::recover_with_hnsw_params_and_mode(
+        2,
+        DistanceMetric::Cosine,
+        dir.path(),
+        100,
+        FsyncPolicy::Always,
+        1000,
+        1024 * 1024,
+        metrics,
+        16,
+        200,
+        false,
+        RecoveryMode::BestEffort,
+    )
+    .expect("best_effort recovery should continue with degraded evidence");
+
+    assert_eq!(
+        recovered.len(),
+        0,
+        "best_effort recovery should come up empty when all persisted evidence is missing/corrupt"
+    );
 }

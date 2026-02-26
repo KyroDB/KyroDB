@@ -10,8 +10,10 @@
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -159,6 +161,16 @@ impl TenantUsage {
         }
     }
 
+    fn from_snapshot(snapshot: &UsageSnapshot) -> Self {
+        Self {
+            query_count: AtomicU64::new(snapshot.query_count),
+            insert_count: AtomicU64::new(snapshot.insert_count),
+            delete_count: AtomicU64::new(snapshot.delete_count),
+            vector_count: AtomicU64::new(snapshot.vector_count),
+            storage_bytes: AtomicU64::new(snapshot.storage_bytes),
+        }
+    }
+
     /// Reset all counters to zero (for testing)
     #[cfg(test)]
     pub fn reset(&self) {
@@ -177,13 +189,52 @@ impl Default for TenantUsage {
 }
 
 /// Point-in-time snapshot of tenant usage
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub query_count: u64,
     pub insert_count: u64,
     pub delete_count: u64,
     pub vector_count: u64,
     pub storage_bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UsageStateSnapshot {
+    version: u32,
+    timestamp_unix_secs: u64,
+    tenants: HashMap<String, UsageSnapshot>,
+}
+
+const USAGE_STATE_SNAPSHOT_VERSION: u32 = 1;
+static USAGE_SNAPSHOT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    #[cfg(unix)]
+    {
+        let dir = File::open(parent).with_context(|| {
+            format!(
+                "Failed to open usage snapshot parent directory {}",
+                parent.display()
+            )
+        })?;
+        dir.sync_all().with_context(|| {
+            format!(
+                "Failed to fsync usage snapshot parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+
+    Ok(())
 }
 
 impl UsageSnapshot {
@@ -262,6 +313,121 @@ impl UsageTracker {
             .iter()
             .map(|(tenant_id, tracker)| (tenant_id.clone(), tracker.snapshot()))
             .collect()
+    }
+
+    /// Persist per-tenant usage to a crash-safe snapshot file.
+    ///
+    /// Write flow: temp file + fsync + atomic rename + parent dir fsync.
+    pub fn persist_snapshot(&self, path: &Path) -> Result<()> {
+        let snapshot = UsageStateSnapshot {
+            version: USAGE_STATE_SNAPSHOT_VERSION,
+            timestamp_unix_secs: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .context("System time before UNIX epoch")?
+                .as_secs(),
+            tenants: self.get_all_snapshots(),
+        };
+        let bytes =
+            bincode::serialize(&snapshot).context("Failed to serialize usage state snapshot")?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create usage snapshot directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Usage snapshot path has no parent"))?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Usage snapshot path has no file name"))?;
+        let tmp_seq = USAGE_SNAPSHOT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let thread_id = format!("{:?}", std::thread::current().id())
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>();
+        let tmp_name = format!(
+            ".{}.tmp.{}.{}.{}",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            thread_id,
+            tmp_seq
+        );
+        let tmp_path = parent.join(tmp_name);
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .with_context(|| {
+                format!(
+                    "Failed to create usage snapshot temp file {}",
+                    tmp_path.display()
+                )
+            })?;
+        file.write_all(&bytes)
+            .with_context(|| format!("Failed to write usage snapshot {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to fsync usage snapshot {}", tmp_path.display()))?;
+        drop(file);
+
+        std::fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "Failed to atomically rename usage snapshot {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+        sync_parent_dir(path)?;
+
+        Ok(())
+    }
+
+    /// Restore usage from snapshot if it exists.
+    ///
+    /// Returns number of restored tenants.
+    pub fn restore_snapshot_if_exists(&self, path: &Path) -> Result<usize> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to read usage snapshot {}: {}",
+                    path.display(),
+                    e
+                ))
+            }
+        };
+
+        let snapshot: UsageStateSnapshot = bincode::deserialize(&bytes).with_context(|| {
+            format!(
+                "Failed to deserialize usage snapshot payload {}",
+                path.display()
+            )
+        })?;
+        if snapshot.version != USAGE_STATE_SNAPSHOT_VERSION {
+            anyhow::bail!(
+                "Unsupported usage snapshot version {} in {} (expected {})",
+                snapshot.version,
+                path.display(),
+                USAGE_STATE_SNAPSHOT_VERSION
+            );
+        }
+
+        let restored_len = snapshot.tenants.len();
+        let restored_usage: HashMap<String, Arc<TenantUsage>> = snapshot
+            .tenants
+            .into_iter()
+            .map(|(tenant_id, usage)| (tenant_id, Arc::new(TenantUsage::from_snapshot(&usage))))
+            .collect();
+        *self.usage.write() = restored_usage;
+
+        Ok(restored_len)
     }
 
     /// Export usage statistics to CSV file for billing
@@ -343,7 +509,7 @@ impl Default for UsageTracker {
 mod tests {
     use super::*;
     use std::thread;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     #[test]
     fn test_tenant_usage_basic() {
@@ -601,5 +767,47 @@ mod tests {
         assert_eq!(snapshot.delete_count, 0);
         assert_eq!(snapshot.vector_count, 0);
         assert_eq!(snapshot.storage_bytes, 0);
+    }
+
+    #[test]
+    fn test_usage_tracker_persist_and_restore_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot_path = temp_dir.path().join("usage_state.snap");
+
+        let tracker = UsageTracker::new();
+        let tenant_a = tracker.get_or_create("tenant_a");
+        tenant_a.record_query_batch(7);
+        tenant_a.record_insert_batch(3, 1536);
+        tracker
+            .get_or_create("tenant_b")
+            .record_delete_batch(2, 2048);
+
+        tracker.persist_snapshot(&snapshot_path).unwrap();
+
+        let restored = UsageTracker::new();
+        let restored_tenants = restored.restore_snapshot_if_exists(&snapshot_path).unwrap();
+        assert_eq!(restored_tenants, 2);
+
+        let restored_a = restored.get_snapshot("tenant_a").unwrap();
+        assert_eq!(restored_a.query_count, 7);
+        assert_eq!(restored_a.insert_count, 3);
+        assert_eq!(restored_a.vector_count, 3);
+        assert_eq!(restored_a.storage_bytes, 4608);
+
+        let restored_b = restored.get_snapshot("tenant_b").unwrap();
+        assert_eq!(restored_b.delete_count, 2);
+        assert_eq!(restored_b.vector_count, 0);
+        assert_eq!(restored_b.storage_bytes, 0);
+    }
+
+    #[test]
+    fn test_usage_tracker_restore_snapshot_missing_file_is_noop() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot_path = temp_dir.path().join("missing_usage_state.snap");
+        let tracker = UsageTracker::new();
+
+        let restored = tracker.restore_snapshot_if_exists(&snapshot_path).unwrap();
+        assert_eq!(restored, 0);
+        assert_eq!(tracker.tenant_count(), 0);
     }
 }

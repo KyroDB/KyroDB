@@ -29,6 +29,7 @@
 //! ```
 
 use crate::config::DistanceMetric;
+use crate::hnsw_backend::RecoveryMode;
 use crate::proto::MetadataFilter;
 use crate::{
     AccessPatternLogger, CacheStrategy, CachedVector, CircuitBreaker, FsyncPolicy, HnswBackend,
@@ -38,6 +39,7 @@ use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -104,6 +106,7 @@ pub struct TieredEngineStats {
     pub queries_rejected: u64, // Queries rejected due to queue saturation
     pub current_queue_depth: u64,        // Current in-flight queries
     pub circuit_breaker_rejections: u64, // Queries failed due to circuit breaker open
+    pub worker_saturation_count: u64,    // Searches that could not obtain a worker permit
 }
 
 /// Source tier for point lookups.
@@ -175,6 +178,9 @@ pub struct TieredEngineConfig {
     /// Snapshot interval (create snapshot every N inserts to cold tier)
     pub snapshot_interval: usize,
 
+    /// Recovery strictness for persistence startup.
+    pub recovery_mode: RecoveryMode,
+
     /// Maximum WAL size before rotation (bytes).
     ///
     /// When the active WAL reaches this size, a new WAL segment is created and
@@ -209,6 +215,7 @@ impl Default for TieredEngineConfig {
             data_dir: None,
             fsync_policy: FsyncPolicy::Always,
             snapshot_interval: 10_000,
+            recovery_mode: RecoveryMode::Strict,
             max_wal_size_bytes: 100 * 1024 * 1024, // 100 MB
             flush_interval: Duration::from_secs(30),
             cache_timeout_ms: 10,         // 10ms for cache
@@ -227,6 +234,7 @@ struct TieredEngineComponents {
     hot_tier: Arc<HotTier>,
     cold_tier: Arc<HnswBackend>,
     query_semaphore: Arc<Semaphore>,
+    search_worker_semaphore: Arc<Semaphore>,
     stats: Arc<RwLock<TieredEngineStats>>,
     cache_circuit_breaker: Arc<CircuitBreaker>,
     hot_tier_circuit_breaker: Arc<CircuitBreaker>,
@@ -263,6 +271,9 @@ pub struct TieredEngine {
 
     /// Semaphore for load shedding (max concurrent queries)
     pub(crate) query_semaphore: Arc<Semaphore>,
+
+    /// Semaphore bounding blocking search workers.
+    pub(crate) search_worker_semaphore: Arc<Semaphore>,
 }
 
 impl TieredEngine {
@@ -322,11 +333,13 @@ impl TieredEngine {
         };
 
         let query_semaphore = Arc::new(Semaphore::new(config.max_concurrent_queries));
+        let search_worker_semaphore = Arc::new(Semaphore::new(config.max_concurrent_queries));
 
         Ok(TieredEngineComponents {
             hot_tier,
             cold_tier,
             query_semaphore,
+            search_worker_semaphore,
             stats: Arc::new(RwLock::new(TieredEngineStats::default())),
             cache_circuit_breaker: Arc::new(CircuitBreaker::new()),
             hot_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
@@ -361,6 +374,7 @@ impl TieredEngine {
             hot_tier_circuit_breaker: components.hot_tier_circuit_breaker,
             cold_tier_circuit_breaker: components.cold_tier_circuit_breaker,
             query_semaphore: components.query_semaphore,
+            search_worker_semaphore: components.search_worker_semaphore,
         })
     }
 
@@ -397,6 +411,7 @@ impl TieredEngine {
             hot_tier_circuit_breaker: components.hot_tier_circuit_breaker,
             cold_tier_circuit_breaker: components.cold_tier_circuit_breaker,
             query_semaphore: components.query_semaphore,
+            search_worker_semaphore: components.search_worker_semaphore,
         })
     }
 
@@ -411,7 +426,7 @@ impl TieredEngine {
 
         // Recover cold tier from WAL + snapshot
         let metrics = crate::metrics::MetricsCollector::new();
-        let cold_tier = Arc::new(HnswBackend::recover_with_hnsw_params(
+        let cold_tier = Arc::new(HnswBackend::recover_with_hnsw_params_and_mode(
             config.embedding_dimension,
             config.hnsw_distance,
             &data_dir_str,
@@ -423,6 +438,7 @@ impl TieredEngine {
             config.hnsw_m,
             config.hnsw_ef_construction,
             config.hnsw_disable_normalization_check,
+            config.recovery_mode,
         )?);
 
         // Create fresh hot tier (ephemeral)
@@ -436,6 +452,8 @@ impl TieredEngine {
         recovered_config.data_dir = Some(data_dir_str);
 
         let query_semaphore = Arc::new(Semaphore::new(recovered_config.max_concurrent_queries));
+        let search_worker_semaphore =
+            Arc::new(Semaphore::new(recovered_config.max_concurrent_queries));
 
         Ok(Self {
             cache_strategy: Arc::new(RwLock::new(cache_strategy)),
@@ -449,6 +467,7 @@ impl TieredEngine {
             hot_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
             cold_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
             query_semaphore,
+            search_worker_semaphore,
         })
     }
 
@@ -1489,34 +1508,57 @@ impl TieredEngine {
         let hot_timeout = Duration::from_millis(self.config.hot_tier_timeout_ms);
         if self.hot_tier_circuit_breaker.is_closed() {
             hot_accessed = true;
-            match tokio::time::timeout(hot_timeout, async {
-                tokio::task::spawn_blocking({
-                    let query_vec = normalized_query.clone();
-                    let hot_tier = Arc::clone(&self.hot_tier);
-                    let k_candidates = k * 2;
-                    move || hot_tier.knn_search(&query_vec, k_candidates)
-                })
-                .await
-            })
-            .await
-            {
-                Ok(Ok(hot)) => {
-                    hot_results = hot;
-                    self.hot_tier_circuit_breaker.record_success();
-                }
-                Ok(Err(e)) => {
-                    self.hot_tier_circuit_breaker.record_failure();
-                    error!("Hot tier task panicked: {}", e);
-                    partial = true;
+            match self.search_worker_semaphore.clone().try_acquire_owned() {
+                Ok(worker_permit) => {
+                    let hot_cancel = Arc::new(AtomicBool::new(false));
+                    match tokio::time::timeout(hot_timeout, async {
+                        tokio::task::spawn_blocking({
+                            let query_vec = normalized_query.clone();
+                            let hot_tier = Arc::clone(&self.hot_tier);
+                            let k_candidates = k * 2;
+                            let hot_cancel_worker = Arc::clone(&hot_cancel);
+                            move || {
+                                let _worker_permit = worker_permit;
+                                hot_tier.knn_search_with_cancel(
+                                    &query_vec,
+                                    k_candidates,
+                                    Some(hot_cancel_worker.as_ref()),
+                                )
+                            }
+                        })
+                        .await
+                    })
+                    .await
+                    {
+                        Ok(Ok(hot)) => {
+                            hot_results = hot;
+                            self.hot_tier_circuit_breaker.record_success();
+                        }
+                        Ok(Err(e)) => {
+                            self.hot_tier_circuit_breaker.record_failure();
+                            error!("Hot tier task panicked: {}", e);
+                            partial = true;
+                        }
+                        Err(_) => {
+                            hot_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.hot_tier_circuit_breaker.record_failure();
+                            let mut stats = self.stats.write();
+                            stats.hot_tier_timeouts += 1;
+                            warn!(
+                                "Hot tier timed out after {}ms",
+                                self.config.hot_tier_timeout_ms
+                            );
+                            partial = true;
+                        }
+                    }
                 }
                 Err(_) => {
-                    self.hot_tier_circuit_breaker.record_failure();
-                    let mut stats = self.stats.write();
-                    stats.hot_tier_timeouts += 1;
                     warn!(
-                        "Hot tier timed out after {}ms",
-                        self.config.hot_tier_timeout_ms
+                        "Hot tier search worker queue saturated (limit: {}); skipping hot tier",
+                        self.config.max_concurrent_queries
                     );
+                    let mut stats = self.stats.write();
+                    stats.worker_saturation_count += 1;
                     partial = true;
                 }
             }
@@ -1534,13 +1576,66 @@ impl TieredEngine {
         let cold_timeout = Duration::from_millis(self.config.cold_tier_timeout_ms);
         if cold_tier_has_docs && self.cold_tier_circuit_breaker.is_closed() {
             cold_accessed = true;
+            let worker_permit = match self.search_worker_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if hot_results.is_empty() {
+                        {
+                            let mut stats = self.stats.write();
+                            stats.queries_rejected += 1;
+                            stats.worker_saturation_count += 1;
+                        }
+                        drop(permit);
+                        self.refresh_queue_depth_metric();
+                        return Err(anyhow!(
+                            "Search worker queue saturated: {} active workers (max: {})",
+                            self.config.max_concurrent_queries,
+                            self.config.max_concurrent_queries
+                        ));
+                    }
+
+                    warn!(
+                        "Cold tier search worker queue saturated (limit: {}); returning hot-tier partial results",
+                        self.config.max_concurrent_queries
+                    );
+                    {
+                        let mut stats = self.stats.write();
+                        stats.worker_saturation_count += 1;
+                        stats.partial_results_returned += 1;
+                    }
+                    let mut partial_results: Vec<SearchResult> = hot_results
+                        .into_iter()
+                        .map(|(doc_id, distance)| SearchResult { doc_id, distance })
+                        .collect();
+                    partial_results.sort_by(|a, b| {
+                        a.distance
+                            .partial_cmp(&b.distance)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    partial_results.truncate(k);
+                    drop(permit);
+                    self.refresh_queue_depth_metric();
+                    return Ok((partial_results, SearchExecutionPath::HotTierOnly));
+                }
+            };
+
+            let cold_cancel = Arc::new(AtomicBool::new(false));
             match tokio::time::timeout(cold_timeout, async {
                 tokio::task::spawn_blocking({
                     let query_vec = normalized_query.clone();
                     let cold_tier = Arc::clone(&self.cold_tier);
                     let effective_ef_search =
                         ef_search_override.or(Some(self.config.hnsw_ef_search));
-                    move || cold_tier.knn_search_with_ef(&query_vec, k * 2, effective_ef_search)
+                    let cold_cancel_worker = Arc::clone(&cold_cancel);
+                    move || {
+                        let _worker_permit = worker_permit;
+                        cold_tier.knn_search_with_ef_cancel(
+                            &query_vec,
+                            k * 2,
+                            effective_ef_search,
+                            Some(cold_cancel_worker.as_ref()),
+                        )
+                    }
                 })
                 .await
             })
@@ -1566,6 +1661,7 @@ impl TieredEngine {
                 }
                 Err(_) => {
                     // Timeout
+                    cold_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     self.cold_tier_circuit_breaker.record_failure();
                     let mut stats = self.stats.write();
                     stats.cold_tier_timeouts += 1;
@@ -2835,6 +2931,71 @@ mod tests {
         // No queries should be rejected
         let stats = engine.stats();
         assert_eq!(stats.queries_rejected, 0);
+    }
+
+    #[tokio::test]
+    async fn test_search_worker_saturation_rejects_when_no_partial_results() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        let cache = LruCacheStrategy::new(8);
+        let embeddings = vec![normalize(vec![1.0, 2.0]); 4];
+        let config = TieredEngineConfig {
+            max_concurrent_queries: 2,
+            hnsw_max_elements: 64,
+            embedding_dimension: 2,
+            data_dir: None,
+            ..Default::default()
+        };
+
+        let query_cache = Arc::new(QueryHashCache::new(64, 0.90));
+        let initial_metadata = vec![std::collections::HashMap::new(); embeddings.len()];
+        let engine = Arc::new(
+            TieredEngine::new(
+                Box::new(cache),
+                query_cache,
+                embeddings,
+                initial_metadata,
+                config,
+            )
+            .unwrap(),
+        );
+
+        let worker_limit = engine.config.max_concurrent_queries as u32;
+        let _held_workers = engine
+            .search_worker_semaphore
+            .clone()
+            .acquire_many_owned(worker_limit)
+            .await
+            .expect("must be able to reserve all worker permits");
+
+        let query = normalize(vec![1.0, 2.0]);
+        let err = engine
+            .knn_search_with_timeouts(&query, 3)
+            .await
+            .expect_err("query should be rejected when all search workers are saturated");
+
+        assert!(
+            err.to_string().contains("Search worker queue saturated"),
+            "error should mention worker saturation, got: {}",
+            err
+        );
+
+        let stats = engine.stats();
+        assert_eq!(
+            stats.queries_rejected, 1,
+            "worker saturation should increment queries_rejected"
+        );
+        assert!(
+            stats.worker_saturation_count >= 1,
+            "worker saturation should increment worker_saturation_count (got {})",
+            stats.worker_saturation_count
+        );
     }
 
     #[test]

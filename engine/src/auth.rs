@@ -36,6 +36,11 @@ pub struct TenantInfo {
     /// Maximum vectors this tenant can store
     pub max_vectors: usize,
 
+    /// Grants access to admin-only observability operations (for example,
+    /// cross-tenant usage views).
+    #[serde(default)]
+    pub is_admin: bool,
+
     /// Whether this API key is currently enabled
     pub enabled: bool,
 
@@ -309,6 +314,7 @@ impl Default for AuthManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::io::{Seek, Write};
     use tempfile::NamedTempFile;
 
@@ -318,6 +324,7 @@ mod tests {
             tenant_name: format!("{} Corp", tenant_id),
             max_qps: 1000,
             max_vectors: 1_000_000,
+            is_admin: false,
             enabled: true,
             created_at: "2025-10-16T00:00:00Z".to_string(),
         }
@@ -581,5 +588,68 @@ api_keys:
             .validate("kyro_startup_b4e8f1a9d2c3567890fedcba98765432")
             .is_some());
         assert_eq!(auth.key_count(), 1);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn prop_api_key_validation_accepts_well_formed_keys(
+            tenant_id in "[A-Za-z0-9_]{1,32}",
+            secret in "[A-Za-z0-9]{32,64}",
+        ) {
+            let key = format!("kyro_{}_{}", tenant_id, secret);
+            prop_assert!(AuthManager::validate_api_key(&key).is_ok());
+        }
+
+        #[test]
+        fn prop_api_key_validation_rejects_non_alnum_secret(
+            tenant_id in "[A-Za-z0-9_]{1,32}",
+            left in "[A-Za-z0-9]{16,32}",
+            right in "[A-Za-z0-9]{16,32}",
+            invalid in prop_oneof![Just('!'), Just('-'), Just(':'), Just('/'), Just('~')],
+        ) {
+            let secret = format!("{}{}{}", left, invalid, right);
+            let key = format!("kyro_{}_{}", tenant_id, secret);
+            prop_assert!(AuthManager::validate_api_key(&key).is_err());
+        }
+
+        #[test]
+        fn prop_add_key_rejects_tenant_prefix_mismatch(
+            key_tenant in "[A-Za-z0-9_]{1,24}",
+            info_tenant in "[A-Za-z0-9_]{1,24}",
+            secret in "[A-Za-z0-9]{32,48}",
+        ) {
+            prop_assume!(key_tenant != info_tenant);
+            let auth = AuthManager::new();
+            let key = format!("kyro_{}_{}", key_tenant, secret);
+            let mut info = create_test_tenant_info(&info_tenant);
+            info.tenant_name = "Tenant".to_string();
+            prop_assert!(auth.add_key(key, info).is_err());
+        }
+
+        #[test]
+        fn prop_tenant_info_validate_matches_contract(
+            tenant_id in proptest::collection::vec(any::<char>(), 0..16)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            tenant_name in proptest::collection::vec(any::<char>(), 0..16)
+                .prop_map(|chars| chars.into_iter().collect::<String>()),
+            max_vectors in 0usize..4,
+        ) {
+            let info = TenantInfo {
+                tenant_id: tenant_id.clone(),
+                tenant_name: tenant_name.clone(),
+                max_qps: 0,
+                max_vectors,
+                is_admin: false,
+                enabled: true,
+                created_at: String::new(),
+            };
+            let expected_ok = !tenant_id.is_empty()
+                && tenant_id.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && !tenant_name.is_empty()
+                && max_vectors > 0;
+            prop_assert_eq!(info.validate().is_ok(), expected_ok);
+        }
     }
 }

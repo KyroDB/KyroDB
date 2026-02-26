@@ -57,6 +57,9 @@ pub mod metadata_filter;
 // Adaptive oversampling for filtered search
 pub mod adaptive_oversampling;
 
+// API input validation (shared by server and fuzz/property tests)
+pub mod api_validation;
+
 // ANN backend abstraction (internal)
 pub(crate) mod ann_backend;
 

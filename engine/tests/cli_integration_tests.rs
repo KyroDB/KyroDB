@@ -3,14 +3,34 @@
 use anyhow::Result;
 use kyrodb_engine::backup::{BackupManager, BackupType};
 use kyrodb_engine::hnsw_backend::HnswBackend;
-use kyrodb_engine::persistence::FsyncPolicy;
+use kyrodb_engine::metrics::MetricsCollector;
+use kyrodb_engine::persistence::{FsyncPolicy, Manifest, WalReader};
 use kyrodb_engine::DistanceMetric;
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
 fn empty_metadata(n: usize) -> Vec<HashMap<String, String>> {
     vec![HashMap::new(); n]
+}
+
+fn recover_backend(
+    data_dir: &Path,
+    dimension: usize,
+    distance: DistanceMetric,
+) -> Result<HnswBackend> {
+    let metrics = MetricsCollector::new();
+    HnswBackend::recover(
+        dimension,
+        distance,
+        data_dir,
+        100,
+        FsyncPolicy::Always,
+        10,
+        100 * 1024 * 1024,
+        metrics,
+    )
 }
 
 #[test]
@@ -39,6 +59,27 @@ fn test_cli_backup_create_full() -> Result<()> {
         100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
+    let mut wal_only_metadata = HashMap::new();
+    wal_only_metadata.insert("source".to_string(), "wal_only".to_string());
+    backend.insert(10, vec![9.0, 9.0, 9.0, 9.0], wal_only_metadata)?;
+    backend.sync_wal()?;
+    let mut wal_entries_while_live = 0usize;
+    let mut wal_diag_live = Vec::new();
+    for entry in std::fs::read_dir(data_path)? {
+        let entry = entry?;
+        let wal_name = entry.file_name().to_string_lossy().to_string();
+        if !wal_name.starts_with("wal_") || !wal_name.ends_with(".wal") {
+            continue;
+        }
+        let mut reader = WalReader::open(&entry.path())?;
+        let entries = reader.read_all()?;
+        wal_entries_while_live += entries.len();
+        wal_diag_live.push((wal_name, entries.len(), reader.corrupted_entries()));
+    }
+    assert!(
+        wal_entries_while_live > 0,
+        "Insert should append at least one WAL entry before backup: {wal_diag_live:?}"
+    );
     drop(backend);
 
     let output = Command::new(env!("CARGO_BIN_EXE_kyrodb_backup"))
@@ -64,10 +105,18 @@ fn test_cli_backup_create_full() -> Result<()> {
         matches!(backups[0].backup_type, BackupType::Full),
         "Should be full backup"
     );
-    // Note: vector_count is a rough estimate (size/1024), don't assert exact count
-    println!(
-        "Backup created with {} vectors (estimated)",
-        backups[0].vector_count
+    assert_eq!(
+        backups[0].vector_count,
+        embeddings.len() as u64,
+        "Full backup should capture snapshot document count"
+    );
+    assert!(
+        backups[0].snapshot_file.is_some(),
+        "Full backup metadata should include snapshot filename"
+    );
+    assert!(
+        backups[0].max_wal_file_id.is_some(),
+        "Full backup metadata should include WAL high watermark"
     );
 
     Ok(())
@@ -94,6 +143,27 @@ fn test_cli_backup_list() -> Result<()> {
         100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
+    let mut wal_only_metadata = HashMap::new();
+    wal_only_metadata.insert("source".to_string(), "wal_only".to_string());
+    backend.insert(10, vec![9.0, 9.0, 9.0, 9.0], wal_only_metadata)?;
+    backend.sync_wal()?;
+    let mut wal_entries_while_live = 0usize;
+    let mut wal_diag_live = Vec::new();
+    for entry in std::fs::read_dir(data_path)? {
+        let entry = entry?;
+        let wal_name = entry.file_name().to_string_lossy().to_string();
+        if !wal_name.starts_with("wal_") || !wal_name.ends_with(".wal") {
+            continue;
+        }
+        let mut reader = WalReader::open(&entry.path())?;
+        let entries = reader.read_all()?;
+        wal_entries_while_live += entries.len();
+        wal_diag_live.push((wal_name, entries.len(), reader.corrupted_entries()));
+    }
+    assert!(
+        wal_entries_while_live > 0,
+        "Insert should append at least one WAL entry before backup: {wal_diag_live:?}"
+    );
     drop(backend);
 
     let backup_manager = BackupManager::new(backup_dir.path(), data_dir.path())?;
@@ -190,10 +260,45 @@ fn test_cli_restore_from_backup() -> Result<()> {
         100 * 1024 * 1024,
     )?;
     backend.create_snapshot()?;
+    let mut wal_only_metadata = HashMap::new();
+    wal_only_metadata.insert("source".to_string(), "wal_only".to_string());
+    backend.insert(10, vec![9.0, 9.0, 9.0, 9.0], wal_only_metadata)?;
+    backend.sync_wal()?;
+    let mut wal_entries_while_live = 0usize;
+    let mut wal_diag_live = Vec::new();
+    for entry in std::fs::read_dir(data_path)? {
+        let entry = entry?;
+        let wal_name = entry.file_name().to_string_lossy().to_string();
+        if !wal_name.starts_with("wal_") || !wal_name.ends_with(".wal") {
+            continue;
+        }
+        let mut reader = WalReader::open(&entry.path())?;
+        let entries = reader.read_all()?;
+        wal_entries_while_live += entries.len();
+        wal_diag_live.push((wal_name, entries.len(), reader.corrupted_entries()));
+    }
+    assert!(
+        wal_entries_while_live > 0,
+        "Insert should append at least one WAL entry before backup: {wal_diag_live:?}"
+    );
     drop(backend);
 
     let backup_manager = BackupManager::new(backup_dir.path(), data_dir.path())?;
     let metadata = backup_manager.create_full_backup("Pre-restore backup".to_string())?;
+    let mut wal_entries_before_restore = 0usize;
+    let mut wal_diag_before = Vec::new();
+    for entry in std::fs::read_dir(data_dir.path())? {
+        let entry = entry?;
+        let wal_name = entry.file_name().to_string_lossy().to_string();
+        if !wal_name.starts_with("wal_") || !wal_name.ends_with(".wal") {
+            continue;
+        }
+        let wal_path = entry.path();
+        let mut reader = WalReader::open(&wal_path)?;
+        let entries = reader.read_all()?;
+        wal_entries_before_restore += entries.len();
+        wal_diag_before.push((wal_name, entries.len(), reader.corrupted_entries()));
+    }
 
     std::fs::remove_dir_all(data_dir.path())?;
     std::fs::create_dir_all(data_dir.path())?;
@@ -212,27 +317,42 @@ fn test_cli_restore_from_backup() -> Result<()> {
     println!("Error: {}", String::from_utf8_lossy(&output.stderr));
 
     assert!(output.status.success(), "CLI restore should succeed");
-
-    // Debug: List files in restored directory
-    println!("Files in restored directory:");
-    for entry in std::fs::read_dir(data_dir.path())? {
-        let entry = entry?;
-        println!("  - {}", entry.file_name().to_string_lossy());
+    let manifest_after_restore = Manifest::load(data_dir.path().join("MANIFEST"))?;
+    let mut wal_entries_after_restore = 0usize;
+    let mut wal_diag_after = Vec::new();
+    for wal_segment in &manifest_after_restore.wal_segments {
+        let wal_path = data_dir.path().join(wal_segment);
+        let mut reader = WalReader::open(&wal_path)?;
+        let entries = reader.read_all()?;
+        wal_entries_after_restore += entries.len();
+        wal_diag_after.push((
+            wal_segment.clone(),
+            entries.len(),
+            reader.corrupted_entries(),
+        ));
     }
-
-    // Note: Backend recovery is skipped because BackupManager uses snapshot_<number> format
-    // while HnswBackend uses snapshot_<timestamp>.snap format. The CLI restore command
-    // successfully extracts files, but full end-to-end recovery requires format alignment.
-    //
-    // Verify that at least MANIFEST and WAL files were restored
     assert!(
-        data_dir.path().join("MANIFEST").exists(),
-        "MANIFEST should be restored"
+        wal_entries_after_restore > 0,
+        "Restored data should include replayable WAL entries: live={wal_diag_live:?} before={wal_diag_before:?} after={wal_diag_after:?}",
     );
-    let has_wal = std::fs::read_dir(data_dir.path())?
-        .filter_map(|e| e.ok())
-        .any(|e| e.file_name().to_string_lossy().ends_with(".wal"));
-    assert!(has_wal, "At least one WAL file should be restored");
+    assert!(
+        wal_entries_after_restore >= wal_entries_before_restore,
+        "Restored WAL entries should not regress: live={wal_diag_live:?} before={wal_diag_before:?} after={wal_diag_after:?}",
+    );
+    let recovered = recover_backend(data_dir.path(), 4, DistanceMetric::Euclidean)?;
+    assert_eq!(
+        recovered.len(),
+        3,
+        "Recovered engine should include snapshot and WAL-only inserts; live={wal_diag_live:?} before={wal_diag_before:?} after={wal_diag_after:?}"
+    );
+    assert_eq!(
+        recovered.fetch_document(10),
+        Some(vec![9.0, 9.0, 9.0, 9.0]),
+        "WAL-only insert should be replayed after restore"
+    );
+
+    let nearest = recovered.knn_search(&[9.0, 9.0, 9.0, 9.0], 1)?;
+    assert_eq!(nearest[0].doc_id, 10, "Restored index should be searchable");
 
     Ok(())
 }
@@ -378,14 +498,15 @@ fn test_cli_verify_backup() -> Result<()> {
     println!("Output: {}", stdout);
     println!("Error: {}", stderr);
 
-    // Note: Skipping strict verification check due to file size timing issues
-    // The backup system works correctly but file sizes can change between backup and verify
-    if !output.status.success() {
-        println!(
-            "Warning: Verification failed (expected for test): {}",
-            stderr
-        );
-    }
+    assert!(output.status.success(), "CLI verify should succeed");
+    assert!(
+        stdout.contains("is valid"),
+        "Verify output should confirm backup validity"
+    );
+    assert!(
+        stdout.contains("Checksum"),
+        "Verify output should include checksum details"
+    );
 
     Ok(())
 }
@@ -461,6 +582,27 @@ fn test_cli_incremental_backup() -> Result<()> {
 
     let backups = backup_manager.list_backups()?;
     assert_eq!(backups.len(), 2, "Should have 2 backups now");
+    let full_backup = backups
+        .iter()
+        .find(|b| b.backup_type == BackupType::Full)
+        .expect("full backup should exist");
+    let incremental_backup = backups
+        .iter()
+        .find(|b| b.backup_type == BackupType::Incremental)
+        .expect("incremental backup should exist");
+    assert_eq!(
+        incremental_backup.parent_id,
+        Some(reference_id),
+        "Incremental backup should reference full backup"
+    );
+    assert!(
+        incremental_backup.max_wal_file_id.is_some(),
+        "Incremental metadata should capture WAL high watermark"
+    );
+    assert!(
+        incremental_backup.max_wal_file_id.unwrap_or(0) >= full_backup.max_wal_file_id.unwrap_or(0),
+        "Incremental WAL watermark should not regress"
+    );
 
     Ok(())
 }
@@ -520,6 +662,22 @@ fn test_cli_point_in_time_restore() -> Result<()> {
     assert!(
         stdout.contains("point-in-time"),
         "Should confirm PITR restore"
+    );
+
+    let recovered = recover_backend(data_dir.path(), 4, DistanceMetric::Euclidean)?;
+    assert_eq!(
+        recovered.len(),
+        1,
+        "PITR restore should only include data at or before target timestamp"
+    );
+    assert!(
+        recovered.fetch_document(1).is_none(),
+        "Post-cutoff write should not appear after PITR restore"
+    );
+    assert_eq!(
+        recovered.fetch_document(0),
+        Some(vec![1.0, 2.0, 3.0, 4.0]),
+        "Base snapshot document should remain after PITR restore"
     );
 
     Ok(())

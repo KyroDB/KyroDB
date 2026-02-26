@@ -216,6 +216,7 @@ pub fn filter_tenant_results(results: Vec<SearchResult>, tenant_id: &str) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::thread;
@@ -497,5 +498,60 @@ mod tests {
         // Valid tenant IDs with numbers
         assert_eq!(manager.allocate_doc_id("tenant123").unwrap(), 0);
         assert_eq!(manager.allocate_doc_id("org_456_test").unwrap(), 0);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn prop_namespace_parse_roundtrip(
+            tenant_id in "[A-Za-z0-9_]{1,32}",
+            doc_id in any::<u64>(),
+        ) {
+            let manager = TenantManager::new();
+            let namespaced = manager.namespace_doc_id(&tenant_id, doc_id).expect("valid tenant_id");
+            prop_assert_eq!(manager.parse_tenant_id(&namespaced), Some(tenant_id.clone()));
+            prop_assert_eq!(manager.parse_doc_id(&namespaced), Some(doc_id));
+            prop_assert!(manager.belongs_to_tenant(&namespaced, &tenant_id));
+        }
+
+        #[test]
+        fn prop_tenant_ids_with_colon_are_rejected(
+            left in "[A-Za-z0-9_]{0,16}",
+            right in "[A-Za-z0-9_]{0,16}",
+        ) {
+            let manager = TenantManager::new();
+            let tenant_id = format!("{left}:{right}");
+            prop_assert!(manager.allocate_doc_id(&tenant_id).is_err());
+            prop_assert!(manager.namespace_doc_id(&tenant_id, 42).is_err());
+        }
+
+        #[test]
+        fn prop_filter_tenant_results_never_leaks_cross_tenant_rows(
+            target_tenant in "[A-Za-z0-9_]{1,16}",
+            rows in proptest::collection::vec(("[A-Za-z0-9_]{1,16}", any::<u64>(), -1000i32..1000i32), 0..64),
+        ) {
+            let input: Vec<SearchResult> = rows
+                .iter()
+                .map(|(tenant, doc_id, distance)| {
+                    SearchResult::new(format!("{tenant}:{doc_id}"), *distance as f32)
+                })
+                .collect();
+
+            let expected: Vec<String> = input
+                .iter()
+                .filter(|row| row.id.starts_with(&format!("{target_tenant}:")))
+                .map(|row| row.id.clone())
+                .collect();
+
+            let filtered = filter_tenant_results(input, &target_tenant);
+            let filtered_ids: Vec<String> = filtered.iter().map(|row| row.id.clone()).collect();
+            let expected_prefix = format!("{}:", target_tenant);
+
+            prop_assert_eq!(filtered_ids, expected);
+            prop_assert!(filtered
+                .iter()
+                .all(|row| row.id.starts_with(&expected_prefix)));
+        }
     }
 }

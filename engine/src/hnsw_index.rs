@@ -4,6 +4,7 @@
 //! cosine similarity, type-safe u64 doc IDs, and strict runtime validation.
 
 use anyhow::Result;
+use std::sync::atomic::AtomicBool;
 
 use crate::ann_backend::{create_default_backend, AnnBackend};
 use crate::config::DistanceMetric;
@@ -282,6 +283,17 @@ impl HnswVectorIndex {
         k: usize,
         ef_search_override: Option<usize>,
     ) -> Result<Vec<SearchResult>> {
+        self.knn_search_with_ef_cancel(query, k, ef_search_override, None)
+    }
+
+    /// k-NN search with optional ef_search override and cancellation support.
+    pub fn knn_search_with_ef_cancel(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Vec<SearchResult>> {
         if query.len() != self.dimension {
             anyhow::bail!(
                 "Query dimension mismatch: expected {}, got {}",
@@ -334,7 +346,9 @@ impl HnswVectorIndex {
             }
             ef
         };
-        let results = self.backend.search(query, k, ef_search);
+        let results = self
+            .backend
+            .search_with_cancel(query, k, ef_search, cancelled);
 
         // For small indexes, HNSW may return fewer results
         // Accepted tradeoff: no external embedding storage overhead

@@ -52,6 +52,8 @@ fn test_pitr_incremental_chain_traversal() {
         checksum: 0x11111111,
         parent_id: None,
         description: "Full backup".to_string(),
+        max_wal_file_id: None,
+        snapshot_file: None,
     };
 
     // Inc1 at T0+100, parent=Full
@@ -65,6 +67,8 @@ fn test_pitr_incremental_chain_traversal() {
         checksum: 0x22222222,
         parent_id: Some(full_id),
         description: "Inc1".to_string(),
+        max_wal_file_id: None,
+        snapshot_file: None,
     };
 
     // Inc2 at T0+200, parent=Inc1 (forms chain)
@@ -78,6 +82,8 @@ fn test_pitr_incremental_chain_traversal() {
         checksum: 0x33333333,
         parent_id: Some(inc1_id),
         description: "Inc2".to_string(),
+        max_wal_file_id: None,
+        snapshot_file: None,
     };
 
     // Inc3 at T0+300, parent=Inc2 (extends chain)
@@ -91,6 +97,8 @@ fn test_pitr_incremental_chain_traversal() {
         checksum: 0x44444444,
         parent_id: Some(inc2_id),
         description: "Inc3".to_string(),
+        max_wal_file_id: None,
+        snapshot_file: None,
     };
 
     // Save all metadata files
@@ -283,7 +291,7 @@ fn test_backup_create_and_verify_checksum() {
     fs::create_dir_all(&data_dir).unwrap();
 
     // Create dummy data files
-    fs::write(data_dir.join("MANIFEST"), b"manifest content").unwrap();
+    fs::write(data_dir.join("MANIFEST"), b"snapshot_number: 1\n").unwrap();
     fs::write(data_dir.join("snapshot_1"), b"snapshot data").unwrap();
     fs::write(data_dir.join("wal_1000.wal"), b"wal data 1").unwrap();
 
@@ -342,6 +350,8 @@ fn test_prune_backups_respects_min_age() {
         checksum: 0x11111111,
         parent_id: None,
         description: "Old backup".to_string(),
+        max_wal_file_id: None,
+        snapshot_file: None,
     };
 
     // Create recent backup (1 day old) - should NOT be prunable with min_age=3
@@ -355,6 +365,8 @@ fn test_prune_backups_respects_min_age() {
         checksum: 0x22222222,
         parent_id: None,
         description: "Recent backup".to_string(),
+        max_wal_file_id: None,
+        snapshot_file: None,
     };
 
     // Save metadata and create tar files

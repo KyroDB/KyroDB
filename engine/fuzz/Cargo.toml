@@ -1,0 +1,38 @@
+[package]
+name = "kyrodb-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+prost = "0.12"
+kyrodb-engine = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "auth_surface"
+path = "fuzz_targets/auth_surface.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tenant_surface"
+path = "fuzz_targets/tenant_surface.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_validation_surface"
+path = "fuzz_targets/api_validation_surface.rs"
+test = false
+doc = false
+bench = false

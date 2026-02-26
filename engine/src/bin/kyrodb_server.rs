@@ -22,6 +22,10 @@
 
 use anyhow::Context;
 use clap::Parser;
+use kyrodb_engine::api_validation::{
+    validate_insert_request, validate_search_request as validate_api_search_request,
+    SearchValidationPlan,
+};
 use kyrodb_engine::training_task::{spawn_training_task, TrainingConfig};
 use kyrodb_engine::{
     access_logger::AccessPatternLogger,
@@ -39,7 +43,6 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 use tracing::{error, info, instrument, warn};
@@ -49,7 +52,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use axum::middleware::Next;
 use axum::{
     body::Body,
-    extract::State as AxumState,
+    extract::{Extension, Query, State as AxumState},
     http::{header::CONTENT_TYPE, HeaderValue, Response as HttpResponse, StatusCode},
     middleware,
     routing::get,
@@ -66,13 +69,14 @@ use kyrodb::{
     kyro_db_service_server::{KyroDbService, KyroDbServiceServer},
     *,
 };
+use serde::Deserialize;
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
 // ============================================================================
 
-/// Maximum embedding dimension to prevent DoS attacks
-const MAX_EMBEDDING_DIM: usize = 4096;
+/// Maximum embedding dimension to prevent DoS attacks.
+const MAX_EMBEDDING_DIM: usize = kyrodb_engine::api_validation::MAX_EMBEDDING_DIM;
 
 /// Maximum batch size for bulk operations to prevent memory exhaustion
 const MAX_BATCH_SIZE: usize = 10000;
@@ -83,15 +87,16 @@ const BULK_SEARCH_BATCH_SIZE: usize = 128;
 /// Maximum time to wait for a BulkSearch micro-batch (milliseconds)
 const BULK_SEARCH_MAX_WAIT_MS: u64 = 2;
 
-/// Minimum valid document ID (0 is reserved)
-const MIN_DOC_ID: u64 = 1;
+/// Minimum valid document ID (0 is reserved).
+const MIN_DOC_ID: u64 = kyrodb_engine::api_validation::MIN_DOC_ID;
 
 /// Maximum total documents for a single bulk_load_hnsw stream to prevent
 /// runaway CPU/disk usage. Configurable via max_total_documents if needed.
 const MAX_TOTAL_BULK_LOAD_DOCUMENTS: u64 = 10_000_000;
 
-/// Maximum k value for k-NN search to prevent excessive computation
-const MAX_KNN_K: u32 = 1000;
+/// Maximum k value for k-NN search to prevent excessive computation.
+#[cfg(test)]
+const MAX_KNN_K: u32 = kyrodb_engine::api_validation::MAX_KNN_K;
 
 /// Interval for persisting per-tenant usage snapshots to disk.
 const USAGE_EXPORT_INTERVAL_SECS: u64 = 60;
@@ -258,6 +263,17 @@ struct TenantContext {
     max_vectors: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ObservabilityAuthContext {
+    tenant_id: String,
+    is_admin: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UsageQuery {
+    scope: Option<String>,
+}
+
 /// Stable tenant-local → global doc_id mapping.
 ///
 /// global_doc_id layout:
@@ -420,7 +436,7 @@ impl TenantIdMapper {
 
 /// Server state - holds engine and runtime metrics
 struct ServerState {
-    engine: Arc<RwLock<TieredEngine>>,
+    engine: Arc<TieredEngine>,
     start_time: Instant,
     app_config: kyrodb_engine::config::KyroDbConfig,
     engine_config: TieredEngineConfig,
@@ -432,6 +448,7 @@ struct ServerState {
     rate_limiter: Option<RateLimiter>,
     tenant_id_mapper: Option<TenantIdMapper>,
     tenant_vector_counts: Option<parking_lot::RwLock<HashMap<String, usize>>>,
+    tenant_quota_locks: Option<parking_lot::RwLock<HashMap<String, Arc<parking_lot::Mutex<()>>>>>,
     usage_tracker: Option<Arc<UsageTracker>>,
 
     /// Cached flag: true when environment_type == "benchmark".
@@ -445,10 +462,7 @@ struct KyroDBServiceImpl {
     state: Arc<ServerState>,
 }
 
-struct SearchPlan {
-    search_k: usize,
-    ef_search_override: Option<usize>,
-}
+type SearchPlan = SearchValidationPlan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct BatchSearchKey {
@@ -487,6 +501,29 @@ impl KyroDBServiceImpl {
         } else {
             Err(Status::resource_exhausted("rate limit exceeded"))
         }
+    }
+
+    /// Return the per-tenant quota mutex used to serialize quota check + insert
+    /// mutations for a tenant. This prevents double reservation/count drift under
+    /// concurrent upserts of the same tenant doc_id.
+    fn tenant_quota_lock(
+        &self,
+        tenant: Option<&TenantContext>,
+    ) -> Option<Arc<parking_lot::Mutex<()>>> {
+        let tenant = tenant?;
+        let locks = self.state.tenant_quota_locks.as_ref()?;
+
+        if let Some(lock) = locks.read().get(&tenant.tenant_id).cloned() {
+            return Some(lock);
+        }
+
+        let mut guard = locks.write();
+        Some(
+            guard
+                .entry(tenant.tenant_id.clone())
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+                .clone(),
+        )
     }
 
     #[allow(clippy::result_large_err)]
@@ -699,61 +736,11 @@ impl KyroDBServiceImpl {
         _tenant: Option<&TenantContext>,
         req: &SearchRequest,
     ) -> Result<SearchPlan, Status> {
-        if req.query_embedding.is_empty() {
+        let plan = validate_api_search_request(req).map_err(|message| {
             self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument("query_embedding cannot be empty"));
-        }
-        if req.query_embedding.len() > MAX_EMBEDDING_DIM {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument(format!(
-                "query_embedding dimension {} exceeds maximum {}",
-                req.query_embedding.len(),
-                MAX_EMBEDDING_DIM
-            )));
-        }
-        if req.k == 0 {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument("k must be greater than 0"));
-        }
-        if req.k > MAX_KNN_K {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument(format!(
-                "k must be <= {}",
-                MAX_KNN_K
-            )));
-        }
-        if req.ef_search > 10_000 {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument(
-                "ef_search must be <= 10000 (0 = server default)",
-            ));
-        }
-
-        let has_namespace = !req.namespace.is_empty();
-        let base_oversampling = if let Some(ref filter) = req.filter {
-            kyrodb_engine::adaptive_oversampling::calculate_oversampling_factor(filter)
-        } else {
-            1
-        };
-        let oversampling_factor = if has_namespace {
-            base_oversampling.saturating_mul(4).min(10)
-        } else {
-            base_oversampling
-        };
-        let search_k = (req.k as usize)
-            .saturating_mul(oversampling_factor)
-            .min(10_000);
-
-        let ef_search_override = if req.ef_search == 0 {
-            None
-        } else {
-            Some(req.ef_search as usize)
-        };
-
-        Ok(SearchPlan {
-            search_k,
-            ef_search_override,
-        })
+            Status::invalid_argument(message)
+        })?;
+        Ok(plan)
     }
 
     fn query_cache_scope(&self, tenant: Option<&TenantContext>, req: &SearchRequest) -> u64 {
@@ -969,7 +956,7 @@ impl KyroDBServiceImpl {
         let plan = self.validate_search_request(tenant, &req)?;
         let query_cache_scope = self.query_cache_scope(tenant, &req);
 
-        let engine = self.state.engine.read().await;
+        let engine = &self.state.engine;
 
         let (results, search_path) = engine
             .knn_search_with_timeouts_with_ef_scoped(
@@ -987,7 +974,7 @@ impl KyroDBServiceImpl {
         self.record_search_path_metrics(search_path);
         self.record_tenant_query_usage(tenant);
 
-        Ok(self.build_search_response(tenant, &req, results, &engine, latency_ns, search_path))
+        Ok(self.build_search_response(tenant, &req, results, engine, latency_ns, search_path))
     }
 
     /// Lean search path for benchmark mode.
@@ -1016,7 +1003,7 @@ impl KyroDBServiceImpl {
         };
         let k = req.k as usize;
 
-        let engine = self.state.engine.read().await;
+        let engine = &self.state.engine;
 
         // Direct cold-tier search — no hot tier, no cache, no spawn_blocking
         let results = engine
@@ -1103,7 +1090,7 @@ impl KyroDBServiceImpl {
                 .collect();
 
             let group_results: Vec<(usize, Result<SearchResponse, Status>)> = {
-                let engine = self.state.engine.read().await;
+                let engine = &self.state.engine;
                 match engine.knn_search_batch_with_ef_detailed_scoped(
                     &queries,
                     key.search_k,
@@ -1139,7 +1126,7 @@ impl KyroDBServiceImpl {
                                         tenant,
                                         &req,
                                         candidates,
-                                        &engine,
+                                        engine,
                                         per_query_latency_ns,
                                         search_path,
                                     );
@@ -1207,24 +1194,9 @@ impl KyroDbService for KyroDBServiceImpl {
         };
 
         // Validate input
-        if req.doc_id < MIN_DOC_ID {
+        if let Err(message) = validate_insert_request(&req) {
             self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument(format!(
-                "doc_id must be >= {}",
-                MIN_DOC_ID
-            )));
-        }
-        if req.embedding.is_empty() {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument("embedding cannot be empty"));
-        }
-        if req.embedding.len() > MAX_EMBEDDING_DIM {
-            self.state.metrics.record_error(ErrorCategory::Validation);
-            return Err(Status::invalid_argument(format!(
-                "embedding dimension {} exceeds maximum {}",
-                req.embedding.len(),
-                MAX_EMBEDDING_DIM
-            )));
+            return Err(Status::invalid_argument(message));
         }
 
         tracing::Span::current().record("doc_id", req.doc_id);
@@ -1232,8 +1204,10 @@ impl KyroDbService for KyroDBServiceImpl {
         let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
         let vector_size_bytes = Self::vector_bytes_for_embedding_len(req.embedding.len());
 
-        let engine = self.state.engine.write().await;
-        let already_exists = self.enforce_vector_quota(tenant.as_ref(), &engine, global_doc_id)?;
+        let engine = &self.state.engine;
+        let quota_lock = self.tenant_quota_lock(tenant.as_ref());
+        let _quota_guard = quota_lock.as_ref().map(|lock| lock.lock());
+        let already_exists = self.enforce_vector_quota(tenant.as_ref(), engine, global_doc_id)?;
 
         // Store namespace in metadata for filtering during search
         // Namespace is stored as reserved key "__namespace__" to avoid conflicts with user metadata
@@ -1350,9 +1324,11 @@ impl KyroDbService for KyroDBServiceImpl {
                         continue;
                     }
                 };
-                let engine = self.state.engine.write().await;
+                let engine = &self.state.engine;
+                let quota_lock = self.tenant_quota_lock(tenant.as_ref());
+                let _quota_guard = quota_lock.as_ref().map(|lock| lock.lock());
                 let already_exists =
-                    match self.enforce_vector_quota(tenant.as_ref(), &engine, global_doc_id) {
+                    match self.enforce_vector_quota(tenant.as_ref(), engine, global_doc_id) {
                         Ok(exists) => exists,
                         Err(status) => {
                             total_failed += 1;
@@ -1531,7 +1507,9 @@ impl KyroDbService for KyroDBServiceImpl {
                 self.enforce_rate_limit(tenant.as_ref())?;
                 let batch = std::mem::take(&mut documents);
                 let batch_len = batch.len() as u64;
-                let engine = self.state.engine.write().await;
+                let engine = &self.state.engine;
+                let quota_lock = self.tenant_quota_lock(tenant.as_ref());
+                let _quota_guard = quota_lock.as_ref().map(|lock| lock.lock());
                 let mut new_doc_ids = HashSet::new();
                 if tenant.is_some() {
                     for (doc_id, _, _) in &batch {
@@ -1582,7 +1560,9 @@ impl KyroDbService for KyroDBServiceImpl {
         if !documents.is_empty() {
             let batch = std::mem::take(&mut documents);
             let batch_len = batch.len() as u64;
-            let engine = self.state.engine.write().await;
+            let engine = &self.state.engine;
+            let quota_lock = self.tenant_quota_lock(tenant.as_ref());
+            let _quota_guard = quota_lock.as_ref().map(|lock| lock.lock());
             let mut new_doc_ids = HashSet::new();
             if tenant.is_some() {
                 for (doc_id, _, _) in &batch {
@@ -1692,7 +1672,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
 
-        let engine = self.state.engine.write().await;
+        let engine = &self.state.engine;
 
         let metadata = match engine.get_metadata(global_doc_id) {
             Some(m) => m,
@@ -1793,7 +1773,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
 
-        let engine = self.state.engine.write().await;
+        let engine = &self.state.engine;
 
         let existing_metadata = match engine.get_metadata(global_doc_id) {
             Some(m) => m,
@@ -1907,7 +1887,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         let global_doc_id = self.map_doc_id(tenant.as_ref(), req.doc_id)?;
 
-        let engine = self.state.engine.read().await;
+        let engine = &self.state.engine;
 
         // Fetch metadata first to enforce tenant/namespace checks without
         // revealing existence via embedding lookup timing.
@@ -2194,7 +2174,7 @@ impl KyroDbService for KyroDBServiceImpl {
             )));
         }
 
-        let engine = self.state.engine.read().await;
+        let engine = &self.state.engine;
 
         // Use bulk query with source tier metadata.
         let mapped_doc_ids = if let Some(tenant) = &tenant {
@@ -2314,7 +2294,7 @@ impl KyroDbService for KyroDBServiceImpl {
         self.enforce_rate_limit(tenant.as_ref())?;
         let req = request.into_inner();
 
-        let engine = self.state.engine.write().await;
+        let engine = &self.state.engine;
 
         let result = match req.delete_criteria {
             Some(batch_delete_request::DeleteCriteria::Ids(id_list)) => {
@@ -2468,7 +2448,7 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<HealthResponse>, Status> {
         let req = request.into_inner();
 
-        let engine = self.state.engine.read().await;
+        let engine = &self.state.engine;
         let stats = engine.stats();
 
         let wal_inconsistent = engine.cold_tier().is_wal_inconsistent();
@@ -2567,7 +2547,7 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<MetricsResponse>, Status> {
         let _ = wal_health_snapshot(&self.state).await;
         refresh_system_metrics(&self.state);
-        let engine = self.state.engine.read().await;
+        let engine = &self.state.engine;
         let stats = engine.stats();
         let cache_size = engine.cache_size() as u64;
         self.state.metrics.set_cache_size(cache_size as usize);
@@ -2636,7 +2616,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
         info!(force = req.force, "Flush hot tier requested");
 
-        let engine = self.state.engine.write().await;
+        let engine = &self.state.engine;
 
         match engine.flush_hot_tier(req.force) {
             Ok(docs_flushed) => {
@@ -2681,7 +2661,7 @@ impl KyroDbService for KyroDBServiceImpl {
             .clone()
             .ok_or_else(|| Status::failed_precondition("data_dir not configured"))?;
         let cold_tier = {
-            let engine = self.state.engine.read().await;
+            let engine = &self.state.engine;
             engine.cold_tier_handle()
         };
 
@@ -2743,7 +2723,7 @@ impl KyroDbService for KyroDBServiceImpl {
 
 async fn wal_health_snapshot(state: &Arc<ServerState>) -> (bool, u64) {
     let (wal_inconsistent, backend_wal_failed) = {
-        let engine = state.engine.read().await;
+        let engine = &state.engine;
         (
             engine.cold_tier().is_wal_inconsistent(),
             engine.cold_tier().wal_writes_failed(),
@@ -2904,7 +2884,14 @@ async fn slo_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRespo
 }
 
 /// Per-tenant usage snapshots (queries/inserts/deletes/storage) for billing systems.
-async fn usage_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
+///
+/// Default scope is caller tenant only (`scope=self`).
+/// `scope=all` is allowed only for admin API keys.
+async fn usage_handler(
+    AxumState(state): AxumState<Arc<ServerState>>,
+    Query(query): Query<UsageQuery>,
+    requester: Option<Extension<ObservabilityAuthContext>>,
+) -> HttpResponse<Body> {
     let Some(usage_tracker) = state.usage_tracker.as_ref() else {
         return HttpResponse::builder()
             .status(StatusCode::NOT_FOUND)
@@ -2924,8 +2911,58 @@ async fn usage_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpRes
             });
     };
 
+    let request_all = match query.scope.as_deref() {
+        None => false,
+        Some(scope) if scope.eq_ignore_ascii_case("self") => false,
+        Some(scope) if scope.eq_ignore_ascii_case("all") => true,
+        Some(scope) => {
+            return HttpResponse::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "error": format!("invalid scope '{}': expected 'self' or 'all'", scope)
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| {
+                    let mut resp = HttpResponse::new(Body::from("{\"error\":\"internal_error\"}"));
+                    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    resp.headers_mut()
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                    resp
+                });
+        }
+    };
+
     let mut snapshots: Vec<(String, kyrodb_engine::UsageSnapshot)> =
-        usage_tracker.get_all_snapshots().into_iter().collect();
+        if state.app_config.auth.enabled {
+            let requester = match requester {
+                Some(Extension(ctx)) => ctx,
+                None => {
+                    let mut resp = HttpResponse::new(Body::from("unauthorized"));
+                    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+                    return resp;
+                }
+            };
+
+            if request_all {
+                if !requester.is_admin {
+                    let mut resp = HttpResponse::new(Body::from("forbidden"));
+                    *resp.status_mut() = StatusCode::FORBIDDEN;
+                    return resp;
+                }
+                usage_tracker.get_all_snapshots().into_iter().collect()
+            } else {
+                usage_tracker
+                    .get_snapshot(&requester.tenant_id)
+                    .map(|snapshot| vec![(requester.tenant_id.clone(), snapshot)])
+                    .unwrap_or_default()
+            }
+        } else {
+            usage_tracker.get_all_snapshots().into_iter().collect()
+        };
+
     snapshots.sort_by(|a, b| a.0.cmp(&b.0));
 
     let total_queries: u64 = snapshots.iter().map(|(_, s)| s.query_count).sum();
@@ -3023,7 +3060,14 @@ async fn observability_auth_middleware(
         });
 
     match api_key.and_then(|k| auth.validate(&k)) {
-        Some(_tenant) => next.run(req).await,
+        Some(tenant) => {
+            let mut req = req;
+            req.extensions_mut().insert(ObservabilityAuthContext {
+                tenant_id: tenant.tenant_id,
+                is_admin: tenant.is_admin,
+            });
+            next.run(req).await
+        }
         None => {
             let mut resp = HttpResponse::new(Body::from("unauthorized"));
             *resp.status_mut() = StatusCode::UNAUTHORIZED;
@@ -3237,12 +3281,20 @@ async fn main() -> anyhow::Result<()> {
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
         fsync_policy,
         snapshot_interval: config.snapshot_interval_mutations(),
+        recovery_mode: match config.persistence.recovery_mode {
+            kyrodb_engine::config::RecoveryMode::Strict => {
+                kyrodb_engine::hnsw_backend::RecoveryMode::Strict
+            }
+            kyrodb_engine::config::RecoveryMode::BestEffort => {
+                kyrodb_engine::hnsw_backend::RecoveryMode::BestEffort
+            }
+        },
         max_wal_size_bytes: config.persistence.max_wal_size_bytes,
         flush_interval: config.wal_flush_interval(),
         cache_timeout_ms: config.timeouts.cache_ms,
         hot_tier_timeout_ms: config.timeouts.hot_tier_ms,
         cold_tier_timeout_ms: config.timeouts.cold_tier_ms,
-        max_concurrent_queries: 1000, // Load shedding: max 1000 in-flight queries
+        max_concurrent_queries: config.timeouts.max_concurrent_queries,
     };
 
     // Create shutdown broadcast channel early for prefetch tasks
@@ -3426,8 +3478,8 @@ async fn main() -> anyhow::Result<()> {
         engine.set_access_logger(logger.clone());
     }
 
-    // Wrap engine in Arc<RwLock> for concurrent access
-    let engine_arc = Arc::new(RwLock::new(engine));
+    // Share engine across services/background tasks.
+    let engine_arc = Arc::new(engine);
 
     // Create metrics collector with configured SLO thresholds.
     let metrics =
@@ -3504,8 +3556,7 @@ async fn main() -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let engine = engine_for_flush.write().await;
-                    match engine.flush_hot_tier(false) {
+                    match engine_for_flush.flush_hot_tier(false) {
                         Ok(count) if count > 0 => {
                             info!(docs_flushed = count, "Background flush completed");
                         }
@@ -3517,8 +3568,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 _ = flush_shutdown_rx.recv() => {
                     info!("Background flush task shutting down gracefully");
-                    let engine = engine_for_flush.write().await;
-                    if let Ok(count) = engine.flush_hot_tier(true) { // Pass true for shutdown flush
+                    if let Ok(count) = engine_for_flush.flush_hot_tier(true) { // Pass true for shutdown flush
                         if count > 0 {
                             info!(docs_flushed = count, "Final flush completed on shutdown");
                         }
@@ -3533,7 +3583,7 @@ async fn main() -> anyhow::Result<()> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         if let (Some(auth_mgr), Some(mapper)) = (&auth, &tenant_id_mapper) {
             let tenants = auth_mgr.enabled_tenants();
-            let engine = engine_arc.read().await;
+            let engine = &engine_arc;
             for tenant in tenants {
                 let tenant_index = mapper
                     .ensure_tenant(&tenant.tenant_id)
@@ -3566,8 +3616,46 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let tenant_quota_locks = if config.auth.enabled {
+        let mut locks: HashMap<String, Arc<parking_lot::Mutex<()>>> = HashMap::new();
+        if let Some(auth_mgr) = &auth {
+            for tenant in auth_mgr.enabled_tenants() {
+                locks.insert(
+                    tenant.tenant_id.clone(),
+                    Arc::new(parking_lot::Mutex::new(())),
+                );
+            }
+        }
+        Some(parking_lot::RwLock::new(locks))
+    } else {
+        None
+    };
+
     let usage_tracker = if config.auth.enabled {
-        Some(Arc::new(UsageTracker::new()))
+        let tracker = Arc::new(UsageTracker::new());
+        let usage_state_path = config
+            .persistence
+            .data_dir
+            .join("usage")
+            .join("usage_state.snap");
+        match tracker.restore_snapshot_if_exists(&usage_state_path) {
+            Ok(restored_tenants) if restored_tenants > 0 => {
+                info!(
+                    path = %usage_state_path.display(),
+                    tenants = restored_tenants,
+                    "Restored persisted usage state"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    path = %usage_state_path.display(),
+                    error = %error,
+                    "Failed to restore usage state snapshot; starting with empty usage tracker"
+                );
+            }
+        }
+        Some(tracker)
     } else {
         None
     };
@@ -3584,6 +3672,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter,
         tenant_id_mapper,
         tenant_vector_counts,
+        tenant_quota_locks,
         usage_tracker,
         is_benchmark_mode: config
             .environment
@@ -3594,6 +3683,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(usage_tracker) = state.usage_tracker.clone() {
         let usage_dir = config.persistence.data_dir.join("usage");
         let latest_usage_csv = usage_dir.join("tenant_usage_latest.csv");
+        let usage_state_snapshot = usage_dir.join("usage_state.snap");
         let mut usage_shutdown_rx = shutdown_tx.subscribe();
 
         tokio::spawn(async move {
@@ -3611,12 +3701,20 @@ async fn main() -> anyhow::Result<()> {
             info!(
                 interval_secs = USAGE_EXPORT_INTERVAL_SECS,
                 path = %latest_usage_csv.display(),
+                state_path = %usage_state_snapshot.display(),
                 "Usage export task started"
             );
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        if let Err(e) = usage_tracker.persist_snapshot(&usage_state_snapshot) {
+                            error!(
+                                error = %e,
+                                path = %usage_state_snapshot.display(),
+                                "Periodic usage state snapshot persistence failed"
+                            );
+                        }
                         if let Err(e) = usage_tracker.export_csv(&latest_usage_csv) {
                             error!(
                                 error = %e,
@@ -3626,6 +3724,14 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     _ = usage_shutdown_rx.recv() => {
+                        if let Err(e) = usage_tracker.persist_snapshot(&usage_state_snapshot) {
+                            error!(
+                                error = %e,
+                                path = %usage_state_snapshot.display(),
+                                "Final usage state snapshot persistence failed"
+                            );
+                        }
+
                         if let Err(e) = usage_tracker.export_csv(&latest_usage_csv) {
                             error!(
                                 error = %e,
@@ -3828,7 +3934,12 @@ async fn main() -> anyhow::Result<()> {
         });
 
     // Start gRPC server with graceful shutdown
-    let mut grpc_builder = Server::builder();
+    let max_concurrent_streams = u32::try_from(config.server.max_connections).unwrap_or(u32::MAX);
+    let connection_timeout = config.connection_timeout();
+    let mut grpc_builder = Server::builder()
+        .concurrency_limit_per_connection(config.server.max_connections)
+        .max_concurrent_streams(Some(max_concurrent_streams))
+        .tcp_keepalive(Some(connection_timeout));
     if config.server.tls.enabled {
         let tls = &config.server.tls;
         let cert_path = tls.cert_path.as_ref().ok_or_else(|| {
@@ -3884,9 +3995,10 @@ mod tests {
         usage_handler, BatchSearchKey, DeleteRequest, HealthStatus, InsertRequest,
         KyroDBServiceImpl, KyroDbService, QueryRequest, SearchErrorKind, SearchRequest,
         ServerState, SnapshotRequest, TenantContext, TieredEngine, TieredEngineConfig,
+        MAX_EMBEDDING_DIM, MAX_KNN_K, MIN_DOC_ID,
     };
     use axum::{
-        body::Body,
+        body::{to_bytes, Body},
         http::{Request as AxumRequest, StatusCode as AxumStatusCode},
         middleware,
         routing::get,
@@ -3897,15 +4009,17 @@ mod tests {
         config::{KyroDbConfig, ObservabilityAuthMode},
         AuthManager, MetricsCollector, QueryHashCache, RateLimiter, TenantInfo, UsageTracker,
     };
+    use proptest::prelude::*;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
-    use tokio::sync::RwLock;
     use tonic::{Code, Request};
     use tower::ServiceExt;
 
     const TEST_OBS_API_KEY: &str = "kyro_tenant_obs_0123456789abcdef0123456789abcdef";
+    const TEST_OBS_OTHER_API_KEY: &str = "kyro_tenant_other_0123456789abcdef0123456789abcdef";
+    const TEST_OBS_ADMIN_API_KEY: &str = "kyro_ops_admin_0123456789abcdef0123456789abcdef";
 
     fn build_test_service_with_seed_data() -> Arc<KyroDBServiceImpl> {
         let engine_config = TieredEngineConfig {
@@ -3932,7 +4046,7 @@ mod tests {
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
-            engine: Arc::new(RwLock::new(engine)),
+            engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config: KyroDbConfig::default(),
             engine_config,
@@ -3942,6 +4056,41 @@ mod tests {
             rate_limiter: None,
             tenant_id_mapper: None,
             tenant_vector_counts: None,
+            tenant_quota_locks: None,
+            usage_tracker: None,
+            is_benchmark_mode: false,
+        });
+
+        Arc::new(KyroDBServiceImpl { state })
+    }
+
+    fn build_validation_test_service() -> Arc<KyroDBServiceImpl> {
+        let engine_config = TieredEngineConfig {
+            embedding_dimension: 16,
+            ..TieredEngineConfig::default()
+        };
+        let engine = TieredEngine::new(
+            Box::new(LruCacheStrategy::new(64)),
+            Arc::new(QueryHashCache::new(64, 0.90)),
+            Vec::new(),
+            Vec::new(),
+            engine_config.clone(),
+        )
+        .unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
+        let state = Arc::new(ServerState {
+            engine: Arc::new(engine),
+            start_time: Instant::now(),
+            app_config: KyroDbConfig::default(),
+            engine_config,
+            shutdown_tx,
+            metrics: MetricsCollector::new(),
+            auth: None,
+            rate_limiter: None,
+            tenant_id_mapper: None,
+            tenant_vector_counts: None,
+            tenant_quota_locks: None,
             usage_tracker: None,
             is_benchmark_mode: false,
         });
@@ -3977,7 +4126,7 @@ mod tests {
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
-            engine: Arc::new(RwLock::new(engine)),
+            engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config,
             engine_config,
@@ -3987,6 +4136,7 @@ mod tests {
             rate_limiter: Some(RateLimiter::new()),
             tenant_id_mapper: None,
             tenant_vector_counts: None,
+            tenant_quota_locks: None,
             usage_tracker: None,
             is_benchmark_mode: true,
         });
@@ -4014,7 +4164,7 @@ mod tests {
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
-            engine: Arc::new(RwLock::new(engine)),
+            engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config,
             engine_config,
@@ -4024,6 +4174,7 @@ mod tests {
             rate_limiter: Some(RateLimiter::new()),
             tenant_id_mapper: None,
             tenant_vector_counts: Some(parking_lot::RwLock::new(HashMap::new())),
+            tenant_quota_locks: Some(parking_lot::RwLock::new(HashMap::new())),
             usage_tracker: Some(Arc::new(UsageTracker::new())),
             is_benchmark_mode: false,
         });
@@ -4062,7 +4213,7 @@ mod tests {
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
-            engine: Arc::new(RwLock::new(engine)),
+            engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config: KyroDbConfig::default(),
             engine_config,
@@ -4072,6 +4223,7 @@ mod tests {
             rate_limiter: None,
             tenant_id_mapper: None,
             tenant_vector_counts: None,
+            tenant_quota_locks: None,
             usage_tracker: None,
             is_benchmark_mode: false,
         });
@@ -4152,6 +4304,33 @@ mod tests {
                     tenant_name: "Tenant Observability".to_string(),
                     max_qps: 1_000,
                     max_vectors: 10_000,
+                    is_admin: false,
+                    enabled: true,
+                    created_at: String::new(),
+                },
+            )
+            .expect("test API key should be valid");
+            auth.add_key(
+                TEST_OBS_OTHER_API_KEY.to_string(),
+                TenantInfo {
+                    tenant_id: "tenant_other".to_string(),
+                    tenant_name: "Tenant Other".to_string(),
+                    max_qps: 1_000,
+                    max_vectors: 10_000,
+                    is_admin: false,
+                    enabled: true,
+                    created_at: String::new(),
+                },
+            )
+            .expect("test API key should be valid");
+            auth.add_key(
+                TEST_OBS_ADMIN_API_KEY.to_string(),
+                TenantInfo {
+                    tenant_id: "ops_admin".to_string(),
+                    tenant_name: "Ops Admin".to_string(),
+                    max_qps: 5_000,
+                    max_vectors: 100_000,
+                    is_admin: true,
                     enabled: true,
                     created_at: String::new(),
                 },
@@ -4165,6 +4344,9 @@ mod tests {
         let usage_tracker = if auth_enabled {
             let tracker = Arc::new(UsageTracker::new());
             tracker.get_or_create("tenant_obs").record_query();
+            tracker.get_or_create("tenant_other").record_query();
+            tracker.get_or_create("tenant_other").record_query();
+            tracker.get_or_create("ops_admin").record_query();
             Some(tracker)
         } else {
             None
@@ -4172,7 +4354,7 @@ mod tests {
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         Arc::new(ServerState {
-            engine: Arc::new(RwLock::new(engine)),
+            engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config,
             engine_config,
@@ -4182,6 +4364,7 @@ mod tests {
             rate_limiter: None,
             tenant_id_mapper: None,
             tenant_vector_counts: None,
+            tenant_quota_locks: None,
             usage_tracker,
             is_benchmark_mode: false,
         })
@@ -4220,6 +4403,79 @@ mod tests {
             classify_search_error_message("query dimension mismatch: expected 768 found 384"),
             SearchErrorKind::Validation
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn prop_search_request_validation_contract(
+            query_dim in 0usize..(MAX_EMBEDDING_DIM + 32),
+            k in 0u32..(MAX_KNN_K + 64),
+            ef_search in 0u32..10_128u32,
+        ) {
+            let service = build_validation_test_service();
+            let req = SearchRequest {
+                query_embedding: vec![0.1; query_dim],
+                k,
+                ef_search,
+                include_embeddings: false,
+                filter: None,
+                metadata_filters: HashMap::new(),
+                namespace: String::new(),
+                min_score: 0.0,
+            };
+            let result = service.validate_search_request(None, &req);
+
+            let should_fail = query_dim == 0
+                || query_dim > MAX_EMBEDDING_DIM
+                || k == 0
+                || k > MAX_KNN_K
+                || ef_search > 10_000;
+            if should_fail {
+                match result {
+                    Err(status) => prop_assert_eq!(status.code(), Code::InvalidArgument),
+                    Ok(_) => prop_assert!(false, "invalid search request unexpectedly succeeded"),
+                }
+            } else {
+                prop_assert!(result.is_ok());
+            }
+        }
+
+        #[test]
+        fn prop_insert_request_validation_contract(
+            doc_id in 0u64..8u64,
+            embedding_dim in 0usize..(MAX_EMBEDDING_DIM + 32),
+        ) {
+            let service = build_validation_test_service();
+            let req = InsertRequest {
+                doc_id,
+                embedding: vec![0.3; embedding_dim],
+                metadata: HashMap::new(),
+                namespace: String::new(),
+            };
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let result = runtime.block_on(service.insert(Request::new(req)));
+
+            let api_invalid = doc_id < MIN_DOC_ID
+                || embedding_dim == 0
+                || embedding_dim > MAX_EMBEDDING_DIM;
+            if api_invalid {
+                let status = result.expect_err("API-invalid insert must fail");
+                prop_assert_eq!(status.code(), Code::InvalidArgument);
+            } else if embedding_dim == 16 {
+                prop_assert!(result.is_ok());
+            } else {
+                let status = result.expect_err(
+                    "dimension mismatch beyond API bounds should fail in backend"
+                );
+                prop_assert_eq!(status.code(), Code::Internal);
+            }
+        }
     }
 
     #[test]
@@ -4329,18 +4585,17 @@ mod tests {
                 .await
         });
 
-        // Let search acquire its first read-lock and start work.
+        // Let search start work before issuing a writer mutation.
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         let writer_engine = Arc::clone(&service.state.engine);
         let writer_start = Instant::now();
-        let writer_guard = tokio::time::timeout(Duration::from_secs(2), writer_engine.write())
-            .await
-            .expect("writer lock acquisition timed out during bulk search");
-        writer_guard
-            .insert(99_999, vec![0.1; 16], HashMap::new())
-            .unwrap();
-        drop(writer_guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            writer_engine.insert(99_999, vec![0.1; 16], HashMap::new())
+        })
+        .await
+        .expect("writer insert timed out during bulk search")
+        .expect("writer insert should succeed");
         let writer_wait = writer_start.elapsed();
 
         let responses = search_task.await.unwrap();
@@ -4406,6 +4661,65 @@ mod tests {
         assert_eq!(
             quota_count, 1,
             "quota counter must remain consistent after concurrent inserts"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tenant_quota_count_stays_stable_for_concurrent_upserts_same_doc() {
+        let service = build_test_service_with_tenant_quota(10);
+        let tenant = tenant_ctx(10);
+
+        let s1 = Arc::clone(&service);
+        let t1 = tenant.clone();
+        let h1 = tokio::spawn(async move {
+            let req = tenant_insert_request(1, vec![0.1; 16], t1);
+            s1.insert(req).await
+        });
+
+        let s2 = Arc::clone(&service);
+        let t2 = tenant.clone();
+        let h2 = tokio::spawn(async move {
+            let req = tenant_insert_request(1, vec![0.2; 16], t2);
+            s2.insert(req).await
+        });
+
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+        assert!(
+            r1.is_ok() && r2.is_ok(),
+            "concurrent upserts to same doc_id should succeed: r1={:?}, r2={:?}",
+            r1.err(),
+            r2.err()
+        );
+
+        let quota_count = service
+            .state
+            .tenant_vector_counts
+            .as_ref()
+            .expect("tenant vector quota map")
+            .read()
+            .get("tenant_quota")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            quota_count, 1,
+            "quota count must not drift for concurrent upserts to same doc_id"
+        );
+
+        let usage = service
+            .state
+            .usage_tracker
+            .as_ref()
+            .expect("usage tracker")
+            .get_snapshot("tenant_quota")
+            .expect("tenant usage snapshot");
+        assert_eq!(
+            usage.insert_count, 1,
+            "usage insert counter must treat second write as update"
+        );
+        assert_eq!(
+            usage.vector_count, 1,
+            "usage vector count must reflect one stored vector for upserted doc_id"
         );
     }
 
@@ -4589,6 +4903,115 @@ mod tests {
             .await
             .expect("request should succeed");
         assert_eq!(authenticated.status(), AxumStatusCode::OK);
+
+        let authenticated_body = to_bytes(authenticated.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let authenticated_json: serde_json::Value =
+            serde_json::from_slice(&authenticated_body).expect("valid json");
+        let tenants = authenticated_json["tenants"]
+            .as_array()
+            .expect("tenants array");
+        assert_eq!(
+            tenants.len(),
+            1,
+            "default /usage response must be scoped to caller tenant"
+        );
+        assert_eq!(tenants[0]["tenant_id"], "tenant_obs");
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_is_scoped_to_calling_tenant() {
+        let state = build_observability_test_state(true, ObservabilityAuthMode::All);
+        let app = build_observability_test_app(state);
+
+        let tenant_obs = app
+            .clone()
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/usage")
+                    .header("x-api-key", TEST_OBS_API_KEY)
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(tenant_obs.status(), AxumStatusCode::OK);
+        let tenant_obs_body = to_bytes(tenant_obs.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let tenant_obs_json: serde_json::Value =
+            serde_json::from_slice(&tenant_obs_body).expect("valid json");
+        let tenant_obs_rows = tenant_obs_json["tenants"]
+            .as_array()
+            .expect("tenants array");
+        assert_eq!(tenant_obs_rows.len(), 1);
+        assert_eq!(tenant_obs_rows[0]["tenant_id"], "tenant_obs");
+
+        let tenant_other = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/usage")
+                    .header("x-api-key", TEST_OBS_OTHER_API_KEY)
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(tenant_other.status(), AxumStatusCode::OK);
+        let tenant_other_body = to_bytes(tenant_other.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let tenant_other_json: serde_json::Value =
+            serde_json::from_slice(&tenant_other_body).expect("valid json");
+        let tenant_other_rows = tenant_other_json["tenants"]
+            .as_array()
+            .expect("tenants array");
+        assert_eq!(tenant_other_rows.len(), 1);
+        assert_eq!(tenant_other_rows[0]["tenant_id"], "tenant_other");
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_scope_all_requires_admin() {
+        let state = build_observability_test_state(true, ObservabilityAuthMode::All);
+        let app = build_observability_test_app(state);
+
+        let forbidden = app
+            .clone()
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/usage?scope=all")
+                    .header("x-api-key", TEST_OBS_API_KEY)
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(forbidden.status(), AxumStatusCode::FORBIDDEN);
+
+        let admin = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/usage?scope=all")
+                    .header("x-api-key", TEST_OBS_ADMIN_API_KEY)
+                    .body(Body::empty())
+                    .expect("valid request"),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(admin.status(), AxumStatusCode::OK);
+
+        let admin_body = to_bytes(admin.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let admin_json: serde_json::Value =
+            serde_json::from_slice(&admin_body).expect("valid json");
+        let tenants = admin_json["tenants"].as_array().expect("tenants array");
+        assert!(
+            tenants.len() >= 3,
+            "admin scope=all should return all tenants, got {}",
+            tenants.len()
+        );
     }
 
     #[tokio::test]

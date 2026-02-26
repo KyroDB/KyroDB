@@ -31,6 +31,15 @@ use tracing::{debug, error, info, instrument, trace, warn};
 static FALLBACK_WAL_FILE_ID: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_WAL_INIT: std::sync::Once = std::sync::Once::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecoveryMode {
+    /// Fail recovery if required evidence is missing/corrupted.
+    #[default]
+    Strict,
+    /// Continue recovery with degraded guarantees when evidence is incomplete.
+    BestEffort,
+}
+
 /// Returns a process-unique monotonic WAL file ID for the clock-failure path.
 /// First call seeds the counter with (pid << 32 | random_u32); subsequent calls
 /// increment atomically.  The 32-bit PID prefix partitions the namespace across
@@ -878,7 +887,6 @@ impl HnswBackend {
         )
     }
 
-    #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval, hnsw_m, hnsw_ef_construction))]
     #[allow(clippy::too_many_arguments)]
     pub fn recover_with_hnsw_params(
         embedding_dimension: usize,
@@ -892,6 +900,38 @@ impl HnswBackend {
         hnsw_m: usize,
         hnsw_ef_construction: usize,
         disable_normalization_check: bool,
+    ) -> Result<Self> {
+        Self::recover_with_hnsw_params_and_mode(
+            embedding_dimension,
+            distance,
+            data_dir,
+            max_elements,
+            fsync_policy,
+            snapshot_interval,
+            max_wal_size_bytes,
+            metrics,
+            hnsw_m,
+            hnsw_ef_construction,
+            disable_normalization_check,
+            RecoveryMode::Strict,
+        )
+    }
+
+    #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval, hnsw_m, hnsw_ef_construction))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_with_hnsw_params_and_mode(
+        embedding_dimension: usize,
+        distance: DistanceMetric,
+        data_dir: impl AsRef<Path>,
+        max_elements: usize,
+        fsync_policy: FsyncPolicy,
+        snapshot_interval: usize,
+        max_wal_size_bytes: u64,
+        metrics: MetricsCollector,
+        hnsw_m: usize,
+        hnsw_ef_construction: usize,
+        disable_normalization_check: bool,
+        recovery_mode: RecoveryMode,
     ) -> Result<Self> {
         if embedding_dimension == 0 {
             anyhow::bail!("embedding dimension must be > 0");
@@ -986,8 +1026,19 @@ impl HnswBackend {
                         error = %e,
                         "failed to load snapshot (primary and all fallbacks corrupted)"
                     );
-                    // Continue with empty state - will replay all WAL entries
-                    warn!("continuing recovery with empty state from WAL only");
+                    match recovery_mode {
+                        RecoveryMode::Strict => {
+                            return Err(e).context(
+                                "strict recovery mode: refusing to continue after snapshot corruption",
+                            );
+                        }
+                        RecoveryMode::BestEffort => {
+                            // Continue with empty state - will replay all WAL entries.
+                            warn!(
+                                "best_effort recovery: continuing with empty state from WAL only"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -996,8 +1047,21 @@ impl HnswBackend {
         for wal_name in &manifest.wal_segments {
             let wal_path = data_dir.join(wal_name);
             if !wal_path.exists() {
-                warn!(wal_segment = wal_name, "WAL segment missing; skipping");
-                continue;
+                match recovery_mode {
+                    RecoveryMode::Strict => {
+                        anyhow::bail!(
+                            "strict recovery mode: required WAL segment missing: {}",
+                            wal_name
+                        );
+                    }
+                    RecoveryMode::BestEffort => {
+                        warn!(
+                            wal_segment = wal_name,
+                            "best_effort recovery: WAL segment missing; skipping"
+                        );
+                        continue;
+                    }
+                }
             }
             info!(wal_segment = wal_name, "replaying WAL");
             let mut reader = WalReader::open(&wal_path)?;
@@ -1755,6 +1819,12 @@ impl HnswBackend {
         let mut manifest = Manifest::load(&manifest_path)?;
         manifest.latest_snapshot = Some(snapshot_name.clone());
 
+        // Crash-safe ordering:
+        // 1) Persist snapshot pointer while keeping full WAL segment list.
+        // 2) Compact WAL files.
+        // 3) Persist pruned WAL segment list.
+        manifest.save(&manifest_path)?;
+
         // WAL Compaction: Delete old WAL segments that are fully captured in the snapshot.
         // This prevents unbounded disk usage growth when WAL rotation is enabled.
         let compacted = self.compact_old_wal_segments(
@@ -1770,6 +1840,7 @@ impl HnswBackend {
                 "WAL compaction complete"
             );
         }
+
         manifest.save(&manifest_path)?;
 
         // Reset insert counter
@@ -2215,6 +2286,17 @@ impl HnswBackend {
         k: usize,
         ef_search_override: Option<usize>,
     ) -> Result<Vec<SearchResult>> {
+        self.knn_search_with_ef_cancel(query, k, ef_search_override, None)
+    }
+
+    #[instrument(level = "trace", skip(self, query, cancelled), fields(k, dim = query.len(), ef_search_override))]
+    pub fn knn_search_with_ef_cancel(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Vec<SearchResult>> {
         if query.is_empty() {
             anyhow::bail!("query embedding cannot be empty");
         }
@@ -2249,7 +2331,12 @@ impl HnswBackend {
             let index = self.index.read();
             let distance = index.distance_metric();
             let normalized_query = normalize_query_if_needed(distance, query)?;
-            index.knn_search_with_ef(normalized_query.as_ref(), search_k, ef_search_override)?
+            index.knn_search_with_ef_cancel(
+                normalized_query.as_ref(),
+                search_k,
+                ef_search_override,
+                cancelled,
+            )?
         };
 
         // Backend results are already sorted by ascending distance.

@@ -1,6 +1,9 @@
+use crate::persistence::Manifest;
+#[cfg(test)]
+use crate::persistence::Snapshot;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -34,6 +37,12 @@ pub struct BackupMetadata {
     pub parent_id: Option<Uuid>,
     /// Human-readable description
     pub description: String,
+    /// Highest numeric WAL file id included in this backup, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wal_file_id: Option<u64>,
+    /// Snapshot filename included in this backup, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_file: Option<String>,
 }
 
 impl BackupMetadata {
@@ -55,6 +64,8 @@ impl BackupMetadata {
             checksum,
             parent_id: None,
             description,
+            max_wal_file_id: None,
+            snapshot_file: None,
         }
     }
 
@@ -77,6 +88,8 @@ impl BackupMetadata {
             checksum,
             parent_id: Some(parent_id),
             description,
+            max_wal_file_id: None,
+            snapshot_file: None,
         }
     }
 }
@@ -289,6 +302,193 @@ fn stream_member_to_writer<R: Read, W: Write>(
     Ok(())
 }
 
+enum ArchiveEntrySource {
+    Path(PathBuf),
+    Bytes(Vec<u8>),
+}
+
+struct ArchiveEntry {
+    name: String,
+    source: ArchiveEntrySource,
+}
+
+impl ArchiveEntry {
+    fn from_path(name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            name: name.into(),
+            source: ArchiveEntrySource::Path(path.into()),
+        }
+    }
+
+    fn from_bytes(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            source: ArchiveEntrySource::Bytes(bytes),
+        }
+    }
+}
+
+enum ManifestLayout {
+    Modern(Manifest),
+    Legacy {
+        snapshot_number: Option<u64>,
+        raw_bytes: Vec<u8>,
+    },
+}
+
+fn parse_wal_file_id(file_name: &str) -> Option<u64> {
+    file_name
+        .strip_prefix("wal_")
+        .and_then(|s| s.strip_suffix(".wal"))
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+fn list_wal_segments_in_dir(data_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut wal_files = Vec::new();
+    for entry in fs::read_dir(data_dir).with_context(|| {
+        format!(
+            "Failed to read data directory while collecting WAL segments: {}",
+            data_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("wal_") && name.ends_with(".wal") {
+            wal_files.push((name, entry.path()));
+        }
+    }
+
+    wal_files.sort_by(|(a_name, _), (b_name, _)| {
+        let a_id = parse_wal_file_id(a_name).unwrap_or(0);
+        let b_id = parse_wal_file_id(b_name).unwrap_or(0);
+        a_id.cmp(&b_id).then_with(|| a_name.cmp(b_name))
+    });
+    Ok(wal_files)
+}
+
+fn read_manifest_layout(path: &Path) -> Result<Option<ManifestLayout>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+
+    if let Ok(manifest) = serde_json::from_slice::<Manifest>(&raw) {
+        return Ok(Some(ManifestLayout::Modern(manifest)));
+    }
+
+    let text = std::str::from_utf8(&raw)
+        .with_context(|| format!("MANIFEST is not valid UTF-8: {}", path.display()))?;
+    let snapshot_number = text
+        .lines()
+        .find(|line| line.starts_with("snapshot_number:"))
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("snapshot_number:"))
+    {
+        return Ok(Some(ManifestLayout::Legacy {
+            snapshot_number,
+            raw_bytes: raw,
+        }));
+    }
+
+    Err(anyhow!(
+        "Failed to parse MANIFEST as modern JSON or recognized legacy format: {}",
+        path.display()
+    ))
+}
+
+fn read_archive_entry_payload(entry: &ArchiveEntry) -> Result<Vec<u8>> {
+    match &entry.source {
+        ArchiveEntrySource::Path(path) => {
+            fs::read(path).with_context(|| format!("Failed to read {}", path.display()))
+        }
+        ArchiveEntrySource::Bytes(bytes) => Ok(bytes.clone()),
+    }
+}
+
+/// Read snapshot `doc_count` from the serialized header without deserializing
+/// the full snapshot payload into memory.
+fn read_snapshot_doc_count(path: &Path) -> Result<u64> {
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open snapshot file {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    let mut magic = [0u8; 4];
+    reader
+        .read_exact(&mut magic)
+        .with_context(|| format!("Failed to read snapshot magic from {}", path.display()))?;
+    let magic_val = u32::from_le_bytes(magic);
+    anyhow::ensure!(
+        magic_val == 0x534E4150, // "SNAP"
+        "Invalid snapshot magic in {}: expected {:#x}, got {:#x}",
+        path.display(),
+        0x534E4150u32,
+        magic_val
+    );
+
+    let mut size_bytes = [0u8; 8];
+    reader.read_exact(&mut size_bytes).with_context(|| {
+        format!(
+            "Failed to read snapshot payload size from {}",
+            path.display()
+        )
+    })?;
+    let payload_size = u64::from_le_bytes(size_bytes);
+
+    let mut payload_reader = reader.take(payload_size);
+    let _version: u32 = bincode::deserialize_from(&mut payload_reader)
+        .with_context(|| format!("Failed to read snapshot version from {}", path.display()))?;
+    let _timestamp: u64 = bincode::deserialize_from(&mut payload_reader)
+        .with_context(|| format!("Failed to read snapshot timestamp from {}", path.display()))?;
+    let doc_count: usize = bincode::deserialize_from(&mut payload_reader)
+        .with_context(|| format!("Failed to read snapshot doc_count from {}", path.display()))?;
+
+    Ok(doc_count as u64)
+}
+
+fn write_backup_archive(backup_path: &Path, entries: &[ArchiveEntry]) -> Result<u32> {
+    let backup_file = File::create(backup_path).context("Failed to create backup file")?;
+    let mut writer = BufWriter::new(backup_file);
+    let entry_count = entries.len();
+    anyhow::ensure!(
+        entry_count <= MAX_BACKUP_ARCHIVE_FILES as usize,
+        "backup archive contains too many members: {} (max {})",
+        entry_count,
+        MAX_BACKUP_ARCHIVE_FILES
+    );
+    anyhow::ensure!(
+        entry_count <= u32::MAX as usize,
+        "backup archive member count exceeds u32 range: {}",
+        entry_count
+    );
+    writer.write_all(&(entry_count as u32).to_le_bytes())?;
+
+    let mut checksum = 0u32;
+    for entry in entries {
+        debug!("Backing up file: {}", entry.name);
+        let payload = read_archive_entry_payload(entry)?;
+
+        let name_bytes = entry.name.as_bytes();
+        writer.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+        writer.write_all(name_bytes)?;
+        writer.write_all(&(payload.len() as u64).to_le_bytes())?;
+        writer.write_all(&payload)?;
+
+        checksum = checksum.wrapping_add(crc32fast::hash(&payload));
+    }
+
+    writer.flush()?;
+    writer
+        .get_ref()
+        .sync_all()
+        .context("Failed to fsync backup archive")?;
+    drop(writer);
+    Ok(checksum)
+}
+
 /// Compute CRC32 checksum of a backup file
 /// This matches the algorithm used during backup creation
 /// Backup format: [file_count][name_len][name][data_len][data]...
@@ -349,109 +549,151 @@ impl BackupManager {
         };
 
         let backup_path = self.backup_dir.join(format!("backup_{}.tar", backup_id));
-
-        // Read MANIFEST to get snapshot number
         let manifest_path = self.data_dir.join("MANIFEST");
-        let snapshot_number = if manifest_path.exists() {
-            let manifest = fs::read_to_string(&manifest_path).context("Failed to read MANIFEST")?;
-            manifest
-                .lines()
-                .find(|line| line.starts_with("snapshot_number:"))
-                .and_then(|line| line.split(':').nth(1))
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        // Collect files to backup
-        let mut files_to_backup = Vec::new();
+        let mut entries = Vec::new();
         let mut vector_count = 0u64;
+        let mut snapshot_file = None;
+        let mut max_wal_file_id: Option<u64> = None;
 
-        // Add MANIFEST
-        if manifest_path.exists() {
-            files_to_backup.push(("MANIFEST".to_string(), manifest_path.clone()));
-        }
+        match read_manifest_layout(&manifest_path)? {
+            Some(ManifestLayout::Modern(mut manifest)) => {
+                let discovered_wal_segments = list_wal_segments_in_dir(&self.data_dir)?;
+                let discovered_names: BTreeSet<String> = discovered_wal_segments
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                let listed_names: BTreeSet<String> =
+                    manifest.wal_segments.iter().cloned().collect();
 
-        // Add current snapshot
-        if snapshot_number > 0 {
-            let snapshot_path = self.data_dir.join(format!("snapshot_{}", snapshot_number));
-            if snapshot_path.exists() {
-                files_to_backup.push((
-                    format!("snapshot_{}", snapshot_number),
-                    snapshot_path.clone(),
-                ));
-                // Vector count not tracked for full backups
-                // Parsing snapshot format would require loading entire file into memory
-                // which defeats the purpose of lightweight backup creation.
-                // Users should rely on database metrics for accurate vector counts.
-                vector_count = 0;
+                for listed in &manifest.wal_segments {
+                    anyhow::ensure!(
+                        discovered_names.contains(listed),
+                        "MANIFEST references missing WAL segment '{}' in {}",
+                        listed,
+                        self.data_dir.display()
+                    );
+                }
+
+                for discovered in discovered_names.difference(&listed_names) {
+                    warn!(
+                        wal_segment = discovered,
+                        "WAL segment exists on disk but not in MANIFEST; adding to backup MANIFEST"
+                    );
+                    manifest.wal_segments.push(discovered.clone());
+                }
+
+                manifest.wal_segments.sort_by(|a, b| {
+                    let a_id = parse_wal_file_id(a).unwrap_or(0);
+                    let b_id = parse_wal_file_id(b).unwrap_or(0);
+                    a_id.cmp(&b_id).then_with(|| a.cmp(b))
+                });
+                manifest.wal_segments.dedup();
+
+                if let Some(snapshot_name) = &manifest.latest_snapshot {
+                    let snapshot_path = self.data_dir.join(snapshot_name);
+                    anyhow::ensure!(
+                        snapshot_path.exists(),
+                        "MANIFEST references missing snapshot '{}' in {}",
+                        snapshot_name,
+                        self.data_dir.display()
+                    );
+                    match read_snapshot_doc_count(&snapshot_path) {
+                        Ok(count) => vector_count = count,
+                        Err(error) => {
+                            warn!(
+                                snapshot = %snapshot_path.display(),
+                                error = %error,
+                                "Failed to read snapshot doc_count from header; storing vector_count=0"
+                            );
+                            vector_count = 0;
+                        }
+                    }
+                    snapshot_file = Some(snapshot_name.clone());
+                    entries.push(ArchiveEntry::from_path(
+                        snapshot_name.clone(),
+                        snapshot_path,
+                    ));
+                }
+
+                let manifest_bytes =
+                    serde_json::to_vec_pretty(&manifest).context("Failed to serialize MANIFEST")?;
+                entries.push(ArchiveEntry::from_bytes("MANIFEST", manifest_bytes));
+
+                for segment in &manifest.wal_segments {
+                    let path = self.data_dir.join(segment);
+                    anyhow::ensure!(
+                        path.exists(),
+                        "WAL segment '{}' listed in MANIFEST is missing from {}",
+                        segment,
+                        self.data_dir.display()
+                    );
+                    max_wal_file_id = match (max_wal_file_id, parse_wal_file_id(segment)) {
+                        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+                        (None, Some(candidate)) => Some(candidate),
+                        (current, None) => current,
+                    };
+                    entries.push(ArchiveEntry::from_path(segment.clone(), path));
+                }
+            }
+            Some(ManifestLayout::Legacy {
+                snapshot_number,
+                raw_bytes,
+            }) => {
+                entries.push(ArchiveEntry::from_bytes("MANIFEST", raw_bytes));
+
+                if let Some(snapshot_number) = snapshot_number.filter(|n| *n > 0) {
+                    let snapshot_name = format!("snapshot_{}", snapshot_number);
+                    let snapshot_path = self.data_dir.join(&snapshot_name);
+                    anyhow::ensure!(
+                        snapshot_path.exists(),
+                        "Legacy MANIFEST references missing snapshot '{}' in {}",
+                        snapshot_name,
+                        self.data_dir.display()
+                    );
+                    snapshot_file = Some(snapshot_name.clone());
+                    entries.push(ArchiveEntry::from_path(snapshot_name, snapshot_path));
+                }
+
+                for (name, path) in list_wal_segments_in_dir(&self.data_dir)? {
+                    max_wal_file_id = match (max_wal_file_id, parse_wal_file_id(&name)) {
+                        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+                        (None, Some(candidate)) => Some(candidate),
+                        (current, None) => current,
+                    };
+                    entries.push(ArchiveEntry::from_path(name, path));
+                }
+            }
+            None => {
+                warn!(
+                    "No MANIFEST found in {}; creating WAL-only backup",
+                    self.data_dir.display()
+                );
+                for (name, path) in list_wal_segments_in_dir(&self.data_dir)? {
+                    max_wal_file_id = match (max_wal_file_id, parse_wal_file_id(&name)) {
+                        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+                        (None, Some(candidate)) => Some(candidate),
+                        (current, None) => current,
+                    };
+                    entries.push(ArchiveEntry::from_path(name, path));
+                }
             }
         }
 
-        // Add active WAL files (last 5)
-        let mut wal_files: Vec<_> = fs::read_dir(&self.data_dir)?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .map(|name| name.starts_with("wal_") && name.ends_with(".wal"))
-                    .unwrap_or(false)
-            })
-            .collect();
+        anyhow::ensure!(
+            !entries.is_empty(),
+            "No recoverable state found in {} (missing MANIFEST/snapshot/WAL files)",
+            self.data_dir.display()
+        );
 
-        wal_files.sort_by_key(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(|name| {
-                    name.strip_prefix("wal_")
-                        .and_then(|s| s.strip_suffix(".wal"))
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-                .unwrap_or(0)
-        });
-
-        // Take last 5 WAL files
-        for entry in wal_files.iter().rev().take(5) {
-            let path = entry.path();
-            files_to_backup.push((
-                entry.file_name().to_string_lossy().to_string(),
-                path.clone(),
-            ));
+        let mut unique_entries = Vec::with_capacity(entries.len());
+        let mut seen_names = BTreeSet::new();
+        for entry in entries {
+            if seen_names.insert(entry.name.clone()) {
+                unique_entries.push(entry);
+            }
         }
 
-        // Create tar archive
-        let backup_file = File::create(&backup_path).context("Failed to create backup file")?;
-        let mut writer = BufWriter::new(backup_file);
-
-        // Simple tar-like format: [file_count][name_len][name][data_len][data]...
-        writer.write_all(&(files_to_backup.len() as u32).to_le_bytes())?;
-
-        let mut checksum = 0u32;
-        for (name, path) in &files_to_backup {
-            debug!("Backing up file: {}", name);
-
-            // Write filename
-            let name_bytes = name.as_bytes();
-            writer.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
-            writer.write_all(name_bytes)?;
-
-            // Write file data
-            let mut file = File::open(path)?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)?;
-
-            writer.write_all(&(buffer.len() as u64).to_le_bytes())?;
-            writer.write_all(&buffer)?;
-
-            // Update checksum
-            checksum = checksum.wrapping_add(crc32fast::hash(&buffer));
-        }
-
-        writer.flush()?;
-        drop(writer);
+        let checksum = write_backup_archive(&backup_path, &unique_entries)?;
 
         // Store the archive byte size so CLI verification can compare against on-disk artifact size.
         let archive_size = fs::metadata(&backup_path)?.len();
@@ -466,6 +708,8 @@ impl BackupManager {
             checksum,
             parent_id: None,
             description,
+            max_wal_file_id,
+            snapshot_file,
         };
 
         // Save metadata as JSON
@@ -506,79 +750,88 @@ impl BackupManager {
             .as_secs();
 
         let backup_path = self.backup_dir.join(format!("backup_{}.tar", backup_id));
+        let manifest_path = self.data_dir.join("MANIFEST");
+        let manifest_layout = read_manifest_layout(&manifest_path)?;
+        let mut entries = Vec::new();
+        let mut max_wal_file_id: Option<u64> = None;
 
-        // Collect WAL files modified after parent backup
-        let mut wal_files: Vec<_> = fs::read_dir(&self.data_dir)?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        let modified_timestamp = modified
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        return modified_timestamp >= parent_metadata.timestamp;
-                    }
-                }
-                false
-            })
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .map(|name| name.starts_with("wal_") && name.ends_with(".wal"))
-                    .unwrap_or(false)
-            })
-            .collect();
+        let all_wal_segments = list_wal_segments_in_dir(&self.data_dir)?;
+        let modified_since_parent = |path: &Path| -> bool {
+            path.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() >= parent_metadata.timestamp)
+                .unwrap_or(false)
+        };
 
-        if wal_files.is_empty() {
+        let wal_segments: Vec<(String, PathBuf)> =
+            if let Some(parent_max) = parent_metadata.max_wal_file_id {
+                all_wal_segments
+                    .into_iter()
+                    .filter(|(name, path)| match parse_wal_file_id(name) {
+                        Some(file_id) => {
+                            file_id > parent_max
+                                || (file_id == parent_max && modified_since_parent(path))
+                        }
+                        None => modified_since_parent(path),
+                    })
+                    .collect()
+            } else {
+                all_wal_segments
+                    .into_iter()
+                    .filter(|(_, path)| modified_since_parent(path))
+                    .collect()
+            };
+
+        if wal_segments.is_empty() {
             return Err(anyhow!("No new WAL files since parent backup"));
         }
 
-        wal_files.sort_by_key(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(|name| {
-                    name.strip_prefix("wal_")
-                        .and_then(|s| s.strip_suffix(".wal"))
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-                .unwrap_or(0)
-        });
-
-        let mut checksum = 0u32;
-
-        // Create tar archive with WAL files
-        let backup_file = File::create(&backup_path)?;
-        let mut writer = BufWriter::new(backup_file);
-
-        writer.write_all(&(wal_files.len() as u32).to_le_bytes())?;
-
-        for entry in &wal_files {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            debug!("Backing up WAL: {}", name);
-
-            // Write filename
-            let name_bytes = name.as_bytes();
-            writer.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
-            writer.write_all(name_bytes)?;
-
-            // Write file data
-            let mut file = File::open(&path)?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)?;
-
-            writer.write_all(&(buffer.len() as u64).to_le_bytes())?;
-            writer.write_all(&buffer)?;
-
-            checksum = checksum.wrapping_add(crc32fast::hash(&buffer));
+        match manifest_layout {
+            Some(ManifestLayout::Modern(mut manifest)) => {
+                let discovered_names: BTreeSet<String> =
+                    wal_segments.iter().map(|(name, _)| name.clone()).collect();
+                let listed_names: BTreeSet<String> =
+                    manifest.wal_segments.iter().cloned().collect();
+                for discovered in discovered_names.difference(&listed_names) {
+                    warn!(
+                        wal_segment = discovered,
+                        "WAL segment exists on disk but not in MANIFEST; adding to incremental backup MANIFEST"
+                    );
+                    manifest.wal_segments.push(discovered.clone());
+                }
+                manifest.wal_segments.sort_by(|a, b| {
+                    let a_id = parse_wal_file_id(a).unwrap_or(0);
+                    let b_id = parse_wal_file_id(b).unwrap_or(0);
+                    a_id.cmp(&b_id).then_with(|| a.cmp(b))
+                });
+                manifest.wal_segments.dedup();
+                let manifest_bytes =
+                    serde_json::to_vec_pretty(&manifest).context("Failed to serialize MANIFEST")?;
+                entries.push(ArchiveEntry::from_bytes("MANIFEST", manifest_bytes));
+            }
+            Some(ManifestLayout::Legacy { raw_bytes, .. }) => {
+                entries.push(ArchiveEntry::from_bytes("MANIFEST", raw_bytes));
+            }
+            None => {
+                return Err(anyhow!(
+                    "Cannot create incremental backup without MANIFEST in {}",
+                    self.data_dir.display()
+                ));
+            }
         }
 
-        writer.flush()?;
-        drop(writer);
+        for (name, path) in wal_segments {
+            max_wal_file_id = match (max_wal_file_id, parse_wal_file_id(&name)) {
+                (Some(current), Some(candidate)) => Some(current.max(candidate)),
+                (None, Some(candidate)) => Some(candidate),
+                (current, None) => current,
+            };
+            entries.push(ArchiveEntry::from_path(name, path));
+        }
+
+        let checksum = write_backup_archive(&backup_path, &entries)?;
 
         // Store the archive byte size so CLI verification can compare against on-disk artifact size.
         let archive_size = fs::metadata(&backup_path)?.len();
@@ -593,6 +846,8 @@ impl BackupManager {
             checksum,
             parent_id: Some(parent_id),
             description,
+            max_wal_file_id,
+            snapshot_file: None,
         };
 
         // Save metadata
@@ -1526,11 +1781,24 @@ mod tests {
         let temp_data = TempDir::new().unwrap();
         let temp_backup = TempDir::new().unwrap();
 
-        // Create some test files
-        fs::write(temp_data.path().join("MANIFEST"), "snapshot_number: 100\n").unwrap();
-        fs::write(temp_data.path().join("snapshot_100"), b"test snapshot data").unwrap();
+        // Create modern MANIFEST + snapshot layout.
+        let snapshot_name = "snapshot_100.snap";
+        let snapshot = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            vec![(0, vec![1.0, 0.0])],
+            vec![(0, std::collections::HashMap::new())],
+            0,
+        )
+        .unwrap();
+        snapshot.save(temp_data.path().join(snapshot_name)).unwrap();
+
         fs::write(temp_data.path().join("wal_1000.wal"), b"wal entry 1").unwrap();
         fs::write(temp_data.path().join("wal_1001.wal"), b"wal entry 2").unwrap();
+        let mut manifest = Manifest::new();
+        manifest.latest_snapshot = Some(snapshot_name.to_string());
+        manifest.wal_segments = vec!["wal_1000.wal".to_string(), "wal_1001.wal".to_string()];
+        manifest.save(temp_data.path().join("MANIFEST")).unwrap();
 
         let manager = BackupManager::new(temp_backup.path(), temp_data.path()).unwrap();
         let metadata = manager
@@ -1541,6 +1809,9 @@ mod tests {
         assert!(metadata.size_bytes > 0);
         assert!(metadata.checksum != 0);
         assert_eq!(metadata.parent_id, None);
+        assert_eq!(metadata.vector_count, 1);
+        assert_eq!(metadata.snapshot_file.as_deref(), Some(snapshot_name));
+        assert_eq!(metadata.max_wal_file_id, Some(1001));
 
         // Verify backup files exist
         let backup_tar = temp_backup
@@ -1558,20 +1829,40 @@ mod tests {
     fn test_backup_manager_create_incremental() {
         let temp_data = TempDir::new().unwrap();
         let temp_backup = TempDir::new().unwrap();
+        let temp_restore = TempDir::new().unwrap();
 
-        // Create test files
-        fs::write(temp_data.path().join("MANIFEST"), "snapshot_number: 100\n").unwrap();
-        fs::write(temp_data.path().join("snapshot_100"), b"test data").unwrap();
+        let snapshot_name = "snapshot_100.snap";
+        let snapshot = Snapshot::new(
+            2,
+            crate::config::DistanceMetric::Cosine,
+            vec![(0, vec![1.0, 0.0])],
+            vec![(0, std::collections::HashMap::new())],
+            0,
+        )
+        .unwrap();
+        snapshot.save(temp_data.path().join(snapshot_name)).unwrap();
         fs::write(temp_data.path().join("wal_1000.wal"), b"wal 1").unwrap();
+        let mut manifest = Manifest::new();
+        manifest.latest_snapshot = Some(snapshot_name.to_string());
+        manifest.wal_segments = vec!["wal_1000.wal".to_string()];
+        manifest.save(temp_data.path().join("MANIFEST")).unwrap();
 
         let manager = BackupManager::new(temp_backup.path(), temp_data.path()).unwrap();
 
         // Create full backup
         let full_metadata = manager.create_full_backup("Full".to_string()).unwrap();
+        assert_eq!(full_metadata.max_wal_file_id, Some(1000));
 
         // Wait a moment and create new WAL
         thread::sleep(Duration::from_millis(100));
         fs::write(temp_data.path().join("wal_1001.wal"), b"wal 2").unwrap();
+        let mut updated_manifest = Manifest::load(temp_data.path().join("MANIFEST")).unwrap();
+        updated_manifest
+            .wal_segments
+            .push("wal_1001.wal".to_string());
+        updated_manifest
+            .save(temp_data.path().join("MANIFEST"))
+            .unwrap();
 
         // Create incremental
         let inc_metadata = manager
@@ -1581,6 +1872,21 @@ mod tests {
         assert_eq!(inc_metadata.backup_type, BackupType::Incremental);
         assert_eq!(inc_metadata.parent_id, Some(full_metadata.id));
         assert!(inc_metadata.size_bytes > 0);
+        assert_eq!(inc_metadata.max_wal_file_id, Some(1001));
+        assert!(inc_metadata.snapshot_file.is_none());
+
+        // Restore from incremental backup ID and ensure final MANIFEST includes new WAL segment.
+        let restore_mgr = RestoreManager::new(temp_backup.path(), temp_restore.path()).unwrap();
+        restore_mgr.restore_from_backup(inc_metadata.id).unwrap();
+        let restored_manifest = Manifest::load(temp_restore.path().join("MANIFEST")).unwrap();
+        assert!(
+            restored_manifest
+                .wal_segments
+                .iter()
+                .any(|segment| segment == "wal_1001.wal"),
+            "Incremental restore should carry forward updated MANIFEST"
+        );
+        assert!(temp_restore.path().join("wal_1001.wal").exists());
     }
 
     #[test]
@@ -1656,6 +1962,8 @@ mod tests {
             checksum: 0,
             parent_id: None,
             description: "malicious".to_string(),
+            max_wal_file_id: None,
+            snapshot_file: None,
         };
         fs::write(
             temp_backup
@@ -1719,6 +2027,8 @@ mod tests {
             checksum: 0,
             parent_id: None,
             description: "oversized".to_string(),
+            max_wal_file_id: None,
+            snapshot_file: None,
         };
         fs::write(
             temp_backup
@@ -1876,8 +2186,10 @@ mod tests {
         let client =
             S3Client::new("test-kyrodb-backups".to_string(), "test-prefix".to_string()).await;
 
-        // Just verify we can create the client
-        assert!(client.is_ok() || client.is_err()); // Either works (depends on env)
+        assert!(
+            client.is_ok(),
+            "S3 client initialization should succeed when credentials are configured: {client:?}"
+        );
     }
 
     #[tokio::test]
@@ -1936,6 +2248,8 @@ mod tests {
             checksum: 0xDEADBEEF,
             parent_id: None,
             description: "Test backup".to_string(),
+            max_wal_file_id: Some(777),
+            snapshot_file: Some("snapshot_777.snap".to_string()),
         };
 
         // Serialize to JSON

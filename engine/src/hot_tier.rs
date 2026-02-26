@@ -355,7 +355,24 @@ impl HotTier {
     ///
     /// For `DistanceMetric::InnerProduct`, correctness assumes embeddings are L2-normalized.
     pub fn knn_search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.knn_search_with_cancel(query, k, None)
+    }
+
+    /// k-NN search over hot tier documents with optional cancellation.
+    pub fn knn_search_with_cancel(
+        &self,
+        query: &[f32],
+        k: usize,
+        cancelled: Option<&AtomicBool>,
+    ) -> Vec<(u64, f32)> {
         if k == 0 {
+            return Vec::new();
+        }
+
+        if cancelled
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
             return Vec::new();
         }
 
@@ -377,7 +394,15 @@ impl HotTier {
         // Complexity: O(n * k) in worst case, but k is typically small (<= 100).
         let mut top: Vec<(u64, f32)> = Vec::with_capacity(k);
 
-        for (doc_id, doc) in docs.iter() {
+        for (idx, (doc_id, doc)) in docs.iter().enumerate() {
+            if (idx & 0x3F) == 0
+                && cancelled
+                    .map(|flag| flag.load(Ordering::Relaxed))
+                    .unwrap_or(false)
+            {
+                break;
+            }
+
             let distance = match distance_metric {
                 DistanceMetric::Cosine => Self::cosine_distance_with_cached_norm(
                     query,

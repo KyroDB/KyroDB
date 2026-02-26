@@ -195,6 +195,16 @@ rate_limit:
   # Burst capacity (token bucket size)
   burst_capacity: 10000
 
+# Query timeout and load-shedding configuration
+timeouts:
+  # Per-layer fail-safe timeout budgets (milliseconds)
+  cache_ms: 10
+  hot_tier_ms: 50
+  cold_tier_ms: 1000
+
+  # Maximum in-flight queries admitted by the engine semaphore.
+  max_concurrent_queries: 1000
+
 # Logging Configuration
 logging:
   # Log level: trace, debug, info, warn, error

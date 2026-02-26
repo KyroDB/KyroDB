@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::AtomicBool;
 
 use crate::config::DistanceMetric;
 use crate::hnsw_index::SearchResult;
@@ -73,6 +74,13 @@ fn distance_order(lhs: f32, rhs: f32) -> Ordering {
 }
 
 #[inline]
+fn cancellation_requested(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled
+        .map(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+#[inline]
 fn keep_top_k_by_distance(results: &mut Vec<SearchResult>, k: usize) {
     if k == 0 {
         results.clear();
@@ -99,7 +107,17 @@ pub(crate) trait AnnBackend: Send + Sync {
     fn estimated_memory_bytes(&self) -> usize {
         0
     }
-    fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult>;
+    fn search_with_cancel(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        cancelled: Option<&AtomicBool>,
+    ) -> Vec<SearchResult>;
+    #[allow(dead_code)]
+    fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult> {
+        self.search_with_cancel(query, k, ef_search, None)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -397,14 +415,30 @@ impl FlatGraph {
         }
     }
 
-    fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        cancelled: Option<&AtomicBool>,
+    ) -> Vec<SearchResult> {
         if self.len() == 0 || k == 0 {
             return Vec::new();
         }
-        self.search_fp32(query, k, ef_search)
+        self.search_fp32(query, k, ef_search, cancelled)
     }
 
-    fn search_fp32(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult> {
+    fn search_fp32(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        cancelled: Option<&AtomicBool>,
+    ) -> Vec<SearchResult> {
+        if cancellation_requested(cancelled) {
+            return Vec::new();
+        }
+
         let ef = ef_search.max(k).min(self.len().max(1));
         let mut entry = self.entry_by_layer[self.max_layer];
         if entry as usize >= self.len() {
@@ -413,12 +447,20 @@ impl FlatGraph {
         let mut entry_dist = self.distance_to(query, entry);
 
         for layer in (1..=self.max_layer).rev() {
-            let (new_entry, new_dist) = self.greedy_descent_layer(query, entry, entry_dist, layer);
+            if cancellation_requested(cancelled) {
+                return Vec::new();
+            }
+            let (new_entry, new_dist) =
+                self.greedy_descent_layer(query, entry, entry_dist, layer, cancelled);
             entry = new_entry;
             entry_dist = new_dist;
         }
 
-        self.search_layer0_exact(query, entry, entry_dist, k, ef)
+        if cancellation_requested(cancelled) {
+            return Vec::new();
+        }
+
+        self.search_layer0_exact(query, entry, entry_dist, k, ef, cancelled)
     }
 
     fn greedy_descent_layer(
@@ -427,12 +469,20 @@ impl FlatGraph {
         mut current: u32,
         mut current_dist: f32,
         layer: usize,
+        cancelled: Option<&AtomicBool>,
     ) -> (u32, f32) {
         let node_count = self.len();
         loop {
+            if cancellation_requested(cancelled) {
+                return (current, current_dist);
+            }
+
             let mut improved = false;
             let neighbors = self.neighbors(layer, current);
             for (idx, &nbr) in neighbors.iter().enumerate() {
+                if (idx & 0x0F) == 0 && cancellation_requested(cancelled) {
+                    return (current, current_dist);
+                }
                 self.prefetch_neighbor_lookahead(neighbors, idx, 1, 1);
                 if nbr as usize >= node_count {
                     continue;
@@ -457,6 +507,7 @@ impl FlatGraph {
         entry_dist: f32,
         k: usize,
         ef: usize,
+        cancelled: Option<&AtomicBool>,
     ) -> Vec<SearchResult> {
         FLAT_SEARCH_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
@@ -472,8 +523,13 @@ impl FlatGraph {
                 dense_id: entry,
             });
             let mut worst_dist = entry_dist;
+            let mut cancelled_search = false;
 
             while let Some(candidate) = scratch.candidates.pop() {
+                if cancellation_requested(cancelled) {
+                    break;
+                }
+
                 let candidate_dist = -candidate.neg_distance;
                 if scratch.results.len() >= ef && candidate_dist > worst_dist {
                     break;
@@ -481,6 +537,10 @@ impl FlatGraph {
 
                 let neighbors = self.neighbors(0, candidate.dense_id);
                 for (idx, &nbr) in neighbors.iter().enumerate() {
+                    if (idx & 0x0F) == 0 && cancellation_requested(cancelled) {
+                        cancelled_search = true;
+                        break;
+                    }
                     self.prefetch_neighbor_lookahead(neighbors, idx, scratch.results.len(), ef);
                     if nbr as usize >= node_count {
                         continue;
@@ -508,6 +568,10 @@ impl FlatGraph {
                             .map(|v| v.distance)
                             .unwrap_or(f32::MAX);
                     }
+                }
+
+                if cancelled_search {
+                    break;
                 }
             }
 
@@ -1162,7 +1226,7 @@ impl SingleGraphBackend {
 
         for layer in (inserted_level.saturating_add(1)..=top).rev() {
             let (new_entry, new_dist) =
-                flat.greedy_descent_layer(embedding, entry, entry_dist, layer);
+                flat.greedy_descent_layer(embedding, entry, entry_dist, layer, None);
             entry = new_entry;
             entry_dist = new_dist;
         }
@@ -1331,11 +1395,17 @@ impl AnnBackend for SingleGraphBackend {
             .unwrap_or(0)
     }
 
-    fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult> {
+    fn search_with_cancel(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        cancelled: Option<&AtomicBool>,
+    ) -> Vec<SearchResult> {
         self.flat_graph
             .read()
             .as_ref()
-            .map(|flat| flat.search(query, k, ef_search))
+            .map(|flat| flat.search(query, k, ef_search, cancelled))
             .unwrap_or_default()
     }
 }
@@ -1487,6 +1557,19 @@ mod tests {
         assert!(
             scratch.visited_bits.capacity() <= VISITED_BITSET_RETAIN_WORDS * 2,
             "visited bitset should release retained capacity after large query"
+        );
+    }
+
+    #[test]
+    fn search_honors_pre_cancelled_flag() {
+        let backend = seeded_backend();
+        let query = make_vec(7);
+        let cancelled = AtomicBool::new(true);
+
+        let results = backend.search_with_cancel(&query, 8, 64, Some(&cancelled));
+        assert!(
+            results.is_empty(),
+            "pre-cancelled search should return immediately with no results"
         );
     }
 

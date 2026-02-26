@@ -47,6 +47,35 @@ fn unix_timestamp_secs_now() -> u64 {
     }
 }
 
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    #[cfg(unix)]
+    {
+        let dir = File::open(parent).with_context(|| {
+            format!(
+                "Failed to open parent directory for fsync: {}",
+                parent.display()
+            )
+        })?;
+        dir.sync_all().with_context(|| {
+            format!(
+                "Failed to fsync parent directory after rename: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum WalOp {
@@ -644,6 +673,7 @@ impl Snapshot {
 
         // Atomic rename
         std::fs::rename(&temp_path, path).context("Failed to rename snapshot file")?;
+        sync_parent_dir(path)?;
 
         Ok(())
     }
@@ -931,10 +961,17 @@ impl Manifest {
 
         let manifest_json =
             serde_json::to_string_pretty(self).context("Failed to serialize manifest")?;
-
-        std::fs::write(&temp_path, manifest_json).context("Failed to write manifest temp file")?;
+        {
+            let mut file =
+                File::create(&temp_path).context("Failed to create manifest temp file")?;
+            file.write_all(manifest_json.as_bytes())
+                .context("Failed to write manifest temp file")?;
+            file.sync_all()
+                .context("Failed to fsync manifest temp file")?;
+        }
 
         std::fs::rename(&temp_path, path).context("Failed to rename manifest file")?;
+        sync_parent_dir(path)?;
 
         Ok(())
     }

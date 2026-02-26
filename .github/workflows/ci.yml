@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint-and-test:
+    name: Lint + Unit/Integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Full test suite
+        run: cargo test --all
+
+  cli-and-loom:
+    name: CLI + Loom
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: CLI integration tests
+        run: cargo test -p kyrodb-engine --features cli-tools --test cli_integration_tests
+
+      - name: Loom concurrency tests
+        run: cargo test -p kyrodb-engine --features loom --test loom_concurrency_tests --release
+
+  soak-smoke:
+    name: Soak/Chaos Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release server and load tester
+        run: cargo build --release -p kyrodb-engine --bin kyrodb_server --bin kyrodb_load_tester
+
+      - name: Run soak/chaos smoke harness
+        run: scripts/qa/run_soak_chaos_recovery.sh
+        env:
+          BUILD_BINARIES: "0"
+          SOAK_CYCLES: "2"
+          CYCLE_DURATION_SECS: "15"
+          KILL_EVERY_N_CYCLES: "2"
+          QPS: "200"
+          CONCURRENCY: "8"
+          DATASET_SIZE: "512"
+          LOAD_TESTER_REQUEST_TIMEOUT_MS: "10000"
+          LOAD_TESTER_MAX_FAILURE_RATIO: "0.80"
+
+  fuzz-smoke:
+    name: Fuzz Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz smoke harness
+        run: scripts/qa/run_fuzz_smoke.sh
+        env:
+          FUZZ_TIME_PER_TARGET_SECS: "20"
+          FUZZ_MAX_INPUT_LEN: "4096"
