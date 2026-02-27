@@ -1,12 +1,12 @@
 // Authentication and API key management for multi-tenant KyroDB
 //
 // Design:
-// - Fast in-memory HashMap lookup for O(1) API key validation
+// - In-memory API key registry with constant-time byte comparison
 // - API key format: kyro_<tenant_id>_<secret> (e.g., kyro_acme_a3f9d8e2c1b4...)
 // - Support file-based key storage with hot reload
 // - No crypto overhead: simple string comparison
 //
-// Performance: ~50ns per validation (in-memory HashMap lookup)
+// Performance: linear in active API key count (constant-time compare per key)
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 /// API key format: kyro_<tenant_id>_<secret>
 pub type ApiKey = String;
@@ -57,7 +58,7 @@ impl TenantInfo {
         anyhow::ensure!(
             self.tenant_id
                 .chars()
-                .all(|c| c.is_alphanumeric() || c == '_'),
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "tenant_id must be alphanumeric with underscores only: {}",
             self.tenant_id
         );
@@ -149,10 +150,11 @@ impl AuthManager {
 
             // Verify tenant_id matches key prefix
             let expected_prefix = format!("kyro_{}_", entry.tenant_info.tenant_id);
+            let redacted = Self::redact_api_key(&entry.key);
             anyhow::ensure!(
                 entry.key.starts_with(&expected_prefix),
                 "API key {} does not match tenant_id {} (expected prefix: {})",
-                entry.key,
+                redacted,
                 entry.tenant_info.tenant_id,
                 expected_prefix
             );
@@ -174,30 +176,32 @@ impl AuthManager {
     /// Since tenant_id can contain underscores, we need special parsing logic:
     /// The secret is always the last 32+ alphanumeric characters after the final underscore.
     fn validate_api_key(key: &str) -> Result<()> {
+        let redacted = Self::redact_api_key(key);
+
         anyhow::ensure!(
             key.starts_with("kyro_"),
             "API key must start with 'kyro_': {}",
-            key
+            redacted
         );
 
         anyhow::ensure!(
             key.len() >= 39, // "kyro_" (5) + at least 1 char tenant + "_" (1) + 32 char secret = 39 min
             "API key too short (minimum 39 characters): {}",
-            key
+            redacted
         );
 
         // Find the last underscore (separates tenant_id from secret)
         let last_underscore_pos = key.rfind('_').ok_or_else(|| {
             anyhow::anyhow!(
                 "API key must have format kyro_<tenant_id>_<secret>: {}",
-                key
+                redacted
             )
         })?;
 
         anyhow::ensure!(
             last_underscore_pos > 5, // Must be after "kyro_"
             "API key must have format kyro_<tenant_id>_<secret>: {}",
-            key
+            redacted
         );
 
         let tenant_id = &key[5..last_underscore_pos]; // After "kyro_" and before last "_"
@@ -206,29 +210,37 @@ impl AuthManager {
         anyhow::ensure!(
             !tenant_id.is_empty(),
             "tenant_id cannot be empty in API key: {}",
-            key
+            redacted
         );
 
         anyhow::ensure!(
             !secret.is_empty(),
             "secret cannot be empty in API key: {}",
-            key
+            redacted
         );
 
         anyhow::ensure!(
             secret.len() >= 32,
             "secret must be at least 32 characters (got {}): {}",
             secret.len(),
-            key
+            redacted
         );
 
         anyhow::ensure!(
             secret.chars().all(|c| c.is_ascii_alphanumeric()),
             "secret must be alphanumeric: {}",
-            key
+            redacted
         );
 
         Ok(())
+    }
+
+    fn redact_api_key(key: &str) -> String {
+        if let Some(last_underscore) = key.rfind('_') {
+            format!("{}_<redacted>", &key[..last_underscore])
+        } else {
+            "<redacted>".to_string()
+        }
     }
 
     /// Return all enabled tenants (deduplicated by tenant_id at caller if needed).
@@ -247,13 +259,24 @@ impl AuthManager {
     /// - API key does not exist
     /// - API key is disabled (enabled = false)
     ///
-    /// # Performance
-    /// O(1) lookup via HashMap. ~50ns on modern hardware.
+    /// # Security
+    /// Uses constant-time byte comparison (`subtle::ConstantTimeEq`) to avoid
+    /// timing side-channels on API key equality checks.
     pub fn validate(&self, api_key: &str) -> Option<TenantInfo> {
         let keys = self.api_keys.read();
-        keys.get(api_key)
-            .filter(|tenant_info| tenant_info.enabled)
-            .cloned()
+        let mut validated = None;
+        for (stored_key, tenant_info) in keys.iter() {
+            if stored_key.len() != api_key.len() {
+                continue;
+            }
+            if stored_key.as_bytes().ct_eq(api_key.as_bytes()).unwrap_u8() == 1 {
+                if tenant_info.enabled {
+                    validated = Some(tenant_info.clone());
+                }
+                break;
+            }
+        }
+        validated
     }
 
     /// Add or update a single API key (for testing/dynamic provisioning)
@@ -263,10 +286,11 @@ impl AuthManager {
 
         // Verify tenant_id matches key prefix
         let expected_prefix = format!("kyro_{}_", tenant_info.tenant_id);
+        let redacted = Self::redact_api_key(&key);
         anyhow::ensure!(
             key.starts_with(&expected_prefix),
             "API key {} does not match tenant_id {} (expected prefix: {})",
-            key,
+            redacted,
             tenant_info.tenant_id,
             expected_prefix
         );
@@ -534,6 +558,49 @@ api_keys:
     }
 
     #[test]
+    fn test_api_key_errors_redact_secret_material() {
+        let raw_key = "notpref_a3f9d8e2c1b4567890abcdef12345678";
+        let err = AuthManager::validate_api_key(raw_key)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains(raw_key),
+            "error must not leak full API key: {err}"
+        );
+        assert!(
+            err.contains("kyro_acme_<redacted>") || err.contains("<redacted>"),
+            "error should include only redacted key context: {err}"
+        );
+    }
+
+    #[test]
+    fn test_add_key_mismatch_error_redacts_key() {
+        let auth = AuthManager::new();
+        let key = "kyro_acme_a3f9d8e2c1b4567890abcdef12345678".to_string();
+        let tenant_info = create_test_tenant_info("other");
+        let err = auth
+            .add_key(key.clone(), tenant_info)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains(&key),
+            "mismatch error must not leak full API key: {err}"
+        );
+        assert!(err.contains("kyro_acme_<redacted>"));
+    }
+
+    #[test]
+    fn test_tenant_info_rejects_non_ascii_tenant_id() {
+        let mut info = create_test_tenant_info("acme");
+        info.tenant_id = "teñant".to_string();
+        let err = info
+            .validate()
+            .expect_err("non-ASCII tenant IDs must be rejected")
+            .to_string();
+        assert!(err.contains("tenant_id must be alphanumeric"));
+    }
+
+    #[test]
     fn test_atomic_reload() {
         let yaml_v1 = r#"
 api_keys:
@@ -646,7 +713,9 @@ api_keys:
                 created_at: String::new(),
             };
             let expected_ok = !tenant_id.is_empty()
-                && tenant_id.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && tenant_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
                 && !tenant_name.is_empty()
                 && max_vectors > 0;
             prop_assert_eq!(info.validate().is_ok(), expected_ok);

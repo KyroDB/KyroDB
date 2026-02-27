@@ -10,6 +10,7 @@ Current repository scope:
 
 - single-node engine and server (`kyrodb-engine`)
 - gRPC data plane (insert/query/search/bulk operations)
+- panic-contained gRPC request execution (handler panic => `INTERNAL`, process stays up)
 - layered retrieval path (L1 cache, hot tier, HNSW cold tier)
 - WAL/snapshot persistence and recovery
 - auth, tenancy, rate limiting, usage accounting
@@ -58,8 +59,12 @@ scripts/qa/run_fuzz_smoke.sh
   - `auth.enabled=false` => `404`
   - `auth.enabled=true` => API key required
   - `scope=all` => admin key required
+- input validation rejects non-finite embeddings (`NaN`/`Inf`) on insert/search paths
+- gRPC handler panics are converted to `INTERNAL` responses; server process continues serving
+- persistence recovery defaults to `strict`; `best_effort` is only allowed in `benchmark` environment mode
 - backup restore is destructive to target data directory and requires `BACKUP_ALLOW_CLEAR=true`
 - incremental backups require new WAL entries since the parent backup (writes must occur after the parent); incremental creation is only possible after additional WAL activity
+- backup create is fail-closed if snapshot/WAL source files change during archive creation; quiesce writes for deterministic backup windows
 
 Pilot baseline note:
 

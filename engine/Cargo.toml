@@ -74,6 +74,7 @@ rayon = "1.10"  # Parallel doc-to-queries map building
 tonic = { version = "0.10", features = ["tls"] }
 prost = "0.12"
 tokio-stream = "0.1"
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
 tracing-appender = "0.2"
@@ -90,6 +91,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 serde_yaml = "0.9"
 toml = "0.8"
 chrono = "0.4"  # ISO 8601 timestamp validation for API keys
+subtle = "2.5"  # Constant-time API key equality checks
 
 # CLI tools: Progress bars and table formatting (optional)
 indicatif = { version = "0.17", optional = true }

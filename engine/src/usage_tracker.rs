@@ -8,6 +8,7 @@
 //
 // Performance: ~20ns per operation (atomic increment)
 
+use crate::persistence::sync_parent_dir;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -207,35 +208,6 @@ struct UsageStateSnapshot {
 
 const USAGE_STATE_SNAPSHOT_VERSION: u32 = 1;
 static USAGE_SNAPSHOT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn sync_parent_dir(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-
-    #[cfg(unix)]
-    {
-        let dir = File::open(parent).with_context(|| {
-            format!(
-                "Failed to open usage snapshot parent directory {}",
-                parent.display()
-            )
-        })?;
-        dir.sync_all().with_context(|| {
-            format!(
-                "Failed to fsync usage snapshot parent directory {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = parent;
-    }
-
-    Ok(())
-}
 
 impl UsageSnapshot {
     /// Calculate total billable events

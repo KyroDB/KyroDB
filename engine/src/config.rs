@@ -185,6 +185,10 @@ pub struct CacheConfig {
     /// Query cache (L1b) cosine similarity threshold for semantic matches.
     pub query_cache_similarity_threshold: f32,
 
+    /// Maximum number of returned search doc_ids to log per request for
+    /// learned predictor training.
+    pub search_access_log_top_n: usize,
+
     /// Optional max age (seconds) for Hot Tier flush decisions.
     ///
     /// If not set, the server falls back to `training_interval_secs` for
@@ -208,6 +212,40 @@ pub struct CacheConfig {
 
     /// Target cache utilization for auto-tuning (0.0-1.0)
     pub target_utilization: f32,
+
+    /// Semantic adapter tuning for HSC admission.
+    pub semantic: SemanticAdapterConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SemanticAdapterConfig {
+    /// Threshold for high-confidence hot decisions (skip semantic scan).
+    pub high_confidence_threshold: f32,
+
+    /// Threshold for low-confidence cold decisions (skip semantic scan).
+    pub low_confidence_threshold: f32,
+
+    /// Minimum cosine similarity for semantic match boosts.
+    pub semantic_similarity_threshold: f32,
+
+    /// Maximum embeddings retained by semantic adapter.
+    pub max_cached_embeddings: usize,
+
+    /// Number of recent embeddings scanned for semantic similarity.
+    pub similarity_scan_limit: usize,
+}
+
+impl Default for SemanticAdapterConfig {
+    fn default() -> Self {
+        Self {
+            high_confidence_threshold: 0.60,
+            low_confidence_threshold: 0.25,
+            semantic_similarity_threshold: 0.80,
+            max_cached_embeddings: 100_000,
+            similarity_scan_limit: 2_000,
+        }
+    }
 }
 
 impl Default for CacheConfig {
@@ -221,6 +259,7 @@ impl Default for CacheConfig {
             predictor_capacity_multiplier: 4,
             query_cache_capacity: 100,
             query_cache_similarity_threshold: 0.52,
+            search_access_log_top_n: 16,
             hot_tier_max_age_secs: None,
             training_window_secs: 3600,
             recency_halflife_secs: 1800,
@@ -228,6 +267,7 @@ impl Default for CacheConfig {
             admission_threshold: 0.15,
             auto_tune_threshold: true,
             target_utilization: 0.85,
+            semantic: SemanticAdapterConfig::default(),
         }
     }
 }
@@ -748,6 +788,49 @@ impl KyroDbConfig {
             self.cache.query_cache_similarity_threshold
         );
         anyhow::ensure!(
+            self.cache.search_access_log_top_n > 0,
+            "search_access_log_top_n must be > 0, got {}",
+            self.cache.search_access_log_top_n
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.cache.semantic.high_confidence_threshold),
+            "cache.semantic.high_confidence_threshold must be in [0.0, 1.0], got {}",
+            self.cache.semantic.high_confidence_threshold
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.cache.semantic.low_confidence_threshold),
+            "cache.semantic.low_confidence_threshold must be in [0.0, 1.0], got {}",
+            self.cache.semantic.low_confidence_threshold
+        );
+        anyhow::ensure!(
+            self.cache.semantic.low_confidence_threshold
+                <= self.cache.semantic.high_confidence_threshold,
+            "cache.semantic.low_confidence_threshold ({}) must be <= high_confidence_threshold ({})",
+            self.cache.semantic.low_confidence_threshold,
+            self.cache.semantic.high_confidence_threshold
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.cache.semantic.semantic_similarity_threshold),
+            "cache.semantic.semantic_similarity_threshold must be in [0.0, 1.0], got {}",
+            self.cache.semantic.semantic_similarity_threshold
+        );
+        anyhow::ensure!(
+            self.cache.semantic.max_cached_embeddings > 0,
+            "cache.semantic.max_cached_embeddings must be > 0, got {}",
+            self.cache.semantic.max_cached_embeddings
+        );
+        anyhow::ensure!(
+            self.cache.semantic.similarity_scan_limit > 0,
+            "cache.semantic.similarity_scan_limit must be > 0, got {}",
+            self.cache.semantic.similarity_scan_limit
+        );
+        anyhow::ensure!(
+            self.cache.semantic.similarity_scan_limit <= self.cache.semantic.max_cached_embeddings,
+            "cache.semantic.similarity_scan_limit ({}) must be <= max_cached_embeddings ({})",
+            self.cache.semantic.similarity_scan_limit,
+            self.cache.semantic.max_cached_embeddings
+        );
+        anyhow::ensure!(
             self.cache.min_training_samples > 0
                 && self.cache.min_training_samples <= self.cache.capacity,
             "min_training_samples must be in range [1, {}], got {}",
@@ -899,6 +982,15 @@ impl KyroDbConfig {
         // If the environment type is not "benchmark", reject configurations
         // that disable durability guarantees (these are only safe for benchmarks).
         if environment_type != "benchmark" {
+            if !matches!(self.cache.strategy, CacheStrategy::Learned) {
+                anyhow::bail!(
+                    "Unsupported cache strategy {:?} for environment.type=\"{}\": \
+                     production and pilot deployments require Hybrid Semantic Cache \
+                     (`cache.strategy = \"learned\"`). Non-HSC strategies are benchmark-only.",
+                    self.cache.strategy,
+                    self.environment.environment_type
+                );
+            }
             if matches!(self.persistence.fsync_policy, FsyncPolicy::None) {
                 anyhow::bail!(
                     "Unsafe persistence configuration: fsync_policy=\"none\" is only permitted \
@@ -1197,6 +1289,56 @@ mod tests {
     }
 
     #[test]
+    fn test_search_access_log_top_n_validation() {
+        let mut config = KyroDbConfig::default();
+        config.cache.search_access_log_top_n = 0;
+        assert!(
+            config.validate().is_err(),
+            "search_access_log_top_n must be > 0"
+        );
+    }
+
+    #[test]
+    fn test_semantic_cache_config_validation() {
+        let mut config = KyroDbConfig::default();
+        config.cache.semantic.low_confidence_threshold = 0.9;
+        config.cache.semantic.high_confidence_threshold = 0.5;
+        assert!(
+            config.validate().is_err(),
+            "low confidence threshold must not exceed high confidence threshold"
+        );
+
+        let mut config = KyroDbConfig::default();
+        config.cache.semantic.similarity_scan_limit = 0;
+        assert!(
+            config.validate().is_err(),
+            "similarity_scan_limit must be positive"
+        );
+
+        let mut config = KyroDbConfig::default();
+        config.cache.semantic.max_cached_embeddings = 100;
+        config.cache.semantic.similarity_scan_limit = 200;
+        assert!(
+            config.validate().is_err(),
+            "similarity_scan_limit must not exceed max_cached_embeddings"
+        );
+    }
+
+    #[test]
+    fn test_semantic_cache_config_custom_profile_passes() {
+        let mut config = KyroDbConfig::default();
+        config.cache.semantic.high_confidence_threshold = 0.70;
+        config.cache.semantic.low_confidence_threshold = 0.20;
+        config.cache.semantic.semantic_similarity_threshold = 0.88;
+        config.cache.semantic.max_cached_embeddings = 50_000;
+        config.cache.semantic.similarity_scan_limit = 1_000;
+        assert!(
+            config.validate().is_ok(),
+            "valid semantic cache tuning profile should pass"
+        );
+    }
+
+    #[test]
     fn test_hnsw_m_parameter_range() {
         let mut config = KyroDbConfig::default();
 
@@ -1266,6 +1408,36 @@ mod tests {
         assert!(
             config.validate().is_ok(),
             "benchmark mode should allow best_effort recovery and unsafe persistence"
+        );
+    }
+
+    #[test]
+    fn test_non_benchmark_rejects_non_hsc_cache_strategy() {
+        let mut config = KyroDbConfig::default();
+        config.cache.strategy = CacheStrategy::Lru;
+        assert!(
+            config.validate().is_err(),
+            "non-benchmark environments must reject non-HSC cache strategies"
+        );
+
+        config.cache.strategy = CacheStrategy::AbTest;
+        assert!(
+            config.validate().is_err(),
+            "non-benchmark environments must reject benchmark-only cache strategies"
+        );
+    }
+
+    #[test]
+    fn test_benchmark_allows_non_hsc_cache_strategy() {
+        let mut config = KyroDbConfig::default();
+        config.environment.environment_type = "benchmark".to_string();
+        config.cache.strategy = CacheStrategy::Lru;
+        config.persistence.recovery_mode = RecoveryMode::BestEffort;
+        config.persistence.fsync_policy = FsyncPolicy::None;
+        config.persistence.snapshot_interval_mutations = 0;
+        assert!(
+            config.validate().is_ok(),
+            "benchmark environment should allow non-HSC cache strategy for baselines"
         );
     }
 

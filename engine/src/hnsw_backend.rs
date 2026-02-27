@@ -5,7 +5,7 @@
 //!
 //! **Persistence**: WAL + snapshots for durability and fast recovery.
 
-use crate::config::DistanceMetric;
+use crate::config::{DistanceMetric, RecoveryMode};
 use crate::hnsw_index::{HnswVectorIndex, SearchResult};
 use crate::metadata_filter;
 use crate::metrics::MetricsCollector;
@@ -30,15 +30,6 @@ use tracing::{debug, error, info, instrument, trace, warn};
 /// collisions with WAL files from a previous process that also had a bad clock.
 static FALLBACK_WAL_FILE_ID: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_WAL_INIT: std::sync::Once = std::sync::Once::new();
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RecoveryMode {
-    /// Fail recovery if required evidence is missing/corrupted.
-    #[default]
-    Strict,
-    /// Continue recovery with degraded guarantees when evidence is incomplete.
-    BestEffort,
-}
 
 /// Returns a process-unique monotonic WAL file ID for the clock-failure path.
 /// First call seeds the counter with (pid << 32 | random_u32); subsequent calls
@@ -376,6 +367,9 @@ pub struct HnswBackend {
     /// Reads remain available (the in-memory index may still serve queries).
     /// Operators must inspect the WAL, repair, and restart.
     wal_inconsistent: Arc<AtomicBool>,
+    /// Serializes write ordering while allowing reads to proceed until actual
+    /// in-memory mutation requires index/store write locks.
+    write_gate: Arc<Mutex<()>>,
 }
 
 /// Persistence state for HnswBackend
@@ -668,6 +662,7 @@ impl HnswBackend {
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: None,
             wal_inconsistent: Arc::new(AtomicBool::new(false)),
+            write_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -841,6 +836,7 @@ impl HnswBackend {
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: Some(persistence),
             wal_inconsistent: Arc::new(AtomicBool::new(false)),
+            write_gate: Arc::new(Mutex::new(())),
         };
 
         // Durability: initial state must be recoverable even if no user-triggered snapshot
@@ -888,6 +884,7 @@ impl HnswBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[instrument(level = "info", skip(data_dir, metrics), fields(data_dir = %data_dir.as_ref().to_path_buf().display(), max_elements, snapshot_interval, hnsw_m, hnsw_ef_construction))]
     pub fn recover_with_hnsw_params(
         embedding_dimension: usize,
         distance: DistanceMetric,
@@ -1065,7 +1062,15 @@ impl HnswBackend {
             }
             info!(wal_segment = wal_name, "replaying WAL");
             let mut reader = WalReader::open(&wal_path)?;
-            let entries = reader.read_all()?;
+            let entries = match recovery_mode {
+                RecoveryMode::Strict => reader.read_all_strict().with_context(|| {
+                    format!(
+                        "strict recovery mode: WAL segment {} contains corrupted frames",
+                        wal_name
+                    )
+                })?,
+                RecoveryMode::BestEffort => reader.read_all()?,
+            };
 
             for entry in entries {
                 if entry.seq_no > max_wal_seq {
@@ -1245,6 +1250,7 @@ impl HnswBackend {
             metadata_index: Arc::new(RwLock::new(metadata_index)),
             persistence: Some(persistence),
             wal_inconsistent: Arc::new(AtomicBool::new(false)),
+            write_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -1376,36 +1382,44 @@ impl HnswBackend {
         let mut attempted_compaction = false;
         loop {
             let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
+            let write_gate_guard = self.write_gate.lock();
 
-            // Serialize WAL append and in-memory mutation in one write critical section.
-            // This guarantees WAL replay order matches acknowledged commit order.
-            let mut index = self.index.write();
-            let mut store = self.doc_store.write();
-            if index.is_full() {
-                let tombstones = store
-                    .internal_to_external
-                    .iter()
-                    .filter(|v| v.is_none())
-                    .count();
-                drop(index);
-                drop(store);
-                drop(snapshot_guard);
+            // Read-only preflight under write gate: avoid long-held index/store write locks while
+            // performing WAL fsync.
+            let (old_internal_id, old_metadata) = {
+                let index = self.index.read();
+                let store = self.doc_store.read();
+                if index.is_full() {
+                    let tombstones = store
+                        .internal_to_external
+                        .iter()
+                        .filter(|v| v.is_none())
+                        .count();
+                    drop(store);
+                    drop(index);
+                    drop(write_gate_guard);
+                    drop(snapshot_guard);
 
-                if !attempted_compaction && tombstones > 0 {
-                    attempted_compaction = true;
-                    let reclaimed = self.compact_tombstones()?;
-                    if reclaimed > 0 {
-                        continue;
+                    if !attempted_compaction && tombstones > 0 {
+                        attempted_compaction = true;
+                        let reclaimed = self.compact_tombstones()?;
+                        if reclaimed > 0 {
+                            continue;
+                        }
                     }
+
+                    let index = self.index.read();
+                    anyhow::bail!(
+                        "HNSW index full: {} elements (max {})",
+                        index.len(),
+                        index.capacity()
+                    );
                 }
 
-                let index = self.index.read();
-                anyhow::bail!(
-                    "HNSW index full: {} elements (max {})",
-                    index.len(),
-                    index.capacity()
-                );
-            }
+                let old_internal_id = store.external_to_internal.get(&doc_id).copied();
+                let old_metadata = old_internal_id.map(|id| store.metadata[id].clone());
+                (old_internal_id, old_metadata)
+            };
 
             let embedding_for_wal = embedding.clone();
             let metadata_for_wal = metadata.clone();
@@ -1443,8 +1457,9 @@ impl HnswBackend {
                 }
             }
 
-            let old_internal_id = store.external_to_internal.get(&doc_id).copied();
-            let old_metadata = old_internal_id.map(|id| store.metadata[id].clone());
+            // WAL has been made durable for this mutation; now apply in-memory changes.
+            let mut index = self.index.write();
+            let mut store = self.doc_store.write();
             let internal_id = store.embeddings.len();
 
             if let Err(e) = index.add_vector(internal_id as u64, &embedding) {
@@ -1541,6 +1556,7 @@ impl HnswBackend {
             // performing disk I/O while holding write locks would block writers.
             drop(index);
             drop(store);
+            drop(write_gate_guard);
             drop(snapshot_guard);
 
             if should_create_snapshot {
@@ -1817,7 +1833,26 @@ impl HnswBackend {
             );
         }
         let mut manifest = Manifest::load(&manifest_path)?;
+        let latest_snapshot_seq = manifest.latest_snapshot_wal_seq.unwrap_or(0);
+        if latest_snapshot_seq > last_wal_seq {
+            warn!(
+                committed_snapshot_seq = latest_snapshot_seq,
+                candidate_snapshot_seq = last_wal_seq,
+                committed_snapshot = manifest.latest_snapshot.as_deref().unwrap_or("unknown"),
+                candidate_snapshot = %snapshot_name,
+                "newer snapshot already committed; skipping stale snapshot manifest update"
+            );
+            if let Err(e) = std::fs::remove_file(&snapshot_path) {
+                warn!(
+                    path = %snapshot_path.display(),
+                    error = %e,
+                    "failed to remove stale snapshot file after race detection"
+                );
+            }
+            return Ok(());
+        }
         manifest.latest_snapshot = Some(snapshot_name.clone());
+        manifest.latest_snapshot_wal_seq = Some(last_wal_seq);
 
         // Crash-safe ordering:
         // 1) Persist snapshot pointer while keeping full WAL segment list.
@@ -1841,6 +1876,7 @@ impl HnswBackend {
             );
         }
 
+        manifest.latest_snapshot_wal_seq = Some(last_wal_seq);
         manifest.save(&manifest_path)?;
 
         // Reset insert counter
@@ -1919,14 +1955,15 @@ impl HnswBackend {
         }
 
         let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
-
-        let mut store = self.doc_store.write();
-        let internal_id = match store.external_to_internal.get(&doc_id) {
-            Some(id) => *id,
-            None => return Ok(false),
+        let write_gate_guard = self.write_gate.lock();
+        let (internal_id, old_metadata) = {
+            let store = self.doc_store.read();
+            let internal_id = match store.external_to_internal.get(&doc_id) {
+                Some(id) => *id,
+                None => return Ok(false),
+            };
+            (internal_id, store.metadata[internal_id].clone())
         };
-
-        let old_metadata = store.metadata[internal_id].clone();
 
         // Apply update
         let updated_metadata = if merge {
@@ -1993,6 +2030,7 @@ impl HnswBackend {
         }
 
         // Update in-memory metadata
+        let mut store = self.doc_store.write();
         store.metadata[internal_id] = updated_metadata.clone();
         drop(store);
 
@@ -2002,6 +2040,7 @@ impl HnswBackend {
             meta_index.replace_doc(internal_id as u64, &old_metadata, &updated_metadata);
         }
 
+        drop(write_gate_guard);
         drop(snapshot_guard);
 
         if should_snapshot {
@@ -2037,21 +2076,24 @@ impl HnswBackend {
 
         // Check existence first to avoid logging unnecessary WAL entries
         let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
+        let write_gate_guard = self.write_gate.lock();
+        let (internal_id, old_metadata) = {
+            let store = self.doc_store.read();
+            let internal_id = match store.external_to_internal.get(&doc_id) {
+                Some(id) => *id,
+                None => return Ok(false),
+            };
 
-        let mut store = self.doc_store.write();
-        let internal_id = match store.external_to_internal.get(&doc_id) {
-            Some(id) => *id,
-            None => return Ok(false),
+            if store
+                .internal_to_external
+                .get(internal_id)
+                .and_then(|v| *v)
+                .is_none()
+            {
+                return Ok(false);
+            }
+            (internal_id, store.metadata[internal_id].clone())
         };
-
-        if store
-            .internal_to_external
-            .get(internal_id)
-            .and_then(|v| *v)
-            .is_none()
-        {
-            return Ok(false);
-        }
 
         let mut should_snapshot = false;
 
@@ -2106,7 +2148,7 @@ impl HnswBackend {
         }
 
         // Update in-memory state (Soft Delete)
-        let old_metadata = store.metadata[internal_id].clone();
+        let mut store = self.doc_store.write();
         store.internal_to_external[internal_id] = None;
         store.external_to_internal.remove(&doc_id);
         store.metadata[internal_id].clear();
@@ -2115,6 +2157,7 @@ impl HnswBackend {
         let mut meta_index = self.metadata_index.write();
         meta_index.remove_doc(internal_id as u64, &old_metadata);
 
+        drop(write_gate_guard);
         drop(snapshot_guard);
 
         if should_snapshot {
@@ -2135,40 +2178,45 @@ impl HnswBackend {
             anyhow::bail!("Batch delete rejected: WAL is in an inconsistent state.");
         }
 
-        // Acquire write lock for document store
+        // Acquire snapshot read lock (blocks concurrent snapshot writes) and write gate
+        // to serialize WAL + in-memory mutations without holding doc_store write lock
+        // during WAL fsync.
         let snapshot_guard = self.persistence.as_ref().map(|p| p.snapshot_lock.read());
+        let write_gate_guard = self.write_gate.lock();
 
-        let mut store = self.doc_store.write();
         let mut deleted_count = 0;
         let mut wal_entries = Vec::with_capacity(doc_ids.len());
         let mut deletes: Vec<(u64, usize, HashMap<String, String>)> = Vec::new();
         let timestamp = Self::timestamp();
 
         // First pass: identify valid deletes and prepare WAL entries
-        for &doc_id in doc_ids {
-            let internal_id = match store.external_to_internal.get(&doc_id) {
-                Some(id) => *id,
-                None => continue,
-            };
+        {
+            let store = self.doc_store.read();
+            for &doc_id in doc_ids {
+                let internal_id = match store.external_to_internal.get(&doc_id) {
+                    Some(id) => *id,
+                    None => continue,
+                };
 
-            if store
-                .internal_to_external
-                .get(internal_id)
-                .and_then(|v| *v)
-                .is_none()
-            {
-                continue;
+                if store
+                    .internal_to_external
+                    .get(internal_id)
+                    .and_then(|v| *v)
+                    .is_none()
+                {
+                    continue;
+                }
+
+                wal_entries.push(WalEntry {
+                    op: WalOp::Delete,
+                    doc_id,
+                    embedding: Vec::new(),
+                    metadata: HashMap::new(),
+                    seq_no: 0,
+                    timestamp,
+                });
+                deletes.push((doc_id, internal_id, store.metadata[internal_id].clone()));
             }
-
-            wal_entries.push(WalEntry {
-                op: WalOp::Delete,
-                doc_id,
-                embedding: Vec::new(),
-                metadata: HashMap::new(),
-                seq_no: 0,
-                timestamp,
-            });
-            deletes.push((doc_id, internal_id, store.metadata[internal_id].clone()));
         }
 
         if wal_entries.is_empty() {
@@ -2227,6 +2275,7 @@ impl HnswBackend {
         }
 
         let mut removed_meta: Vec<(u64, HashMap<String, String>)> = Vec::new();
+        let mut store = self.doc_store.write();
 
         // Apply changes to memory
         for (doc_id, internal_id, old_meta) in deletes {
@@ -2241,6 +2290,7 @@ impl HnswBackend {
 
         // Release locks before snapshot
         drop(store);
+        drop(write_gate_guard);
 
         if !removed_meta.is_empty() {
             let mut meta_index = self.metadata_index.write();
@@ -3060,6 +3110,10 @@ mod tests {
         // Verify WAL compaction occurred (old WAL segments should be deleted)
         let manifest_path = data_dir.join("MANIFEST");
         let manifest = Manifest::load(&manifest_path).unwrap();
+        assert!(
+            manifest.latest_snapshot_wal_seq.is_some(),
+            "manifest must track latest snapshot WAL sequence"
+        );
 
         // Should only have the active WAL segment remaining after compaction
         // (old WAL segments captured in snapshot are deleted)
@@ -3072,6 +3126,62 @@ mod tests {
         // Verify metadata persisted
         let meta2 = backend.fetch_metadata(2).unwrap();
         assert_eq!(meta2.get("idx").unwrap(), "2");
+    }
+
+    #[test]
+    fn test_create_snapshot_refuses_to_overwrite_newer_manifest_snapshot() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path();
+
+        let backend = HnswBackend::with_persistence(
+            2,
+            DistanceMetric::Cosine,
+            vec![normalize(vec![1.0, 0.0])],
+            vec![HashMap::new()],
+            100,
+            data_dir,
+            FsyncPolicy::Never,
+            100,
+            1024 * 1024,
+        )
+        .unwrap();
+
+        backend
+            .insert(10, normalize(vec![0.0, 1.0]), HashMap::new())
+            .unwrap();
+
+        let manifest_path = data_dir.join("MANIFEST");
+        let mut manifest = Manifest::load(&manifest_path).unwrap();
+        manifest.latest_snapshot = Some("snapshot_newer.snap".to_string());
+        manifest.latest_snapshot_wal_seq = Some(10_000);
+        manifest.save(&manifest_path).unwrap();
+
+        let snapshot_count_before = std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("snapshot_"))
+            .count();
+
+        backend.create_snapshot().unwrap();
+
+        let persisted = Manifest::load(&manifest_path).unwrap();
+        assert_eq!(
+            persisted.latest_snapshot.as_deref(),
+            Some("snapshot_newer.snap")
+        );
+        assert_eq!(persisted.latest_snapshot_wal_seq, Some(10_000));
+
+        let snapshot_count_after = std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("snapshot_"))
+            .count();
+        assert_eq!(
+            snapshot_count_after, snapshot_count_before,
+            "stale snapshot must be removed instead of accumulating orphan files"
+        );
     }
 
     #[test]

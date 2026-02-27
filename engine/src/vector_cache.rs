@@ -6,9 +6,11 @@
 //! Supports both LRU baseline and Hybrid Semantic Cache admission policies.
 
 use parking_lot::RwLock;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+use crate::lru_index::LruIndex;
 
 /// Cached vector with metadata
 #[derive(Clone, Debug)]
@@ -22,27 +24,15 @@ pub struct CachedVector {
 /// Vector cache with LRU eviction
 ///
 /// # Thread Safety
-/// Uses single RwLock protecting both HashMap and VecDeque to prevent TOCTOU races.
-/// Multiple readers can access simultaneously, writes are exclusive.
-///
-/// # Concurrency Design
-/// Previous design used separate locks for cache and LRU queue, which caused race:
-/// - Thread A: reads cache (finds doc_id) → releases lock
-/// - Thread B: evicts doc_id from both cache and queue
-/// - Thread A: acquires LRU lock → tries to update queue for evicted doc_id → queue drift
-///
-/// Current design: Single lock protects both structures atomically.
+/// Uses a single RwLock protecting an insertion-ordered map.
+/// Recency updates are O(1) and atomic with value access.
 ///
 /// # Performance
-/// - Get: O(1) hashmap lookup + O(n) LRU queue update (where n = capacity)
-/// - Insert: O(1) hashmap insert + O(1) LRU queue push
-/// - Eviction: O(1) (evicts oldest when full)
-///
-/// Lock contention: Acceptable for cache sizes <100k entries. For larger caches,
-/// consider sharded locks or lock-free skip list.
+/// - Get miss: O(1) with shared read lock
+/// - Get hit: O(1) recency promotion (upgradable read → write)
+/// - Insert/eviction: O(1)
 pub struct VectorCache {
-    /// Combined cache state: (HashMap, LRU queue)
-    /// Single lock prevents TOCTOU races between cache lookup and LRU update
+    /// Combined cache state: insertion-ordered map (front=oldest, back=newest)
     state: Arc<RwLock<CacheState>>,
 
     /// Maximum capacity
@@ -54,11 +44,8 @@ pub struct VectorCache {
 
 /// Internal cache state protected by single RwLock
 struct CacheState {
-    /// Main cache storage (doc_id → cached vector)
     cache: HashMap<u64, CachedVector>,
-
-    /// LRU queue (front = oldest, back = newest)
-    lru_queue: VecDeque<u64>,
+    lru: LruIndex<u64>,
 }
 
 /// Cache statistics
@@ -81,7 +68,7 @@ impl VectorCache {
         Self {
             state: Arc::new(RwLock::new(CacheState {
                 cache: HashMap::with_capacity(capacity),
-                lru_queue: VecDeque::with_capacity(capacity),
+                lru: LruIndex::with_capacity(capacity),
             })),
             capacity,
             stats: Arc::new(RwLock::new(CacheStats {
@@ -98,30 +85,26 @@ impl VectorCache {
     /// Updates LRU queue on hit (moves to back).
     ///
     /// # Performance
-    /// O(1) hashmap lookup + O(n) LRU queue update (where n = capacity)
-    /// Typically <100ns for small caches (<10k entries)
-    ///
-    /// # Atomicity
-    /// Single lock acquisition ensures no TOCTOU race between cache lookup and LRU update.
+    /// O(1) lookup. Miss path stays on shared read lock; hit path upgrades lock
+    /// to move entry to the back of the LRU order.
     pub fn get(&self, doc_id: u64) -> Option<CachedVector> {
-        let mut state = self.state.write();
-
-        if let Some(cached) = state.cache.get(&doc_id).cloned() {
-            // Cache hit - update LRU queue atomically
-            if let Some(pos) = state.lru_queue.iter().position(|&id| id == doc_id) {
-                state.lru_queue.remove(pos);
-                state.lru_queue.push_back(doc_id);
-            }
-
-            // Update stats (separate lock to reduce contention)
-            self.stats.write().hits += 1;
-
-            Some(cached)
-        } else {
-            // Cache miss
+        let state = self.state.upgradable_read();
+        let Some(cached) = state.cache.get(&doc_id).cloned() else {
             self.stats.write().misses += 1;
-            None
-        }
+            return None;
+        };
+
+        let mut state = parking_lot::RwLockUpgradableReadGuard::upgrade(state);
+        let _ = state.lru.touch(doc_id);
+        self.stats.write().hits += 1;
+        Some(cached)
+    }
+
+    /// Side-effect-free cache probe.
+    ///
+    /// Returns a cloned cached vector without mutating hit/miss counters or LRU order.
+    pub fn peek(&self, doc_id: u64) -> Option<CachedVector> {
+        self.state.read().cache.get(&doc_id).cloned()
     }
 
     /// Insert vector into cache
@@ -130,33 +113,21 @@ impl VectorCache {
     /// Returns the evicted doc_id if an eviction occurred (for feedback tracking).
     ///
     /// # Performance
-    /// O(1) hashmap insert + O(1) LRU queue push
-    ///
-    /// # Atomicity
-    /// Single lock ensures cache and LRU queue remain synchronized.
+    /// O(1) update/insert and O(1) LRU eviction.
     pub fn insert(&self, cached_vector: CachedVector) -> Option<u64> {
         let doc_id = cached_vector.doc_id;
         let mut state = self.state.write();
 
-        // Check if already in cache (update case) - use Entry API to avoid double lookup
-        if let std::collections::hash_map::Entry::Occupied(mut e) = state.cache.entry(doc_id) {
-            e.insert(cached_vector);
-
-            // Update LRU position
-            if let Some(pos) = state.lru_queue.iter().position(|&id| id == doc_id) {
-                state.lru_queue.remove(pos);
-                state.lru_queue.push_back(doc_id);
-            } else {
-                // Defensive: doc_id in cache but not in queue (should never happen with single lock)
-                state.lru_queue.push_back(doc_id);
-            }
-
-            return None; // No eviction on update
+        // Update existing entry and promote to MRU.
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = state.cache.entry(doc_id) {
+            entry.insert(cached_vector);
+            let _ = state.lru.touch(doc_id);
+            return None;
         }
 
         // Evict if at capacity
         let evicted_doc_id = if state.cache.len() >= self.capacity {
-            if let Some(evict_id) = state.lru_queue.pop_front() {
+            if let Some(evict_id) = state.lru.pop_lru() {
                 state.cache.remove(&evict_id);
                 self.stats.write().evictions += 1;
                 Some(evict_id)
@@ -169,15 +140,15 @@ impl VectorCache {
 
         // Insert new entry
         state.cache.insert(doc_id, cached_vector);
-        state.lru_queue.push_back(doc_id);
+        state.lru.insert_new(doc_id);
 
         evicted_doc_id
     }
 
     /// Get cache statistics
     pub fn stats(&self) -> CacheStatsSnapshot {
-        let stats = self.stats.read();
         let state = self.state.read();
+        let stats = self.stats.read();
 
         let total_requests = stats.hits + stats.misses;
         let hit_rate = if total_requests > 0 {
@@ -200,7 +171,7 @@ impl VectorCache {
     pub fn clear(&self) {
         let mut state = self.state.write();
         state.cache.clear();
-        state.lru_queue.clear();
+        state.lru.clear();
 
         let mut stats = self.stats.write();
         stats.hits = 0;
@@ -221,13 +192,12 @@ impl VectorCache {
     /// Remove cached vector by doc_id (if present)
     pub fn remove(&self, doc_id: u64) -> bool {
         let mut state = self.state.write();
-        let removed = state.cache.remove(&doc_id).is_some();
-        if removed {
-            if let Some(pos) = state.lru_queue.iter().position(|&id| id == doc_id) {
-                state.lru_queue.remove(pos);
-            }
+        if state.cache.remove(&doc_id).is_some() {
+            let _ = state.lru.remove(doc_id);
+            true
+        } else {
+            false
         }
-        removed
     }
 
     /// Get maximum capacity
@@ -273,6 +243,21 @@ mod tests {
         assert!(cache.get(1).is_some());
         assert_eq!(cache.stats().hits, 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_peek_has_no_side_effects() {
+        let cache = VectorCache::new(10);
+        cache.insert(create_test_vector(1, 128));
+
+        let before = cache.stats();
+        assert!(cache.peek(1).is_some());
+        assert!(cache.peek(999).is_none());
+        let after = cache.stats();
+
+        assert_eq!(after.hits, before.hits);
+        assert_eq!(after.misses, before.misses);
+        assert_eq!(after.evictions, before.evictions);
     }
 
     #[test]

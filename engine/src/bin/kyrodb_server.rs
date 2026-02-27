@@ -22,6 +22,7 @@
 
 use anyhow::Context;
 use clap::Parser;
+use futures_util::FutureExt;
 use kyrodb_engine::api_validation::{
     validate_insert_request, validate_search_request as validate_api_search_request,
     SearchValidationPlan,
@@ -34,14 +35,17 @@ use kyrodb_engine::{
     },
     config::ObservabilityAuthMode,
     AuthManager, ErrorCategory, FsyncPolicy, HealthStatus, LearnedCachePredictor, Manifest,
-    MetricsCollector, PointQueryTier, RateLimiter, SearchExecutionPath, SloThresholds, TenantInfo,
-    TieredEngine, TieredEngineConfig, UsageTracker,
+    MetricsCollector, PointQueryTier, RateLimiter, SearchExecutionPath, SemanticAdapter,
+    SemanticConfig, SloThresholds, TenantInfo, TieredEngine, TieredEngineConfig, UsageTracker,
 };
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
@@ -58,6 +62,7 @@ use axum::{
     routing::get,
     Router,
 };
+use tower::{Layer, Service};
 use tower_http::trace::TraceLayer;
 
 // Generated protobuf code
@@ -246,6 +251,112 @@ fn refresh_system_metrics(state: &ServerState) {
             state.metrics.set_disk_used(disk_used_bytes);
         }
     }
+}
+
+fn append_hsc_lifecycle_metrics(state: &ServerState, prometheus_text: &mut String) {
+    let Some(stats) = state.engine.hsc_lifecycle_stats() else {
+        return;
+    };
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_predictor_trained Whether the HSC predictor has completed training (0|1)\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_predictor_trained gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_predictor_trained {}\n",
+        u64::from(stats.predictor_trained)
+    ));
+
+    prometheus_text.push_str("# HELP kyrodb_hsc_cache_threshold Current HSC admission threshold\n");
+    prometheus_text.push_str("# TYPE kyrodb_hsc_cache_threshold gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_cache_threshold {:.6}\n",
+        stats.cache_threshold
+    ));
+
+    prometheus_text
+        .push_str("# HELP kyrodb_hsc_tracked_docs Number of docs tracked by the HSC predictor\n");
+    prometheus_text.push_str("# TYPE kyrodb_hsc_tracked_docs gauge\n");
+    prometheus_text.push_str(&format!("kyrodb_hsc_tracked_docs {}\n", stats.tracked_docs));
+
+    prometheus_text
+        .push_str("# HELP kyrodb_hsc_hot_doc_count Current L1a document-cache population\n");
+    prometheus_text.push_str("# TYPE kyrodb_hsc_hot_doc_count gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_hot_doc_count {}\n",
+        stats.hot_doc_count
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_training_skips_total Retraining intervals skipped due to insufficient access events\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_training_skips_total counter\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_training_skips_total {}\n",
+        stats.training_skips
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_access_logger_depth Current queued access events for retraining\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_access_logger_depth gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_access_logger_depth {}\n",
+        stats.access_logger_depth
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_semantic_enabled Whether semantic admission is active (0|1)\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_semantic_enabled gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_semantic_enabled {}\n",
+        u64::from(stats.semantic_enabled)
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_semantic_fast_path_decisions_total Total semantic-adapter fast-path decisions\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_semantic_fast_path_decisions_total counter\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_semantic_fast_path_decisions_total {}\n",
+        stats.semantic_fast_path_decisions
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_semantic_slow_path_decisions_total Total semantic-adapter slow-path decisions\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_semantic_slow_path_decisions_total counter\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_semantic_slow_path_decisions_total {}\n",
+        stats.semantic_slow_path_decisions
+    ));
+
+    prometheus_text
+        .push_str("# HELP kyrodb_hsc_semantic_hits_total Total semantic-adapter similarity hits\n");
+    prometheus_text.push_str("# TYPE kyrodb_hsc_semantic_hits_total counter\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_semantic_hits_total {}\n",
+        stats.semantic_hits
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_semantic_misses_total Total semantic-adapter similarity misses\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_semantic_misses_total counter\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_semantic_misses_total {}\n",
+        stats.semantic_misses
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_semantic_cached_embeddings Current semantic embedding cache size\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_semantic_cached_embeddings gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_semantic_cached_embeddings {}\n",
+        stats.semantic_cached_embeddings
+    ));
 }
 
 // ============================================================================
@@ -460,6 +571,86 @@ struct ServerState {
 /// gRPC service implementation
 struct KyroDBServiceImpl {
     state: Arc<ServerState>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct GrpcPanicContainmentLayer;
+
+#[derive(Clone)]
+struct GrpcPanicContainmentService<S> {
+    inner: S,
+}
+
+impl<S> Layer<S> for GrpcPanicContainmentLayer {
+    type Service = GrpcPanicContainmentService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GrpcPanicContainmentService { inner }
+    }
+}
+
+fn panic_payload_to_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&'static str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn grpc_internal_panic_response(
+    method_path: &str,
+    payload: &(dyn std::any::Any + Send),
+) -> tonic::codegen::http::Response<tonic::body::BoxBody> {
+    let panic_msg = panic_payload_to_message(payload);
+    error!(
+        method = method_path,
+        panic = %panic_msg,
+        "gRPC handler panicked; returning INTERNAL and continuing"
+    );
+    Status::internal("internal server panic").to_http()
+}
+
+impl<S, B> Service<tonic::codegen::http::Request<B>> for GrpcPanicContainmentService<S>
+where
+    S: Service<
+            tonic::codegen::http::Request<B>,
+            Response = tonic::codegen::http::Response<tonic::body::BoxBody>,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = tonic::codegen::http::Response<tonic::body::BoxBody>;
+    type Error = S::Error;
+    type Future = Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>,
+    >;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
+        let method_path = request.uri().path().to_string();
+        let call_result = panic::catch_unwind(AssertUnwindSafe(|| self.inner.call(request)));
+
+        Box::pin(async move {
+            let inner_future = match call_result {
+                Ok(future) => future,
+                Err(payload) => {
+                    return Ok(grpc_internal_panic_response(&method_path, payload.as_ref()))
+                }
+            };
+
+            match AssertUnwindSafe(inner_future).catch_unwind().await {
+                Ok(response) => response,
+                Err(payload) => Ok(grpc_internal_panic_response(&method_path, payload.as_ref())),
+            }
+        })
+    }
 }
 
 type SearchPlan = SearchValidationPlan;
@@ -852,6 +1043,7 @@ impl KyroDBServiceImpl {
     ) -> SearchResponse {
         let total_found = results.len() as u32;
         let mut final_results = Vec::with_capacity(req.k as usize);
+        let mut served_global_doc_ids = Vec::with_capacity(req.k as usize);
         let mut candidates = results.into_iter();
 
         let has_namespace = !req.namespace.is_empty();
@@ -874,15 +1066,9 @@ impl KyroDBServiceImpl {
                 continue;
             }
 
-            let fetched_doc = if needs_metadata || req.include_embeddings {
-                engine.get_document_with_metadata(candidate.doc_id)
-            } else {
-                None
-            };
-
             let metadata = if needs_metadata {
-                let metadata = match fetched_doc.as_ref() {
-                    Some((_, metadata)) => metadata.clone(),
+                let metadata = match engine.get_metadata(candidate.doc_id) {
+                    Some(metadata) => metadata,
                     None => continue,
                 };
 
@@ -915,8 +1101,8 @@ impl KyroDBServiceImpl {
             };
 
             let embedding = if req.include_embeddings {
-                fetched_doc
-                    .map(|(embedding, _)| embedding)
+                engine
+                    .get_embedding_cache_aware(candidate.doc_id)
                     .unwrap_or_default()
             } else {
                 vec![]
@@ -927,12 +1113,23 @@ impl KyroDBServiceImpl {
                 continue;
             }
 
+            served_global_doc_ids.push(candidate.doc_id);
             final_results.push(kyrodb::SearchResult {
                 doc_id: local_doc_id,
                 score,
                 embedding,
                 metadata,
             });
+        }
+
+        let access_log_limit = self
+            .state
+            .app_config
+            .cache
+            .search_access_log_top_n
+            .min(served_global_doc_ids.len());
+        if access_log_limit > 0 {
+            let _ = engine.log_served_search_accesses(&served_global_doc_ids[..access_log_limit]);
         }
 
         let latency_ms = latency_ns as f64 / 1_000_000.0;
@@ -2741,7 +2938,8 @@ async fn wal_health_snapshot(state: &Arc<ServerState>) -> (bool, u64) {
 async fn metrics_handler(AxumState(state): AxumState<Arc<ServerState>>) -> HttpResponse<Body> {
     let _ = wal_health_snapshot(&state).await;
     refresh_system_metrics(&state);
-    let prometheus_text = state.metrics.export_prometheus();
+    let mut prometheus_text = state.metrics.export_prometheus();
+    append_hsc_lifecycle_metrics(&state, &mut prometheus_text);
 
     let mut resp = HttpResponse::new(Body::from(prometheus_text));
     *resp.status_mut() = StatusCode::OK;
@@ -3281,14 +3479,7 @@ async fn main() -> anyhow::Result<()> {
         data_dir: Some(config.persistence.data_dir.to_string_lossy().to_string()),
         fsync_policy,
         snapshot_interval: config.snapshot_interval_mutations(),
-        recovery_mode: match config.persistence.recovery_mode {
-            kyrodb_engine::config::RecoveryMode::Strict => {
-                kyrodb_engine::hnsw_backend::RecoveryMode::Strict
-            }
-            kyrodb_engine::config::RecoveryMode::BestEffort => {
-                kyrodb_engine::hnsw_backend::RecoveryMode::BestEffort
-            }
-        },
+        recovery_mode: config.persistence.recovery_mode,
         max_wal_size_bytes: config.persistence.max_wal_size_bytes,
         flush_interval: config.wal_flush_interval(),
         cache_timeout_ms: config.timeouts.cache_ms,
@@ -3302,6 +3493,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize or recover engine
     info!("Initializing TieredEngine with configured cache strategy...");
+    let benchmark_mode = config
+        .environment
+        .environment_type
+        .eq_ignore_ascii_case("benchmark");
 
     // Helper to create cache strategy (L1a) and expose learned strategy for training.
     let create_cache_strategy = || {
@@ -3325,42 +3520,71 @@ async fn main() -> anyhow::Result<()> {
         learned_predictor.set_auto_tune(config.cache.auto_tune_threshold);
         learned_predictor.set_target_utilization(config.cache.target_utilization);
 
-        // NOTE: L1b query cache handles semantic search‑result reuse.
-        let learned_strategy = Arc::new(LearnedCacheStrategy::new(
+        // L1a is always HSC (learned + semantic) for non-benchmark environments.
+        let semantic_adapter = SemanticAdapter::with_config(SemanticConfig {
+            high_confidence_threshold: config.cache.semantic.high_confidence_threshold,
+            low_confidence_threshold: config.cache.semantic.low_confidence_threshold,
+            semantic_similarity_threshold: config.cache.semantic.semantic_similarity_threshold,
+            max_cached_embeddings: config.cache.semantic.max_cached_embeddings,
+            similarity_scan_limit: config.cache.semantic.similarity_scan_limit,
+        });
+        let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
             config.cache.capacity,
             learned_predictor,
+            semantic_adapter,
         ));
 
-        let (strategy_box, learned_for_training): (
+        let (strategy_box, learned_for_training, effective_strategy): (
             Box<dyn kyrodb_engine::CacheStrategy>,
             Option<Arc<LearnedCacheStrategy>>,
-        ) = match config.cache.strategy {
-            kyrodb_engine::config::CacheStrategy::Lru => {
-                (Box::new(LruCacheStrategy::new(config.cache.capacity)), None)
+            &'static str,
+        ) = if benchmark_mode {
+            match config.cache.strategy {
+                kyrodb_engine::config::CacheStrategy::Lru => (
+                    Box::new(LruCacheStrategy::new(config.cache.capacity)),
+                    None,
+                    "lru",
+                ),
+                kyrodb_engine::config::CacheStrategy::Learned => (
+                    Box::new(SharedLearnedCacheStrategy::new(learned_strategy.clone())),
+                    Some(learned_strategy.clone()),
+                    "hsc_learned_semantic",
+                ),
+                kyrodb_engine::config::CacheStrategy::AbTest => (
+                    Box::new(AbTestSplitter::new(
+                        lru_strategy.clone(),
+                        learned_strategy.clone(),
+                    )),
+                    Some(learned_strategy.clone()),
+                    "abtest_lru_vs_hsc",
+                ),
             }
-            kyrodb_engine::config::CacheStrategy::Learned => (
+        } else {
+            (
                 Box::new(SharedLearnedCacheStrategy::new(learned_strategy.clone())),
                 Some(learned_strategy.clone()),
-            ),
-            kyrodb_engine::config::CacheStrategy::AbTest => (
-                Box::new(AbTestSplitter::new(
-                    lru_strategy.clone(),
-                    learned_strategy.clone(),
-                )),
-                Some(learned_strategy.clone()),
-            ),
+                "hsc_learned_semantic_enforced",
+            )
         };
 
         Ok::<
             (
                 Box<dyn kyrodb_engine::CacheStrategy>,
                 Option<Arc<LearnedCacheStrategy>>,
+                &'static str,
             ),
             anyhow::Error,
-        >((strategy_box, learned_for_training))
+        >((strategy_box, learned_for_training, effective_strategy))
     };
 
-    let (cache_strategy, mut learned_strategy_for_training) = create_cache_strategy()?;
+    let (cache_strategy, mut learned_strategy_for_training, effective_cache_strategy) =
+        create_cache_strategy()?;
+    info!(
+        configured_cache_strategy = ?config.cache.strategy,
+        effective_cache_strategy,
+        benchmark_mode,
+        "Resolved runtime cache strategy"
+    );
 
     // Create query cache (L1b) - semantic search‑result cache
     let query_cache = Arc::new(kyrodb_engine::QueryHashCache::new(
@@ -3432,8 +3656,11 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                let (fallback_cache_strategy, fallback_learned_strategy_for_training) =
-                    create_cache_strategy()?;
+                let (
+                    fallback_cache_strategy,
+                    fallback_learned_strategy_for_training,
+                    _fallback_effective_cache_strategy,
+                ) = create_cache_strategy()?;
                 learned_strategy_for_training = fallback_learned_strategy_for_training;
                 let query_cache_fallback = Arc::new(kyrodb_engine::QueryHashCache::new(
                     config.cache.query_cache_capacity,
@@ -3937,6 +4164,7 @@ async fn main() -> anyhow::Result<()> {
     let max_concurrent_streams = u32::try_from(config.server.max_connections).unwrap_or(u32::MAX);
     let connection_timeout = config.connection_timeout();
     let mut grpc_builder = Server::builder()
+        .layer(GrpcPanicContainmentLayer)
         .concurrency_limit_per_connection(config.server.max_connections)
         .max_concurrent_streams(Some(max_concurrent_streams))
         .tcp_keepalive(Some(connection_timeout));
@@ -3991,11 +4219,11 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_wal_health_overrides, classify_search_error_message, observability_auth_middleware,
-        usage_handler, BatchSearchKey, DeleteRequest, HealthStatus, InsertRequest,
-        KyroDBServiceImpl, KyroDbService, QueryRequest, SearchErrorKind, SearchRequest,
-        ServerState, SnapshotRequest, TenantContext, TieredEngine, TieredEngineConfig,
-        MAX_EMBEDDING_DIM, MAX_KNN_K, MIN_DOC_ID,
+        append_hsc_lifecycle_metrics, apply_wal_health_overrides, classify_search_error_message,
+        observability_auth_middleware, usage_handler, BatchSearchKey, DeleteRequest,
+        GrpcPanicContainmentLayer, HealthStatus, InsertRequest, KyroDBServiceImpl, KyroDbService,
+        QueryRequest, SearchErrorKind, SearchRequest, ServerState, SnapshotRequest, TenantContext,
+        TieredEngine, TieredEngineConfig, MAX_EMBEDDING_DIM, MAX_KNN_K, MIN_DOC_ID,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -4005,17 +4233,20 @@ mod tests {
         Router,
     };
     use kyrodb_engine::{
+        access_logger::AccessPatternLogger,
         cache_strategy::LruCacheStrategy,
         config::{KyroDbConfig, ObservabilityAuthMode},
-        AuthManager, MetricsCollector, QueryHashCache, RateLimiter, TenantInfo, UsageTracker,
+        AuthManager, LearnedCachePredictor, LearnedCacheStrategy, MetricsCollector, QueryHashCache,
+        RateLimiter, SemanticAdapter, TenantInfo, UsageTracker,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
+    use std::convert::Infallible;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use tonic::{Code, Request};
-    use tower::ServiceExt;
+    use tower::{service_fn, Layer, Service, ServiceExt};
 
     const TEST_OBS_API_KEY: &str = "kyro_tenant_obs_0123456789abcdef0123456789abcdef";
     const TEST_OBS_OTHER_API_KEY: &str = "kyro_tenant_other_0123456789abcdef0123456789abcdef";
@@ -4541,6 +4772,38 @@ mod tests {
         assert_eq!(err.code(), Code::Unauthenticated);
     }
 
+    #[tokio::test]
+    async fn search_include_embeddings_hydrates_vectors() {
+        let service = build_test_service_with_seed_data();
+        let request = Request::new(SearchRequest {
+            query_embedding: vec![0.1; 16],
+            k: 5,
+            ef_search: 128,
+            include_embeddings: true,
+            filter: None,
+            metadata_filters: HashMap::new(),
+            namespace: String::new(),
+            min_score: 0.0,
+        });
+
+        let response = service
+            .search(request)
+            .await
+            .expect("search should succeed")
+            .into_inner();
+        assert!(
+            !response.results.is_empty(),
+            "search should return at least one result"
+        );
+        for result in &response.results {
+            assert_eq!(
+                result.embedding.len(),
+                16,
+                "include_embeddings=true must return hydrated embeddings"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bulk_batch_groups_do_not_starve_writers() {
         let service = build_test_service_with_seed_data();
@@ -4920,6 +5183,60 @@ mod tests {
         assert_eq!(tenants[0]["tenant_id"], "tenant_obs");
     }
 
+    #[test]
+    fn hsc_lifecycle_metrics_are_emitted_for_learned_strategy() {
+        let predictor = LearnedCachePredictor::new(256).expect("predictor");
+        let strategy =
+            LearnedCacheStrategy::new_with_semantic(64, predictor, SemanticAdapter::new());
+        strategy.record_training_skip();
+        let mut engine = TieredEngine::new(
+            Box::new(strategy),
+            Arc::new(QueryHashCache::new(64, 0.90)),
+            vec![vec![1.0; 16]],
+            vec![HashMap::new()],
+            TieredEngineConfig {
+                embedding_dimension: 16,
+                hnsw_max_elements: 128,
+                data_dir: None,
+                ..TieredEngineConfig::default()
+            },
+        )
+        .expect("engine");
+
+        let logger = Arc::new(parking_lot::RwLock::new(AccessPatternLogger::new(64)));
+        logger.write().log_doc_accesses(&[11, 12, 13]);
+        engine.set_access_logger(logger);
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
+        let state = ServerState {
+            engine: Arc::new(engine),
+            start_time: Instant::now(),
+            app_config: KyroDbConfig::default(),
+            engine_config: TieredEngineConfig {
+                embedding_dimension: 16,
+                hnsw_max_elements: 128,
+                data_dir: None,
+                ..TieredEngineConfig::default()
+            },
+            shutdown_tx,
+            metrics: MetricsCollector::new(),
+            auth: None,
+            rate_limiter: None,
+            tenant_id_mapper: None,
+            tenant_vector_counts: None,
+            tenant_quota_locks: None,
+            usage_tracker: None,
+            is_benchmark_mode: false,
+        };
+
+        let mut output = String::new();
+        append_hsc_lifecycle_metrics(&state, &mut output);
+        assert!(output.contains("kyrodb_hsc_predictor_trained"));
+        assert!(output.contains("kyrodb_hsc_access_logger_depth 3"));
+        assert!(output.contains("kyrodb_hsc_semantic_enabled 1"));
+        assert!(output.contains("kyrodb_hsc_training_skips_total 1"));
+    }
+
     #[tokio::test]
     async fn usage_endpoint_is_scoped_to_calling_tenant() {
         let state = build_observability_test_state(true, ObservabilityAuthMode::All);
@@ -5099,5 +5416,72 @@ mod tests {
             res.documents_snapshotted >= 1,
             "snapshot should include seeded documents"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_panic_containment_layer_converts_future_panics_to_internal() {
+        let service = GrpcPanicContainmentLayer.layer(service_fn(
+            |_req: tonic::codegen::http::Request<()>| async move {
+                panic!("simulated handler panic");
+                #[allow(unreachable_code)]
+                Ok::<tonic::codegen::http::Response<tonic::body::BoxBody>, Infallible>(
+                    tonic::Status::ok("ok").to_http(),
+                )
+            },
+        ));
+
+        let response = service
+            .oneshot(
+                tonic::codegen::http::Request::builder()
+                    .uri("/kyrodb.KyroDbService/Search")
+                    .body(())
+                    .expect("request"),
+            )
+            .await
+            .expect("panic should be converted into grpc INTERNAL response");
+
+        let status = tonic::Status::from_header_map(response.headers())
+            .expect("panic response must include grpc-status");
+        assert_eq!(status.code(), Code::Internal);
+    }
+
+    #[derive(Clone)]
+    struct PanicOnCallService;
+
+    impl<B> Service<tonic::codegen::http::Request<B>> for PanicOnCallService {
+        type Response = tonic::codegen::http::Response<tonic::body::BoxBody>;
+        type Error = Infallible;
+        type Future = std::future::Ready<
+            Result<tonic::codegen::http::Response<tonic::body::BoxBody>, Infallible>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: tonic::codegen::http::Request<B>) -> Self::Future {
+            panic!("panic before future construction");
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_panic_containment_layer_converts_call_panics_to_internal() {
+        let service = GrpcPanicContainmentLayer.layer(PanicOnCallService);
+        let response = service
+            .oneshot(
+                tonic::codegen::http::Request::builder()
+                    .uri("/kyrodb.KyroDbService/Insert")
+                    .body(())
+                    .expect("request"),
+            )
+            .await
+            .expect("call panic should be converted into grpc INTERNAL response");
+
+        let status = tonic::Status::from_header_map(response.headers())
+            .expect("panic response must include grpc-status");
+        assert_eq!(status.code(), Code::Internal);
     }
 }

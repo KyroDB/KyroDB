@@ -7,10 +7,10 @@
 //! - Durability guarantees with different fsync policies
 
 use kyrodb_engine::{
-    hnsw_backend::RecoveryMode, metrics::MetricsCollector, DistanceMetric, FsyncPolicy,
-    HnswBackend, Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter,
+    config::RecoveryMode, metrics::MetricsCollector, DistanceMetric, FsyncPolicy, HnswBackend,
+    Manifest, Snapshot, WalEntry, WalOp, WalReader, WalWriter,
 };
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap, fs, io::Write};
 use tempfile::TempDir;
 
 fn normalize(mut v: Vec<f32>) -> Vec<f32> {
@@ -262,6 +262,7 @@ fn test_recovery_skips_legacy_wal_before_snapshot() {
     let manifest = Manifest {
         version: 1,
         latest_snapshot: Some(snapshot_name.to_string()),
+        latest_snapshot_wal_seq: Some(snapshot.last_wal_seq),
         wal_segments: vec![wal_name.to_string()],
         last_updated: snapshot_ts,
     };
@@ -531,5 +532,86 @@ fn test_best_effort_recovery_allows_snapshot_corrupt_and_missing_wal() {
         recovered.len(),
         0,
         "best_effort recovery should come up empty when all persisted evidence is missing/corrupt"
+    );
+}
+
+#[test]
+fn test_strict_recovery_fails_on_checksum_valid_deserialize_corruption() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path();
+
+    let wal_name = "wal_corrupt_payload.wal";
+    let wal_path = data_dir.join(wal_name);
+    let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Never).unwrap();
+    writer
+        .append(&WalEntry {
+            op: WalOp::Insert,
+            doc_id: 1,
+            embedding: normalize(vec![1.0, 0.0]),
+            metadata: HashMap::new(),
+            seq_no: 1,
+            timestamp: 10,
+        })
+        .unwrap();
+    drop(writer);
+
+    // Append checksum-valid frame with payload that is not a valid WalEntry encoding.
+    let payload = [0xAA, 0xBB, 0xCC];
+    let checksum = crc32fast::hash(&payload).to_le_bytes();
+    let mut file = fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+    file.write_all(&(payload.len() as u32).to_le_bytes())
+        .unwrap();
+    file.write_all(&payload).unwrap();
+    file.write_all(&checksum).unwrap();
+    file.flush().unwrap();
+
+    let manifest = Manifest {
+        version: 1,
+        latest_snapshot: None,
+        latest_snapshot_wal_seq: None,
+        wal_segments: vec![wal_name.to_string()],
+        last_updated: 1,
+    };
+    manifest.save(data_dir.join("MANIFEST")).unwrap();
+
+    let strict_metrics = MetricsCollector::new();
+    let strict = HnswBackend::recover_with_hnsw_params_and_mode(
+        2,
+        DistanceMetric::Cosine,
+        data_dir,
+        100,
+        FsyncPolicy::Never,
+        1000,
+        1024 * 1024,
+        strict_metrics,
+        16,
+        200,
+        false,
+        RecoveryMode::Strict,
+    );
+    assert!(
+        strict.is_err(),
+        "strict recovery must fail closed on checksum-valid WAL deserialize corruption"
+    );
+
+    let best_effort_metrics = MetricsCollector::new();
+    let best_effort = HnswBackend::recover_with_hnsw_params_and_mode(
+        2,
+        DistanceMetric::Cosine,
+        data_dir,
+        100,
+        FsyncPolicy::Never,
+        1000,
+        1024 * 1024,
+        best_effort_metrics,
+        16,
+        200,
+        false,
+        RecoveryMode::BestEffort,
+    )
+    .expect("best_effort should continue by skipping corrupted WAL frames");
+    assert!(
+        best_effort.fetch_document(1).is_some(),
+        "best_effort replay should preserve valid entries despite later corruption"
     );
 }

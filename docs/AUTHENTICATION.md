@@ -64,6 +64,11 @@ Accepted auth headers:
 - `x-api-key: <key>`
 - `authorization: Bearer <key>`
 
+Auth verification guarantees:
+
+- API key equality checks use constant-time comparison
+- API key validation/mismatch errors redact secret material in surfaced messages
+
 ### Observability Auth Rules
 
 `server.observability_auth` controls `/metrics`, `/health`, `/ready`, `/slo`:
@@ -77,6 +82,7 @@ Accepted auth headers:
 ### Tenant Isolation and Quotas
 
 - `max_vectors` is enforced on write path (`RESOURCE_EXHAUSTED` on overflow)
+- tenant identifiers are ASCII-only (`[A-Za-z0-9_]`)
 - tenant-local `doc_id` must fit `u32`
 - out-of-range tenant-local IDs return `INVALID_ARGUMENT` (`DOC_ID_OUT_OF_RANGE`)
 - reserved metadata keys are server-owned and overwritten if client-provided

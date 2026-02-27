@@ -32,6 +32,9 @@ pub fn validate_search_request(req: &SearchRequest) -> Result<SearchValidationPl
             MAX_EMBEDDING_DIM
         ));
     }
+    if req.query_embedding.iter().any(|v| !v.is_finite()) {
+        return Err("query_embedding must contain only finite values (no NaN/Inf)".to_string());
+    }
     if req.k == 0 {
         return Err("k must be greater than 0".to_string());
     }
@@ -86,6 +89,9 @@ pub fn validate_insert_request(req: &InsertRequest) -> Result<(), String> {
             req.embedding.len(),
             MAX_EMBEDDING_DIM
         ));
+    }
+    if req.embedding.iter().any(|v| !v.is_finite()) {
+        return Err("embedding must contain only finite values (no NaN/Inf)".to_string());
     }
     Ok(())
 }
@@ -148,6 +154,18 @@ mod tests {
     }
 
     #[test]
+    fn search_validation_rejects_non_finite_values() {
+        let mut req = baseline_search_request();
+        req.query_embedding[3] = f32::NAN;
+        let err = validate_search_request(&req).expect_err("NaN must be rejected");
+        assert!(err.contains("finite values"));
+
+        req.query_embedding[3] = f32::INFINITY;
+        let err = validate_search_request(&req).expect_err("Inf must be rejected");
+        assert!(err.contains("finite values"));
+    }
+
+    #[test]
     fn insert_validation_contract() {
         let valid = InsertRequest {
             doc_id: MIN_DOC_ID,
@@ -164,5 +182,12 @@ mod tests {
         let mut bad_embedding = valid.clone();
         bad_embedding.embedding.clear();
         assert!(validate_insert_request(&bad_embedding).is_err());
+
+        let mut non_finite = valid;
+        non_finite.embedding[0] = f32::NEG_INFINITY;
+        assert!(
+            validate_insert_request(&non_finite).is_err(),
+            "non-finite embedding values must be rejected"
+        );
     }
 }

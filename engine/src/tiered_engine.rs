@@ -28,12 +28,11 @@
 //!        → Background flush reconciles remaining hot-only state (if any)
 //! ```
 
-use crate::config::DistanceMetric;
-use crate::hnsw_backend::RecoveryMode;
+use crate::config::{DistanceMetric, RecoveryMode};
 use crate::proto::MetadataFilter;
 use crate::{
-    AccessPatternLogger, CacheStrategy, CachedVector, CircuitBreaker, FsyncPolicy, HnswBackend,
-    HotTier, QueryHashCache, SearchResult,
+    AccessPatternLogger, CacheLifecycleStats, CacheStrategy, CachedVector, CircuitBreaker,
+    FsyncPolicy, HnswBackend, HotTier, QueryHashCache, SearchResult,
 };
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
@@ -44,7 +43,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::time::interval;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 /// Tiered engine statistics (Two-Level Cache Architecture)
 ///
@@ -244,7 +243,7 @@ struct TieredEngineComponents {
 /// Tiered Engine - Two-level cache vector database
 pub struct TieredEngine {
     /// Layer 1a: Document Cache (Learned frequency-based, hot documents)
-    cache_strategy: Arc<RwLock<Box<dyn CacheStrategy>>>,
+    cache_strategy: Arc<dyn CacheStrategy>,
 
     /// Layer 1b: Query Cache (Semantic similarity-based, paraphrased queries)
     query_cache: Arc<QueryHashCache>,
@@ -332,6 +331,9 @@ impl TieredEngine {
             )?)
         };
 
+        // Distinct semaphores intentionally protect different scopes:
+        // - query_semaphore: bounds total in-flight user queries
+        // - search_worker_semaphore: bounds blocking worker tasks that can outlive request timeouts
         let query_semaphore = Arc::new(Semaphore::new(config.max_concurrent_queries));
         let search_worker_semaphore = Arc::new(Semaphore::new(config.max_concurrent_queries));
 
@@ -363,7 +365,7 @@ impl TieredEngine {
         let components = Self::build_internal(initial_embeddings, initial_metadata, &config)?;
 
         Ok(Self {
-            cache_strategy: Arc::new(RwLock::new(cache_strategy)),
+            cache_strategy: Arc::from(cache_strategy),
             query_cache,
             hot_tier: components.hot_tier,
             cold_tier: components.cold_tier,
@@ -385,13 +387,13 @@ impl TieredEngine {
     /// to the engine's query path.
     ///
     /// # Parameters
-    /// - `cache_strategy`: Shared cache strategy wrapped in Arc<RwLock<>>
+    /// - `cache_strategy`: Shared cache strategy handle
     /// - `query_cache`: Layer 1b query cache
     /// - `initial_embeddings`: Initial documents to load into cold tier
     /// - `initial_metadata`: Metadata for initial documents
     /// - `config`: Configuration for all tiers
     pub fn new_with_shared_strategy(
-        cache_strategy: Arc<RwLock<Box<dyn CacheStrategy>>>,
+        cache_strategy: Arc<dyn CacheStrategy>,
         query_cache: Arc<QueryHashCache>,
         initial_embeddings: Vec<Vec<f32>>,
         initial_metadata: Vec<std::collections::HashMap<String, String>>,
@@ -456,7 +458,7 @@ impl TieredEngine {
             Arc::new(Semaphore::new(recovered_config.max_concurrent_queries));
 
         Ok(Self {
-            cache_strategy: Arc::new(RwLock::new(cache_strategy)),
+            cache_strategy: Arc::from(cache_strategy),
             query_cache,
             hot_tier,
             cold_tier,
@@ -474,6 +476,23 @@ impl TieredEngine {
     /// Set access logger (for cache training)
     pub fn set_access_logger(&mut self, logger: Arc<RwLock<AccessPatternLogger>>) {
         self.access_logger = Some(logger);
+    }
+
+    #[inline]
+    fn log_point_access(&self, doc_id: u64) {
+        if let Some(ref logger) = self.access_logger {
+            logger.write().log_doc_access(doc_id);
+        }
+    }
+
+    /// Log served search results for predictor training.
+    ///
+    /// Uses batched logging to avoid one lock acquisition per document.
+    pub fn log_served_search_accesses(&self, doc_ids: &[u64]) -> usize {
+        if let Some(ref logger) = self.access_logger {
+            return logger.write().log_doc_accesses(doc_ids);
+        }
+        0
     }
 
     #[inline]
@@ -496,13 +515,8 @@ impl TieredEngine {
     /// 5. Log access for training
     ///
     /// # Lock Ordering Discipline
-    /// **Lock Ordering**: Always acquire locks in this order to prevent deadlocks:
-    /// 1. cache_strategy (read/write)
-    /// 2. stats (write)
-    /// 3. access_logger (write)
-    ///
-    /// Never hold multiple locks simultaneously. Always drop locks before
-    /// calling methods that may acquire other locks.
+    /// `CacheStrategy` implementations provide their own internal synchronization.
+    /// TieredEngine should not hold stats/access-logger locks across strategy calls.
     ///
     /// # Returns
     /// - `Some(embedding)` if document found in any tier
@@ -516,7 +530,7 @@ impl TieredEngine {
     pub fn query_with_source(
         &self,
         doc_id: u64,
-        query_embedding: Option<&[f32]>,
+        _query_embedding: Option<&[f32]>,
     ) -> Option<(Vec<f32>, PointQueryTier)> {
         // Increment total queries (isolated lock)
         {
@@ -526,12 +540,7 @@ impl TieredEngine {
 
         // Layer 1: Check cache with circuit breaker protection
         if !self.cache_circuit_breaker.is_open() {
-            let cached_result = {
-                let cache = self.cache_strategy.read();
-                cache.get_cached(doc_id)
-            }; // cache_strategy lock released
-
-            if let Some(cached) = cached_result {
+            if let Some(cached) = self.cache_strategy.get_cached(doc_id) {
                 // Cache hit - record success
                 self.cache_circuit_breaker.record_success();
 
@@ -541,12 +550,7 @@ impl TieredEngine {
                     stats.cache_hits += 1;
                 } // stats lock released
 
-                // Log access (no other locks held)
-                if let Some(ref logger) = self.access_logger {
-                    if let Some(query_emb) = query_embedding {
-                        logger.write().log_access(doc_id, query_emb);
-                    }
-                } // logger lock released
+                self.log_point_access(doc_id);
 
                 return Some((cached.embedding, PointQueryTier::Cache));
             }
@@ -581,10 +585,7 @@ impl TieredEngine {
                 } // Lock released
 
                 // Cache admission decision for L1a (isolated)
-                let should_cache_decision = {
-                    let cache = self.cache_strategy.write();
-                    cache.should_cache(doc_id, &embedding)
-                }; // cache_strategy lock released
+                let should_cache_decision = self.cache_strategy.should_cache(doc_id, &embedding);
 
                 if should_cache_decision {
                     let cached = CachedVector {
@@ -593,16 +594,10 @@ impl TieredEngine {
                         distance: 0.0,
                         cached_at: Instant::now(),
                     };
-                    // Insert into L1a document cache (isolated)
-                    self.cache_strategy.write().insert_cached(cached);
-                } // cache_strategy lock released
+                    self.cache_strategy.insert_cached(cached);
+                }
 
-                // Log access (no other locks held)
-                if let Some(ref logger) = self.access_logger {
-                    if let Some(query_emb) = query_embedding {
-                        logger.write().log_access(doc_id, query_emb);
-                    }
-                } // logger lock released
+                self.log_point_access(doc_id);
 
                 return Some((embedding, PointQueryTier::HotTier));
             }
@@ -637,10 +632,7 @@ impl TieredEngine {
                 } // Lock released
 
                 // Cache admission decision for L1a (isolated)
-                let should_cache_decision = {
-                    let cache = self.cache_strategy.write();
-                    cache.should_cache(doc_id, &embedding)
-                }; // cache_strategy lock released
+                let should_cache_decision = self.cache_strategy.should_cache(doc_id, &embedding);
 
                 if should_cache_decision {
                     let cached = CachedVector {
@@ -649,16 +641,10 @@ impl TieredEngine {
                         distance: 0.0,
                         cached_at: Instant::now(),
                     };
-                    // Insert into L1a document cache (isolated)
-                    self.cache_strategy.write().insert_cached(cached);
-                } // cache_strategy lock released
+                    self.cache_strategy.insert_cached(cached);
+                }
 
-                // Log access (no other locks held)
-                if let Some(ref logger) = self.access_logger {
-                    if let Some(query_emb) = query_embedding {
-                        logger.write().log_access(doc_id, query_emb);
-                    }
-                } // logger lock released
+                self.log_point_access(doc_id);
 
                 return Some((embedding, PointQueryTier::ColdTier));
             }
@@ -703,6 +689,20 @@ impl TieredEngine {
         }
 
         None
+    }
+
+    /// Get embedding by ID with L1a cache participation (no metrics side effects).
+    ///
+    /// Used for response hydration paths where we want cache acceleration without
+    /// mutating point-query counters/training state.
+    pub fn get_embedding_cache_aware(&self, doc_id: u64) -> Option<Vec<f32>> {
+        if let Some(cached) = self.cache_strategy.peek_cached(doc_id) {
+            return Some(cached.embedding);
+        }
+        if let Some(embedding) = self.hot_tier.get(doc_id) {
+            return Some(embedding);
+        }
+        self.cold_tier.fetch_document(doc_id)
     }
 
     /// Get document metadata by ID
@@ -777,7 +777,7 @@ impl TieredEngine {
         let cold_deleted = self.cold_tier.delete(doc_id)?;
 
         // Invalidate document cache entries (L1a)
-        self.cache_strategy.write().invalidate(doc_id);
+        self.cache_strategy.invalidate(doc_id);
 
         // Remove any cached queries referencing this document (best effort)
         let removed_queries = self.query_cache.invalidate_doc(doc_id);
@@ -881,11 +881,8 @@ impl TieredEngine {
         self.cold_tier.batch_delete(&unique_doc_ids)?;
 
         // Invalidate caches
-        {
-            let cache = self.cache_strategy.write();
-            for &id in &unique_doc_ids {
-                cache.invalidate(id);
-            }
+        for &id in &unique_doc_ids {
+            self.cache_strategy.invalidate(id);
         }
 
         // Query cache invalidation
@@ -1443,7 +1440,7 @@ impl TieredEngine {
 
         // Load shedding: Try to acquire semaphore permit
         // Keep permit alive for the full search scope.
-        let permit = match self.query_semaphore.try_acquire() {
+        let query_permit = match self.query_semaphore.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
                 // Queue saturated - reject query
@@ -1464,7 +1461,7 @@ impl TieredEngine {
         let normalized_query = match normalize_query_for_search(self.config.hnsw_distance, query) {
             Ok(query) => query,
             Err(e) => {
-                drop(permit);
+                drop(query_permit);
                 self.refresh_queue_depth_metric();
                 return Err(e);
             }
@@ -1480,7 +1477,7 @@ impl TieredEngine {
                     stats.query_cache_hits += 1;
                     stats.total_queries += 1;
                 }
-                drop(permit);
+                drop(query_permit);
                 self.refresh_queue_depth_metric();
                 return Ok((cached, SearchExecutionPath::CacheHit));
             } else {
@@ -1577,7 +1574,7 @@ impl TieredEngine {
         if cold_tier_has_docs && self.cold_tier_circuit_breaker.is_closed() {
             cold_accessed = true;
             let worker_permit = match self.search_worker_semaphore.clone().try_acquire_owned() {
-                Ok(permit) => permit,
+                Ok(worker_permit) => worker_permit,
                 Err(_) => {
                     if hot_results.is_empty() {
                         {
@@ -1585,7 +1582,7 @@ impl TieredEngine {
                             stats.queries_rejected += 1;
                             stats.worker_saturation_count += 1;
                         }
-                        drop(permit);
+                        drop(query_permit);
                         self.refresh_queue_depth_metric();
                         return Err(anyhow!(
                             "Search worker queue saturated: {} active workers (max: {})",
@@ -1613,7 +1610,7 @@ impl TieredEngine {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     partial_results.truncate(k);
-                    drop(permit);
+                    drop(query_permit);
                     self.refresh_queue_depth_metric();
                     return Ok((partial_results, SearchExecutionPath::HotTierOnly));
                 }
@@ -1732,7 +1729,7 @@ impl TieredEngine {
             SearchExecutionPath::Degraded
         };
 
-        drop(permit);
+        drop(query_permit);
         self.refresh_queue_depth_metric();
         Ok((results, path))
     }
@@ -1790,7 +1787,7 @@ impl TieredEngine {
         }
 
         // Upsert semantics: invalidate point-lookup cache so readers won't observe stale embeddings.
-        self.cache_strategy.write().invalidate(doc_id);
+        self.cache_strategy.invalidate(doc_id);
 
         let mut embedding = embedding;
         normalize_in_place_if_needed(self.config.hnsw_distance, &mut embedding)?;
@@ -1799,18 +1796,19 @@ impl TieredEngine {
         self.cold_tier
             .insert(doc_id, embedding.clone(), metadata.clone())?;
 
+        let removed_by_doc = self.query_cache.invalidate_doc(doc_id);
+        let removed_by_insert = self
+            .query_cache
+            .invalidate_for_insert(&embedding, self.config.hnsw_distance);
+        trace!(
+            doc_id,
+            removed_by_doc,
+            removed_by_insert,
+            "invalidated query cache entries affected by insert"
+        );
+
         // Keep recent writes in hot tier to accelerate mixed hot/cold search merges.
         self.hot_tier.insert(doc_id, embedding, metadata);
-
-        // L1b caches top-k search results. On a cache hit the search path returns
-        // immediately WITHOUT checking the hot tier, so any insert makes cached
-        // results potentially stale (the new vector may be closer to a cached query
-        // than its current top-k). We must clear the entire query cache here because
-        // we cannot know which cached queries are affected without re-running distance
-        // computations against all cached query vectors (too expensive for the write
-        // path). For deletes, targeted invalidate_doc() suffices because only queries
-        // whose result sets contain the deleted doc_id are affected.
-        self.query_cache.clear();
 
         let mut stats = self.stats.write();
         stats.total_inserts += 1;
@@ -2003,11 +2001,8 @@ impl TieredEngine {
     }
 
     fn invalidate_caches_after_bulk_load(&self, doc_ids: &[u64]) {
-        {
-            let cache = self.cache_strategy.write();
-            for doc_id in doc_ids {
-                cache.invalidate(*doc_id);
-            }
+        for doc_id in doc_ids {
+            self.cache_strategy.invalidate(*doc_id);
         }
 
         // L1b caches search results, so bulk loads can change k-NN results even if
@@ -2203,7 +2198,14 @@ impl TieredEngine {
 
     /// Current number of entries in L1a cache.
     pub fn cache_size(&self) -> usize {
-        self.cache_strategy.read().size()
+        self.cache_strategy.size()
+    }
+
+    /// Snapshot HSC lifecycle state for observability endpoints.
+    pub fn hsc_lifecycle_stats(&self) -> Option<CacheLifecycleStats> {
+        let mut stats = self.cache_strategy.lifecycle_stats()?;
+        stats.access_logger_depth = self.access_logger.as_ref().map_or(0, |l| l.read().len());
+        Some(stats)
     }
 
     /// Get cold tier reference (for direct access if needed)
@@ -2277,7 +2279,11 @@ fn normalize_query_for_search<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AccessPatternLogger;
+    use crate::LearnedCachePredictor;
+    use crate::LearnedCacheStrategy;
     use crate::LruCacheStrategy;
+    use crate::SemanticAdapter;
     use tempfile::TempDir;
 
     #[test]
@@ -2366,6 +2372,130 @@ mod tests {
         let stats = engine.stats();
         assert_eq!(stats.hot_tier_hits, 1);
         assert_eq!(stats.hot_tier_size, 1);
+    }
+
+    #[test]
+    fn test_point_query_logs_access_without_query_embedding() {
+        let cache = LruCacheStrategy::new(32);
+        let query_cache = Arc::new(QueryHashCache::new(32, 0.85));
+        let initial_embeddings = vec![vec![1.0, 0.0]];
+        let initial_metadata = vec![std::collections::HashMap::new()];
+        let config = TieredEngineConfig {
+            embedding_dimension: 2,
+            hnsw_max_elements: 16,
+            data_dir: None,
+            ..Default::default()
+        };
+
+        let mut engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            initial_embeddings,
+            initial_metadata,
+            config,
+        )
+        .unwrap();
+
+        let logger = Arc::new(RwLock::new(AccessPatternLogger::new(64)));
+        engine.set_access_logger(logger.clone());
+
+        let result = engine.query(0, None);
+        assert!(result.is_some(), "point query should return seeded doc");
+
+        let events = logger
+            .read()
+            .get_recent_window(std::time::Duration::from_secs(60));
+        assert_eq!(
+            events.len(),
+            1,
+            "point query should emit a training access event without query embedding"
+        );
+        assert_eq!(events[0].doc_id, 0);
+    }
+
+    #[test]
+    fn test_search_access_logging_is_batched() {
+        let cache = LruCacheStrategy::new(32);
+        let query_cache = Arc::new(QueryHashCache::new(32, 0.85));
+        let config = TieredEngineConfig {
+            embedding_dimension: 2,
+            hnsw_max_elements: 16,
+            data_dir: None,
+            ..Default::default()
+        };
+
+        let mut engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            config,
+        )
+        .unwrap();
+
+        let logger = Arc::new(RwLock::new(AccessPatternLogger::new(64)));
+        engine.set_access_logger(logger.clone());
+
+        let logged = engine.log_served_search_accesses(&[10, 11, 12, 13]);
+        assert_eq!(logged, 4);
+        assert_eq!(logger.read().stats().total_accesses, 4);
+    }
+
+    #[test]
+    fn test_hsc_lifecycle_stats_reports_semantic_and_logger_depth() {
+        let predictor = LearnedCachePredictor::new(256).unwrap();
+        let strategy =
+            LearnedCacheStrategy::new_with_semantic(64, predictor, SemanticAdapter::new());
+        let query_cache = Arc::new(QueryHashCache::new(64, 0.85));
+        let config = TieredEngineConfig {
+            embedding_dimension: 2,
+            hnsw_max_elements: 32,
+            data_dir: None,
+            ..Default::default()
+        };
+
+        let mut engine = TieredEngine::new(
+            Box::new(strategy),
+            query_cache,
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            config,
+        )
+        .unwrap();
+
+        let logger = Arc::new(RwLock::new(AccessPatternLogger::new(64)));
+        engine.set_access_logger(logger);
+        let logged = engine.log_served_search_accesses(&[7, 8, 9, 10]);
+        assert_eq!(logged, 4);
+
+        let lifecycle = engine
+            .hsc_lifecycle_stats()
+            .expect("learned strategy should expose lifecycle stats");
+        assert!(lifecycle.semantic_enabled);
+        assert_eq!(lifecycle.access_logger_depth, 4);
+        assert_eq!(lifecycle.hot_doc_count, 0);
+    }
+
+    #[test]
+    fn test_hsc_lifecycle_stats_absent_for_lru_strategy() {
+        let engine = TieredEngine::new(
+            Box::new(LruCacheStrategy::new(64)),
+            Arc::new(QueryHashCache::new(64, 0.85)),
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                embedding_dimension: 2,
+                hnsw_max_elements: 32,
+                data_dir: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            engine.hsc_lifecycle_stats().is_none(),
+            "non-HSC strategies should not emit HSC lifecycle snapshots"
+        );
     }
 
     #[test]

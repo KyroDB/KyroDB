@@ -1380,7 +1380,7 @@ async fn main() -> Result<()> {
         data_dir: None, // No persistence for validation
         fsync_policy: kyrodb_engine::FsyncPolicy::Never,
         snapshot_interval: 10000,
-        recovery_mode: kyrodb_engine::hnsw_backend::RecoveryMode::Strict,
+        recovery_mode: kyrodb_engine::config::RecoveryMode::Strict,
         max_wal_size_bytes: 0,
         flush_interval: Duration::from_secs(60),
         cache_timeout_ms: 10,

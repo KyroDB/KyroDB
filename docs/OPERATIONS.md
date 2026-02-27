@@ -69,6 +69,14 @@ Check:
 - `kyrodb_hnsw_latency_ns`
 - `kyrodb_cache_hit_rate`
 
+### Sudden INTERNAL gRPC errors with panic logs
+
+Check:
+
+- server logs for `gRPC handler panicked; returning INTERNAL and continuing`
+- request payload quality (non-finite embeddings are rejected)
+- recent deploy changes for panic-triggering handler paths
+
 ### WAL breaker open
 
 Check:

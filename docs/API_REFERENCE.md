@@ -27,6 +27,7 @@ curl -H "x-api-key: <ADMIN_API_KEY>" "https://127.0.0.1:51051/usage?scope=all"
 ```
 
 Security Note: In production, always use HTTPS/TLS when transmitting API keys to prevent credential interception.
+Local default configs run without TLS; for local-only testing use `http://127.0.0.1:51051/...`.
 
 ## Key Contracts
 
@@ -46,7 +47,9 @@ RPC groups:
 
 - `InsertRequest.doc_id >= 1`
 - `InsertRequest.embedding` non-empty and `<= 4096` dimensions
+- `InsertRequest.embedding` values must be finite (`NaN`/`Inf` rejected)
 - `SearchRequest.query_embedding` non-empty and `<= 4096` dimensions
+- `SearchRequest.query_embedding` values must be finite (`NaN`/`Inf` rejected)
 - `SearchRequest.k` in `1..=1000`
 - `SearchRequest.ef_search <= 10000` (`0` means server default)
 
@@ -54,6 +57,12 @@ Tenant-mode doc ID mapping:
 
 - tenant-local doc IDs must fit `u32`
 - overflow returns `INVALID_ARGUMENT` with `DOC_ID_OUT_OF_RANGE`
+
+### Failure Containment
+
+- unexpected panic during gRPC handler execution is contained at the transport layer
+- affected RPC returns `INTERNAL` (`internal server panic`)
+- server process remains running for subsequent requests
 
 ### HTTP Endpoint Behavior
 

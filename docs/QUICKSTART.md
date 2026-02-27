@@ -37,7 +37,21 @@ curl http://127.0.0.1:51051/ready
 curl http://127.0.0.1:51051/slo
 curl http://127.0.0.1:51051/metrics
 
+# Seed one successful write (gRPC) so data-dir is recoverable
+command -v grpcurl >/dev/null || { echo "grpcurl is required for the write smoke-check"; exit 1; }
+# If auth.enabled=true, add: -H "x-api-key: <API_KEY>"
+grpcurl -plaintext \
+  -d '{"doc_id":"1","embedding":[0.10,0.20,0.30],"metadata":{"source":"quickstart"}}' \
+  127.0.0.1:50051 kyrodb.v1.KyroDBService/Insert
+# Success check: expect `found: true`
+grpcurl -plaintext \
+  -d '{"doc_id":"1","include_embedding":false}' \
+  127.0.0.1:50051 kyrodb.v1.KyroDBService/Query
+
 # Backup smoke flow
+# Note: backup create requires a recoverable state (manifest/snapshot/WAL).
+# On a brand-new empty data dir with zero writes, create can fail-closed.
+# Run at least one successful write workload before backup drills.
 ./target/release/kyrodb_backup --data-dir ./data --backup-dir ./backups create --description "quickstart-full"
 ./target/release/kyrodb_backup --data-dir ./data --backup-dir ./backups list --format json
 ./target/release/kyrodb_backup --data-dir ./data --backup-dir ./backups verify <BACKUP_ID>

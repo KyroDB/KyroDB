@@ -52,6 +52,48 @@ fn search_cache_invalidated_on_insert() {
 }
 
 #[test]
+fn search_cache_retained_when_insert_cannot_change_top_k() {
+    let config = TieredEngineConfig {
+        embedding_dimension: 2,
+        ..Default::default()
+    };
+
+    let doc1 = normalize(vec![1.0, 0.0]); // perfect match
+    let embeddings = vec![doc1];
+    let metadata = vec![HashMap::new()];
+
+    let cache_strategy = Box::new(LruCacheStrategy::new(16));
+    let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+
+    let engine = TieredEngine::new(cache_strategy, query_cache, embeddings, metadata, config)
+        .expect("engine init");
+
+    let query = normalize(vec![1.0, 0.0]);
+
+    let first = engine.knn_search(&query, 1).expect("search 1");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].doc_id, 0);
+
+    let before_hits = engine.stats().query_cache_hits;
+
+    // Insert far away vector; top-1 should remain unchanged, so query-cache entry can stay valid.
+    engine
+        .insert(2, normalize(vec![0.0, 1.0]), HashMap::new())
+        .expect("insert");
+
+    let second = engine.knn_search(&query, 1).expect("search 2");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].doc_id, 0);
+
+    let after_hits = engine.stats().query_cache_hits;
+    assert_eq!(
+        after_hits,
+        before_hits + 1,
+        "second search should hit query cache when insert cannot affect top-k"
+    );
+}
+
+#[test]
 fn hnsw_capacity_reclaimed_via_tombstone_compaction() {
     let embeddings = vec![normalize(vec![1.0, 0.0]), normalize(vec![0.0, 1.0])];
     let metadata = vec![HashMap::new(); embeddings.len()];

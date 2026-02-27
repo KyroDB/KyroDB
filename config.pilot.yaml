@@ -50,10 +50,17 @@ cache:
   predictor_capacity_multiplier: 4
   query_cache_capacity: 100
   query_cache_similarity_threshold: 0.52 # Deliberately recall-oriented for pilot; raise toward 0.70-0.80 if semantic false matches appear.
+  search_access_log_top_n: 16
   min_training_samples: 100
   admission_threshold: 0.15
   auto_tune_threshold: true
   target_utilization: 0.85
+  semantic:
+    high_confidence_threshold: 0.60
+    low_confidence_threshold: 0.25
+    semantic_similarity_threshold: 0.80
+    max_cached_embeddings: 100000
+    similarity_scan_limit: 2000
 
 hnsw:
   max_elements: 100000

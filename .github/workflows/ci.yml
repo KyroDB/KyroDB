@@ -37,6 +37,8 @@ jobs:
 
       - name: Full test suite
         run: cargo test --all
+        env:
+          KYRODB_ENABLE_NET_TESTS: "1"
 
   cli-and-loom:
     name: CLI + Loom

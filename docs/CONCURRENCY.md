@@ -33,6 +33,7 @@ ab -n 10000 -c 50 http://127.0.0.1:4030/health
 - keep lock scopes minimal
 - avoid unreviewed nested lock chains
 - treat starvation risk as correctness risk
+- search path uses separate semaphores for request concurrency and blocking-worker concurrency; saturation is handled as explicit backpressure/rejection
 
 Debug behavior:
 

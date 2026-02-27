@@ -47,9 +47,20 @@ export KYRODB__HNSW__DIMENSION=768
 - `rate_limit`
 - `cache`
 - `hnsw`
-- `persistence`
+- `persistence` (WAL/snapshot + `recovery_mode`)
 - `timeouts`
 - `environment`
+
+### Cache/HSC Contract
+
+- Outside `benchmark` mode, `cache.strategy` must be `learned` (HSC fail-closed).
+- L1a semantic admission tuning lives under `cache.semantic`:
+  - `high_confidence_threshold`
+  - `low_confidence_threshold`
+  - `semantic_similarity_threshold`
+  - `max_cached_embeddings`
+  - `similarity_scan_limit`
+- Search-result training ingestion is bounded per request by `cache.search_access_log_top_n`.
 
 ### Startup Guardrails
 
@@ -60,6 +71,12 @@ Examples:
 - non-loopback production gRPC bind with `auth.enabled=false` is rejected
 - non-loopback observability bind with `server.observability_auth=disabled` is rejected
 - pilot mode requires stronger auth/rate-limit protections
+- `persistence.recovery_mode=best_effort` is rejected unless `[environment] type = "benchmark"`
+
+Recovery mode contract:
+
+- `strict` (default): startup fails closed if manifest/snapshot/WAL evidence is incomplete/corrupted
+- `best_effort`: degraded startup mode for benchmark workflows only
 
 ### `/usage` Independence
 

@@ -174,6 +174,21 @@ struct EvictionStats {
     last_evicted: SystemTime,
 }
 
+/// Runtime backlog of feedback signals waiting to influence future training cycles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedbackBacklog {
+    pub false_positive_docs: usize,
+    pub false_negative_docs: usize,
+    pub miss_streak_docs: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct FeedbackSnapshot {
+    false_positives: HashMap<u64, EvictionStats>,
+    false_negatives: HashMap<u64, u32>,
+    miss_counters: HashMap<u64, MissStats>,
+}
+
 impl LearnedCachePredictor {
     /// Create new Hybrid Semantic Cache predictor
     ///
@@ -430,6 +445,63 @@ impl LearnedCachePredictor {
     pub fn tracked_count(&self) -> usize {
         let map = self.hotness_map.read();
         map.len()
+    }
+
+    /// Return current feedback backlog sizes for observability/debugging.
+    pub fn feedback_backlog(&self) -> FeedbackBacklog {
+        FeedbackBacklog {
+            false_positive_docs: self.false_positives.read().len(),
+            false_negative_docs: self.false_negatives.read().len(),
+            miss_streak_docs: self.miss_counters.read().len(),
+        }
+    }
+
+    pub(crate) fn snapshot_feedback(&self) -> FeedbackSnapshot {
+        FeedbackSnapshot {
+            false_positives: self.false_positives.read().clone(),
+            false_negatives: self.false_negatives.read().clone(),
+            miss_counters: self.miss_counters.read().clone(),
+        }
+    }
+
+    pub(crate) fn merge_feedback_snapshot(&mut self, snapshot: FeedbackSnapshot) {
+        if snapshot.false_positives.is_empty()
+            && snapshot.false_negatives.is_empty()
+            && snapshot.miss_counters.is_empty()
+        {
+            return;
+        }
+
+        {
+            let mut fps = self.false_positives.write();
+            for (doc_id, incoming) in snapshot.false_positives {
+                fps.entry(doc_id)
+                    .and_modify(|entry| {
+                        entry.count = entry.count.saturating_add(incoming.count);
+                        if incoming.last_evicted > entry.last_evicted {
+                            entry.last_evicted = incoming.last_evicted;
+                        }
+                    })
+                    .or_insert(incoming);
+            }
+        }
+
+        {
+            let mut fns = self.false_negatives.write();
+            for (doc_id, incoming) in snapshot.false_negatives {
+                let entry = fns.entry(doc_id).or_insert(0);
+                *entry = entry.saturating_add(incoming);
+            }
+        }
+
+        {
+            let mut misses = self.miss_counters.write();
+            for (doc_id, incoming) in snapshot.miss_counters {
+                let entry = misses.entry(doc_id).or_default();
+                entry.total = entry.total.saturating_add(incoming.total);
+                entry.consecutive = entry.consecutive.max(incoming.consecutive);
+            }
+        }
     }
 
     /// Get statistics for monitoring

@@ -83,6 +83,7 @@ pub async fn spawn_training_task(
 
                     // Skip training if insufficient data
                     if events.len() < config.min_events_for_training {
+                        learned_strategy.record_training_skip();
                         continue;
                     }
 
@@ -312,6 +313,7 @@ impl TrainingTaskSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_strategy::CacheStrategy;
     use std::time::SystemTime;
     use tokio::time::{sleep, timeout};
 
@@ -400,6 +402,13 @@ mod tests {
         sleep(Duration::from_millis(500)).await;
 
         // Task should run but skip training (no panic, no error)
+        let lifecycle = strategy
+            .lifecycle_stats()
+            .expect("learned strategy lifecycle stats");
+        assert!(
+            lifecycle.training_skips > 0,
+            "insufficient-data cycles should increment training_skips"
+        );
 
         handle.abort();
     }

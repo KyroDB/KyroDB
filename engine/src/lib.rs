@@ -77,6 +77,7 @@ pub mod learned_predictor_core;
 
 // Cache prediction: Hybrid frequency + semantic similarity
 pub mod learned_cache;
+pub(crate) mod lru_index;
 
 // Access logging: Ring buffer for training data collection
 pub mod access_logger;
@@ -156,7 +157,7 @@ pub use access_logger::{hash_embedding, AccessLoggerStats, AccessPatternLogger};
 // A/B testing components
 pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
 pub use cache_strategy::{
-    AbTestSplitter, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy,
+    AbTestSplitter, CacheLifecycleStats, CacheStrategy, LearnedCacheStrategy, LruCacheStrategy,
     SharedLearnedCacheStrategy,
 };
 pub use query_hash_cache::{CachedQueryResult, QueryCacheStats, QueryHashCache};

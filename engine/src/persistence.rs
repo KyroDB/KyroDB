@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Cursor, ErrorKind, Read, Write};
+use std::io::{BufReader, BufWriter, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,6 +29,8 @@ use crate::metrics::MetricsCollector;
 
 /// WAL magic number (identifies valid WAL files)
 const WAL_MAGIC: u32 = 0x57414C00; // "WAL\0"
+/// Upper bound for a single serialized WAL entry to avoid OOM on corrupted sizes.
+const MAX_WAL_ENTRY_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
 /// Snapshot magic number
 const SNAPSHOT_MAGIC: u32 = 0x534E4150; // "SNAP"
@@ -47,7 +49,7 @@ fn unix_timestamp_secs_now() -> u64 {
     }
 }
 
-fn sync_parent_dir(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -109,7 +111,7 @@ pub enum FsyncPolicy {
 
 /// WAL writer: append-only log with checksums
 pub struct WalWriter {
-    file: BufWriter<File>,
+    file: File,
     path: PathBuf,
     fsync_policy: FsyncPolicy,
     last_fsync: Instant,
@@ -134,22 +136,21 @@ impl WalWriter {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .context("Failed to create WAL file")?;
 
-        let mut writer = BufWriter::new(file);
-
         // Write magic header
-        writer.write_all(&WAL_MAGIC.to_le_bytes())?;
-        writer.flush()?;
+        file.write_all(&WAL_MAGIC.to_le_bytes())?;
+        file.flush()?;
         // Ensure the file header is durable before we ever reference this WAL in the MANIFEST.
-        writer.get_ref().sync_data()?;
+        file.sync_data()?;
 
         Ok(Self {
-            file: writer,
+            file,
             path,
             fsync_policy,
             last_fsync: Instant::now(),
@@ -168,7 +169,15 @@ impl WalWriter {
                 let handler = Arc::clone(error_handler);
                 // Clone entry to avoid borrowing issues
                 let entry_clone = entry.clone();
-                handler.write_with_retry(|| self.append_internal(&entry_clone))
+                let stable_offset = self.bytes_written;
+                let stable_entry_count = self.entry_count;
+                handler.write_with_retry(|| {
+                    self.append_internal_with_rollback(
+                        &entry_clone,
+                        stable_offset,
+                        stable_entry_count,
+                    )
+                })
             }
             None => {
                 // Direct write without error handling
@@ -183,21 +192,76 @@ impl WalWriter {
         self.perform_fsync()
     }
 
+    fn append_internal_with_rollback(
+        &mut self,
+        entry: &WalEntry,
+        stable_offset: u64,
+        stable_entry_count: usize,
+    ) -> Result<()> {
+        match self.append_internal(entry) {
+            Ok(()) => Ok(()),
+            Err(write_err) => {
+                let write_err_msg = write_err.to_string();
+                self.rollback_to_stable_state(stable_offset, stable_entry_count)
+                    .with_context(|| {
+                        format!(
+                            "WAL write failed ({}); rollback to offset {} failed",
+                            write_err_msg, stable_offset
+                        )
+                    })?;
+                Err(write_err)
+            }
+        }
+    }
+
     fn write_entry(&mut self, entry: &WalEntry) -> Result<()> {
         // Serialize entry
         let entry_bytes = bincode::serialize(entry).context("Failed to serialize WAL entry")?;
+        anyhow::ensure!(
+            entry_bytes.len() <= MAX_WAL_ENTRY_BYTES,
+            "WAL entry too large: {} bytes (max {})",
+            entry_bytes.len(),
+            MAX_WAL_ENTRY_BYTES
+        );
 
         // Calculate checksum (CRC32)
         let checksum = crc32fast::hash(&entry_bytes);
 
         // Write: [entry_size (4 bytes) | entry_data | checksum (4 bytes)]
-        let entry_size = entry_bytes.len() as u32;
-        self.file.write_all(&entry_size.to_le_bytes())?;
-        self.file.write_all(&entry_bytes)?;
-        self.file.write_all(&checksum.to_le_bytes())?;
+        let entry_size =
+            u32::try_from(entry_bytes.len()).context("WAL entry size exceeds u32 header limit")?;
+        let mut frame = Vec::with_capacity(4 + entry_bytes.len() + 4);
+        frame.extend_from_slice(&entry_size.to_le_bytes());
+        frame.extend_from_slice(&entry_bytes);
+        frame.extend_from_slice(&checksum.to_le_bytes());
+        self.file.write_all(&frame)?;
 
         self.entry_count += 1;
-        self.bytes_written += 4 + entry_bytes.len() as u64 + 4;
+        self.bytes_written += frame.len() as u64;
+        Ok(())
+    }
+
+    fn rollback_to_offset(&mut self, offset: u64) -> Result<()> {
+        self.file
+            .set_len(offset)
+            .with_context(|| format!("Failed truncating WAL to {} bytes", offset))?;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .with_context(|| format!("Failed seeking WAL to {} after truncate", offset))?;
+        self.file
+            .sync_data()
+            .context("Failed to fsync WAL after rollback truncate")?;
+        Ok(())
+    }
+
+    fn rollback_to_stable_state(
+        &mut self,
+        stable_offset: u64,
+        stable_entry_count: usize,
+    ) -> Result<()> {
+        self.rollback_to_offset(stable_offset)?;
+        self.bytes_written = stable_offset;
+        self.entry_count = stable_entry_count;
         Ok(())
     }
 
@@ -211,13 +275,13 @@ impl WalWriter {
         // - Never: rely on OS buffering (data loss on crash)
         match self.fsync_policy {
             FsyncPolicy::Always => {
-                self.file.get_ref().sync_all()?;
+                self.file.sync_all()?;
             }
             FsyncPolicy::Periodic(interval_ms) => {
                 if interval_ms == 0
                     || self.last_fsync.elapsed() >= Duration::from_millis(interval_ms)
                 {
-                    self.file.get_ref().sync_data()?;
+                    self.file.sync_data()?;
                     self.last_fsync = Instant::now();
                 }
             }
@@ -235,9 +299,39 @@ impl WalWriter {
             Some(error_handler) => {
                 let handler = Arc::clone(error_handler);
                 let entries_clone = entries.to_vec();
-                handler.write_with_retry(|| self.append_batch_internal(&entries_clone))
+                let stable_offset = self.bytes_written;
+                let stable_entry_count = self.entry_count;
+                handler.write_with_retry(|| {
+                    self.append_batch_internal_with_rollback(
+                        &entries_clone,
+                        stable_offset,
+                        stable_entry_count,
+                    )
+                })
             }
             None => self.append_batch_internal(entries),
+        }
+    }
+
+    fn append_batch_internal_with_rollback(
+        &mut self,
+        entries: &[WalEntry],
+        stable_offset: u64,
+        stable_entry_count: usize,
+    ) -> Result<()> {
+        match self.append_batch_internal(entries) {
+            Ok(()) => Ok(()),
+            Err(write_err) => {
+                let write_err_msg = write_err.to_string();
+                self.rollback_to_stable_state(stable_offset, stable_entry_count)
+                    .with_context(|| {
+                        format!(
+                            "WAL batch write failed ({}); rollback to offset {} failed",
+                            write_err_msg, stable_offset
+                        )
+                    })?;
+                Err(write_err)
+            }
         }
     }
 
@@ -252,7 +346,7 @@ impl WalWriter {
     #[instrument(level = "trace", skip(self))]
     pub fn sync(&mut self) -> Result<()> {
         self.file.flush()?;
-        self.file.get_ref().sync_all()?;
+        self.file.sync_all()?;
         Ok(())
     }
 
@@ -278,7 +372,6 @@ impl WalWriter {
         // Clone file descriptor for background sync
         let file = self
             .file
-            .get_ref()
             .try_clone()
             .context("Failed to clone file descriptor for async sync")?;
 
@@ -550,18 +643,31 @@ impl WalReader {
             }
 
             let entry_size = u32::from_le_bytes(size_bytes) as usize;
+            if entry_size == 0 || entry_size > MAX_WAL_ENTRY_BYTES {
+                self.corrupted_entries += 1;
+                warn!(
+                    entry_size,
+                    max_entry_size = MAX_WAL_ENTRY_BYTES,
+                    "invalid WAL entry size; stopping replay at corrupted tail"
+                );
+                break;
+            }
 
             // Read entry data
             let mut entry_bytes = vec![0u8; entry_size];
-            self.file
-                .read_exact(&mut entry_bytes)
-                .context("Failed to read WAL entry data")?;
+            match self.file.read_exact(&mut entry_bytes) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e).context("Failed to read WAL entry data"),
+            }
 
             // Read checksum
             let mut checksum_bytes = [0u8; 4];
-            self.file
-                .read_exact(&mut checksum_bytes)
-                .context("Failed to read WAL checksum")?;
+            match self.file.read_exact(&mut checksum_bytes) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e).context("Failed to read WAL checksum"),
+            }
 
             let stored_checksum = u32::from_le_bytes(checksum_bytes);
             let computed_checksum = crc32fast::hash(&entry_bytes);
@@ -577,13 +683,34 @@ impl WalReader {
             }
 
             // Deserialize entry
-            let entry: WalEntry =
-                bincode::deserialize(&entry_bytes).context("Failed to deserialize WAL entry")?;
+            let entry: WalEntry = match bincode::deserialize(&entry_bytes) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    self.corrupted_entries += 1;
+                    warn!(error = %e, "failed to deserialize WAL entry; skipping");
+                    continue;
+                }
+            };
 
             entries.push(entry);
             self.valid_entries += 1;
         }
 
+        Ok(entries)
+    }
+
+    /// Read all entries and fail if any corrupted frames are observed.
+    ///
+    /// Use this for strict recovery paths where acknowledged writes must never
+    /// be silently dropped.
+    pub fn read_all_strict(&mut self) -> Result<Vec<WalEntry>> {
+        let entries = self.read_all()?;
+        if self.corrupted_entries > 0 {
+            bail!(
+                "WAL contains {} corrupted entries under strict replay",
+                self.corrupted_entries
+            );
+        }
         Ok(entries)
     }
 
@@ -931,6 +1058,7 @@ impl Snapshot {
 pub struct Manifest {
     pub version: u32,
     pub latest_snapshot: Option<String>,
+    pub latest_snapshot_wal_seq: Option<u64>,
     pub wal_segments: Vec<String>,
     pub last_updated: u64,
 }
@@ -948,6 +1076,7 @@ impl Manifest {
         Self {
             version: 1,
             latest_snapshot: None,
+            latest_snapshot_wal_seq: None,
             wal_segments: Vec::new(),
             last_updated: timestamp,
         }
@@ -1006,6 +1135,17 @@ mod tests {
     use std::io::Seek;
     use tempfile::TempDir;
 
+    fn test_wal_entry(doc_id: u64, seq_no: u64) -> WalEntry {
+        WalEntry {
+            op: WalOp::Insert,
+            doc_id,
+            embedding: vec![0.1, 0.2, 0.3],
+            timestamp: 1_000 + seq_no,
+            metadata: HashMap::new(),
+            seq_no,
+        }
+    }
+
     #[test]
     fn test_wal_write_read() {
         let dir = TempDir::new().unwrap();
@@ -1014,15 +1154,7 @@ mod tests {
         // Write entries
         let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Always).unwrap();
 
-        let entry1 = WalEntry {
-            op: WalOp::Insert,
-            doc_id: 42,
-            embedding: vec![0.1, 0.2, 0.3],
-            timestamp: 1000,
-            metadata: HashMap::new(),
-            seq_no: 1,
-        };
-
+        let entry1 = test_wal_entry(42, 1);
         let entry2 = WalEntry {
             op: WalOp::Delete,
             doc_id: 99,
@@ -1046,6 +1178,141 @@ mod tests {
         assert_eq!(entries[1].doc_id, 99);
         assert_eq!(reader.valid_entries(), 2);
         assert_eq!(reader.corrupted_entries(), 0);
+    }
+
+    #[test]
+    fn test_wal_reader_tolerates_truncated_tail_payload() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("truncated_payload.wal");
+
+        let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Never).unwrap();
+        let entry1 = test_wal_entry(1, 1);
+        let entry2 = test_wal_entry(2, 2);
+        writer.append(&entry1).unwrap();
+        drop(writer);
+
+        let entry2_bytes = bincode::serialize(&entry2).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&(entry2_bytes.len() as u32).to_le_bytes())
+            .unwrap();
+        let partial_len = entry2_bytes.len() / 2;
+        file.write_all(&entry2_bytes[..partial_len]).unwrap();
+        file.flush().unwrap();
+
+        let mut reader = WalReader::open(&wal_path).unwrap();
+        let entries = reader.read_all().unwrap();
+        assert_eq!(entries.len(), 1, "truncated tail payload must be ignored");
+        assert_eq!(entries[0].doc_id, entry1.doc_id);
+    }
+
+    #[test]
+    fn test_wal_reader_tolerates_truncated_tail_checksum() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("truncated_checksum.wal");
+
+        let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Never).unwrap();
+        let entry1 = test_wal_entry(10, 1);
+        let entry2 = test_wal_entry(20, 2);
+        writer.append(&entry1).unwrap();
+        drop(writer);
+
+        let entry2_bytes = bincode::serialize(&entry2).unwrap();
+        let checksum = crc32fast::hash(&entry2_bytes).to_le_bytes();
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&(entry2_bytes.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&entry2_bytes).unwrap();
+        file.write_all(&checksum[..2]).unwrap(); // truncated checksum tail
+        file.flush().unwrap();
+
+        let mut reader = WalReader::open(&wal_path).unwrap();
+        let entries = reader.read_all().unwrap();
+        assert_eq!(entries.len(), 1, "truncated checksum tail must be ignored");
+        assert_eq!(entries[0].doc_id, entry1.doc_id);
+    }
+
+    #[test]
+    fn test_wal_rollback_to_offset_removes_partial_bytes() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("rollback_partial.wal");
+
+        let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Never).unwrap();
+        writer.append(&test_wal_entry(1, 1)).unwrap();
+        let stable_offset = writer.bytes_written();
+
+        // Simulate a partial frame that was appended before a retry.
+        writer.file.write_all(&[0xAA, 0xBB, 0xCC]).unwrap();
+        writer.file.flush().unwrap();
+        writer.rollback_to_offset(stable_offset).unwrap();
+        writer.append(&test_wal_entry(2, 2)).unwrap();
+        drop(writer);
+
+        let mut reader = WalReader::open(&wal_path).unwrap();
+        let entries = reader.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].doc_id, 1);
+        assert_eq!(entries[1].doc_id, 2);
+    }
+
+    #[test]
+    fn test_rollback_to_stable_state_restores_writer_counters() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("rollback_state.wal");
+
+        let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Never).unwrap();
+        writer.append(&test_wal_entry(1, 1)).unwrap();
+
+        let stable_offset = writer.bytes_written;
+        let stable_entry_count = writer.entry_count;
+
+        writer.write_entry(&test_wal_entry(2, 2)).unwrap();
+        assert!(
+            writer.bytes_written > stable_offset,
+            "write_entry should advance bytes_written"
+        );
+        assert!(
+            writer.entry_count > stable_entry_count,
+            "write_entry should advance entry_count"
+        );
+
+        writer
+            .rollback_to_stable_state(stable_offset, stable_entry_count)
+            .unwrap();
+        assert_eq!(writer.bytes_written, stable_offset);
+        assert_eq!(writer.entry_count, stable_entry_count);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), stable_offset);
+    }
+
+    #[test]
+    fn test_wal_reader_strict_rejects_deserialize_corruption() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("deserialize_corrupt.wal");
+
+        let mut writer = WalWriter::create(&wal_path, FsyncPolicy::Never).unwrap();
+        writer.append(&test_wal_entry(1, 1)).unwrap();
+        drop(writer);
+
+        // Append a checksum-valid frame that cannot deserialize as WalEntry.
+        let payload = [0xAA, 0xBB, 0xCC];
+        let checksum = crc32fast::hash(&payload).to_le_bytes();
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&payload).unwrap();
+        file.write_all(&checksum).unwrap();
+        file.flush().unwrap();
+
+        let mut tolerant_reader = WalReader::open(&wal_path).unwrap();
+        let tolerant_entries = tolerant_reader.read_all().unwrap();
+        assert_eq!(tolerant_entries.len(), 1);
+        assert_eq!(tolerant_reader.corrupted_entries(), 1);
+
+        let mut strict_reader = WalReader::open(&wal_path).unwrap();
+        let err = strict_reader.read_all_strict().unwrap_err().to_string();
+        assert!(
+            err.contains("corrupted entries"),
+            "strict replay must fail when deserialize corruption is observed: {err}"
+        );
     }
 
     #[test]

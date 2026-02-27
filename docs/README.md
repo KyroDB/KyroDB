@@ -44,3 +44,5 @@ Index the active KyroDB documentation set.
 ## Related Docs
 
 - [../README.md](../README.md)
+- [ENGINEERING_STATUS.md](ENGINEERING_STATUS.md)
+- [VISION.md](VISION.md)

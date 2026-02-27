@@ -33,29 +33,32 @@ fn create_access(doc_id: u64, seconds_ago: u64) -> AccessEvent {
     }
 }
 
-/// BUG 1 REGRESSION TEST: Hybrid Semantic Cache must bootstrap before training
+/// BUG 1 REGRESSION TEST: Hybrid Semantic Cache must perform bounded warmup before training
 ///
-/// Previously: Hybrid Semantic Cache's should_cache() returned false when predictor
-/// was untrained, causing chicken-and-egg deadlock (no caching → no training data).
+/// Previously: Hybrid Semantic Cache either cached nothing (deadlock) or cached
+/// everything (pollution) before the first training cycle.
 ///
-/// Fix: should_cache() returns true when tracked_count() == 0 (bootstrap mode)
+/// Fix: should_cache() applies bounded warmup (seed quota + sampled admits)
 #[test]
-fn test_learned_cache_bootstraps_before_training() {
+fn test_learned_cache_bounded_warmup_before_training() {
     let predictor = LearnedCachePredictor::new(100).unwrap();
     let strategy = Arc::new(LearnedCacheStrategy::new(100, predictor));
 
-    // CRITICAL: Before training, should cache everything (bootstrap mode)
+    let mut admitted = 0usize;
+    for doc_id in 1..=1000 {
+        if strategy.should_cache(doc_id, &vec![0.5; 128]) {
+            admitted += 1;
+            strategy.insert_cached(create_test_vector(doc_id));
+        }
+    }
+
     assert!(
-        strategy.should_cache(1, &vec![0.5; 128]),
-        "Untrained Hybrid Semantic Cache must cache doc 1 (bootstrap mode)"
+        admitted > 0,
+        "Untrained Hybrid Semantic Cache must admit some documents during warmup"
     );
     assert!(
-        strategy.should_cache(2, &vec![0.5; 128]),
-        "Untrained Hybrid Semantic Cache must cache doc 2 (bootstrap mode)"
-    );
-    assert!(
-        strategy.should_cache(99, &vec![0.5; 128]),
-        "Untrained Hybrid Semantic Cache must cache doc 99 (bootstrap mode)"
+        admitted < 1000,
+        "Warmup must be bounded; admitting all docs before training causes cache pollution"
     );
 
     // Verify tracked_count is 0 (untrained)

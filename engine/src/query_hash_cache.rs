@@ -23,12 +23,14 @@
 
 use parking_lot::RwLock;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::config::DistanceMetric;
 use crate::hnsw_index::SearchResult;
+use crate::lru_index::LruIndex;
 
 /// Cached query result
 ///
@@ -105,20 +107,14 @@ pub struct QueryCacheStats {
 /// simultaneously, writes (inserts/evictions) are exclusive.
 ///
 /// # Memory Layout
-/// - cache: HashMap<query_hash, CachedQueryResult>
-/// - query_embeddings: HashMap<query_hash, Vec<f32>> (for similarity matching)
-/// - lru_queue: VecDeque<query_hash> (for LRU eviction)
+/// - state.cache: query key -> cached top-k result
+/// - state.query_embeddings: query key -> embedding for similarity scan
+/// - state.lru: O(1) LRU index over query keys
 ///
 /// Total memory: capacity × (384-dim × 4 bytes + 64 bytes overhead) ≈ 1600 bytes/query
 pub struct QueryHashCache {
-    /// Main cache storage: query_hash → cached result
-    cache: Arc<RwLock<HashMap<QueryCacheKey, CachedQueryResult>>>,
-
-    /// Query embeddings for similarity matching
-    query_embeddings: Arc<RwLock<HashMap<QueryCacheKey, Vec<f32>>>>,
-
-    /// LRU queue (front = oldest, back = newest)
-    lru_queue: Arc<RwLock<VecDeque<QueryCacheKey>>>,
+    /// Main state: query cache entry + embedding + LRU order
+    state: Arc<RwLock<QueryCacheState>>,
 
     /// Cache capacity (max number of queries)
     capacity: usize,
@@ -131,6 +127,13 @@ pub struct QueryHashCache {
 
     /// Statistics (separate lock to avoid contention)
     stats: Arc<RwLock<QueryCacheStatsInternal>>,
+}
+
+#[derive(Debug, Default)]
+struct QueryCacheState {
+    cache: HashMap<QueryCacheKey, CachedQueryResult>,
+    query_embeddings: HashMap<QueryCacheKey, Vec<f32>>,
+    lru: LruIndex<QueryCacheKey>,
 }
 
 /// Internal statistics (mutable)
@@ -155,9 +158,11 @@ impl QueryHashCache {
     /// Example: 100 queries × 1600 bytes = 160 KB
     pub fn new(capacity: usize, similarity_threshold: f32) -> Self {
         Self {
-            cache: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
-            query_embeddings: Arc::new(RwLock::new(HashMap::with_capacity(capacity))),
-            lru_queue: Arc::new(RwLock::new(VecDeque::with_capacity(capacity))),
+            state: Arc::new(RwLock::new(QueryCacheState {
+                cache: HashMap::with_capacity(capacity),
+                query_embeddings: HashMap::with_capacity(capacity),
+                lru: LruIndex::with_capacity(capacity),
+            })),
             capacity,
             similarity_threshold: similarity_threshold.clamp(0.0, 1.0),
             similarity_scan_limit: 2000, // Limit similarity scan to 2000 most recent queries
@@ -192,25 +197,39 @@ impl QueryHashCache {
         let query_hash = Self::hash_embedding(query_embedding);
         let query_key = QueryCacheKey { scope, query_hash };
 
-        // Step 1: Try exact match (fast path)
-        {
-            let cache = self.cache.read();
-            if let Some(cached) = cache.get(&query_key) {
-                // Exact match - update LRU.
-                self.update_lru(query_key);
+        // Exact lookup on shared read lock to avoid serializing misses.
+        enum ExactLookup {
+            Hit(Vec<SearchResult>),
+            InsufficientK,
+            Miss,
+        }
 
-                if cached.requested_k >= k {
-                    self.stats.write().exact_hits += 1;
+        let exact_lookup = {
+            let state = self.state.read();
+            match state.cache.get(&query_key) {
+                Some(cached) if cached.requested_k >= k => {
                     let take = k.min(cached.results.len());
-                    return Some(cached.results[..take].to_vec());
+                    ExactLookup::Hit(cached.results[..take].to_vec())
                 }
+                Some(_) => ExactLookup::InsufficientK,
+                None => ExactLookup::Miss,
+            }
+        };
 
-                // Exact entry exists but was computed with a smaller k; do not fall through to
-                // similarity matching (would return unrelated results). Force a miss so the caller
-                // recomputes with the correct k.
+        match exact_lookup {
+            ExactLookup::Hit(results) => {
+                // Best-effort recency refresh: avoid blocking read path when writers are active.
+                if let Some(mut state) = self.state.try_write() {
+                    let _ = state.lru.touch(query_key);
+                }
+                self.stats.write().exact_hits += 1;
+                return Some(results);
+            }
+            ExactLookup::InsufficientK => {
                 self.stats.write().misses += 1;
                 return None;
             }
+            ExactLookup::Miss => {}
         }
 
         // Step 2: Try similarity match (slower path)
@@ -255,42 +274,33 @@ impl QueryHashCache {
 
         let requested_k = requested_k.max(results.len());
 
-        let mut cache = self.cache.write();
-        let mut query_embs = self.query_embeddings.write();
-        let mut lru = self.lru_queue.write();
+        let mut state = self.state.write();
 
         // Check if already in cache (update case)
-        if let std::collections::hash_map::Entry::Occupied(mut e) = cache.entry(query_key) {
-            let existing_k = e.get().requested_k;
+        if let Some(existing) = state.cache.get_mut(&query_key) {
+            let existing_k = existing.requested_k;
             if requested_k >= existing_k {
                 // Update existing entry (monotonic: keep the larger-k entry).
-                e.insert(CachedQueryResult {
+                *existing = CachedQueryResult {
                     results,
                     requested_k,
                     query_hash,
                     scope,
                     cached_at: Instant::now(),
-                });
-                query_embs.insert(query_key, query_embedding);
+                };
+                state.query_embeddings.insert(query_key, query_embedding);
             }
-
-            // Move to back of LRU queue
-            if let Some(pos) = lru.iter().position(|&h| h == query_key) {
-                lru.remove(pos);
-                lru.push_back(query_key);
-            } else {
-                // Defensive: should never happen
-                lru.push_back(query_key);
-            }
+            // Move to MRU position.
+            let _ = state.lru.touch(query_key);
 
             return None; // No eviction on update
         }
 
         // Evict if at capacity
-        let evicted_hash = if cache.len() >= self.capacity {
-            if let Some(evict_key) = lru.pop_front() {
-                cache.remove(&evict_key);
-                query_embs.remove(&evict_key);
+        let evicted_hash = if state.cache.len() >= self.capacity {
+            if let Some(evict_key) = state.lru.pop_lru() {
+                state.cache.remove(&evict_key);
+                state.query_embeddings.remove(&evict_key);
                 self.stats.write().evictions += 1;
                 Some(evict_key.query_hash)
             } else {
@@ -301,7 +311,7 @@ impl QueryHashCache {
         };
 
         // Insert new entry
-        cache.insert(
+        state.cache.insert(
             query_key,
             CachedQueryResult {
                 results,
@@ -311,16 +321,16 @@ impl QueryHashCache {
                 cached_at: Instant::now(),
             },
         );
-        query_embs.insert(query_key, query_embedding);
-        lru.push_back(query_key);
+        state.query_embeddings.insert(query_key, query_embedding);
+        state.lru.insert_new(query_key);
 
         evicted_hash
     }
 
     /// Get cache statistics
     pub fn stats(&self) -> QueryCacheStats {
+        let state = self.state.read();
         let stats = self.stats.read();
-        let cache = self.cache.read();
 
         let total_hits = stats.exact_hits + stats.similarity_hits;
         let total_requests = total_hits + stats.misses;
@@ -343,7 +353,7 @@ impl QueryHashCache {
             misses: stats.misses,
             hit_rate,
             evictions: stats.evictions,
-            size: cache.len(),
+            size: state.cache.len(),
             capacity: self.capacity,
             avg_similarity,
         }
@@ -351,9 +361,10 @@ impl QueryHashCache {
 
     /// Clear cache (useful for testing)
     pub fn clear(&self) {
-        self.cache.write().clear();
-        self.query_embeddings.write().clear();
-        self.lru_queue.write().clear();
+        let mut state = self.state.write();
+        state.cache.clear();
+        state.query_embeddings.clear();
+        state.lru.clear();
 
         let mut stats = self.stats.write();
         stats.exact_hits = 0;
@@ -365,12 +376,12 @@ impl QueryHashCache {
 
     /// Get current cache size
     pub fn len(&self) -> usize {
-        self.cache.read().len()
+        self.state.read().cache.len()
     }
 
     /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
-        self.cache.read().is_empty()
+        self.state.read().cache.is_empty()
     }
 
     /// Get cache capacity
@@ -386,28 +397,80 @@ impl QueryHashCache {
     ///
     /// Returns the number of invalidated entries to aid profiling.
     pub fn invalidate_doc(&self, doc_id: u64) -> usize {
-        let mut cache = self.cache.write();
-        let mut query_embs = self.query_embeddings.write();
-        let mut lru = self.lru_queue.write();
+        let mut state = self.state.write();
+        let to_remove: Vec<QueryCacheKey> = state
+            .cache
+            .iter()
+            .filter_map(|(key, entry)| {
+                if entry.results.iter().any(|r| r.doc_id == doc_id) {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        let mut removed_hashes = Vec::new();
-        cache.retain(|&hash, entry| {
-            if entry.results.iter().any(|r| r.doc_id == doc_id) {
-                removed_hashes.push(hash);
-                false
-            } else {
-                true
+        for key in &to_remove {
+            state.cache.remove(key);
+            state.query_embeddings.remove(key);
+            let _ = state.lru.remove(*key);
+        }
+
+        to_remove.len()
+    }
+
+    /// Invalidate only cache entries whose top-k boundary can be changed by a new/updated vector.
+    ///
+    /// This avoids global cache flushes on every write while preserving read-your-writes
+    /// semantics for affected query results.
+    pub fn invalidate_for_insert(&self, embedding: &[f32], distance: DistanceMetric) -> usize {
+        let mut state = self.state.write();
+
+        let mut removed_keys = Vec::new();
+
+        for (key, cached) in state.cache.iter() {
+            let Some(query_embedding) = state.query_embeddings.get(key) else {
+                removed_keys.push(*key);
+                continue;
+            };
+
+            // If the cached answer was already shorter than requested_k (e.g. filtered query),
+            // any successful insert might change the top-k, so invalidate conservatively.
+            if cached.results.len() < cached.requested_k {
+                removed_keys.push(*key);
+                continue;
             }
-        });
 
-        for hash in &removed_hashes {
-            query_embs.remove(hash);
-            if let Some(pos) = lru.iter().position(|&h| h == *hash) {
-                lru.remove(pos);
+            if query_embedding.len() != embedding.len() {
+                removed_keys.push(*key);
+                continue;
+            }
+
+            let candidate_distance = Self::distance(query_embedding, embedding, distance);
+            if !candidate_distance.is_finite() {
+                removed_keys.push(*key);
+                continue;
+            }
+
+            let worst_cached_distance = cached
+                .results
+                .iter()
+                .map(|result| result.distance)
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            // Tie-inclusive to preserve deterministic ordering guarantees.
+            if candidate_distance <= worst_cached_distance {
+                removed_keys.push(*key);
             }
         }
 
-        removed_hashes.len()
+        for key in &removed_keys {
+            state.cache.remove(key);
+            state.query_embeddings.remove(key);
+            let _ = state.lru.remove(*key);
+        }
+
+        removed_keys.len()
     }
 
     /// Set similarity threshold
@@ -460,66 +523,66 @@ impl QueryHashCache {
         query_key: QueryCacheKey,
         k: usize,
     ) -> Option<Vec<SearchResult>> {
-        let query_embs = self.query_embeddings.read();
-        let cache = self.cache.read();
-        let lru = self.lru_queue.read();
+        let (best_key, best_similarity) = {
+            let state = self.state.read();
 
-        // Scan most recent queries (back of LRU queue)
-        let scan_count = self.similarity_scan_limit.min(lru.len());
-        let candidates = lru.iter().rev().take(scan_count);
+            // Scan most recent queries (MRU -> LRU).
+            let scan_count = self.similarity_scan_limit.min(state.lru.len());
+            let mut best_similarity = self.similarity_threshold;
+            let mut best_key = None;
 
-        let mut best_similarity = self.similarity_threshold;
-        let mut best_hash = None;
+            state.lru.for_each_recent(scan_count, |candidate_key| {
+                if candidate_key.scope != scope || candidate_key == query_key {
+                    return true;
+                }
 
-        for &candidate_key in candidates {
-            if candidate_key.scope != scope {
-                continue;
-            }
+                let Some(candidate) = state.cache.get(&candidate_key) else {
+                    return true;
+                };
+                if candidate.requested_k < k {
+                    return true;
+                }
 
-            if candidate_key == query_key {
-                continue; // Skip self (already checked in exact match)
-            }
+                let Some(candidate_emb) = state.query_embeddings.get(&candidate_key) else {
+                    return true;
+                };
 
-            let candidate = match cache.get(&candidate_key) {
-                Some(candidate) => candidate,
-                None => continue,
-            };
-
-            if candidate.requested_k < k {
-                continue;
-            }
-
-            if let Some(candidate_emb) = query_embs.get(&candidate_key) {
                 let similarity = Self::cosine_similarity(query_embedding, candidate_emb);
-
                 if similarity > best_similarity {
                     best_similarity = similarity;
-                    best_hash = Some(candidate_key);
+                    best_key = Some(candidate_key);
                 }
+                true
+            });
+
+            (best_key, best_similarity)
+        };
+
+        if let Some(matched_key) = best_key {
+            // Refresh recency; if entry was evicted in the meantime, count as miss.
+            let cached_results = {
+                let mut state = self.state.write();
+                let _ = state.lru.touch(matched_key);
+                state.cache.get(&matched_key).and_then(|entry| {
+                    if entry.requested_k < k {
+                        return None;
+                    }
+                    let take = k.min(entry.results.len());
+                    Some(entry.results[..take].to_vec())
+                })
+            };
+
+            if let Some(results) = cached_results {
+                let mut stats = self.stats.write();
+                stats.similarity_hits += 1;
+                stats.total_similarity_score += best_similarity as f64;
+                Some(results)
+            } else {
+                self.stats.write().misses += 1;
+                None
             }
-        }
-
-        if let Some(matched_hash) = best_hash {
-            // Found similar query - update LRU and stats
-            drop(query_embs);
-            drop(lru);
-
-            self.update_lru(matched_hash);
-
-            let mut stats = self.stats.write();
-            stats.similarity_hits += 1;
-            stats.total_similarity_score += best_similarity as f64;
-
-            cache.get(&matched_hash).map(|cached| {
-                let take = k.min(cached.results.len());
-                cached.results[..take].to_vec()
-            })
         } else {
             // No match - record miss
-            drop(query_embs);
-            drop(cache);
-            drop(lru);
-
             self.stats.write().misses += 1;
             None
         }
@@ -545,18 +608,12 @@ impl QueryHashCache {
         crate::simd::cosine_similarity_f32(a, b)
     }
 
-    /// Update LRU queue (move query key to back)
-    ///
-    /// Called on cache hit to mark query as recently used.
-    fn update_lru(&self, query_key: QueryCacheKey) {
-        let mut lru = self.lru_queue.write();
-
-        if let Some(pos) = lru.iter().position(|&h| h == query_key) {
-            lru.remove(pos);
-            lru.push_back(query_key);
-        } else {
-            // Defensive: query in cache but not in LRU (should never happen)
-            lru.push_back(query_key);
+    #[inline]
+    fn distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
+        match metric {
+            DistanceMetric::Euclidean => crate::simd::l2_distance_f32(a, b),
+            DistanceMetric::Cosine => 1.0 - crate::simd::cosine_similarity_f32(a, b),
+            DistanceMetric::InnerProduct => 1.0 - crate::simd::dot_f32(a, b),
         }
     }
 }
@@ -763,6 +820,43 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.stats().total_hits, 0);
         assert_eq!(cache.stats().misses, 0);
+    }
+
+    #[test]
+    fn test_invalidate_for_insert_removes_affected_queries() {
+        let cache = QueryHashCache::new(10, 0.85);
+        let query = create_test_embedding(11, 64);
+        let cached_results = vec![SearchResult {
+            doc_id: 42,
+            distance: 0.25,
+        }];
+        cache.insert_with_k(query.clone(), cached_results, 1);
+
+        let removed = cache.invalidate_for_insert(&query, DistanceMetric::Cosine);
+        assert_eq!(removed, 1);
+        assert!(
+            cache.get(&query, 1).is_none(),
+            "cache entry must be invalidated when inserted vector can enter top-k"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_for_insert_keeps_unaffected_queries() {
+        let cache = QueryHashCache::new(10, 0.85);
+        let query = vec![1.0, 0.0];
+        let orthogonal = vec![0.0, 1.0];
+        let cached_results = vec![SearchResult {
+            doc_id: 7,
+            distance: 0.0,
+        }];
+        cache.insert_with_k(query.clone(), cached_results, 1);
+
+        let removed = cache.invalidate_for_insert(&orthogonal, DistanceMetric::Cosine);
+        assert_eq!(removed, 0);
+        assert!(
+            cache.get(&query, 1).is_some(),
+            "cache entry should be retained when inserted vector cannot affect top-k"
+        );
     }
 
     #[test]

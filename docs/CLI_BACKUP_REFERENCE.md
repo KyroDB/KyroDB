@@ -60,6 +60,11 @@ Commands:
 - `prune`
 - `verify`
 
+`list --format json` behavior:
+
+- when backups exist: emits JSON array
+- when backup directory is empty: emits `No backups found` (plain text)
+
 ### Restore Safety Gate (`BACKUP_ALLOW_CLEAR`)
 
 `BACKUP_ALLOW_CLEAR` explicitly enables destructive clear/overwrite behavior for the restore command (`kyrodb_backup ... restore ...`). When this variable is unset/false (default), restore remains in safe mode and refuses directory-clear operations.

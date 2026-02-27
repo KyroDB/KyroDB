@@ -31,10 +31,18 @@ cargo build --release --bin kyrodb_backup --features cli-tools
 
 # Incremental backup (after new WAL activity)
 command -v jq >/dev/null || { echo "jq is required for parent backup selection"; exit 1; }
-PARENT_ID=$(
-  ./target/release/kyrodb_backup --data-dir ./data --backup-dir ./backups list --format json \
-    | jq -r 'sort_by(.timestamp) | last | .id // empty'
-)
+set -o pipefail
+PARENT_LOOKUP_ERR="$(mktemp)"
+if ! PARENT_ID=$(
+  ./target/release/kyrodb_backup --data-dir ./data --backup-dir ./backups list --format json 2>>"$PARENT_LOOKUP_ERR" \
+    | jq -r 'sort_by(.timestamp) | last | .id // empty' 2>>"$PARENT_LOOKUP_ERR"
+); then
+  echo "Failed to compute PARENT_ID from kyrodb_backup list output:"
+  cat "$PARENT_LOOKUP_ERR"
+  rm -f "$PARENT_LOOKUP_ERR"
+  exit 1
+fi
+rm -f "$PARENT_LOOKUP_ERR"
 if [ -z "$PARENT_ID" ]; then
   echo "No parent backup found. Run a full backup first or select a parent manually from list output."
   exit 1
@@ -53,7 +61,10 @@ export BACKUP_ALLOW_CLEAR=true
 ## Key Contracts
 
 - backup creation requires a recoverable KyroDB data directory (manifest/snapshot/WAL state)
-- incremental backup requires post-parent WAL segments
+- backup create fails on an empty/non-recoverable data directory (`No recoverable state found ...`)
+- backup creation is fail-closed if any source file (snapshot/WAL) changes while archive creation is in progress
+- backup create retries bounded consistency attempts and returns an error if the dataset stays write-active
+- incremental backup requires new WAL entries since the parent backup (writes must occur after parent creation)
 - if no new WAL exists after parent, incremental create fails (`No new WAL files since parent backup`)
 - `verify` takes a positional ID (`verify <BACKUP_ID>`)
 - restore refuses directory clear unless `BACKUP_ALLOW_CLEAR=true`

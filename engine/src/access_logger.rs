@@ -72,6 +72,15 @@ pub struct AccessPatternLogger {
 }
 
 impl AccessPatternLogger {
+    #[inline]
+    fn build_read_event(doc_id: u64) -> AccessEvent {
+        AccessEvent {
+            doc_id,
+            timestamp: SystemTime::now(),
+            access_type: crate::learned_cache::AccessType::Read,
+        }
+    }
+
     /// Create new access pattern logger
     ///
     /// # Parameters
@@ -116,23 +125,39 @@ impl AccessPatternLogger {
     /// - `doc_id`: Document ID that was accessed
     #[inline]
     pub fn log_access(&self, doc_id: u64, _query_embedding: &[f32]) {
-        // Store doc_id only (embeddings removed to prevent memory leak)
-        // learned predictor training only needs doc_id and timestamp, not the full embedding
-        // This reduces AccessEvent from ~1568 bytes to ~32 bytes (48× reduction!)
-        let event = AccessEvent {
-            doc_id,
-            timestamp: SystemTime::now(),
-            access_type: crate::learned_cache::AccessType::Read,
-        };
+        self.log_doc_access(doc_id);
+    }
 
-        // Write lock - push event (overwrites oldest if full)
+    /// Log a single document access (doc_id only).
+    ///
+    /// This is the preferred hot-path API when callers do not need to pass a query embedding.
+    #[inline]
+    pub fn log_doc_access(&self, doc_id: u64) {
+        let event = Self::build_read_event(doc_id);
         let mut events = self.events.write();
-        // Use push_overwrite to ensure FIFO behavior when buffer is full
-        // try_push returns Err when full without overwriting, which caused test_access_logger_enforces_capacity to fail
         events.push_overwrite(event);
         drop(events);
-
         self.total_accesses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Log a batch of document accesses under one lock acquisition.
+    ///
+    /// Returns the number of logged events.
+    #[inline]
+    pub fn log_doc_accesses(&self, doc_ids: &[u64]) -> usize {
+        if doc_ids.is_empty() {
+            return 0;
+        }
+
+        let mut events = self.events.write();
+        for doc_id in doc_ids {
+            events.push_overwrite(Self::build_read_event(*doc_id));
+        }
+        drop(events);
+
+        self.total_accesses
+            .fetch_add(doc_ids.len() as u64, Ordering::Relaxed);
+        doc_ids.len()
     }
 
     /// Log access with pre-computed event (zero overhead)
@@ -335,6 +360,15 @@ mod tests {
         // Should be at capacity (oldest overwritten)
         assert_eq!(logger.len(), 10);
         assert_eq!(logger.stats().total_accesses, 20);
+    }
+
+    #[test]
+    fn test_batch_access_logging() {
+        let logger = AccessPatternLogger::new(16);
+        let logged = logger.log_doc_accesses(&[1, 2, 3, 4, 5]);
+        assert_eq!(logged, 5);
+        assert_eq!(logger.len(), 5);
+        assert_eq!(logger.stats().total_accesses, 5);
     }
 
     #[test]

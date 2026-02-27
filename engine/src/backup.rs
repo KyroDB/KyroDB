@@ -3,7 +3,7 @@ use crate::persistence::Manifest;
 use crate::persistence::Snapshot;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -125,6 +125,7 @@ const MAX_BACKUP_ARCHIVE_FILES: u32 = 1_000_000;
 const MAX_BACKUP_MEMBER_NAME_BYTES: u32 = 1024;
 const MAX_BACKUP_MEMBER_SIZE_BYTES: u64 = 1 << 40; // 1 TiB per member
 const BACKUP_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const BACKUP_CONSISTENCY_MAX_ATTEMPTS: usize = 3;
 
 /// Shared utility function to list backups from a directory
 /// This eliminates code duplication between BackupManager and RestoreManager
@@ -326,6 +327,63 @@ impl ArchiveEntry {
             source: ArchiveEntrySource::Bytes(bytes),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceFingerprint {
+    size_bytes: u64,
+    modified_unix_nanos: u128,
+}
+
+fn fingerprint_for_path(path: &Path) -> Result<SourceFingerprint> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to stat source file {}", path.display()))?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .with_context(|| format!("Failed to read modified time for {}", path.display()))?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    Ok(SourceFingerprint {
+        size_bytes: metadata.len(),
+        modified_unix_nanos,
+    })
+}
+
+fn snapshot_source_fingerprints(
+    entries: &[ArchiveEntry],
+) -> Result<HashMap<String, SourceFingerprint>> {
+    let mut fingerprints = HashMap::new();
+    for entry in entries {
+        if let ArchiveEntrySource::Path(path) = &entry.source {
+            fingerprints.insert(entry.name.clone(), fingerprint_for_path(path)?);
+        }
+    }
+    Ok(fingerprints)
+}
+
+fn verify_source_fingerprints(
+    entries: &[ArchiveEntry],
+    expected: &HashMap<String, SourceFingerprint>,
+) -> Result<()> {
+    for entry in entries {
+        if let ArchiveEntrySource::Path(path) = &entry.source {
+            let Some(expected_fp) = expected.get(&entry.name) else {
+                anyhow::bail!(
+                    "Missing expected fingerprint for backup source '{}'",
+                    entry.name
+                );
+            };
+            let actual = fingerprint_for_path(path)?;
+            anyhow::ensure!(
+                actual == *expected_fp,
+                "backup source '{}' changed during archive creation (size/mtime drift)",
+                entry.name
+            );
+        }
+    }
+    Ok(())
 }
 
 enum ManifestLayout {
@@ -693,10 +751,36 @@ impl BackupManager {
             }
         }
 
-        let checksum = write_backup_archive(&backup_path, &unique_entries)?;
-
-        // Store the archive byte size so CLI verification can compare against on-disk artifact size.
-        let archive_size = fs::metadata(&backup_path)?.len();
+        let mut checksum = None;
+        let mut archive_size = None;
+        for attempt in 1..=BACKUP_CONSISTENCY_MAX_ATTEMPTS {
+            let source_fingerprints = snapshot_source_fingerprints(&unique_entries)?;
+            let written_checksum = write_backup_archive(&backup_path, &unique_entries)?;
+            match verify_source_fingerprints(&unique_entries, &source_fingerprints) {
+                Ok(()) => {
+                    checksum = Some(written_checksum);
+                    archive_size = Some(fs::metadata(&backup_path)?.len());
+                    break;
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(&backup_path);
+                    warn!(
+                        attempt,
+                        max_attempts = BACKUP_CONSISTENCY_MAX_ATTEMPTS,
+                        error = %err,
+                        "backup sources changed while archiving; retrying for consistency"
+                    );
+                    if attempt == BACKUP_CONSISTENCY_MAX_ATTEMPTS {
+                        return Err(err).context(
+                            "Failed to produce a consistent backup while source files were mutating. \
+                             Retry with quiesced writes.",
+                        );
+                    }
+                }
+            }
+        }
+        let checksum = checksum.expect("checksum must be set after consistency loop");
+        let archive_size = archive_size.expect("archive size must be set after consistency loop");
 
         // Create metadata with the same backup_id
         let metadata = BackupMetadata {
@@ -831,10 +915,36 @@ impl BackupManager {
             entries.push(ArchiveEntry::from_path(name, path));
         }
 
-        let checksum = write_backup_archive(&backup_path, &entries)?;
-
-        // Store the archive byte size so CLI verification can compare against on-disk artifact size.
-        let archive_size = fs::metadata(&backup_path)?.len();
+        let mut checksum = None;
+        let mut archive_size = None;
+        for attempt in 1..=BACKUP_CONSISTENCY_MAX_ATTEMPTS {
+            let source_fingerprints = snapshot_source_fingerprints(&entries)?;
+            let written_checksum = write_backup_archive(&backup_path, &entries)?;
+            match verify_source_fingerprints(&entries, &source_fingerprints) {
+                Ok(()) => {
+                    checksum = Some(written_checksum);
+                    archive_size = Some(fs::metadata(&backup_path)?.len());
+                    break;
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(&backup_path);
+                    warn!(
+                        attempt,
+                        max_attempts = BACKUP_CONSISTENCY_MAX_ATTEMPTS,
+                        error = %err,
+                        "incremental backup sources changed while archiving; retrying for consistency"
+                    );
+                    if attempt == BACKUP_CONSISTENCY_MAX_ATTEMPTS {
+                        return Err(err).context(
+                            "Failed to produce a consistent incremental backup while source files were mutating. \
+                             Retry with quiesced writes.",
+                        );
+                    }
+                }
+            }
+        }
+        let checksum = checksum.expect("checksum must be set after consistency loop");
+        let archive_size = archive_size.expect("archive size must be set after consistency loop");
 
         // Create metadata with the same backup_id
         let metadata = BackupMetadata {
@@ -2263,5 +2373,22 @@ mod tests {
         assert_eq!(deserialized.id, metadata.id);
         assert_eq!(deserialized.timestamp, metadata.timestamp);
         assert_eq!(deserialized.backup_type, BackupType::Full);
+    }
+
+    #[test]
+    fn test_source_fingerprint_detects_file_drift() {
+        let temp = TempDir::new().unwrap();
+        let wal_path = temp.path().join("wal_1.wal");
+        fs::write(&wal_path, b"v1").unwrap();
+
+        let entries = vec![ArchiveEntry::from_path("wal_1.wal", wal_path.clone())];
+        let fingerprints = snapshot_source_fingerprints(&entries).unwrap();
+
+        // Ensure modified timestamp changes on filesystems with coarse mtime granularity.
+        std::thread::sleep(Duration::from_millis(2));
+        fs::write(&wal_path, b"v2-changed").unwrap();
+
+        let err = verify_source_fingerprints(&entries, &fingerprints).unwrap_err();
+        assert!(err.to_string().contains("changed during archive creation"));
     }
 }
