@@ -17,20 +17,23 @@
 //! With query cache: Query 2 and 3 hit L1b (fast, semantic match)
 //!
 //! # Performance
-//! - Exact match: <10ns (HashMap lookup by query_hash)
-//! - Similarity scan: <1μs (limit to 2000 recent queries, SIMD cosine similarity)
-//! - Memory: ~154 KB for 100 queries × 384-dim embeddings
+//! - Exact match: O(1) hash lookup by query hash
+//! - Similarity match: O(min(cache_size, scan_limit) * dim)
+//! - Memory: O(capacity * dim)
 
 use parking_lot::RwLock;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::DistanceMetric;
 use crate::hnsw_index::SearchResult;
 use crate::lru_index::LruIndex;
+
+const INSERT_INVALIDATION_PREFIX_DIMS: usize = 32;
 
 /// Cached query result
 ///
@@ -127,13 +130,24 @@ pub struct QueryHashCache {
 
     /// Statistics (separate lock to avoid contention)
     stats: Arc<RwLock<QueryCacheStatsInternal>>,
+
+    /// Monotonic generation bumped whenever the underlying search space mutates.
+    invalidation_generation: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 struct QueryCacheState {
     cache: HashMap<QueryCacheKey, CachedQueryResult>,
     query_embeddings: HashMap<QueryCacheKey, Vec<f32>>,
+    query_embedding_stats: HashMap<QueryCacheKey, QueryEmbeddingStats>,
+    doc_to_query_keys: HashMap<u64, Vec<QueryCacheKey>>,
     lru: LruIndex<QueryCacheKey>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QueryEmbeddingStats {
+    norm: f32,
+    tail_norm: f32,
 }
 
 /// Internal statistics (mutable)
@@ -144,6 +158,11 @@ struct QueryCacheStatsInternal {
     misses: u64,
     evictions: u64,
     total_similarity_score: f64, // For computing average
+}
+
+enum CacheInsertDisposition {
+    Inserted(Option<u64>),
+    SkippedGeneration,
 }
 
 impl QueryHashCache {
@@ -161,12 +180,15 @@ impl QueryHashCache {
             state: Arc::new(RwLock::new(QueryCacheState {
                 cache: HashMap::with_capacity(capacity),
                 query_embeddings: HashMap::with_capacity(capacity),
+                query_embedding_stats: HashMap::with_capacity(capacity),
+                doc_to_query_keys: HashMap::with_capacity(capacity.saturating_mul(4)),
                 lru: LruIndex::with_capacity(capacity),
             })),
             capacity,
             similarity_threshold: similarity_threshold.clamp(0.0, 1.0),
             similarity_scan_limit: 2000, // Limit similarity scan to 2000 most recent queries
             stats: Arc::new(RwLock::new(QueryCacheStatsInternal::default())),
+            invalidation_generation: AtomicU64::new(0),
         }
     }
 
@@ -175,10 +197,6 @@ impl QueryHashCache {
     /// Performs two-level lookup:
     /// 1. Exact match: Check if query_hash exists in cache (O(1))
     /// 2. Similarity match: Scan recent queries for similarity > threshold (O(k))
-    ///
-    /// # Performance
-    /// - Exact match: <10ns
-    /// - Similarity scan: <1μs (2000 queries × 0.5ns per comparison)
     ///
     /// # Returns
     /// - `Some(Vec<SearchResult>)` if exact or similarity match found
@@ -269,38 +287,104 @@ impl QueryHashCache {
         results: Vec<SearchResult>,
         requested_k: usize,
     ) -> Option<u64> {
+        match self.insert_with_k_scoped_internal(scope, query_embedding, results, requested_k, None)
+        {
+            CacheInsertDisposition::Inserted(evicted_hash) => evicted_hash,
+            CacheInsertDisposition::SkippedGeneration => None,
+        }
+    }
+
+    pub fn insert_with_k_scoped_if_generation(
+        &self,
+        scope: u64,
+        query_embedding: Vec<f32>,
+        results: Vec<SearchResult>,
+        requested_k: usize,
+        expected_generation: u64,
+    ) -> bool {
+        matches!(
+            self.insert_with_k_scoped_internal(
+                scope,
+                query_embedding,
+                results,
+                requested_k,
+                Some(expected_generation),
+            ),
+            CacheInsertDisposition::Inserted(_)
+        )
+    }
+
+    pub fn invalidation_generation(&self) -> u64 {
+        self.invalidation_generation.load(Ordering::Acquire)
+    }
+
+    fn insert_with_k_scoped_internal(
+        &self,
+        scope: u64,
+        query_embedding: Vec<f32>,
+        results: Vec<SearchResult>,
+        requested_k: usize,
+        expected_generation: Option<u64>,
+    ) -> CacheInsertDisposition {
         let query_hash = Self::hash_embedding(&query_embedding);
         let query_key = QueryCacheKey { scope, query_hash };
+        let embedding_stats =
+            Self::embedding_stats(&query_embedding, INSERT_INVALIDATION_PREFIX_DIMS);
 
         let requested_k = requested_k.max(results.len());
 
+        if let Some(expected_generation) = expected_generation {
+            if self.invalidation_generation.load(Ordering::Acquire) != expected_generation {
+                return CacheInsertDisposition::SkippedGeneration;
+            }
+        }
+
         let mut state = self.state.write();
 
+        if let Some(expected_generation) = expected_generation {
+            if self.invalidation_generation.load(Ordering::Acquire) != expected_generation {
+                return CacheInsertDisposition::SkippedGeneration;
+            }
+        }
+
         // Check if already in cache (update case)
-        if let Some(existing) = state.cache.get_mut(&query_key) {
+        if let Some(existing) = state.cache.get(&query_key) {
             let existing_k = existing.requested_k;
             if requested_k >= existing_k {
+                let new_doc_ids = Self::unique_result_doc_ids(&results);
                 // Update existing entry (monotonic: keep the larger-k entry).
-                *existing = CachedQueryResult {
-                    results,
-                    requested_k,
-                    query_hash,
-                    scope,
-                    cached_at: Instant::now(),
-                };
+                if let Some(old_entry) = state.cache.insert(
+                    query_key,
+                    CachedQueryResult {
+                        results,
+                        requested_k,
+                        query_hash,
+                        scope,
+                        cached_at: Instant::now(),
+                    },
+                ) {
+                    Self::unindex_entry_docs(&mut state, query_key, &old_entry.results);
+                }
+                Self::index_entry_doc_ids(&mut state, query_key, &new_doc_ids);
                 state.query_embeddings.insert(query_key, query_embedding);
+                state
+                    .query_embedding_stats
+                    .insert(query_key, embedding_stats);
             }
             // Move to MRU position.
             let _ = state.lru.touch(query_key);
 
-            return None; // No eviction on update
+            return CacheInsertDisposition::Inserted(None);
         }
 
         // Evict if at capacity
         let evicted_hash = if state.cache.len() >= self.capacity {
             if let Some(evict_key) = state.lru.pop_lru() {
-                state.cache.remove(&evict_key);
-                state.query_embeddings.remove(&evict_key);
+                if let Some(old_entry) = state.cache.remove(&evict_key) {
+                    Self::unindex_entry_docs(&mut state, evict_key, &old_entry.results);
+                }
+                let _ = state.query_embeddings.remove(&evict_key);
+                let _ = state.query_embedding_stats.remove(&evict_key);
                 self.stats.write().evictions += 1;
                 Some(evict_key.query_hash)
             } else {
@@ -311,6 +395,7 @@ impl QueryHashCache {
         };
 
         // Insert new entry
+        let inserted_doc_ids = Self::unique_result_doc_ids(&results);
         state.cache.insert(
             query_key,
             CachedQueryResult {
@@ -322,9 +407,13 @@ impl QueryHashCache {
             },
         );
         state.query_embeddings.insert(query_key, query_embedding);
+        state
+            .query_embedding_stats
+            .insert(query_key, embedding_stats);
+        Self::index_entry_doc_ids(&mut state, query_key, &inserted_doc_ids);
         state.lru.insert_new(query_key);
 
-        evicted_hash
+        CacheInsertDisposition::Inserted(evicted_hash)
     }
 
     /// Get cache statistics
@@ -361,9 +450,12 @@ impl QueryHashCache {
 
     /// Clear cache (useful for testing)
     pub fn clear(&self) {
+        let _ = self.invalidation_generation.fetch_add(1, Ordering::AcqRel);
         let mut state = self.state.write();
         state.cache.clear();
         state.query_embeddings.clear();
+        state.query_embedding_stats.clear();
+        state.doc_to_query_keys.clear();
         state.lru.clear();
 
         let mut stats = self.stats.write();
@@ -391,32 +483,31 @@ impl QueryHashCache {
 
     /// Remove cached queries that resolve to the specified document ID.
     ///
-    /// Complexity: O(cache_size) because we scan/rebuild the internal maps. Deletes are expected
-    /// to be far less frequent than reads; if profiling ever shows this path dominating runtime,
-    /// consider maintaining a doc_id→hash index to achieve near O(k) invalidation.
-    ///
+    /// Uses a reverse index (`doc_id -> query keys`) for near O(affected_entries)
+    /// invalidation instead of scanning the full cache.
     /// Returns the number of invalidated entries to aid profiling.
     pub fn invalidate_doc(&self, doc_id: u64) -> usize {
+        let _ = self.invalidation_generation.fetch_add(1, Ordering::AcqRel);
         let mut state = self.state.write();
-        let to_remove: Vec<QueryCacheKey> = state
-            .cache
-            .iter()
-            .filter_map(|(key, entry)| {
-                if entry.results.iter().any(|r| r.doc_id == doc_id) {
-                    Some(*key)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut to_remove = match state.doc_to_query_keys.remove(&doc_id) {
+            Some(keys) => keys,
+            None => return 0,
+        };
+        to_remove.sort_unstable_by(|a, b| {
+            a.scope
+                .cmp(&b.scope)
+                .then_with(|| a.query_hash.cmp(&b.query_hash))
+        });
+        to_remove.dedup();
 
-        for key in &to_remove {
-            state.cache.remove(key);
-            state.query_embeddings.remove(key);
-            let _ = state.lru.remove(*key);
+        let mut removed = 0usize;
+        for key in to_remove {
+            if Self::remove_entry(&mut state, key) {
+                removed += 1;
+            }
         }
 
-        to_remove.len()
+        removed
     }
 
     /// Invalidate only cache entries whose top-k boundary can be changed by a new/updated vector.
@@ -424,18 +515,18 @@ impl QueryHashCache {
     /// This avoids global cache flushes on every write while preserving read-your-writes
     /// semantics for affected query results.
     pub fn invalidate_for_insert(&self, embedding: &[f32], distance: DistanceMetric) -> usize {
+        let _ = self.invalidation_generation.fetch_add(1, Ordering::AcqRel);
+        let prefix_dims = INSERT_INVALIDATION_PREFIX_DIMS.min(embedding.len());
+        let insert_stats = Self::embedding_stats(embedding, prefix_dims);
+
         let mut state = self.state.write();
-
         let mut removed_keys = Vec::new();
-
         for (key, cached) in state.cache.iter() {
             let Some(query_embedding) = state.query_embeddings.get(key) else {
                 removed_keys.push(*key);
                 continue;
             };
 
-            // If the cached answer was already shorter than requested_k (e.g. filtered query),
-            // any successful insert might change the top-k, so invalidate conservatively.
             if cached.results.len() < cached.requested_k {
                 removed_keys.push(*key);
                 continue;
@@ -446,31 +537,55 @@ impl QueryHashCache {
                 continue;
             }
 
+            let worst_cached_distance = cached
+                .results
+                .iter()
+                .map(|result| result.distance)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if !worst_cached_distance.is_finite() {
+                removed_keys.push(*key);
+                continue;
+            }
+
+            let query_stats = state
+                .query_embedding_stats
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| Self::embedding_stats(query_embedding, prefix_dims));
+            if !Self::insert_can_affect_cached_boundary(
+                query_embedding,
+                query_stats,
+                embedding,
+                insert_stats,
+                prefix_dims,
+                worst_cached_distance,
+                distance,
+            ) {
+                continue;
+            }
+
             let candidate_distance = Self::distance(query_embedding, embedding, distance);
             if !candidate_distance.is_finite() {
                 removed_keys.push(*key);
                 continue;
             }
 
-            let worst_cached_distance = cached
-                .results
-                .iter()
-                .map(|result| result.distance)
-                .fold(f32::NEG_INFINITY, f32::max);
-
-            // Tie-inclusive to preserve deterministic ordering guarantees.
             if candidate_distance <= worst_cached_distance {
                 removed_keys.push(*key);
             }
         }
 
-        for key in &removed_keys {
-            state.cache.remove(key);
-            state.query_embeddings.remove(key);
-            let _ = state.lru.remove(*key);
+        if removed_keys.is_empty() {
+            return 0;
         }
 
-        removed_keys.len()
+        let mut removed = 0usize;
+        for key in removed_keys {
+            if Self::remove_entry(&mut state, key) {
+                removed += 1;
+            }
+        }
+        removed
     }
 
     /// Set similarity threshold
@@ -486,6 +601,184 @@ impl QueryHashCache {
     // =========================================================================
     // Private Helper Methods
     // =========================================================================
+
+    #[inline]
+    fn embedding_stats(embedding: &[f32], prefix_dims: usize) -> QueryEmbeddingStats {
+        let prefix_dims = prefix_dims.min(embedding.len());
+        let mut norm_sq = 0.0f32;
+        let mut tail_sq = 0.0f32;
+        for (idx, &value) in embedding.iter().enumerate() {
+            let sq = value * value;
+            norm_sq += sq;
+            if idx >= prefix_dims {
+                tail_sq += sq;
+            }
+        }
+        QueryEmbeddingStats {
+            norm: norm_sq.sqrt(),
+            tail_norm: tail_sq.sqrt(),
+        }
+    }
+
+    #[inline]
+    fn dot_prefix(a: &[f32], b: &[f32], prefix_dims: usize) -> f32 {
+        let limit = prefix_dims.min(a.len()).min(b.len());
+        let mut dot = 0.0f32;
+        for i in 0..limit {
+            dot += a[i] * b[i];
+        }
+        dot
+    }
+
+    #[inline]
+    fn l2_prefix_sq(a: &[f32], b: &[f32], prefix_dims: usize) -> f32 {
+        let limit = prefix_dims.min(a.len()).min(b.len());
+        let mut sq = 0.0f32;
+        for i in 0..limit {
+            let diff = a[i] - b[i];
+            sq += diff * diff;
+        }
+        sq
+    }
+
+    #[inline]
+    fn dot_upper_bound_from_prefix(
+        query_embedding: &[f32],
+        query_stats: QueryEmbeddingStats,
+        insert_embedding: &[f32],
+        insert_stats: QueryEmbeddingStats,
+        prefix_dims: usize,
+    ) -> Option<f32> {
+        if query_embedding.len() != insert_embedding.len() {
+            return None;
+        }
+        let prefix_dot = Self::dot_prefix(query_embedding, insert_embedding, prefix_dims);
+        Some(prefix_dot + query_stats.tail_norm * insert_stats.tail_norm)
+    }
+
+    #[inline]
+    fn cosine_upper_bound_from_prefix(
+        query_embedding: &[f32],
+        query_stats: QueryEmbeddingStats,
+        insert_embedding: &[f32],
+        insert_stats: QueryEmbeddingStats,
+        prefix_dims: usize,
+    ) -> Option<f32> {
+        let denom = query_stats.norm * insert_stats.norm;
+        if !denom.is_finite() || denom <= 0.0 {
+            return None;
+        }
+        let upper_dot = Self::dot_upper_bound_from_prefix(
+            query_embedding,
+            query_stats,
+            insert_embedding,
+            insert_stats,
+            prefix_dims,
+        )?;
+        Some((upper_dot / denom).clamp(-1.0, 1.0))
+    }
+
+    #[inline]
+    fn insert_can_affect_cached_boundary(
+        query_embedding: &[f32],
+        query_stats: QueryEmbeddingStats,
+        insert_embedding: &[f32],
+        insert_stats: QueryEmbeddingStats,
+        prefix_dims: usize,
+        worst_cached_distance: f32,
+        metric: DistanceMetric,
+    ) -> bool {
+        if query_embedding.len() != insert_embedding.len() {
+            return true;
+        }
+        if !worst_cached_distance.is_finite() {
+            return true;
+        }
+
+        match metric {
+            DistanceMetric::Euclidean => {
+                let radius_sq = worst_cached_distance.max(0.0).powi(2);
+                Self::l2_prefix_sq(query_embedding, insert_embedding, prefix_dims) <= radius_sq
+            }
+            DistanceMetric::Cosine => {
+                let similarity_threshold = 1.0 - worst_cached_distance;
+                if !similarity_threshold.is_finite() {
+                    return true;
+                }
+                Self::cosine_upper_bound_from_prefix(
+                    query_embedding,
+                    query_stats,
+                    insert_embedding,
+                    insert_stats,
+                    prefix_dims,
+                )
+                .map(|upper_bound| upper_bound >= similarity_threshold)
+                .unwrap_or(true)
+            }
+            DistanceMetric::InnerProduct => {
+                let dot_threshold = 1.0 - worst_cached_distance;
+                if !dot_threshold.is_finite() {
+                    return true;
+                }
+                Self::dot_upper_bound_from_prefix(
+                    query_embedding,
+                    query_stats,
+                    insert_embedding,
+                    insert_stats,
+                    prefix_dims,
+                )
+                .map(|upper_bound| upper_bound >= dot_threshold)
+                .unwrap_or(true)
+            }
+        }
+    }
+
+    fn unique_result_doc_ids(results: &[SearchResult]) -> Vec<u64> {
+        let mut doc_ids: Vec<u64> = results.iter().map(|r| r.doc_id).collect();
+        if doc_ids.len() <= 1 {
+            return doc_ids;
+        }
+        doc_ids.sort_unstable();
+        doc_ids.dedup();
+        doc_ids
+    }
+
+    fn index_entry_doc_ids(state: &mut QueryCacheState, key: QueryCacheKey, doc_ids: &[u64]) {
+        for &doc_id in doc_ids {
+            let keys = state.doc_to_query_keys.entry(doc_id).or_default();
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+
+    fn unindex_entry_docs(
+        state: &mut QueryCacheState,
+        key: QueryCacheKey,
+        results: &[SearchResult],
+    ) {
+        for doc_id in Self::unique_result_doc_ids(results) {
+            if let Some(keys) = state.doc_to_query_keys.get_mut(&doc_id) {
+                keys.retain(|entry_key| *entry_key != key);
+                if keys.is_empty() {
+                    state.doc_to_query_keys.remove(&doc_id);
+                }
+            }
+        }
+    }
+
+    fn remove_entry(state: &mut QueryCacheState, key: QueryCacheKey) -> bool {
+        let removed_entry = state.cache.remove(&key);
+        let _ = state.query_embeddings.remove(&key);
+        let _ = state.query_embedding_stats.remove(&key);
+        let _ = state.lru.remove(key);
+        if let Some(entry) = removed_entry {
+            Self::unindex_entry_docs(state, key, &entry.results);
+            true
+        } else {
+            false
+        }
+    }
 
     /// Hash embedding to 64-bit query hash
     ///
@@ -514,8 +807,6 @@ impl QueryHashCache {
     ///
     /// # Performance
     /// O(k × d) where k = min(cache_size, scan_limit), d = embedding_dim
-    /// For k=2000, d=384: ~768K ops × 0.5ns = ~400μs worst case
-    /// Typical case: k=100, <20μs
     fn find_similar_query(
         &self,
         scope: u64,
@@ -658,6 +949,17 @@ mod tests {
             doc_id,
             distance: 0.0,
         }]
+    }
+
+    fn make_results_multi(doc_ids: &[u64]) -> Vec<SearchResult> {
+        doc_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, &doc_id)| SearchResult {
+                doc_id,
+                distance: idx as f32 * 0.01,
+            })
+            .collect()
     }
 
     #[test]
@@ -856,6 +1158,132 @@ mod tests {
         assert!(
             cache.get(&query, 1).is_some(),
             "cache entry should be retained when inserted vector cannot affect top-k"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_for_insert_euclidean_prefilter_preserves_exactness() {
+        let cache = QueryHashCache::new(10, 0.85);
+        let mut query = vec![0.0; 64];
+        query[0] = 1.0;
+        cache.insert_with_k(
+            query.clone(),
+            vec![SearchResult {
+                doc_id: 7,
+                distance: 0.25,
+            }],
+            1,
+        );
+
+        let far = vec![10.0; 64];
+        let removed_far = cache.invalidate_for_insert(&far, DistanceMetric::Euclidean);
+        assert_eq!(
+            removed_far, 0,
+            "far insert must not invalidate cached top-k"
+        );
+        assert!(cache.get(&query, 1).is_some());
+
+        let removed_near = cache.invalidate_for_insert(&query, DistanceMetric::Euclidean);
+        assert_eq!(
+            removed_near, 1,
+            "identical insert must invalidate cached top-k"
+        );
+        assert!(cache.get(&query, 1).is_none());
+    }
+
+    #[test]
+    fn test_invalidate_for_insert_inner_product_prefilter_preserves_exactness() {
+        let cache = QueryHashCache::new(10, 0.85);
+        let mut query = vec![0.0; 64];
+        query[0] = 1.0;
+        cache.insert_with_k(
+            query.clone(),
+            vec![SearchResult {
+                doc_id: 8,
+                distance: 0.4,
+            }],
+            1,
+        );
+
+        let mut opposite = vec![0.0; 64];
+        opposite[0] = -1.0;
+        let removed_opposite = cache.invalidate_for_insert(&opposite, DistanceMetric::InnerProduct);
+        assert_eq!(removed_opposite, 0);
+        assert!(cache.get(&query, 1).is_some());
+
+        let mut similar = vec![0.0; 64];
+        similar[0] = 0.9;
+        similar[1] = 0.1;
+        let removed_similar = cache.invalidate_for_insert(&similar, DistanceMetric::InnerProduct);
+        assert_eq!(removed_similar, 1);
+        assert!(cache.get(&query, 1).is_none());
+    }
+
+    #[test]
+    fn test_generation_guard_blocks_stale_backfill_after_invalidation() {
+        let cache = QueryHashCache::new(10, 0.85);
+        let query = create_test_embedding(222, 64);
+        let generation = cache.invalidation_generation();
+
+        let removed = cache.invalidate_for_insert(&query, DistanceMetric::Cosine);
+        assert_eq!(removed, 0);
+
+        let inserted = cache.insert_with_k_scoped_if_generation(
+            0,
+            query.clone(),
+            make_results(9),
+            1,
+            generation,
+        );
+        assert!(
+            !inserted,
+            "cache fill computed before an invalidating write must be dropped"
+        );
+        assert!(cache.get(&query, 1).is_none());
+    }
+
+    #[test]
+    fn test_invalidate_doc_removes_only_affected_queries() {
+        let cache = QueryHashCache::new(16, 0.85);
+        let q1 = create_test_embedding(101, 64);
+        let q2 = create_test_embedding(102, 64);
+        let q3 = create_test_embedding(103, 64);
+
+        cache.insert_with_k(q1.clone(), make_results_multi(&[1, 2]), 2);
+        cache.insert_with_k(q2.clone(), make_results_multi(&[1, 3]), 2);
+        cache.insert_with_k(q3.clone(), make_results_multi(&[4, 5]), 2);
+
+        let removed_doc1 = cache.invalidate_doc(1);
+        assert_eq!(removed_doc1, 2, "two cached queries reference doc_id=1");
+        assert!(cache.get(&q1, 2).is_none(), "q1 must be invalidated");
+        assert!(cache.get(&q2, 2).is_none(), "q2 must be invalidated");
+        assert!(cache.get(&q3, 2).is_some(), "q3 should remain valid");
+
+        // Ensure reverse index cleanup is complete; doc_id=2 belonged only to q1.
+        let removed_doc2 = cache.invalidate_doc(2);
+        assert_eq!(
+            removed_doc2, 0,
+            "stale reverse-index entries must be cleaned on invalidation"
+        );
+    }
+
+    #[test]
+    fn test_update_reindexes_doc_invalidation_targets() {
+        let cache = QueryHashCache::new(8, 0.85);
+        let q = create_test_embedding(111, 64);
+
+        cache.insert_with_k(q.clone(), make_results_multi(&[10]), 1);
+        cache.insert_with_k(q.clone(), make_results_multi(&[20, 30]), 2);
+
+        assert_eq!(
+            cache.invalidate_doc(10),
+            0,
+            "old doc_id must not remain indexed after entry update"
+        );
+        assert_eq!(
+            cache.invalidate_doc(20),
+            1,
+            "new doc_ids must drive invalidation after update"
         );
     }
 

@@ -206,6 +206,23 @@ impl HnswVectorIndex {
     /// For small batches (<100 vectors), falls through to sequential insert to
     /// avoid scheduler overhead.
     pub fn parallel_insert_batch(&mut self, data: &[(&[f32], usize)]) -> Result<()> {
+        self.parallel_insert_batch_impl(data, true)
+    }
+
+    /// Batch insert fast path for trusted callers (FFI benchmark adapter).
+    ///
+    /// Safety contract is identical to `parallel_insert_batch`, but callers own
+    /// all per-vector validation to avoid redundant O(N*D) scans in hot paths.
+    #[cfg(feature = "ffi-bench")]
+    pub(crate) fn parallel_insert_batch_trusted(&mut self, data: &[(&[f32], usize)]) -> Result<()> {
+        self.parallel_insert_batch_impl(data, false)
+    }
+
+    fn parallel_insert_batch_impl(
+        &mut self,
+        data: &[(&[f32], usize)],
+        validate_vectors: bool,
+    ) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -220,33 +237,35 @@ impl HnswVectorIndex {
             );
         }
 
-        // Validate dimensions upfront — cheaper than failing mid-insert
-        let needs_norm_check = matches!(
-            self.distance,
-            DistanceMetric::Cosine | DistanceMetric::InnerProduct
-        ) && !self.disable_normalization_check;
+        if validate_vectors {
+            // Validate dimensions upfront — cheaper than failing mid-insert.
+            let needs_norm_check = matches!(
+                self.distance,
+                DistanceMetric::Cosine | DistanceMetric::InnerProduct
+            ) && !self.disable_normalization_check;
 
-        for (i, (embedding, _)) in data.iter().enumerate() {
-            if embedding.len() != self.dimension {
-                anyhow::bail!(
-                    "Batch insert: embedding[{}] dimension mismatch: expected {}, got {}",
-                    i,
-                    self.dimension,
-                    embedding.len()
-                );
-            }
-            if embedding.iter().any(|v| !v.is_finite()) {
-                anyhow::bail!("Batch insert: embedding[{}] contains non-finite values", i);
-            }
-            if needs_norm_check {
-                let norm_sq = crate::simd::sum_squares_f32(embedding);
-                if !(NORMALIZATION_NORM_SQ_MIN..=NORMALIZATION_NORM_SQ_MAX).contains(&norm_sq) {
+            for (i, (embedding, _)) in data.iter().enumerate() {
+                if embedding.len() != self.dimension {
                     anyhow::bail!(
-                        "Batch insert: embedding[{}] {:?} requires L2-normalized vectors; norm_sq={}",
+                        "Batch insert: embedding[{}] dimension mismatch: expected {}, got {}",
                         i,
-                        self.distance,
-                        norm_sq
+                        self.dimension,
+                        embedding.len()
                     );
+                }
+                if embedding.iter().any(|v| !v.is_finite()) {
+                    anyhow::bail!("Batch insert: embedding[{}] contains non-finite values", i);
+                }
+                if needs_norm_check {
+                    let norm_sq = crate::simd::sum_squares_f32(embedding);
+                    if !(NORMALIZATION_NORM_SQ_MIN..=NORMALIZATION_NORM_SQ_MAX).contains(&norm_sq) {
+                        anyhow::bail!(
+                            "Batch insert: embedding[{}] {:?} requires L2-normalized vectors; norm_sq={}",
+                            i,
+                            self.distance,
+                            norm_sq
+                        );
+                    }
                 }
             }
         }
@@ -294,6 +313,32 @@ impl HnswVectorIndex {
         ef_search_override: Option<usize>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Vec<SearchResult>> {
+        self.knn_search_with_ef_cancel_impl(query, k, ef_search_override, cancelled, true)
+    }
+
+    /// Query fast path for trusted callers (FFI benchmark adapter).
+    ///
+    /// Caller must guarantee finite values and metric-specific normalization
+    /// semantics where required.
+    #[cfg(feature = "ffi-bench")]
+    pub(crate) fn knn_search_with_ef_cancel_trusted(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Vec<SearchResult>> {
+        self.knn_search_with_ef_cancel_impl(query, k, ef_search_override, cancelled, false)
+    }
+
+    fn knn_search_with_ef_cancel_impl(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search_override: Option<usize>,
+        cancelled: Option<&AtomicBool>,
+        validate_query: bool,
+    ) -> Result<Vec<SearchResult>> {
         if query.len() != self.dimension {
             anyhow::bail!(
                 "Query dimension mismatch: expected {}, got {}",
@@ -301,7 +346,7 @@ impl HnswVectorIndex {
                 query.len()
             );
         }
-        if query.iter().any(|v| !v.is_finite()) {
+        if validate_query && query.iter().any(|v| !v.is_finite()) {
             anyhow::bail!("query contains non-finite values");
         }
 
@@ -312,10 +357,12 @@ impl HnswVectorIndex {
             anyhow::bail!("k must be <= 10,000 (requested: {})", k);
         }
 
-        if matches!(
-            self.distance,
-            DistanceMetric::Cosine | DistanceMetric::InnerProduct
-        ) && !self.disable_normalization_check
+        if validate_query
+            && matches!(
+                self.distance,
+                DistanceMetric::Cosine | DistanceMetric::InnerProduct
+            )
+            && !self.disable_normalization_check
         {
             let norm_sq = crate::simd::sum_squares_f32(query);
             if !(NORMALIZATION_NORM_SQ_MIN..=NORMALIZATION_NORM_SQ_MAX).contains(&norm_sq) {

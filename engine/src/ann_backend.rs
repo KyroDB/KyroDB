@@ -6,6 +6,7 @@
 //! dual-engine drift and cache/consistency ambiguity.
 
 use parking_lot::RwLock;
+#[cfg(not(feature = "ffi-bench"))]
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -19,23 +20,39 @@ const MIN_EF_CONSTRUCTION: usize = 128;
 const SCRATCH_HEAP_RETAIN_CAPACITY: usize = 32_768;
 const VISITED_TOUCHED_RETAIN_CAPACITY: usize = 131_072;
 const VISITED_BITSET_RETAIN_WORDS: usize = (8 * 1024 * 1024) / std::mem::size_of::<u64>();
+#[cfg(not(feature = "ffi-bench"))]
 const PARALLEL_STAGING_THRESHOLD: usize = 128;
+#[cfg(not(feature = "ffi-bench"))]
 const PARALLEL_STAGING_CHUNK_SIZE_SMALL: usize = 512;
+#[cfg(not(feature = "ffi-bench"))]
 const PARALLEL_STAGING_CHUNK_SIZE_MEDIUM: usize = 1024;
+#[cfg(not(feature = "ffi-bench"))]
 const PARALLEL_STAGING_CHUNK_SIZE_LARGE: usize = 2048;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_CACHELINE_BYTES: usize = 64;
 const PREFETCH_NEIGHBOR_LOOKAHEAD_MAX: usize = 2;
 const INVALID_DENSE_ID: u32 = u32::MAX;
 const DIVERSIFIED_CANDIDATE_BUDGET_MULTIPLIER: usize = 12;
+const MAX_DIVERSITY_PAIRWISE_CHECKS: usize = 8_192;
+#[cfg(not(feature = "ffi-bench"))]
+const PARALLEL_REVERSE_PLAN_THRESHOLD: usize = 8;
 
 #[inline]
 fn metric_distance(distance: DistanceMetric, query: &[f32], candidate: &[f32]) -> f32 {
     match distance {
-        DistanceMetric::Euclidean => crate::simd::l2_distance_f32(query, candidate),
+        // Use squared L2 internally (ordering-equivalent, avoids sqrt in hot paths).
+        DistanceMetric::Euclidean => crate::simd::l2_distance_sq_f32(query, candidate),
         DistanceMetric::Cosine | DistanceMetric::InnerProduct => {
             (1.0 - crate::simd::dot_f32(query, candidate)).max(0.0)
         }
+    }
+}
+
+#[inline]
+fn metric_distance_to_user(distance: DistanceMetric, raw_distance: f32) -> f32 {
+    match distance {
+        DistanceMetric::Euclidean => raw_distance.max(0.0).sqrt(),
+        DistanceMetric::Cosine | DistanceMetric::InnerProduct => raw_distance,
     }
 }
 
@@ -579,7 +596,7 @@ impl FlatGraph {
             while let Some(item) = scratch.results.pop() {
                 out.push(SearchResult {
                     doc_id: self.dense_to_origin[item.dense_id as usize],
-                    distance: item.distance,
+                    distance: metric_distance_to_user(self.distance, item.distance),
                 });
             }
             keep_top_k_by_distance(&mut out, k);
@@ -694,15 +711,21 @@ impl FlatGraph {
         }
 
         let mut selected = Vec::with_capacity(max_neighbors);
+        let node_count = self.len();
         let budget = candidates
             .len()
             .min(max_neighbors.saturating_mul(DIVERSIFIED_CANDIDATE_BUDGET_MULTIPLIER));
+        let mut pairwise_checks = 0usize;
+        let mut pairwise_budget_exhausted = false;
 
         // HNSW neighbor diversity heuristic:
         // accept candidate `c` if it is not closer to any already-selected node
         // than it is to the query node.
         for &(cand, dist_to_query) in candidates.iter().take(budget) {
-            if cand as usize >= self.len() {
+            if pairwise_budget_exhausted {
+                break;
+            }
+            if cand as usize >= node_count {
                 continue;
             }
             if selected.contains(&cand) {
@@ -711,6 +734,12 @@ impl FlatGraph {
 
             let mut diversified = true;
             for &chosen in &selected {
+                if pairwise_checks >= MAX_DIVERSITY_PAIRWISE_CHECKS {
+                    pairwise_budget_exhausted = true;
+                    diversified = false;
+                    break;
+                }
+                pairwise_checks += 1;
                 let dist_to_chosen = self.distance_between_dense(cand, chosen);
                 if dist_to_chosen < dist_to_query {
                     diversified = false;
@@ -729,7 +758,7 @@ impl FlatGraph {
         // Fallback fill to honor max_neighbors when data geometry is highly clustered.
         if selected.len() < max_neighbors {
             for &(cand, _) in candidates.iter().take(budget) {
-                if cand as usize >= self.len() {
+                if cand as usize >= node_count {
                     continue;
                 }
                 if selected.contains(&cand) {
@@ -743,6 +772,41 @@ impl FlatGraph {
         }
 
         selected
+    }
+
+    fn prune_neighbors_by_target_distance(
+        &self,
+        target_dense: u32,
+        candidates: &[u32],
+        max_neighbors: usize,
+    ) -> Vec<u32> {
+        if max_neighbors == 0 || candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let node_count = self.len();
+        let mut scored = Vec::with_capacity(candidates.len());
+        for &nbr in candidates {
+            if nbr == target_dense || nbr as usize >= node_count {
+                continue;
+            }
+            if scored.iter().any(|(existing, _)| *existing == nbr) {
+                continue;
+            }
+            scored.push((nbr, self.distance_between_dense(target_dense, nbr)));
+        }
+
+        if scored.is_empty() {
+            return Vec::new();
+        }
+
+        let cmp = |a: &(u32, f32), b: &(u32, f32)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+        if scored.len() > max_neighbors {
+            scored.select_nth_unstable_by(max_neighbors - 1, cmp);
+            scored.truncate(max_neighbors);
+        }
+        scored.sort_unstable_by(cmp);
+        scored.into_iter().map(|(nbr, _)| nbr).collect()
     }
 
     fn merge_and_prune_reverse_edge(
@@ -767,51 +831,120 @@ impl FlatGraph {
         if current.contains(&incoming_dense) {
             return true;
         }
-        if current.len() < max_neighbors {
-            let mut merged = Vec::with_capacity(current.len() + 1);
-            for &nbr in current {
-                if nbr == target_dense || nbr as usize >= self.len() {
-                    continue;
-                }
-                if !merged.contains(&nbr) {
-                    merged.push(nbr);
-                }
-            }
-            if !merged.contains(&incoming_dense) {
-                merged.push(incoming_dense);
-            }
-            self.set_layer_neighbors(layer, target_dense, &merged);
-            return merged.contains(&incoming_dense);
-        }
 
-        let mut scored = Vec::with_capacity(current.len() + 1);
-        for &nbr in current {
-            if nbr == target_dense || nbr as usize >= self.len() {
-                continue;
-            }
-            if scored.iter().any(|(seen, _)| *seen == nbr) {
-                continue;
-            }
-            scored.push((nbr, self.distance_between_dense(target_dense, nbr)));
-        }
-
-        if !scored.iter().any(|(seen, _)| *seen == incoming_dense) {
-            scored.push((
-                incoming_dense,
-                self.distance_between_dense(target_dense, incoming_dense),
-            ));
-        }
-
-        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-
-        let mut merged = self.select_diverse_neighbors(&scored, max_neighbors);
-        let mut kept_incoming = merged.contains(&incoming_dense);
-        if !kept_incoming && merged.len() < max_neighbors {
-            merged.push(incoming_dense);
-            kept_incoming = true;
-        }
+        let mut candidates = Vec::with_capacity(current.len() + 1);
+        candidates.extend_from_slice(current);
+        candidates.push(incoming_dense);
+        let merged =
+            self.prune_neighbors_by_target_distance(target_dense, &candidates, max_neighbors);
+        let kept_incoming = merged.contains(&incoming_dense);
         self.set_layer_neighbors(layer, target_dense, &merged);
         kept_incoming
+    }
+
+    fn force_attach_reverse_edge(
+        &mut self,
+        layer: usize,
+        target_dense: u32,
+        incoming_dense: u32,
+        max_neighbors: usize,
+    ) -> bool {
+        if layer >= self.neighbors_by_layer.len()
+            || max_neighbors == 0
+            || target_dense as usize >= self.len()
+            || incoming_dense as usize >= self.len()
+            || target_dense == incoming_dense
+        {
+            return false;
+        }
+        if !self.neighbors_by_layer[layer].has_dense(target_dense) {
+            return false;
+        }
+
+        let current = self.neighbors(layer, target_dense);
+        if current.contains(&incoming_dense) {
+            return true;
+        }
+
+        let cmp = |a: &(u32, f32), b: &(u32, f32)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+        let mut neighbors_with_distance =
+            Vec::with_capacity(current.len().saturating_add(1).min(max_neighbors));
+        neighbors_with_distance.push((
+            incoming_dense,
+            self.distance_between_dense(target_dense, incoming_dense),
+        ));
+
+        if max_neighbors > 1 {
+            let node_count = self.len();
+            let mut others = Vec::with_capacity(current.len());
+            for &nbr in current {
+                if nbr == target_dense || nbr == incoming_dense || nbr as usize >= node_count {
+                    continue;
+                }
+                if others.iter().any(|(existing, _)| *existing == nbr) {
+                    continue;
+                }
+                others.push((nbr, self.distance_between_dense(target_dense, nbr)));
+            }
+            let keep = max_neighbors - 1;
+            if keep > 0 {
+                if others.len() > keep {
+                    others.select_nth_unstable_by(keep - 1, cmp);
+                    others.truncate(keep);
+                }
+                neighbors_with_distance.extend(others);
+            }
+        }
+
+        neighbors_with_distance.sort_unstable_by(cmp);
+        let neighbors: Vec<u32> = neighbors_with_distance
+            .into_iter()
+            .take(max_neighbors)
+            .map(|(nbr, _)| nbr)
+            .collect();
+        let kept_incoming = neighbors.contains(&incoming_dense);
+        self.set_layer_neighbors(layer, target_dense, &neighbors);
+        kept_incoming
+    }
+
+    #[cfg(not(feature = "ffi-bench"))]
+    fn plan_reverse_edge_update(
+        &self,
+        layer: usize,
+        target_dense: u32,
+        incoming_dense: u32,
+        max_neighbors: usize,
+    ) -> Option<ReverseEdgePlan> {
+        if layer >= self.neighbors_by_layer.len()
+            || target_dense as usize >= self.len()
+            || incoming_dense as usize >= self.len()
+            || target_dense == incoming_dense
+        {
+            return None;
+        }
+        if !self.neighbors_by_layer[layer].has_dense(target_dense) {
+            return None;
+        }
+
+        let current = self.neighbors(layer, target_dense);
+        if current.contains(&incoming_dense) {
+            return Some(ReverseEdgePlan {
+                target_dense,
+                neighbors: current.to_vec(),
+                kept_incoming: true,
+            });
+        }
+        let mut candidates = Vec::with_capacity(current.len() + 1);
+        candidates.extend_from_slice(current);
+        candidates.push(incoming_dense);
+        let merged =
+            self.prune_neighbors_by_target_distance(target_dense, &candidates, max_neighbors);
+        let kept_incoming = merged.contains(&incoming_dense);
+        Some(ReverseEdgePlan {
+            target_dense,
+            neighbors: merged,
+            kept_incoming,
+        })
     }
 
     /// Connect a freshly-added node using per-layer candidate lists.
@@ -943,9 +1076,35 @@ impl FlatGraph {
 
             // Reverse edges: neighbor -> new_node (bidirectional connectivity).
             let mut reachable = false;
-            for &nbr in &selected {
-                if self.merge_and_prune_reverse_edge(layer, nbr, new_dense, max_nbrs) {
-                    reachable = true;
+            #[cfg(feature = "ffi-bench")]
+            {
+                for &nbr in &selected {
+                    if self.merge_and_prune_reverse_edge(layer, nbr, new_dense, max_nbrs) {
+                        reachable = true;
+                    }
+                }
+            }
+            #[cfg(not(feature = "ffi-bench"))]
+            {
+                if selected.len() >= PARALLEL_REVERSE_PLAN_THRESHOLD {
+                    let reverse_plans: Vec<ReverseEdgePlan> = selected
+                        .par_iter()
+                        .filter_map(|&nbr| {
+                            self.plan_reverse_edge_update(layer, nbr, new_dense, max_nbrs)
+                        })
+                        .collect();
+                    for plan in reverse_plans {
+                        self.set_layer_neighbors(layer, plan.target_dense, &plan.neighbors);
+                        if plan.kept_incoming {
+                            reachable = true;
+                        }
+                    }
+                } else {
+                    for &nbr in &selected {
+                        if self.merge_and_prune_reverse_edge(layer, nbr, new_dense, max_nbrs) {
+                            reachable = true;
+                        }
+                    }
                 }
             }
 
@@ -955,8 +1114,7 @@ impl FlatGraph {
             // because they are the farthest neighbor for every connected node.
             if !reachable {
                 if let Some(&closest_nbr) = selected.first() {
-                    let _ =
-                        self.merge_and_prune_reverse_edge(layer, closest_nbr, new_dense, max_nbrs);
+                    let _ = self.force_attach_reverse_edge(layer, closest_nbr, new_dense, max_nbrs);
                 }
             }
         }
@@ -1161,6 +1319,14 @@ struct InsertPlan {
     layer_neighbors: Vec<Vec<u32>>,
 }
 
+#[cfg(not(feature = "ffi-bench"))]
+#[derive(Debug)]
+struct ReverseEdgePlan {
+    target_dense: u32,
+    neighbors: Vec<u32>,
+    kept_incoming: bool,
+}
+
 impl SingleGraphBackend {
     pub(crate) fn new(
         distance: DistanceMetric,
@@ -1286,6 +1452,7 @@ impl SingleGraphBackend {
         self.apply_insert_plan(flat, embedding, origin_id, &plan);
     }
 
+    #[cfg(not(feature = "ffi-bench"))]
     #[inline]
     fn staging_chunk_size(&self, batch: &[(&[f32], usize)]) -> usize {
         let dim = batch
@@ -1340,48 +1507,80 @@ impl AnnBackend for SingleGraphBackend {
             return;
         }
 
-        let chunk_size = self.staging_chunk_size(batch);
-        for chunk in batch.chunks(chunk_size) {
-            let staged = {
-                let flat_guard = self.flat_graph.read();
-                flat_guard.as_ref().map(|flat| {
-                    if chunk.len() >= PARALLEL_STAGING_THRESHOLD {
-                        chunk
-                            .par_iter()
-                            .map(|(embedding, origin_id)| {
-                                self.build_insert_plan(flat, embedding, *origin_id)
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        chunk
-                            .iter()
-                            .map(|(embedding, origin_id)| {
-                                self.build_insert_plan(flat, embedding, *origin_id)
-                            })
-                            .collect::<Vec<_>>()
-                    }
-                })
-            };
-
+        #[cfg(feature = "ffi-bench")]
+        {
             let mut flat_guard = self.flat_graph.write();
             if let Some(flat) = flat_guard.as_mut() {
-                flat.reserve_for_additional(chunk.len());
+                flat.reserve_for_additional(batch.len());
+                for &(embedding, origin_id) in batch {
+                    self.insert_into_existing_flat(flat, embedding, origin_id);
+                }
+                return;
             }
-            for (idx, &(embedding, origin_id)) in chunk.iter().enumerate() {
+
+            let ((first_embedding, first_origin_id), rest) =
+                batch.split_first().expect("batch is non-empty");
+            *flat_guard = FlatGraph::new_single(
+                self.distance,
+                first_embedding,
+                *first_origin_id as u64,
+                self.layer0_neighbor_cap,
+                self.upper_layer_neighbor_cap,
+            );
+            if let Some(flat) = flat_guard.as_mut() {
+                flat.reserve_for_additional(rest.len());
+                for &(embedding, origin_id) in rest {
+                    self.insert_into_existing_flat(flat, embedding, origin_id);
+                }
+            }
+        }
+
+        #[cfg(not(feature = "ffi-bench"))]
+        let chunk_size = self.staging_chunk_size(batch);
+        #[cfg(not(feature = "ffi-bench"))]
+        {
+            for chunk in batch.chunks(chunk_size) {
+                let staged = {
+                    let flat_guard = self.flat_graph.read();
+                    flat_guard.as_ref().map(|flat| {
+                        if chunk.len() >= PARALLEL_STAGING_THRESHOLD {
+                            chunk
+                                .par_iter()
+                                .map(|(embedding, origin_id)| {
+                                    self.build_insert_plan(flat, embedding, *origin_id)
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            chunk
+                                .iter()
+                                .map(|(embedding, origin_id)| {
+                                    self.build_insert_plan(flat, embedding, *origin_id)
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                };
+
+                let mut flat_guard = self.flat_graph.write();
                 if let Some(flat) = flat_guard.as_mut() {
-                    if let Some(ref staged_plans) = staged {
-                        self.apply_insert_plan(flat, embedding, origin_id, &staged_plans[idx]);
+                    flat.reserve_for_additional(chunk.len());
+                }
+                for (idx, &(embedding, origin_id)) in chunk.iter().enumerate() {
+                    if let Some(flat) = flat_guard.as_mut() {
+                        if let Some(ref staged_plans) = staged {
+                            self.apply_insert_plan(flat, embedding, origin_id, &staged_plans[idx]);
+                        } else {
+                            self.insert_into_existing_flat(flat, embedding, origin_id);
+                        }
                     } else {
-                        self.insert_into_existing_flat(flat, embedding, origin_id);
+                        *flat_guard = FlatGraph::new_single(
+                            self.distance,
+                            embedding,
+                            origin_id as u64,
+                            self.layer0_neighbor_cap,
+                            self.upper_layer_neighbor_cap,
+                        );
                     }
-                } else {
-                    *flat_guard = FlatGraph::new_single(
-                        self.distance,
-                        embedding,
-                        origin_id as u64,
-                        self.layer0_neighbor_cap,
-                        self.upper_layer_neighbor_cap,
-                    );
                 }
             }
         }
@@ -1826,6 +2025,43 @@ mod tests {
             sum_m16 > sum_m48,
             "larger M should produce fewer high-layer assignments"
         );
+    }
+
+    #[cfg(feature = "ffi-bench")]
+    #[test]
+    fn ffi_bench_batch_build_matches_online_insert_results() {
+        const DATASET_SIZE: usize = 256;
+        const DIM: usize = 32;
+        const K: usize = 10;
+
+        let dataset: Vec<Vec<f32>> = (0..DATASET_SIZE)
+            .map(|seed| pseudo_random_vec(seed, DIM))
+            .collect();
+        let batch: Vec<(&[f32], usize)> = dataset
+            .iter()
+            .enumerate()
+            .map(|(id, v)| (v.as_slice(), id))
+            .collect();
+
+        let batch_backend =
+            backend_with_defaults(DistanceMetric::Euclidean, 24, DATASET_SIZE, 8, 400);
+        batch_backend.parallel_insert_slice(&batch);
+
+        let online_backend =
+            backend_with_defaults(DistanceMetric::Euclidean, 24, DATASET_SIZE, 8, 400);
+        for &(embedding, origin_id) in &batch {
+            online_backend.insert(embedding, origin_id);
+        }
+
+        for query_idx in [0usize, 7, 31, 63, 127, 255] {
+            let batch_results = batch_backend.search(&dataset[query_idx], K, 256);
+            let online_results = online_backend.search(&dataset[query_idx], K, 256);
+            assert_eq!(
+                batch_results, online_results,
+                "ffi-bench build path must match deterministic online insertion for query {}",
+                query_idx
+            );
+        }
     }
 
     #[test]

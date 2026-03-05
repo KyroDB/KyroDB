@@ -11,19 +11,23 @@ float:
           args:
             M: 16
             ef_construction: 200
+            trusted_input: true
           query_args: [[20, 40, 80, 120, 200, 300, 400, 600]]
         M-24:
           args:
             M: 24
             ef_construction: 200
+            trusted_input: true
           query_args: [[20, 40, 80, 120, 200, 300, 400, 600]]
         M-36:
           args:
             M: 36
             ef_construction: 300
+            trusted_input: true
           query_args: [[20, 40, 80, 120, 200, 300, 400, 600]]
         M-48:
           args:
             M: 48
             ef_construction: 300
+            trusted_input: true
           query_args: [[20, 40, 80, 120, 200, 300, 400, 600, 800, 1200]]

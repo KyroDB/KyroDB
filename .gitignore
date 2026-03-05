@@ -148,3 +148,5 @@ benchmarks/scripts/analyze_vm_suite.py
 AGENTS.md
 docs/BENCHMARK_REPORT_FX32ms_v2.md
 /kyrodb-python/
+docs/PLATFORM_PLAN.md
+/paper

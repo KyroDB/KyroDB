@@ -1935,11 +1935,33 @@ async fn main() -> Result<()> {
         0.0
     };
 
+    let relevant_in_top_10 = binary_ranking
+        .iter()
+        .take(10)
+        .filter(|r| r.relevance > 0.0)
+        .count();
     let recall_at_10 = if total_relevant > 0 {
+        relevant_in_top_10 as f64 / total_relevant as f64
+    } else {
+        0.0
+    };
+
+    // Keep the library-based recall in lockstep with the explicit top-k
+    // calculation above and fail fast if they ever diverge.
+    let recall_at_10_library = if total_relevant > 0 {
         calculate_recall_at_k(&binary_ranking, 10, total_relevant)
     } else {
         0.0
     };
+    if (recall_at_10 - recall_at_10_library).abs() > 1e-12 {
+        anyhow::bail!(
+            "recall_at_10 mismatch: explicit={} library={} total_relevant={} relevant_in_top_10={}",
+            recall_at_10,
+            recall_at_10_library,
+            total_relevant,
+            relevant_in_top_10
+        );
+    }
 
     println!("  NDCG@10:     {:.4}", ndcg_at_10);
     println!("  MRR:         {:.4}", mrr);

@@ -92,6 +92,18 @@ pub fn sum_squares_f32(v: &[f32]) -> f32 {
 /// Panics if `a.len() != b.len()`.
 #[inline]
 pub fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
+    l2_distance_sq_f32(a, b).sqrt()
+}
+
+/// Returns the squared Euclidean (L2) distance $\|a-b\|_2^2$.
+///
+/// This is preferable for ranking/pruning paths where only relative ordering
+/// matters because it avoids the expensive square root.
+///
+/// # Panics
+/// Panics if `a.len() != b.len()`.
+#[inline]
+pub fn l2_distance_sq_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(
         a.len(),
         b.len(),
@@ -107,24 +119,24 @@ pub fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         if std::arch::is_aarch64_feature_detected!("neon") {
-            return l2_distance_f32_neon(a, b, len);
+            return l2_distance_sq_f32_neon(a, b, len);
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
         if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
-            return l2_distance_f32_avx512(a, b, len);
+            return l2_distance_sq_f32_avx512(a, b, len);
         }
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            return l2_distance_f32_avx2(a, b, len);
+            return l2_distance_sq_f32_avx2(a, b, len);
         }
         if std::is_x86_feature_detected!("sse2") {
-            return l2_distance_f32_sse2(a, b, len);
+            return l2_distance_sq_f32_sse2(a, b, len);
         }
     }
 
-    l2_distance_f32_scalar(a, b, len)
+    l2_distance_sq_f32_scalar(a, b, len)
 }
 
 /// Computes cosine similarity: $(a\cdot b)/(\|a\|\|b\|)$.
@@ -187,13 +199,13 @@ fn sum_squares_f32_scalar(v: &[f32]) -> f32 {
 }
 
 #[inline]
-fn l2_distance_f32_scalar(a: &[f32], b: &[f32], len: usize) -> f32 {
+fn l2_distance_sq_f32_scalar(a: &[f32], b: &[f32], len: usize) -> f32 {
     let mut sum = 0.0;
     for i in 0..len {
         let d = a[i] - b[i];
         sum += d * d;
     }
-    sum.sqrt()
+    sum
 }
 
 #[inline]
@@ -447,7 +459,7 @@ unsafe fn sum_squares_f32_sse2(v: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "fma")]
-unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
+unsafe fn l2_distance_sq_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
     let mut acc2 = _mm256_setzero_ps();
@@ -491,13 +503,13 @@ unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32], len: usize) -> f32 {
         let d = a[i] - b[i];
         sum += d * d;
     }
-    sum.sqrt()
+    sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[target_feature(enable = "fma")]
-unsafe fn l2_distance_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
+unsafe fn l2_distance_sq_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
     let mut acc0 = _mm512_setzero_ps();
     let mut acc1 = _mm512_setzero_ps();
     let mut acc2 = _mm512_setzero_ps();
@@ -541,12 +553,12 @@ unsafe fn l2_distance_f32_avx512(a: &[f32], b: &[f32], len: usize) -> f32 {
         let d = a[i] - b[i];
         sum += d * d;
     }
-    sum.sqrt()
+    sum
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn l2_distance_f32_sse2(a: &[f32], b: &[f32], len: usize) -> f32 {
+unsafe fn l2_distance_sq_f32_sse2(a: &[f32], b: &[f32], len: usize) -> f32 {
     let mut acc = _mm_setzero_ps();
     let chunks = len / 4;
     for i in 0..chunks {
@@ -563,7 +575,7 @@ unsafe fn l2_distance_f32_sse2(a: &[f32], b: &[f32], len: usize) -> f32 {
         let d = a[i] - b[i];
         sum += d * d;
     }
-    sum.sqrt()
+    sum
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -807,7 +819,7 @@ unsafe fn sum_squares_f32_neon(v: &[f32]) -> f32 {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn l2_distance_f32_neon(a: &[f32], b: &[f32], len: usize) -> f32 {
+unsafe fn l2_distance_sq_f32_neon(a: &[f32], b: &[f32], len: usize) -> f32 {
     let mut acc: float32x4_t = vdupq_n_f32(0.0);
     let chunks = len / 4;
     for i in 0..chunks {
@@ -822,7 +834,7 @@ unsafe fn l2_distance_f32_neon(a: &[f32], b: &[f32], len: usize) -> f32 {
         let d = a[i] - b[i];
         sum += d * d;
     }
-    sum.sqrt()
+    sum
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -872,6 +884,8 @@ mod tests {
         let b = vec![1.0, 2.0, 3.0, 5.0];
         let d = l2_distance_f32(&a, &b);
         assert!((d - 1.0).abs() < 1e-6);
+        let d_sq = l2_distance_sq_f32(&a, &b);
+        assert!((d_sq - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -896,7 +910,7 @@ mod tests {
 
         let expected_dot = dot_f32_scalar(&a, &b, a.len());
         let expected_ss = sum_squares_f32_scalar(&a);
-        let expected_l2 = l2_distance_f32_scalar(&a, &b, a.len());
+        let expected_l2 = l2_distance_sq_f32_scalar(&a, &b, a.len()).sqrt();
         let expected_trip = {
             let mut dot = 0.0f32;
             let mut na = 0.0f32;
@@ -914,7 +928,7 @@ mod tests {
         unsafe {
             let got_dot = dot_f32_neon(&a, &b, a.len());
             let got_ss = sum_squares_f32_neon(&a);
-            let got_l2 = l2_distance_f32_neon(&a, &b, a.len());
+            let got_l2 = l2_distance_sq_f32_neon(&a, &b, a.len()).sqrt();
             let got_trip = dot_and_norms_f32_neon(&a, &b, a.len());
 
             assert!((expected_dot - got_dot).abs() < 1e-2);

@@ -19,15 +19,21 @@ class _AnnFfi:
     def __init__(self) -> None:
         self.lib = self._load_library()
 
-        self.lib.kyrodb_ann_create.argtypes = [
+        if not hasattr(self.lib, "kyrodb_ann_create_with_flags"):
+            raise RuntimeError(
+                "libkyrodb_engine is missing kyrodb_ann_create_with_flags; "
+                "rebuild the benchmark library from this KyroDB tree"
+            )
+        self.lib.kyrodb_ann_create_with_flags.argtypes = [
             ctypes.c_uint32,
             ctypes.c_uint64,
             ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.c_uint8,
+            ctypes.c_uint32,
         ]
-        self.lib.kyrodb_ann_create.restype = ctypes.c_void_p
+        self.lib.kyrodb_ann_create_with_flags.restype = ctypes.c_void_p
 
         self.lib.kyrodb_ann_free.argtypes = [ctypes.c_void_p]
         self.lib.kyrodb_ann_free.restype = None
@@ -115,12 +121,14 @@ class KyroDB(BaseANN):
         self.ef_search = int(params.get("ef_search", 50))
 
         self._distance_code = self._metric_to_distance_code(metric)
-        self._normalize = metric.lower() in ("angular", "cosine", "inner_product", "inner-product")
+        self._normalize = metric.lower() in ("angular", "cosine")
+        self._trusted_input = bool(params.get("trusted_input", True))
 
         self._ffi = _AnnFfi.instance()
         self._handle = ctypes.c_void_p(None)
         self._dimension = 0
         self._last_memory_kb = 0.0
+        self._query_ids_buf = np.empty(0, dtype=np.uint32)
 
         self.name = "KyroDB"
 
@@ -132,24 +140,25 @@ class KyroDB(BaseANN):
         if lowered in ("euclidean", "l2"):
             return 1
         if lowered in ("inner_product", "inner-product"):
-            return 2
+            raise ValueError(
+                "KyroDB ANN-Benchmarks adapter does not support inner_product; "
+                "use angular/cosine or euclidean/l2"
+            )
         raise ValueError(
-            f"Unsupported metric '{metric}'. Supported metrics: angular, cosine, euclidean, l2, inner_product"
+            f"Unsupported metric '{metric}'. Supported metrics: angular, cosine, euclidean, l2"
         )
 
     @staticmethod
     def _normalize_rows(arr: np.ndarray) -> np.ndarray:
+        arr = np.array(arr, dtype=np.float32, order="C", copy=True)
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        # Replace zero-norm rows with a small sentinel so they normalize to
-        # a valid unit vector. ANN benchmark datasets like nytimes-256 contain
-        # zero vectors that are undefined under cosine similarity.
         zero_mask = (norms < 1e-30).reshape(-1)
         if np.any(zero_mask):
-            arr = arr.copy()
             arr[zero_mask, 0] = 1e-12
             norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-30)
-        return arr / norms
+        np.divide(arr, norms, out=arr)
+        return arr
 
     @staticmethod
     def _normalize_vector(vec: np.ndarray) -> np.ndarray:
@@ -167,13 +176,16 @@ class KyroDB(BaseANN):
 
     def _create_handle(self, dimension: int, max_elements: int) -> None:
         self._destroy_handle()
-        handle = self._ffi.lib.kyrodb_ann_create(
+        disable_norm_check = 1 if self._normalize else 0
+        flags = 1 if self._trusted_input else 0
+        handle = self._ffi.lib.kyrodb_ann_create_with_flags(
             ctypes.c_uint32(dimension),
             ctypes.c_uint64(max_elements),
             ctypes.c_uint32(self._distance_code),
             ctypes.c_uint32(self.M),
             ctypes.c_uint32(self.ef_construction),
-            ctypes.c_uint8(0),
+            ctypes.c_uint8(disable_norm_check),
+            ctypes.c_uint32(flags),
         )
         if not handle:
             raise RuntimeError(f"kyrodb_ann_create failed: {self._ffi.last_error()}")
@@ -243,7 +255,9 @@ class KyroDB(BaseANN):
         if self._normalize:
             vec = self._normalize_vector(vec)
 
-        out_ids = np.empty(kk, dtype=np.uint32)
+        if self._query_ids_buf.size < kk:
+            self._query_ids_buf = np.empty(kk, dtype=np.uint32)
+        out_ids = self._query_ids_buf
         out_len = ctypes.c_size_t(0)
 
         rc = self._ffi.lib.kyrodb_ann_query_f32(
@@ -261,7 +275,7 @@ class KyroDB(BaseANN):
         count = int(out_len.value)
         if count <= 0:
             return []
-        return [int(x) for x in out_ids[:count]]
+        return out_ids[:count].astype(np.int64, copy=False).tolist()
 
     def get_memory_usage(self) -> float:
         if self._handle.value:

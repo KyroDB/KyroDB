@@ -18,7 +18,8 @@ use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,6 +31,32 @@ use tracing::{debug, error, info, instrument, trace, warn};
 /// collisions with WAL files from a previous process that also had a bad clock.
 static FALLBACK_WAL_FILE_ID: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_WAL_INIT: std::sync::Once = std::sync::Once::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OrderedF64(u64);
+
+impl OrderedF64 {
+    #[inline]
+    fn from_f64(value: f64) -> Self {
+        // `metadata_filter::matches_range` uses standard f64 comparisons where
+        // -0.0 == +0.0, so canonicalize signed zero for index key consistency.
+        let value = if value == 0.0 { 0.0 } else { value };
+        // Convert IEEE-754 bits to a monotonic unsigned ordering key.
+        let bits = value.to_bits();
+        if (bits >> 63) == 0 {
+            Self(bits | (1u64 << 63))
+        } else {
+            Self(!bits)
+        }
+    }
+}
+
+#[inline]
+fn parse_indexable_numeric(value: &str) -> Option<f64> {
+    // Must mirror `metadata_filter::matches_range`: treat any parseable f64
+    // (including NaN / ±inf) as numeric.
+    value.parse::<f64>().ok()
+}
 
 /// Returns a process-unique monotonic WAL file ID for the clock-failure path.
 /// First call seeds the counter with (pid << 32 | random_u32); subsequent calls
@@ -50,6 +77,9 @@ fn next_fallback_wal_file_id() -> u64 {
 struct MetadataInvertedIndex {
     alive: RoaringTreemap,
     by_key_value: HashMap<String, HashMap<String, RoaringTreemap>>,
+    by_key_lex: HashMap<String, BTreeMap<String, RoaringTreemap>>,
+    by_key_numeric: HashMap<String, BTreeMap<OrderedF64, RoaringTreemap>>,
+    numeric_docs_by_key: HashMap<String, RoaringTreemap>,
 }
 
 impl MetadataInvertedIndex {
@@ -69,25 +99,7 @@ impl MetadataInvertedIndex {
         // Defensive: if a caller inserts an already-live doc without using `replace_doc`,
         // ensure we don't leave stale postings behind.
         if self.alive.contains(doc_id) {
-            let mut keys_to_remove: Vec<String> = Vec::new();
-            for (k, values) in self.by_key_value.iter_mut() {
-                let mut values_to_remove: Vec<String> = Vec::new();
-                for (v, bitmap) in values.iter_mut() {
-                    bitmap.remove(doc_id);
-                    if bitmap.is_empty() {
-                        values_to_remove.push(v.clone());
-                    }
-                }
-                for v in values_to_remove {
-                    values.remove(&v);
-                }
-                if values.is_empty() {
-                    keys_to_remove.push(k.clone());
-                }
-            }
-            for k in keys_to_remove {
-                self.by_key_value.remove(&k);
-            }
+            self.remove_doc_from_all_indexes(doc_id);
         }
 
         self.alive.insert(doc_id);
@@ -99,6 +111,30 @@ impl MetadataInvertedIndex {
                 .entry(v.clone())
                 .or_default()
                 .insert(doc_id);
+
+            self.by_key_lex
+                .entry(k.clone())
+                .or_default()
+                .entry(v.clone())
+                .or_default()
+                .insert(doc_id);
+
+            if let Some(value_num) = parse_indexable_numeric(v) {
+                self.numeric_docs_by_key
+                    .entry(k.clone())
+                    .or_default()
+                    .insert(doc_id);
+                // NaN compares false for all range operators in f64 semantics,
+                // so keep NaN docs out of numeric range index matches.
+                if !value_num.is_nan() {
+                    self.by_key_numeric
+                        .entry(k.clone())
+                        .or_default()
+                        .entry(OrderedF64::from_f64(value_num))
+                        .or_default()
+                        .insert(doc_id);
+                }
+            }
         }
     }
 
@@ -115,6 +151,41 @@ impl MetadataInvertedIndex {
                 }
                 if values.is_empty() {
                     self.by_key_value.remove(k);
+                }
+            }
+
+            if let Some(values) = self.by_key_lex.get_mut(k) {
+                if let Some(bitmap) = values.get_mut(v) {
+                    bitmap.remove(doc_id);
+                    if bitmap.is_empty() {
+                        values.remove(v);
+                    }
+                }
+                if values.is_empty() {
+                    self.by_key_lex.remove(k);
+                }
+            }
+
+            if let Some(value_num) = parse_indexable_numeric(v) {
+                if !value_num.is_nan() {
+                    if let Some(values) = self.by_key_numeric.get_mut(k) {
+                        let num_key = OrderedF64::from_f64(value_num);
+                        if let Some(bitmap) = values.get_mut(&num_key) {
+                            bitmap.remove(doc_id);
+                            if bitmap.is_empty() {
+                                values.remove(&num_key);
+                            }
+                        }
+                        if values.is_empty() {
+                            self.by_key_numeric.remove(k);
+                        }
+                    }
+                }
+                if let Some(bitmap) = self.numeric_docs_by_key.get_mut(k) {
+                    bitmap.remove(doc_id);
+                    if bitmap.is_empty() {
+                        self.numeric_docs_by_key.remove(k);
+                    }
                 }
             }
         }
@@ -136,6 +207,169 @@ impl MetadataInvertedIndex {
             .and_then(|m| m.get(value))
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn bitmap_for_key_presence(&self, key: &str) -> RoaringTreemap {
+        let mut out = RoaringTreemap::new();
+        if let Some(values) = self.by_key_value.get(key) {
+            for bitmap in values.values() {
+                out |= bitmap;
+            }
+        }
+        out
+    }
+
+    fn bitmap_for_range_lex(
+        &self,
+        key: &str,
+        bound: &crate::proto::range_match::Bound,
+    ) -> RoaringTreemap {
+        let Some(values) = self.by_key_lex.get(key) else {
+            return RoaringTreemap::new();
+        };
+
+        let mut out = RoaringTreemap::new();
+        match bound {
+            crate::proto::range_match::Bound::Gte(v) => {
+                for (_, bitmap) in values.range((Bound::Included(v.clone()), Bound::Unbounded)) {
+                    out |= bitmap;
+                }
+            }
+            crate::proto::range_match::Bound::Lte(v) => {
+                for (_, bitmap) in values.range((Bound::Unbounded, Bound::Included(v.clone()))) {
+                    out |= bitmap;
+                }
+            }
+            crate::proto::range_match::Bound::Gt(v) => {
+                for (_, bitmap) in values.range((Bound::Excluded(v.clone()), Bound::Unbounded)) {
+                    out |= bitmap;
+                }
+            }
+            crate::proto::range_match::Bound::Lt(v) => {
+                for (_, bitmap) in values.range((Bound::Unbounded, Bound::Excluded(v.clone()))) {
+                    out |= bitmap;
+                }
+            }
+        }
+        out
+    }
+
+    fn bitmap_for_range_numeric(
+        &self,
+        key: &str,
+        bound: &crate::proto::range_match::Bound,
+        bound_num: f64,
+    ) -> RoaringTreemap {
+        // `metadata_filter::matches_range` yields false for numeric comparisons
+        // when bound is NaN.
+        if bound_num.is_nan() {
+            return RoaringTreemap::new();
+        }
+
+        let Some(values) = self.by_key_numeric.get(key) else {
+            return RoaringTreemap::new();
+        };
+
+        let num_key = OrderedF64::from_f64(bound_num);
+        let mut out = RoaringTreemap::new();
+        match bound {
+            crate::proto::range_match::Bound::Gte(_) => {
+                for (_, bitmap) in values.range((Bound::Included(num_key), Bound::Unbounded)) {
+                    out |= bitmap;
+                }
+            }
+            crate::proto::range_match::Bound::Lte(_) => {
+                for (_, bitmap) in values.range((Bound::Unbounded, Bound::Included(num_key))) {
+                    out |= bitmap;
+                }
+            }
+            crate::proto::range_match::Bound::Gt(_) => {
+                for (_, bitmap) in values.range((Bound::Excluded(num_key), Bound::Unbounded)) {
+                    out |= bitmap;
+                }
+            }
+            crate::proto::range_match::Bound::Lt(_) => {
+                for (_, bitmap) in values.range((Bound::Unbounded, Bound::Excluded(num_key))) {
+                    out |= bitmap;
+                }
+            }
+        }
+        out
+    }
+
+    fn remove_doc_from_all_indexes(&mut self, doc_id: u64) {
+        self.alive.remove(doc_id);
+
+        let mut value_keys_to_remove: Vec<String> = Vec::new();
+        for (k, values) in self.by_key_value.iter_mut() {
+            let mut values_to_remove: Vec<String> = Vec::new();
+            for (v, bitmap) in values.iter_mut() {
+                bitmap.remove(doc_id);
+                if bitmap.is_empty() {
+                    values_to_remove.push(v.clone());
+                }
+            }
+            for v in values_to_remove {
+                values.remove(&v);
+            }
+            if values.is_empty() {
+                value_keys_to_remove.push(k.clone());
+            }
+        }
+        for k in value_keys_to_remove {
+            self.by_key_value.remove(&k);
+        }
+
+        let mut lex_keys_to_remove: Vec<String> = Vec::new();
+        for (k, values) in self.by_key_lex.iter_mut() {
+            let mut values_to_remove: Vec<String> = Vec::new();
+            for (v, bitmap) in values.iter_mut() {
+                bitmap.remove(doc_id);
+                if bitmap.is_empty() {
+                    values_to_remove.push(v.clone());
+                }
+            }
+            for v in values_to_remove {
+                values.remove(&v);
+            }
+            if values.is_empty() {
+                lex_keys_to_remove.push(k.clone());
+            }
+        }
+        for k in lex_keys_to_remove {
+            self.by_key_lex.remove(&k);
+        }
+
+        let mut numeric_keys_to_remove: Vec<String> = Vec::new();
+        for (k, values) in self.by_key_numeric.iter_mut() {
+            let mut values_to_remove: Vec<OrderedF64> = Vec::new();
+            for (v, bitmap) in values.iter_mut() {
+                bitmap.remove(doc_id);
+                if bitmap.is_empty() {
+                    values_to_remove.push(*v);
+                }
+            }
+            for v in values_to_remove {
+                values.remove(&v);
+            }
+            if values.is_empty() {
+                numeric_keys_to_remove.push(k.clone());
+            }
+        }
+        for k in numeric_keys_to_remove {
+            self.by_key_numeric.remove(&k);
+        }
+
+        let mut numeric_doc_keys_to_remove: Vec<String> = Vec::new();
+        for (k, bitmap) in self.numeric_docs_by_key.iter_mut() {
+            bitmap.remove(doc_id);
+            if bitmap.is_empty() {
+                numeric_doc_keys_to_remove.push(k.clone());
+            }
+        }
+        for k in numeric_doc_keys_to_remove {
+            self.numeric_docs_by_key.remove(&k);
+        }
     }
 }
 
@@ -194,10 +428,40 @@ fn compile_filter_to_bitmap(
             out -= &sub_b;
             Some(out)
         }
-        // Range requires evaluating actual values.
-        // We fall back to scan for correctness.
-        Some(FilterType::Range(_)) => None,
+        Some(FilterType::Range(range)) => compile_range_filter_to_bitmap(range, index),
     }
+}
+
+fn range_bound_value(bound: &crate::proto::range_match::Bound) -> &str {
+    match bound {
+        crate::proto::range_match::Bound::Gte(v)
+        | crate::proto::range_match::Bound::Lte(v)
+        | crate::proto::range_match::Bound::Gt(v)
+        | crate::proto::range_match::Bound::Lt(v) => v.as_str(),
+    }
+}
+
+fn compile_range_filter_to_bitmap(
+    range: &crate::proto::RangeMatch,
+    index: &MetadataInvertedIndex,
+) -> Option<RoaringTreemap> {
+    let Some(bound) = range.bound.as_ref() else {
+        return Some(index.bitmap_for_key_presence(&range.key));
+    };
+
+    // String-ordered evaluation branch (also covers non-numeric values when bound is numeric).
+    let mut out = index.bitmap_for_range_lex(&range.key, bound);
+
+    // Numeric branch for parseable numeric bound; excludes numerically indexed docs from
+    // the lexicographic branch to preserve `metadata_filter::matches_range` semantics.
+    if let Some(bound_num) = parse_indexable_numeric(range_bound_value(bound)) {
+        if let Some(numeric_docs) = index.numeric_docs_by_key.get(&range.key) {
+            out -= numeric_docs;
+        }
+        out |= index.bitmap_for_range_numeric(&range.key, bound, bound_num);
+    }
+
+    Some(out)
 }
 
 /// Disk space warning threshold (alert if free space < 10%)
@@ -2524,8 +2788,8 @@ impl HnswBackend {
 
     /// Return document IDs matching a structured metadata filter.
     ///
-    /// Fast path uses the inverted index for `Exact`, `InMatch`, `AndFilter`, `OrFilter`, and `NotFilter`.
-    /// Falls back to `scan()` for `Range` (and any shape we cannot compile) to preserve correctness.
+    /// Fast path uses the inverted index for exact/in/not/and/or and indexed range filters.
+    /// Falls back to `scan()` only for malformed or otherwise uncompilable shapes.
     pub fn ids_for_metadata_filter(&self, filter: &MetadataFilter) -> Vec<u64> {
         let store = self.doc_store.read();
         let meta_index = self.metadata_index.read();
@@ -2820,7 +3084,7 @@ fn compute_search_k(k: usize, live_docs: usize, total_slots: usize) -> usize {
 mod tests {
     use super::*;
     use crate::proto::metadata_filter::FilterType;
-    use crate::proto::{ExactMatch, MetadataFilter, NotFilter};
+    use crate::proto::{ExactMatch, MetadataFilter, NotFilter, RangeMatch};
     use std::collections::HashMap;
 
     fn exact(key: &str, value: &str) -> MetadataFilter {
@@ -2828,6 +3092,15 @@ mod tests {
             filter_type: Some(FilterType::Exact(ExactMatch {
                 key: key.to_string(),
                 value: value.to_string(),
+            })),
+        }
+    }
+
+    fn range(key: &str, bound: crate::proto::range_match::Bound) -> MetadataFilter {
+        MetadataFilter {
+            filter_type: Some(FilterType::Range(RangeMatch {
+                key: key.to_string(),
+                bound: Some(bound),
             })),
         }
     }
@@ -2894,6 +3167,118 @@ mod tests {
         };
 
         assert_eq!(backend.ids_for_metadata_filter(&not_a), vec![2]);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_index_compiles_numeric_and_lex_ranges() -> Result<()> {
+        let backend = HnswBackend::new(3, DistanceMetric::Euclidean, Vec::new(), Vec::new(), 128)?;
+
+        backend.insert(
+            1,
+            vec![1.0, 0.0, 0.0],
+            HashMap::from([
+                ("age".to_string(), "10".to_string()),
+                ("ts".to_string(), "2024-01-01".to_string()),
+            ]),
+        )?;
+        backend.insert(
+            2,
+            vec![0.0, 1.0, 0.0],
+            HashMap::from([
+                ("age".to_string(), "20".to_string()),
+                ("ts".to_string(), "2024-02-01".to_string()),
+            ]),
+        )?;
+        backend.insert(
+            3,
+            vec![0.0, 0.0, 1.0],
+            HashMap::from([
+                ("age".to_string(), "30".to_string()),
+                ("ts".to_string(), "2023-12-31".to_string()),
+            ]),
+        )?;
+
+        let age_gt_15 = range(
+            "age",
+            crate::proto::range_match::Bound::Gt("15".to_string()),
+        );
+        assert_eq!(backend.ids_for_metadata_filter(&age_gt_15), vec![2, 3]);
+
+        let age_lte_20 = range(
+            "age",
+            crate::proto::range_match::Bound::Lte("20".to_string()),
+        );
+        assert_eq!(backend.ids_for_metadata_filter(&age_lte_20), vec![1, 2]);
+
+        let ts_gte_2024 = range(
+            "ts",
+            crate::proto::range_match::Bound::Gte("2024-01-01".to_string()),
+        );
+        assert_eq!(backend.ids_for_metadata_filter(&ts_gte_2024), vec![1, 2]);
+
+        assert!(backend.delete(2)?);
+        assert_eq!(backend.ids_for_metadata_filter(&age_gt_15), vec![3]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_index_range_semantics_match_reference_for_ieee_edges() -> Result<()> {
+        let backend = HnswBackend::new(3, DistanceMetric::Euclidean, Vec::new(), Vec::new(), 128)?;
+
+        let docs: Vec<(u64, &str)> = vec![
+            (1, "-0.0"),
+            (2, "0.0"),
+            (3, "NaN"),
+            (4, "inf"),
+            (5, "-inf"),
+            (6, "foo"),
+            (7, "1.5"),
+        ];
+
+        let mut metadata_by_doc: HashMap<u64, HashMap<String, String>> = HashMap::new();
+        for (idx, (doc_id, value)) in docs.iter().enumerate() {
+            let meta = HashMap::from([("x".to_string(), (*value).to_string())]);
+            metadata_by_doc.insert(*doc_id, meta.clone());
+            backend.insert(*doc_id, vec![idx as f32, 0.0, 1.0], meta)?;
+        }
+
+        let filters = vec![
+            range("x", crate::proto::range_match::Bound::Gte("0".to_string())),
+            range("x", crate::proto::range_match::Bound::Lt("0".to_string())),
+            range("x", crate::proto::range_match::Bound::Gt("NaN".to_string())),
+            range(
+                "x",
+                crate::proto::range_match::Bound::Lte("1e9999".to_string()),
+            ),
+            range(
+                "x",
+                crate::proto::range_match::Bound::Gt("1e9999".to_string()),
+            ),
+        ];
+
+        for filter in filters {
+            let mut expected: Vec<u64> = metadata_by_doc
+                .iter()
+                .filter_map(|(doc_id, meta)| {
+                    if crate::metadata_filter::matches(&filter, meta) {
+                        Some(*doc_id)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            expected.sort_unstable();
+
+            let actual = backend.ids_for_metadata_filter(&filter);
+            assert_eq!(
+                actual, expected,
+                "indexed range result diverged from reference matcher for filter {:?}",
+                filter
+            );
+        }
+
         Ok(())
     }
 

@@ -767,8 +767,8 @@ impl TieredEngine {
     ///
     /// # Consistency
     /// - L1a (document cache) entries are invalidated synchronously to prevent stale reads.
-    /// - L1b (query cache) entries referencing the document are removed best-effort by scanning
-    ///   cached queries; this is O(cache_size) but deletes are rare compared to reads.
+    /// - L1b (query cache) entries referencing the document are removed via reverse index lookup
+    ///   (`doc_id -> cached query keys`) to avoid full-cache scans on deletes.
     pub fn delete(&self, doc_id: u64) -> Result<bool> {
         // Delete from hot tier
         let hot_deleted = self.hot_tier.delete(doc_id);
@@ -1014,6 +1014,7 @@ impl TieredEngine {
         let query = normalized_query.as_ref();
 
         let cacheable = ef_search_override.is_none();
+        let cache_generation = cacheable.then(|| self.query_cache.invalidation_generation());
         if cacheable {
             if let Some(cached) = self.query_cache.get_scoped(query_cache_scope, query, k) {
                 let mut stats = self.stats.write();
@@ -1080,11 +1081,12 @@ impl TieredEngine {
                 Cow::Owned(owned) => owned,
                 Cow::Borrowed(borrowed) => borrowed.to_vec(),
             };
-            self.query_cache.insert_with_k_scoped(
+            let _ = self.query_cache.insert_with_k_scoped_if_generation(
                 query_cache_scope,
                 cache_query,
                 merged_results.clone(),
                 k,
+                cache_generation.expect("cache generation must exist when cacheable"),
             );
         }
 
@@ -1183,6 +1185,7 @@ impl TieredEngine {
         }
 
         let cacheable = ef_search_override.is_none();
+        let cache_generation = cacheable.then(|| self.query_cache.invalidation_generation());
         let mut cached_results: Vec<Option<Vec<SearchResult>>> = vec![None; queries.len()];
         let mut miss_indices: Vec<usize> = Vec::new();
         let mut cache_hits = 0u64;
@@ -1299,11 +1302,12 @@ impl TieredEngine {
                     Cow::Owned(owned) => owned.clone(),
                     Cow::Borrowed(borrowed) => borrowed.to_vec(),
                 };
-                self.query_cache.insert_with_k_scoped(
+                let _ = self.query_cache.insert_with_k_scoped_if_generation(
                     query_cache_scope,
                     cache_query,
                     merged_results.clone(),
                     k,
+                    cache_generation.expect("cache generation must exist when cacheable"),
                 );
             }
             merged.push((merged_results, path));
@@ -1467,6 +1471,7 @@ impl TieredEngine {
             }
         };
 
+        let cache_generation = cacheable.then(|| self.query_cache.invalidation_generation());
         if cacheable {
             if let Some(cached) =
                 self.query_cache
@@ -1711,11 +1716,12 @@ impl TieredEngine {
         results.truncate(k);
 
         if cacheable && !partial && !results.is_empty() {
-            self.query_cache.insert_with_k_scoped(
+            let _ = self.query_cache.insert_with_k_scoped_if_generation(
                 query_cache_scope,
                 normalized_query.clone(),
                 results.clone(),
                 k,
+                cache_generation.expect("cache generation must exist when cacheable"),
             );
         }
 

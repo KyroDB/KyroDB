@@ -12,11 +12,14 @@ struct AnnIndexHandle {
     dimension: usize,
     max_elements: usize,
     built: bool,
+    trusted_inputs: bool,
 }
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
 }
+
+const ANN_CREATE_FLAG_TRUST_INPUTS: u32 = 1 << 0;
 
 fn set_last_error(message: impl Into<String>) {
     LAST_ERROR.with(|slot| {
@@ -68,6 +71,27 @@ pub extern "C" fn kyrodb_ann_create(
     ef_construction: u32,
     disable_normalization_check: u8,
 ) -> *mut std::ffi::c_void {
+    kyrodb_ann_create_with_flags(
+        dimension,
+        max_elements,
+        distance_code,
+        m,
+        ef_construction,
+        disable_normalization_check,
+        0,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn kyrodb_ann_create_with_flags(
+    dimension: u32,
+    max_elements: u64,
+    distance_code: u32,
+    m: u32,
+    ef_construction: u32,
+    disable_normalization_check: u8,
+    flags: u32,
+) -> *mut std::ffi::c_void {
     clear_last_error();
     match catch_unwind(AssertUnwindSafe(|| -> Result<*mut std::ffi::c_void> {
         if dimension == 0 {
@@ -81,6 +105,10 @@ pub extern "C" fn kyrodb_ann_create(
         let max_elements_usize = usize::try_from(max_elements)
             .context("max_elements exceeds platform usize capacity")?;
         let disable_normalization_check = disable_normalization_check != 0;
+        if (flags & !ANN_CREATE_FLAG_TRUST_INPUTS) != 0 {
+            anyhow::bail!("unknown create flags: 0x{:x}", flags);
+        }
+        let trusted_inputs = (flags & ANN_CREATE_FLAG_TRUST_INPUTS) != 0;
 
         let index = HnswVectorIndex::new_with_params(
             dimension as usize,
@@ -96,6 +124,7 @@ pub extern "C" fn kyrodb_ann_create(
             dimension: dimension as usize,
             max_elements: max_elements_usize,
             built: false,
+            trusted_inputs,
         });
 
         Ok(Box::into_raw(handle) as *mut std::ffi::c_void)
@@ -106,7 +135,7 @@ pub extern "C" fn kyrodb_ann_create(
             ptr::null_mut()
         }
         Err(_) => {
-            set_last_error("panic in kyrodb_ann_create");
+            set_last_error("panic in kyrodb_ann_create_with_flags");
             ptr::null_mut()
         }
     }
@@ -176,7 +205,11 @@ pub unsafe extern "C" fn kyrodb_ann_build_f32(
             batch.push((&flat[start..end], row));
         }
 
-        state.index.parallel_insert_batch(&batch)?;
+        if state.trusted_inputs {
+            state.index.parallel_insert_batch_trusted(&batch)?;
+        } else {
+            state.index.parallel_insert_batch(&batch)?;
+        }
         state.built = true;
         Ok(())
     })
@@ -225,9 +258,18 @@ pub unsafe extern "C" fn kyrodb_ann_query_f32(
 
         // SAFETY: Caller guarantees `query` points to `cols` contiguous floats.
         let query_slice = unsafe { slice::from_raw_parts(query, cols) };
-        let results = state
-            .index
-            .knn_search_with_ef(query_slice, k, Some(ef_search.max(k)))?;
+        let results = if state.trusted_inputs {
+            state.index.knn_search_with_ef_cancel_trusted(
+                query_slice,
+                k,
+                Some(ef_search.max(k)),
+                None,
+            )?
+        } else {
+            state
+                .index
+                .knn_search_with_ef(query_slice, k, Some(ef_search.max(k)))?
+        };
 
         let out_count = results.len().min(k);
         for (idx, item) in results.iter().take(out_count).enumerate() {
@@ -350,6 +392,50 @@ mod tests {
         assert!(mem > 0, "memory estimate should be non-zero after build");
 
         // SAFETY: handle comes from kyrodb_ann_create and is freed exactly once.
+        unsafe { kyrodb_ann_free(handle) };
+    }
+
+    #[test]
+    fn ffi_create_with_trusted_flag_round_trip() {
+        let handle =
+            kyrodb_ann_create_with_flags(4, 16, 1, 16, 200, 0, ANN_CREATE_FLAG_TRUST_INPUTS);
+        assert!(
+            !handle.is_null(),
+            "create_with_flags failed: {}",
+            get_last_error()
+        );
+
+        let data: [f32; 16] = [
+            1.0, 0.0, 0.0, 0.0, // id 0
+            0.9, 0.1, 0.0, 0.0, // id 1
+            0.0, 1.0, 0.0, 0.0, // id 2
+            0.0, 0.0, 1.0, 0.0, // id 3
+        ];
+
+        // SAFETY: pointers and lengths are valid for the call.
+        let rc_build = unsafe { kyrodb_ann_build_f32(handle, data.as_ptr(), 4, 4) };
+        assert_eq!(rc_build, 0, "build failed: {}", get_last_error());
+
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let mut out_ids = [u32::MAX; 3];
+        let mut out_len: usize = 0;
+        // SAFETY: pointers and lengths are valid for the call.
+        let rc_query = unsafe {
+            kyrodb_ann_query_f32(
+                handle,
+                query.as_ptr(),
+                4,
+                3,
+                16,
+                out_ids.as_mut_ptr(),
+                &mut out_len as *mut usize,
+            )
+        };
+        assert_eq!(rc_query, 0, "query failed: {}", get_last_error());
+        assert!(out_len > 0, "query returned zero results");
+        assert_eq!(out_ids[0], 0, "self match should rank first");
+
+        // SAFETY: handle comes from kyrodb_ann_create_with_flags and is freed exactly once.
         unsafe { kyrodb_ann_free(handle) };
     }
 }

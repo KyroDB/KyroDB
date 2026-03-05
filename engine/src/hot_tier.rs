@@ -13,7 +13,8 @@
 //! - Layer 3 (Cold Tier): Full HNSW index for all documents
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +44,34 @@ struct HotDocument {
     embedding_l2_norm: f32,
     metadata: HashMap<String, String>,
     inserted_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TopKCandidate {
+    doc_id: u64,
+    distance: f32,
+}
+
+impl Eq for TopKCandidate {}
+
+impl PartialEq for TopKCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.doc_id == other.doc_id && self.distance == other.distance
+    }
+}
+
+impl Ord for TopKCandidate {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
+}
+
+impl PartialOrd for TopKCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Hot Tier - Buffer for recent writes
@@ -390,9 +419,8 @@ impl HotTier {
             DistanceMetric::Euclidean => 0.0,
         };
 
-        // Use a bounded list for top-k to avoid sorting all N documents.
-        // Complexity: O(n * k) in worst case, but k is typically small (<= 100).
-        let mut top: Vec<(u64, f32)> = Vec::with_capacity(k);
+        // Keep a bounded max-heap (worst element on top): O(n log k).
+        let mut top_heap: BinaryHeap<TopKCandidate> = BinaryHeap::with_capacity(k);
 
         for (idx, (doc_id, doc)) in docs.iter().enumerate() {
             if (idx & 0x3F) == 0
@@ -423,27 +451,31 @@ impl HotTier {
                 continue;
             }
 
-            if top.len() < k {
-                top.push((*doc_id, distance));
+            if top_heap.len() < k {
+                top_heap.push(TopKCandidate {
+                    doc_id: *doc_id,
+                    distance,
+                });
                 continue;
             }
 
-            // Find current worst (max distance) among top-k.
-            let mut worst_idx = 0usize;
-            let mut worst_dist = top[0].1;
-            for (idx, &(_, d)) in top.iter().enumerate().skip(1) {
-                if d > worst_dist {
-                    worst_dist = d;
-                    worst_idx = idx;
+            let candidate = TopKCandidate {
+                doc_id: *doc_id,
+                distance,
+            };
+            if let Some(worst) = top_heap.peek().copied() {
+                if candidate < worst {
+                    let _ = top_heap.pop();
+                    top_heap.push(candidate);
                 }
-            }
-
-            if distance < worst_dist {
-                top[worst_idx] = (*doc_id, distance);
             }
         }
 
-        top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut top = Vec::with_capacity(top_heap.len());
+        while let Some(item) = top_heap.pop() {
+            top.push((item.doc_id, item.distance));
+        }
+        top.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         top
     }
 
@@ -745,6 +777,24 @@ mod tests {
 
         // Distance should be ~0.0 for identical vectors
         assert!(results[0].1 < 0.0001);
+    }
+
+    #[test]
+    fn test_hot_tier_knn_search_tie_breaks_by_doc_id() {
+        let hot_tier = HotTier::new(1000, Duration::from_secs(60), DistanceMetric::Cosine);
+
+        let embedding = vec![1.0, 0.0, 0.0];
+        hot_tier.insert(9, embedding.clone(), HashMap::new());
+        hot_tier.insert(3, embedding.clone(), HashMap::new());
+        hot_tier.insert(5, embedding.clone(), HashMap::new());
+
+        let results = hot_tier.knn_search(&embedding, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].0, 3,
+            "equal-distance ties must prefer smaller doc_id"
+        );
+        assert!(results[0].1 < 1e-6);
     }
 
     #[test]
