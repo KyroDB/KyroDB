@@ -6,6 +6,27 @@
 //! - Uses the best available ISA at runtime: AVX-512F(+FMA) → AVX2(+FMA) → SSE2 → scalar.
 //! - Builds on non-x86 platforms: uses NEON on aarch64 when available; otherwise falls back to scalar.
 
+use std::sync::OnceLock;
+
+pub(crate) type BinaryF32Kernel = fn(&[f32], &[f32]) -> f32;
+pub(crate) type UnaryF32Kernel = fn(&[f32]) -> f32;
+pub(crate) type DotAndNormsF32Kernel = fn(&[f32], &[f32]) -> (f32, f32, f32);
+
+#[derive(Clone, Copy)]
+pub(crate) struct ResolvedF32Kernels {
+    pub(crate) dot: BinaryF32Kernel,
+    pub(crate) sum_squares: UnaryF32Kernel,
+    pub(crate) l2_distance_sq: BinaryF32Kernel,
+    pub(crate) dot_and_norms: DotAndNormsF32Kernel,
+}
+
+static RESOLVED_F32_KERNELS: OnceLock<ResolvedF32Kernels> = OnceLock::new();
+
+#[inline]
+pub(crate) fn resolved_f32_kernels() -> &'static ResolvedF32Kernels {
+    RESOLVED_F32_KERNELS.get_or_init(detect_best_f32_kernels)
+}
+
 /// Returns the dot product $\sum_i a_i b_i$.
 ///
 /// # Panics
@@ -19,35 +40,11 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         a.len(),
         b.len()
     );
-    let len = a.len();
-    if len == 0 {
+    if a.is_empty() {
         return 0.0;
     }
 
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        // NEON (AdvSIMD) is ubiquitous on aarch64, but keep a defensive check.
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return dot_f32_neon(a, b, len);
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
-            return dot_f32_avx512(a, b, len);
-        }
-        // AVX2 does not strictly imply FMA; guard to avoid executing unsupported instructions.
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            return dot_f32_avx2(a, b, len);
-        }
-        // SSE2 is part of the x86_64 baseline, but keep a defensive check.
-        if std::is_x86_feature_detected!("sse2") {
-            return dot_f32_sse2(a, b, len);
-        }
-    }
-
-    dot_f32_scalar(a, b, len)
+    (resolved_f32_kernels().dot)(a, b)
 }
 
 /// Returns the L2 norm $\|v\|_2$.
@@ -62,28 +59,7 @@ pub fn sum_squares_f32(v: &[f32]) -> f32 {
     if v.is_empty() {
         return 0.0;
     }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return sum_squares_f32_neon(v);
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
-            return sum_squares_f32_avx512(v);
-        }
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            return sum_squares_f32_avx2(v);
-        }
-        if std::is_x86_feature_detected!("sse2") {
-            return sum_squares_f32_sse2(v);
-        }
-    }
-
-    sum_squares_f32_scalar(v)
+    (resolved_f32_kernels().sum_squares)(v)
 }
 
 /// Returns the Euclidean (L2) distance $\|a-b\|_2$.
@@ -111,32 +87,11 @@ pub fn l2_distance_sq_f32(a: &[f32], b: &[f32]) -> f32 {
         a.len(),
         b.len()
     );
-    let len = a.len();
-    if len == 0 {
+    if a.is_empty() {
         return 0.0;
     }
 
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return l2_distance_sq_f32_neon(a, b, len);
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
-            return l2_distance_sq_f32_avx512(a, b, len);
-        }
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            return l2_distance_sq_f32_avx2(a, b, len);
-        }
-        if std::is_x86_feature_detected!("sse2") {
-            return l2_distance_sq_f32_sse2(a, b, len);
-        }
-    }
-
-    l2_distance_sq_f32_scalar(a, b, len)
+    (resolved_f32_kernels().l2_distance_sq)(a, b)
 }
 
 /// Computes cosine similarity: $(a\cdot b)/(\|a\|\|b\|)$.
@@ -210,26 +165,31 @@ fn l2_distance_sq_f32_scalar(a: &[f32], b: &[f32], len: usize) -> f32 {
 
 #[inline]
 fn dot_and_norms_f32(a: &[f32], b: &[f32], len: usize) -> (f32, f32, f32) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return dot_and_norms_f32_neon(a, b, len);
-        }
-    }
+    let _ = len;
+    (resolved_f32_kernels().dot_and_norms)(a, b)
+}
 
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
-            return dot_and_norms_f32_avx512(a, b, len);
-        }
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            return dot_and_norms_f32_avx2(a, b, len);
-        }
-        if std::is_x86_feature_detected!("sse2") {
-            return dot_and_norms_f32_sse2(a, b, len);
-        }
-    }
+#[inline]
+fn dot_f32_scalar_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    dot_f32_scalar(a, b, a.len())
+}
 
+#[inline]
+fn sum_squares_f32_scalar_entry(v: &[f32]) -> f32 {
+    sum_squares_f32_scalar(v)
+}
+
+#[inline]
+fn l2_distance_sq_f32_scalar_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    l2_distance_sq_f32_scalar(a, b, a.len())
+}
+
+#[inline]
+fn dot_and_norms_f32_scalar_entry(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    debug_assert_eq!(a.len(), b.len());
+    let len = a.len();
     let mut dot = 0.0;
     let mut norm_a = 0.0;
     let mut norm_b = 0.0;
@@ -241,6 +201,161 @@ fn dot_and_norms_f32(a: &[f32], b: &[f32], len: usize) -> (f32, f32, f32) {
         norm_b += vb * vb;
     }
     (dot, norm_a, norm_b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_f32_sse2_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { dot_f32_sse2(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_f32_avx2_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { dot_f32_avx2(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_f32_avx512_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { dot_f32_avx512(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sum_squares_f32_sse2_entry(v: &[f32]) -> f32 {
+    unsafe { sum_squares_f32_sse2(v) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sum_squares_f32_avx2_entry(v: &[f32]) -> f32 {
+    unsafe { sum_squares_f32_avx2(v) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sum_squares_f32_avx512_entry(v: &[f32]) -> f32 {
+    unsafe { sum_squares_f32_avx512(v) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn l2_distance_sq_f32_sse2_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { l2_distance_sq_f32_sse2(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn l2_distance_sq_f32_avx2_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { l2_distance_sq_f32_avx2(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn l2_distance_sq_f32_avx512_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { l2_distance_sq_f32_avx512(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_and_norms_f32_sse2_entry(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { dot_and_norms_f32_sse2(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_and_norms_f32_avx2_entry(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { dot_and_norms_f32_avx2(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_and_norms_f32_avx512_entry(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { dot_and_norms_f32_avx512(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_f32_neon_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { dot_f32_neon(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn sum_squares_f32_neon_entry(v: &[f32]) -> f32 {
+    unsafe { sum_squares_f32_neon(v) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn l2_distance_sq_f32_neon_entry(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { l2_distance_sq_f32_neon(a, b, a.len()) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_and_norms_f32_neon_entry(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    debug_assert_eq!(a.len(), b.len());
+    unsafe { dot_and_norms_f32_neon(a, b, a.len()) }
+}
+
+fn detect_best_f32_kernels() -> ResolvedF32Kernels {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return ResolvedF32Kernels {
+            dot: dot_f32_neon_entry,
+            sum_squares: sum_squares_f32_neon_entry,
+            l2_distance_sq: l2_distance_sq_f32_neon_entry,
+            dot_and_norms: dot_and_norms_f32_neon_entry,
+        };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("fma") {
+        return ResolvedF32Kernels {
+            dot: dot_f32_avx512_entry,
+            sum_squares: sum_squares_f32_avx512_entry,
+            l2_distance_sq: l2_distance_sq_f32_avx512_entry,
+            dot_and_norms: dot_and_norms_f32_avx512_entry,
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return ResolvedF32Kernels {
+            dot: dot_f32_avx2_entry,
+            sum_squares: sum_squares_f32_avx2_entry,
+            l2_distance_sq: l2_distance_sq_f32_avx2_entry,
+            dot_and_norms: dot_and_norms_f32_avx2_entry,
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("sse2") {
+        return ResolvedF32Kernels {
+            dot: dot_f32_sse2_entry,
+            sum_squares: sum_squares_f32_sse2_entry,
+            l2_distance_sq: l2_distance_sq_f32_sse2_entry,
+            dot_and_norms: dot_and_norms_f32_sse2_entry,
+        };
+    }
+
+    ResolvedF32Kernels {
+        dot: dot_f32_scalar_entry,
+        sum_squares: sum_squares_f32_scalar_entry,
+        l2_distance_sq: l2_distance_sq_f32_scalar_entry,
+        dot_and_norms: dot_and_norms_f32_scalar_entry,
+    }
 }
 
 // ===== x86_64 SIMD implementations =====

@@ -252,7 +252,7 @@ class KyroDB(BaseANN):
             raise ValueError(
                 f"query dimension mismatch: expected {self._dimension}, got {vec.size}"
             )
-        if self._normalize:
+        if self._normalize and not self._trusted_input:
             vec = self._normalize_vector(vec)
 
         if self._query_ids_buf.size < kk:
@@ -275,7 +275,7 @@ class KyroDB(BaseANN):
         count = int(out_len.value)
         if count <= 0:
             return []
-        return out_ids[:count].astype(np.int64, copy=False).tolist()
+        return out_ids[:count].tolist()
 
     def get_memory_usage(self) -> float:
         if self._handle.value:

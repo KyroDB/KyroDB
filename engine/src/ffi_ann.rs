@@ -17,9 +17,35 @@ struct AnnIndexHandle {
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+    static NORMALIZED_QUERY_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 const ANN_CREATE_FLAG_TRUST_INPUTS: u32 = 1 << 0;
+
+#[inline]
+fn metric_requires_unit_norm(distance: DistanceMetric) -> bool {
+    matches!(
+        distance,
+        DistanceMetric::Cosine | DistanceMetric::InnerProduct
+    )
+}
+
+#[inline]
+fn normalize_query_in_place(query: &mut [f32]) {
+    let norm_sq = crate::simd::sum_squares_f32(query);
+    if !norm_sq.is_finite() || norm_sq <= 1e-30 {
+        query.fill(0.0);
+        if let Some(first) = query.first_mut() {
+            *first = 1.0;
+        }
+        return;
+    }
+
+    let inv_norm = norm_sq.sqrt().recip();
+    for value in query {
+        *value *= inv_norm;
+    }
+}
 
 fn set_last_error(message: impl Into<String>) {
     LAST_ERROR.with(|slot| {
@@ -258,18 +284,32 @@ pub unsafe extern "C" fn kyrodb_ann_query_f32(
 
         // SAFETY: Caller guarantees `query` points to `cols` contiguous floats.
         let query_slice = unsafe { slice::from_raw_parts(query, cols) };
-        let results = if state.trusted_inputs {
-            state.index.knn_search_with_ef_cancel_trusted(
-                query_slice,
-                k,
-                Some(ef_search.max(k)),
-                None,
-            )?
-        } else {
-            state
-                .index
-                .knn_search_with_ef(query_slice, k, Some(ef_search.max(k)))?
-        };
+        let results =
+            if state.trusted_inputs && metric_requires_unit_norm(state.index.distance_metric()) {
+                NORMALIZED_QUERY_SCRATCH.with(|scratch_cell| -> Result<_> {
+                    let mut scratch = scratch_cell.borrow_mut();
+                    scratch.clear();
+                    scratch.extend_from_slice(query_slice);
+                    normalize_query_in_place(scratch.as_mut_slice());
+                    state.index.knn_search_with_ef_cancel_trusted(
+                        scratch.as_slice(),
+                        k,
+                        Some(ef_search.max(k)),
+                        None,
+                    )
+                })?
+            } else if state.trusted_inputs {
+                state.index.knn_search_with_ef_cancel_trusted(
+                    query_slice,
+                    k,
+                    Some(ef_search.max(k)),
+                    None,
+                )?
+            } else {
+                state
+                    .index
+                    .knn_search_with_ef(query_slice, k, Some(ef_search.max(k)))?
+            };
 
         let out_count = results.len().min(k);
         for (idx, item) in results.iter().take(out_count).enumerate() {
@@ -436,6 +476,50 @@ mod tests {
         assert_eq!(out_ids[0], 0, "self match should rank first");
 
         // SAFETY: handle comes from kyrodb_ann_create_with_flags and is freed exactly once.
+        unsafe { kyrodb_ann_free(handle) };
+    }
+
+    #[test]
+    fn ffi_trusted_cosine_query_normalizes_zero_vector_in_rust() {
+        let handle =
+            kyrodb_ann_create_with_flags(4, 16, 0, 16, 200, 1, ANN_CREATE_FLAG_TRUST_INPUTS);
+        assert!(
+            !handle.is_null(),
+            "create_with_flags failed: {}",
+            get_last_error()
+        );
+
+        let data: [f32; 16] = [
+            0.0, 1.0, 0.0, 0.0, // id 0
+            1.0, 0.0, 0.0, 0.0, // id 1
+            0.0, 0.0, 1.0, 0.0, // id 2
+            0.0, 0.0, 0.0, 1.0, // id 3
+        ];
+
+        let rc_build = unsafe { kyrodb_ann_build_f32(handle, data.as_ptr(), 4, 4) };
+        assert_eq!(rc_build, 0, "build failed: {}", get_last_error());
+
+        let query = [0.0_f32, 0.0, 0.0, 0.0];
+        let mut out_ids = [u32::MAX; 1];
+        let mut out_len: usize = 0;
+        let rc_query = unsafe {
+            kyrodb_ann_query_f32(
+                handle,
+                query.as_ptr(),
+                4,
+                1,
+                16,
+                out_ids.as_mut_ptr(),
+                &mut out_len as *mut usize,
+            )
+        };
+        assert_eq!(rc_query, 0, "query failed: {}", get_last_error());
+        assert_eq!(out_len, 1, "zero-vector query should return one result");
+        assert_eq!(
+            out_ids[0], 1,
+            "trusted cosine query should normalize zero vector to the first axis sentinel"
+        );
+
         unsafe { kyrodb_ann_free(handle) };
     }
 }
