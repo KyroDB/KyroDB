@@ -86,7 +86,7 @@ pub trait CacheStrategy: Send + Sync {
 /// LRU baseline strategy
 ///
 /// Always caches accessed vectors, evicts least recently used when full.
-/// This is the baseline for A/B testing (30-40% expected hit rate).
+/// This is the baseline strategy used for A/B comparisons.
 pub struct LruCacheStrategy {
     pub cache: Arc<VectorCache>,
     name: String,

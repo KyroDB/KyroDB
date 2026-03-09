@@ -1,29 +1,7 @@
-//! Enterprise-scale validation workload
+//! Enterprise-scale validation harness for sustained cache and search workloads.
 //!
-//! **Purpose**: Validate KyroDB hybrid semantic-Hybrid Semantic Cache against REALISTIC production RAG workloads
-//!
-//! **What This Test Validates**:
-//! 1. Hybrid cache achieves 55-70% hit rate vs LRU 35-45% (1.5-2× improvement)
-//! 2. No memory leaks under sustained load (4.32M queries)
-//! 3. Training task runs reliably every 10 minutes (72 cycles)
-//! 4. Handles temporal patterns (topic shifts, spikes) + 60% cold traffic
-//! 5. Stats persistence survives restarts
-//!
-//! **Realistic Workload**:
-//! - Corpus: 1M documents (enterprise-scale)
-//! - Cache: 10K vectors (1% of corpus - industry standard)
-//! - Duration: 12 hours
-//! - QPS: 100 queries/second
-//! - Distribution: Zipf 1.01 (real-world web traffic)
-//! - Temporal patterns: Topic rotation + random spikes
-//! - A/B split: 50% LRU baseline, 50% Hybrid Semantic Cache
-//!
-//! **Run on Azure VM**:
-//! ```
-//! cargo build --release --bin validation_enterprise
-//! nohup ./target/release/validation_enterprise > validation.log 2>&1 &
-//! tail -f validation.log
-//! ```
+//! Exercises larger synthetic/semantic workloads, temporal traffic patterns,
+//! retraining behavior, and memory growth under configurable long-running load.
 
 use anyhow::{bail, Context, Result};
 use kyrodb_engine::{
@@ -54,13 +32,13 @@ struct Config {
     /// Target queries per second (default: 100)
     target_qps: u64,
 
-    /// Number of unique documents (enterprise-scale)
+    /// Number of unique documents in the validation corpus.
     corpus_size: usize,
 
-    /// Zipf exponent (1.01 = real-world web traffic)
+    /// Zipf exponent for the synthetic workload.
     zipf_exponent: f64,
 
-    /// Cache capacity (1% of corpus - industry standard)
+    /// Cache capacity for the validation workload.
     cache_capacity: usize,
 
     /// Training interval in seconds (default: 600 = 10 minutes)
@@ -190,8 +168,7 @@ impl Default for Config {
             spike_probability: 0.001,           // 0.1% per query
             spike_duration_secs: 300,           // 5 minutes
 
-            // Production RAG: 30% cold/novel queries, 70% repeat queries
-            // This is REALISTIC for production systems (not artificially reduced)
+            // Default mix for this validation preset: 30% cold/novel queries.
             cold_traffic_ratio: 0.30,
             working_set_bias: 0.2,
             working_set_multiplier: default_working_set_multiplier(),
@@ -1146,7 +1123,7 @@ async fn main() -> Result<()> {
         println!("Loaded configuration from {}", path);
         cfg
     } else {
-        println!("Using built-in default configuration (enterprise-scale workload).");
+        println!("Using built-in default configuration.");
         Config::default()
     };
 
@@ -1188,10 +1165,7 @@ async fn main() -> Result<()> {
     println!("Configuration:");
     println!("  Duration:          {} hours", config.duration_hours);
     println!("  Target QPS:        {}", config.target_qps);
-    println!(
-        "  Corpus size:       {} documents (enterprise-scale)",
-        config.corpus_size
-    );
+    println!("  Corpus size:       {} documents", config.corpus_size);
     println!(
         "  Cache capacity:    {} vectors ({}% of corpus)",
         config.cache_capacity,
@@ -1204,10 +1178,7 @@ async fn main() -> Result<()> {
             learned_cache_capacity as f64 / config.cache_capacity as f64
         );
     }
-    println!(
-        "  Zipf exponent:     {} (real-world distribution)",
-        config.zipf_exponent
-    );
+    println!("  Zipf exponent:     {}", config.zipf_exponent);
 
     let expected_ws = config.expected_working_set_size();
     println!(
@@ -1513,7 +1484,7 @@ async fn main() -> Result<()> {
         interval: Duration::from_secs(config.training_interval_secs),
         window_duration: Duration::from_secs(1800),
         min_events_for_training: 100,
-        predictor_capacity: predictor_capacity,
+        predictor_capacity,
         recency_halflife: Duration::from_secs(600),
         admission_threshold: 0.08,
         auto_tune_enabled: true,

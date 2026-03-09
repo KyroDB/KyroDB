@@ -1,10 +1,4 @@
-//! Benchmarks for Access Pattern Logger
-//!
-//!
-//! Targets:
-//! - Log overhead: <10ns per access
-//! - Flush time: <1ms for 10k events
-//! - Memory: 240MB for 10M events (24 bytes/event)
+//! Criterion benchmarks for the access-pattern logger hot paths.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kyrodb_engine::access_logger::{hash_embedding, AccessPatternLogger};

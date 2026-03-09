@@ -2298,7 +2298,12 @@ mod tests {
 
         assert!(
             client.is_ok(),
-            "S3 client initialization should succeed when credentials are configured: {client:?}"
+            "S3 client initialization should succeed when credentials are configured: {}",
+            client
+                .as_ref()
+                .err()
+                .map(std::string::ToString::to_string)
+                .unwrap_or_default()
         );
     }
 

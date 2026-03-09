@@ -10,8 +10,6 @@
 //! - learned predictor stores doc_id → hotness_score (O(log n) lookup)
 //! - Semantic adapter computes embedding similarity (optional hybrid layer)
 //! - Access logger feeds training data
-//!
-//! Target: 70-90% cache hit rate vs 30-40% LRU baseline
 
 use anyhow::Result;
 use parking_lot::RwLock;

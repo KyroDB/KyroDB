@@ -1,8 +1,4 @@
-//! Benchmarks for Hybrid Semantic Cache Predictor
-//! Targets:
-//! - Hotness prediction: <100ns P99
-//! - Training: <100ms for 10M doc_ids
-//! - Memory: <100MB for 10M doc_ids
+//! Criterion benchmarks for the learned cache predictor hot paths.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kyrodb_engine::learned_cache::{AccessEvent, AccessType, LearnedCachePredictor};

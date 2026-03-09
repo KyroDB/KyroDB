@@ -1,11 +1,22 @@
 # KyroDB Configuration Example (YAML)
 #
 # Copy this file to config.yaml and customize for your deployment.
-# All settings are optional - defaults are production-ready.
+# This template is for local development and general customization, not for direct
+# pilot/production rollout. Start from `config.pilot.yaml` for the hardened baseline.
 #
 # Environment variables override config file values:
 #   KYRODB__SERVER__PORT=50051 ./kyrodb_server
 #   KYRODB__CACHE__CAPACITY=50000 ./kyrodb_server --config config.yaml
+#   KYRODB__ENVIRONMENT__TYPE=benchmark ./kyrodb_server --config config.yaml
+
+# Deployment environment and safety posture
+environment:
+  # Allowed values:
+  # - production (default): standard safety checks
+  # - pilot: stricter launch checks for external pilots
+  # - benchmark: permits benchmark-only cache/persistence settings
+  # Set this here, or override with KYRODB__ENVIRONMENT__TYPE.
+  type: production
 
 # Server Configuration
 server:
@@ -55,9 +66,9 @@ cache:
   capacity: 10000
   
   # Cache eviction strategy: lru, learned, or abtest
-  # - lru: Simple LRU eviction (baseline)
+  # - lru: Simple LRU eviction baseline (allowed only when environment.type = "benchmark"; see environment.type above)
   # - learned: Hybrid Semantic Cache with a learned hotness predictor
-  # - abtest: A/B test between LRU and Learned
+  # - abtest: 50/50 LRU vs learned split for baseline comparison (allowed only when environment.type = "benchmark"; see environment.type above)
   strategy: learned
   
   # Training interval for Hybrid Semantic Cache (seconds)

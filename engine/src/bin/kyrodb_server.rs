@@ -1,6 +1,6 @@
 //! KyroDB Production gRPC Server
 //!
-//! High-performance vector database server optimized for RAG workloads.
+//! gRPC server for the KyroDB single-node runtime.
 //!
 //! # Architecture
 //! - gRPC primary protocol (performance-critical)
@@ -24,8 +24,8 @@ use anyhow::Context;
 use clap::Parser;
 use futures_util::FutureExt;
 use kyrodb_engine::api_validation::{
-    validate_insert_request, validate_search_request as validate_api_search_request,
-    SearchValidationPlan,
+    normalize_search_request as normalize_api_search_request, validate_insert_request,
+    validate_search_request as validate_api_search_request, SearchValidationPlan,
 };
 use kyrodb_engine::training_task::{spawn_training_task, TrainingConfig};
 use kyrodb_engine::{
@@ -551,8 +551,6 @@ struct ServerState {
     start_time: Instant,
     app_config: kyrodb_engine::config::KyroDbConfig,
     engine_config: TieredEngineConfig,
-    #[allow(dead_code)] // Used in shutdown sequence, not via field access
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
     metrics: MetricsCollector,
 
     auth: Option<AuthManager>,
@@ -561,11 +559,6 @@ struct ServerState {
     tenant_vector_counts: Option<parking_lot::RwLock<HashMap<String, usize>>>,
     tenant_quota_locks: Option<parking_lot::RwLock<HashMap<String, Arc<parking_lot::Mutex<()>>>>>,
     usage_tracker: Option<Arc<UsageTracker>>,
-
-    /// Cached flag: true when environment_type == "benchmark".
-    /// Enables lean search path that skips rate limiting, connection tracking,
-    /// semaphore load-shedding, and empty hot-tier/cache checks.
-    is_benchmark_mode: bool,
 }
 
 /// gRPC service implementation
@@ -1041,20 +1034,16 @@ impl KyroDBServiceImpl {
         latency_ns: u64,
         search_path: SearchExecutionPath,
     ) -> SearchResponse {
-        let total_found = results.len() as u32;
         let mut final_results = Vec::with_capacity(req.k as usize);
         let mut served_global_doc_ids = Vec::with_capacity(req.k as usize);
-        let mut candidates = results.into_iter();
+        let candidates = results.into_iter();
 
         let has_namespace = !req.namespace.is_empty();
         let needs_metadata = tenant.is_some() || has_namespace || req.filter.is_some();
 
-        while final_results.len() < req.k as usize {
-            let candidate = match candidates.next() {
-                Some(c) => c,
-                None => break,
-            };
+        let mut total_found = 0u32;
 
+        for candidate in candidates {
             if let Some(tenant) = tenant {
                 if !TenantIdMapper::is_tenant_doc_id(tenant.tenant_index, candidate.doc_id) {
                     continue;
@@ -1100,6 +1089,16 @@ impl KyroDBServiceImpl {
                 HashMap::new()
             };
 
+            let local_doc_id = self.unmap_doc_id(tenant, candidate.doc_id);
+            if tenant.is_some() && local_doc_id < MIN_DOC_ID {
+                continue;
+            }
+
+            total_found = total_found.saturating_add(1);
+            if final_results.len() >= req.k as usize {
+                continue;
+            }
+
             let embedding = if req.include_embeddings {
                 engine
                     .get_embedding_cache_aware(candidate.doc_id)
@@ -1107,11 +1106,6 @@ impl KyroDBServiceImpl {
             } else {
                 vec![]
             };
-
-            let local_doc_id = self.unmap_doc_id(tenant, candidate.doc_id);
-            if tenant.is_some() && local_doc_id < MIN_DOC_ID {
-                continue;
-            }
 
             served_global_doc_ids.push(candidate.doc_id);
             final_results.push(kyrodb::SearchResult {
@@ -1150,6 +1144,7 @@ impl KyroDBServiceImpl {
     ) -> Result<SearchResponse, Status> {
         let start = Instant::now();
         self.enforce_rate_limit(tenant)?;
+        let req = normalize_api_search_request(req);
         let plan = self.validate_search_request(tenant, &req)?;
         let query_cache_scope = self.query_cache_scope(tenant, &req);
 
@@ -1174,79 +1169,6 @@ impl KyroDBServiceImpl {
         Ok(self.build_search_response(tenant, &req, results, engine, latency_ns, search_path))
     }
 
-    /// Lean search path for benchmark mode.
-    ///
-    /// Skips: rate limiting, connection tracking, semaphore load-shedding,
-    /// empty hot-tier/cache checks, and `spawn_blocking`/timeout wrappers.
-    /// Calls the cold tier HNSW index directly for minimum overhead.
-    async fn handle_search_request_benchmark(
-        &self,
-        req: SearchRequest,
-    ) -> Result<SearchResponse, Status> {
-        let start = Instant::now();
-
-        // Minimal validation (keep dimension/k checks, skip oversampling/namespace)
-        if req.query_embedding.is_empty() {
-            return Err(Status::invalid_argument("query_embedding cannot be empty"));
-        }
-        if req.k == 0 {
-            return Err(Status::invalid_argument("k must be greater than 0"));
-        }
-
-        let ef_search_override = if req.ef_search == 0 {
-            None
-        } else {
-            Some(req.ef_search as usize)
-        };
-        let k = req.k as usize;
-
-        let engine = &self.state.engine;
-
-        // Direct cold-tier search — no hot tier, no cache, no spawn_blocking
-        let results = engine
-            .cold_tier()
-            .knn_search_with_ef(&req.query_embedding, k, ef_search_override)
-            .map_err(|e| Status::internal(format!("search failed: {}", e)))?;
-        let total_found = results.len() as u32;
-
-        let latency_ns = start.elapsed().as_nanos() as u64;
-
-        Ok(SearchResponse {
-            results: results
-                .into_iter()
-                .take(k)
-                .map(|r| kyrodb::SearchResult {
-                    doc_id: r.doc_id,
-                    score: self.convert_distance_to_score(r.distance),
-                    embedding: Vec::new(),
-                    metadata: std::collections::HashMap::new(),
-                })
-                .collect(),
-            total_found,
-            search_latency_ms: latency_ns as f32 / 1_000_000.0,
-            search_path: 0, // UNKNOWN — benchmark doesn't need this
-            error: String::new(),
-        })
-    }
-
-    fn benchmark_fast_path_allowed(
-        &self,
-        tenant: Option<&TenantContext>,
-        req: &SearchRequest,
-    ) -> bool {
-        if !self.state.is_benchmark_mode {
-            return false;
-        }
-        if tenant.is_some() {
-            return false;
-        }
-        req.filter.is_none()
-            && req.metadata_filters.is_empty()
-            && req.namespace.is_empty()
-            && !req.include_embeddings
-            && req.min_score <= 0.0
-    }
-
     async fn handle_search_requests_batch(
         &self,
         tenant: Option<&TenantContext>,
@@ -1261,6 +1183,7 @@ impl KyroDBServiceImpl {
             Vec::with_capacity(requests.len());
 
         for (idx, req) in requests.into_iter().enumerate() {
+            let req = normalize_api_search_request(req);
             match self.validate_search_request(tenant, &req) {
                 Ok(plan) => validated.push((idx, req, plan)),
                 Err(e) => {
@@ -1607,12 +1530,6 @@ impl KyroDbService for KyroDBServiceImpl {
         let tenant = self.tenant_context(&request)?;
         self.enforce_rate_limit(tenant.as_ref())?;
         let mut stream = request.into_inner();
-        let benchmark_fast_path = self
-            .state
-            .app_config
-            .environment
-            .environment_type
-            .eq_ignore_ascii_case("benchmark");
 
         // Stream ingestion in bounded chunks.
         // We cannot hold the engine write lock across `.await` on the request stream.
@@ -1627,10 +1544,7 @@ impl KyroDbService for KyroDBServiceImpl {
         let mut total_received = 0u64;
         let mut peak_memory_bytes = sample_process_memory_bytes().unwrap_or(0);
 
-        info!(
-            benchmark_fast_path = benchmark_fast_path,
-            "BulkLoadHnsw: starting streaming load"
-        );
+        info!("BulkLoadHnsw: starting streaming load");
 
         while let Some(req) = stream.message().await? {
             // Re-check rate limit per batch boundary to prevent long-running
@@ -1717,11 +1631,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 }
                 let reserved_slots = new_doc_ids.len();
                 self.reserve_tenant_vectors(tenant.as_ref(), reserved_slots)?;
-                let load_result = if benchmark_fast_path {
-                    engine.bulk_load_cold_tier_fast(batch)
-                } else {
-                    engine.bulk_load_cold_tier(batch)
-                };
+                let load_result = engine.bulk_load_cold_tier(batch);
                 match load_result {
                     Ok((loaded, failed, _duration_ms, _rate)) => {
                         total_loaded += loaded;
@@ -1770,11 +1680,7 @@ impl KyroDbService for KyroDBServiceImpl {
             }
             let reserved_slots = new_doc_ids.len();
             self.reserve_tenant_vectors(tenant.as_ref(), reserved_slots)?;
-            let load_result = if benchmark_fast_path {
-                engine.bulk_load_cold_tier_fast(batch)
-            } else {
-                engine.bulk_load_cold_tier(batch)
-            };
+            let load_result = engine.bulk_load_cold_tier(batch);
             match load_result {
                 Ok((loaded, failed, _duration_ms, _rate)) => {
                     total_loaded += loaded;
@@ -2197,13 +2103,6 @@ impl KyroDbService for KyroDBServiceImpl {
     ) -> Result<Response<SearchResponse>, Status> {
         let tenant = self.tenant_context(&request)?;
         let req = request.into_inner();
-
-        // Benchmark fast path: skip connection tracking, rate limiting, and
-        // multi-tier search. Goes directly to cold-tier HNSW.
-        if self.benchmark_fast_path_allowed(tenant.as_ref(), &req) {
-            let response = self.handle_search_request_benchmark(req).await?;
-            return Ok(Response::new(response));
-        }
 
         // Track connection
         self.state.metrics.increment_connections();
@@ -3280,7 +3179,7 @@ async fn observability_auth_middleware(
 // CLI ARGUMENTS
 // ============================================================================
 
-/// KyroDB - High-performance vector database for RAG workloads
+/// Command-line arguments for `kyrodb_server`.
 #[derive(Parser, Debug)]
 #[command(name = "kyrodb_server")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
@@ -3893,7 +3792,6 @@ async fn main() -> anyhow::Result<()> {
         start_time: Instant::now(),
         app_config: config.clone(),
         engine_config: engine_config.clone(),
-        shutdown_tx: shutdown_tx.clone(),
         metrics: metrics.clone(),
         auth,
         rate_limiter,
@@ -3901,10 +3799,6 @@ async fn main() -> anyhow::Result<()> {
         tenant_vector_counts,
         tenant_quota_locks,
         usage_tracker,
-        is_benchmark_mode: config
-            .environment
-            .environment_type
-            .eq_ignore_ascii_case("benchmark"),
     });
 
     if let Some(usage_tracker) = state.usage_tracker.clone() {
@@ -4222,8 +4116,9 @@ mod tests {
         append_hsc_lifecycle_metrics, apply_wal_health_overrides, classify_search_error_message,
         observability_auth_middleware, usage_handler, BatchSearchKey, DeleteRequest,
         GrpcPanicContainmentLayer, HealthStatus, InsertRequest, KyroDBServiceImpl, KyroDbService,
-        QueryRequest, SearchErrorKind, SearchRequest, ServerState, SnapshotRequest, TenantContext,
-        TieredEngine, TieredEngineConfig, MAX_EMBEDDING_DIM, MAX_KNN_K, MIN_DOC_ID,
+        QueryRequest, SearchErrorKind, SearchExecutionPath, SearchRequest, ServerState,
+        SnapshotRequest, TenantContext, TieredEngine, TieredEngineConfig, MAX_EMBEDDING_DIM,
+        MAX_KNN_K, MIN_DOC_ID,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -4275,13 +4170,11 @@ mod tests {
             engine.insert(doc_id, embedding, HashMap::new()).unwrap();
         }
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
             engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config: KyroDbConfig::default(),
             engine_config,
-            shutdown_tx,
             metrics: MetricsCollector::new(),
             auth: None,
             rate_limiter: None,
@@ -4289,7 +4182,6 @@ mod tests {
             tenant_vector_counts: None,
             tenant_quota_locks: None,
             usage_tracker: None,
-            is_benchmark_mode: false,
         });
 
         Arc::new(KyroDBServiceImpl { state })
@@ -4309,13 +4201,11 @@ mod tests {
         )
         .unwrap();
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
             engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config: KyroDbConfig::default(),
             engine_config,
-            shutdown_tx,
             metrics: MetricsCollector::new(),
             auth: None,
             rate_limiter: None,
@@ -4323,13 +4213,12 @@ mod tests {
             tenant_vector_counts: None,
             tenant_quota_locks: None,
             usage_tracker: None,
-            is_benchmark_mode: false,
         });
 
         Arc::new(KyroDBServiceImpl { state })
     }
 
-    fn build_test_service_with_seed_data_benchmark(auth_enabled: bool) -> Arc<KyroDBServiceImpl> {
+    fn build_test_service_with_seed_data_for_search(auth_enabled: bool) -> Arc<KyroDBServiceImpl> {
         let engine_config = TieredEngineConfig {
             embedding_dimension: 16,
             ..TieredEngineConfig::default()
@@ -4355,13 +4244,11 @@ mod tests {
         let mut app_config = KyroDbConfig::default();
         app_config.auth.enabled = auth_enabled;
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
             engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config,
             engine_config,
-            shutdown_tx,
             metrics: MetricsCollector::new(),
             auth: None,
             rate_limiter: Some(RateLimiter::new()),
@@ -4369,7 +4256,6 @@ mod tests {
             tenant_vector_counts: None,
             tenant_quota_locks: None,
             usage_tracker: None,
-            is_benchmark_mode: true,
         });
 
         Arc::new(KyroDBServiceImpl { state })
@@ -4393,13 +4279,11 @@ mod tests {
         app_config.auth.enabled = true;
         app_config.rate_limit.enabled = true;
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
             engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config,
             engine_config,
-            shutdown_tx,
             metrics: MetricsCollector::new(),
             auth: None,
             rate_limiter: Some(RateLimiter::new()),
@@ -4407,7 +4291,6 @@ mod tests {
             tenant_vector_counts: Some(parking_lot::RwLock::new(HashMap::new())),
             tenant_quota_locks: Some(parking_lot::RwLock::new(HashMap::new())),
             usage_tracker: Some(Arc::new(UsageTracker::new())),
-            is_benchmark_mode: false,
         });
 
         let service = Arc::new(KyroDBServiceImpl { state });
@@ -4442,13 +4325,11 @@ mod tests {
             .insert(1, vec![0.01; 16], HashMap::new())
             .expect("seed insert");
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = Arc::new(ServerState {
             engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config: KyroDbConfig::default(),
             engine_config,
-            shutdown_tx,
             metrics: MetricsCollector::new(),
             auth: None,
             rate_limiter: None,
@@ -4456,7 +4337,6 @@ mod tests {
             tenant_vector_counts: None,
             tenant_quota_locks: None,
             usage_tracker: None,
-            is_benchmark_mode: false,
         });
 
         (Arc::new(KyroDBServiceImpl { state }), temp_dir)
@@ -4583,13 +4463,11 @@ mod tests {
             None
         };
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         Arc::new(ServerState {
             engine: Arc::new(engine),
             start_time: Instant::now(),
             app_config,
             engine_config,
-            shutdown_tx,
             metrics: MetricsCollector::new(),
             auth,
             rate_limiter: None,
@@ -4597,7 +4475,6 @@ mod tests {
             tenant_vector_counts: None,
             tenant_quota_locks: None,
             usage_tracker,
-            is_benchmark_mode: false,
         })
     }
 
@@ -4722,8 +4599,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn benchmark_search_populates_total_found_metadata() {
-        let service = build_test_service_with_seed_data_benchmark(false);
+    async fn search_populates_total_found_metadata() {
+        let service = build_test_service_with_seed_data_for_search(false);
         let request = Request::new(SearchRequest {
             query_embedding: vec![0.1; 16],
             k: 10,
@@ -4738,22 +4615,154 @@ mod tests {
         let response = service
             .search(request)
             .await
-            .expect("benchmark search should succeed")
+            .expect("search should succeed")
             .into_inner();
         assert!(
             !response.results.is_empty(),
-            "benchmark search should return at least one result"
+            "search should return at least one result"
         );
         assert_eq!(
             response.total_found as usize,
             response.results.len(),
-            "total_found must reflect actual benchmark result count"
+            "total_found must reflect actual result count"
         );
     }
 
     #[tokio::test]
-    async fn benchmark_search_requires_tenant_context_when_auth_enabled() {
-        let service = build_test_service_with_seed_data_benchmark(true);
+    async fn search_total_found_respects_request_level_filters() {
+        let service = build_test_service_with_seed_data_for_search(false);
+        let request = Request::new(SearchRequest {
+            query_embedding: vec![0.1; 16],
+            k: 10,
+            ef_search: 128,
+            include_embeddings: false,
+            filter: None,
+            metadata_filters: HashMap::new(),
+            namespace: "missing_namespace".to_string(),
+            min_score: 0.0,
+        });
+
+        let response = service
+            .search(request)
+            .await
+            .expect("filtered search should succeed")
+            .into_inner();
+        assert!(response.results.is_empty());
+        assert_eq!(
+            response.total_found, 0,
+            "total_found must count only results that survive request filtering"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_total_found_counts_filtered_matches_before_k_cap() {
+        let service = build_validation_test_service();
+        let shared_embedding = vec![0.25; 16];
+
+        for doc_id in 1..=8u64 {
+            service
+                .state
+                .engine
+                .insert(
+                    doc_id,
+                    shared_embedding.clone(),
+                    HashMap::from([("__namespace__".to_string(), "blue".to_string())]),
+                )
+                .expect("seed matching namespaced document");
+        }
+
+        let req = SearchRequest {
+            query_embedding: shared_embedding,
+            k: 2,
+            ef_search: 128,
+            include_embeddings: false,
+            filter: None,
+            metadata_filters: HashMap::new(),
+            namespace: "blue".to_string(),
+            min_score: 0.0,
+        };
+
+        let plan = service
+            .validate_search_request(None, &req)
+            .expect("search request should validate");
+        assert!(
+            plan.search_k > req.k as usize,
+            "request-level filtering should oversample search_k"
+        );
+
+        let synthetic_results: Vec<kyrodb_engine::SearchResult> = (1..=8u64)
+            .map(|doc_id| kyrodb_engine::SearchResult {
+                doc_id,
+                distance: 0.0,
+            })
+            .collect();
+        let response = service.build_search_response(
+            None,
+            &req,
+            synthetic_results,
+            &service.state.engine,
+            0,
+            SearchExecutionPath::ColdTierOnly,
+        );
+        assert_eq!(response.results.len(), 2, "response should still honor k");
+        assert_eq!(
+            response.total_found, 8,
+            "total_found must count all filtered hits found in the oversampled candidate set"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_applies_legacy_metadata_filters() {
+        let service = build_test_service_with_seed_data();
+        service
+            .state
+            .engine
+            .insert(
+                1,
+                vec![0.2; 16],
+                HashMap::from([("color".to_string(), "red".to_string())]),
+            )
+            .expect("seed red document");
+        service
+            .state
+            .engine
+            .insert(
+                2,
+                vec![0.19; 16],
+                HashMap::from([("color".to_string(), "blue".to_string())]),
+            )
+            .expect("seed blue document");
+
+        let request = Request::new(SearchRequest {
+            query_embedding: vec![0.2; 16],
+            k: 10,
+            ef_search: 128,
+            include_embeddings: false,
+            filter: None,
+            metadata_filters: HashMap::from([("color".to_string(), "red".to_string())]),
+            namespace: String::new(),
+            min_score: 0.0,
+        });
+
+        let response = service
+            .search(request)
+            .await
+            .expect("filtered search should succeed")
+            .into_inner();
+        assert_eq!(response.total_found as usize, response.results.len());
+        assert!(
+            !response.results.is_empty(),
+            "legacy metadata filter must match"
+        );
+        assert!(response
+            .results
+            .iter()
+            .all(|result| { result.metadata.get("color").map(String::as_str) == Some("red") }));
+    }
+
+    #[tokio::test]
+    async fn search_requires_tenant_context_when_auth_enabled() {
+        let service = build_test_service_with_seed_data_for_search(true);
         let request = Request::new(SearchRequest {
             query_embedding: vec![0.1; 16],
             k: 10,
@@ -4768,7 +4777,7 @@ mod tests {
         let err = service
             .search(request)
             .await
-            .expect_err("auth-enabled benchmark search must enforce tenant context");
+            .expect_err("auth-enabled search must enforce tenant context");
         assert_eq!(err.code(), Code::Unauthenticated);
     }
 
@@ -5207,7 +5216,6 @@ mod tests {
         logger.write().log_doc_accesses(&[11, 12, 13]);
         engine.set_access_logger(logger);
 
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(8);
         let state = ServerState {
             engine: Arc::new(engine),
             start_time: Instant::now(),
@@ -5218,7 +5226,6 @@ mod tests {
                 data_dir: None,
                 ..TieredEngineConfig::default()
             },
-            shutdown_tx,
             metrics: MetricsCollector::new(),
             auth: None,
             rate_limiter: None,
@@ -5226,7 +5233,6 @@ mod tests {
             tenant_vector_counts: None,
             tenant_quota_locks: None,
             usage_tracker: None,
-            is_benchmark_mode: false,
         };
 
         let mut output = String::new();

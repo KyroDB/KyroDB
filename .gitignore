@@ -140,8 +140,6 @@ benchmark_data/
 /*.json
 .github/AGENTS.md
 other_docs/
-docs/ENGINEERING_STATUS.md
-docs/VISION.md
 .venv/       
 simulation.html
 benchmarks/scripts/analyze_vm_suite.py
@@ -150,3 +148,5 @@ docs/BENCHMARK_REPORT_FX32ms_v2.md
 /kyrodb-python/
 docs/PLATFORM_PLAN.md
 /paper
+docs/VISION.md
+docs/ENGINEERING_STATUS.md

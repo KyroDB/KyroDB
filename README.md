@@ -80,7 +80,6 @@ Pilot baseline note:
 - [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)
 - [docs/BACKUP_AND_RECOVERY.md](docs/BACKUP_AND_RECOVERY.md)
 - [docs/OPERATIONS.md](docs/OPERATIONS.md)
-- [docs/ENGINEERING_STATUS.md](docs/ENGINEERING_STATUS.md)
 
 ## License
 

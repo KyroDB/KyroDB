@@ -1,9 +1,8 @@
 //! ANN backend abstraction and single runtime graph engine.
 //!
 //! This module intentionally maintains one authoritative ANN representation
-//! (`FlatGraph`) for both mutation and search paths. The previous hybrid mode
-//! (separate mutable HNSW + read-optimized flat snapshot) is removed to avoid
-//! dual-engine drift and cache/consistency ambiguity.
+//! (`FlatGraph`) for both mutation and search paths to avoid semantic drift
+//! between build and query behavior.
 
 use parking_lot::RwLock;
 use std::cell::RefCell;
@@ -138,6 +137,12 @@ fn keep_top_k_by_distance(results: &mut Vec<SearchResult>, k: usize) {
 pub(crate) trait AnnBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn insert(&self, embedding: &[f32], origin_id: usize);
+    fn sequential_insert_slice(&self, batch: &[(&[f32], usize)]) {
+        for &(embedding, origin_id) in batch {
+            self.insert(embedding, origin_id);
+        }
+        self.on_sequential_batch_complete();
+    }
     fn parallel_insert_slice(&self, batch: &[(&[f32], usize)]);
     fn on_sequential_batch_complete(&self) {}
     fn estimated_memory_bytes(&self) -> usize {
@@ -150,10 +155,6 @@ pub(crate) trait AnnBackend: Send + Sync {
         ef_search: usize,
         cancelled: Option<&AtomicBool>,
     ) -> Vec<SearchResult>;
-    #[allow(dead_code)]
-    fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<SearchResult> {
-        self.search_with_cancel(query, k, ef_search, None)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -822,24 +823,22 @@ impl FlatGraph {
         })
     }
 
-    /// Beam search at a specified graph layer.
-    ///
-    /// Standard HNSW `SEARCH-LAYER` subroutine (Malkov & Yashunin 2016).
-    /// Returns `(dense_id, distance)` pairs sorted by ascending distance.
-    /// Used during construction to find neighbor candidates at each layer.
-    fn search_at_layer(
+    fn search_at_layer_into(
         &self,
         query: &[f32],
         entry: u32,
         entry_dist: f32,
         ef: usize,
         layer: usize,
-    ) -> Vec<(u32, f32)> {
+        out: &mut Vec<(u32, f32)>,
+    ) {
+        out.clear();
         if self.len() == 0 || ef == 0 {
-            return Vec::new();
+            return;
         }
         if layer > self.max_layer {
-            return vec![(entry, entry_dist)];
+            out.push((entry, entry_dist));
+            return;
         }
         let ef = ef.max(1).min(self.len());
 
@@ -925,13 +924,16 @@ impl FlatGraph {
                     }
                 }
 
-                let mut out = Vec::with_capacity(scratch.results.len());
+                out.clear();
+                if out.capacity() < scratch.results.len() {
+                    out.reserve(scratch.results.len() - out.capacity());
+                }
                 while let Some(item) = scratch.results.pop() {
                     out.push((item.dense_id, item.distance));
                 }
                 out.reverse();
                 scratch.finish_query();
-                return out;
+                return;
             }
 
             while let Some(candidate) = scratch.candidates.pop() {
@@ -981,20 +983,23 @@ impl FlatGraph {
                 }
             }
 
-            let mut out = Vec::with_capacity(scratch.results.len());
+            out.clear();
+            if out.capacity() < scratch.results.len() {
+                out.reserve(scratch.results.len() - out.capacity());
+            }
             while let Some(item) = scratch.results.pop() {
                 out.push((item.dense_id, item.distance));
             }
             out.reverse();
             scratch.finish_query();
-            out
         })
     }
 
     #[inline]
-    fn distance_between_dense(&self, lhs: u32, rhs: u32) -> f32 {
-        self.distance_kernel
-            .distance(self.vector_at(lhs), self.vector_at(rhs))
+    unsafe fn distance_between_dense_unchecked(&self, lhs: u32, rhs: u32) -> f32 {
+        let lhs_vec = unsafe { self.vector_at_unchecked(lhs) };
+        let rhs_vec = unsafe { self.vector_at_unchecked(rhs) };
+        self.distance_kernel.distance(lhs_vec, rhs_vec)
     }
 
     fn set_layer_neighbors(&mut self, layer: usize, dense_id: u32, values: &[u32]) {
@@ -1018,16 +1023,31 @@ impl FlatGraph {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     fn select_diverse_neighbors(
         &self,
         candidates: &[(u32, f32)],
         max_neighbors: usize,
     ) -> Vec<u32> {
+        let mut selected = Vec::with_capacity(max_neighbors);
+        self.select_diverse_neighbors_into(candidates, max_neighbors, &mut selected);
+        selected
+    }
+
+    fn select_diverse_neighbors_into(
+        &self,
+        candidates: &[(u32, f32)],
+        max_neighbors: usize,
+        selected: &mut Vec<u32>,
+    ) {
+        selected.clear();
         if max_neighbors == 0 || candidates.is_empty() {
-            return Vec::new();
+            return;
         }
 
-        let mut selected = Vec::with_capacity(max_neighbors);
+        if selected.capacity() < max_neighbors {
+            selected.reserve(max_neighbors.saturating_sub(selected.capacity()));
+        }
         let budget = candidates
             .len()
             .min(max_neighbors.saturating_mul(DIVERSIFIED_CANDIDATE_BUDGET_MULTIPLIER));
@@ -1044,8 +1064,12 @@ impl FlatGraph {
             }
 
             let mut diversified = true;
-            for &chosen in &selected {
-                let dist_to_chosen = self.distance_between_dense(cand, chosen);
+            for &chosen in selected.iter() {
+                let dist_to_chosen = unsafe {
+                    // Safety: candidates and selected neighbors are filtered to
+                    // existing dense IDs before reaching this branch.
+                    self.distance_between_dense_unchecked(cand, chosen)
+                };
                 if dist_to_chosen < dist_to_query {
                     diversified = false;
                     break;
@@ -1055,7 +1079,7 @@ impl FlatGraph {
             if diversified {
                 selected.push(cand);
                 if selected.len() >= max_neighbors {
-                    return selected;
+                    return;
                 }
             }
         }
@@ -1075,16 +1099,15 @@ impl FlatGraph {
                 }
             }
         }
-
-        selected
     }
 
-    fn merge_and_prune_reverse_edge(
+    fn merge_and_prune_reverse_edge_with_scratch(
         &mut self,
         layer: usize,
         target_dense: u32,
         incoming_dense: u32,
         max_neighbors: usize,
+        scratch: &mut ConstructionScratch,
     ) -> bool {
         if layer > self.max_layer
             || target_dense as usize >= self.len()
@@ -1102,49 +1125,76 @@ impl FlatGraph {
             return true;
         }
         if current.len() < max_neighbors {
-            let mut merged = Vec::with_capacity(current.len() + 1);
+            scratch.reverse_merged.clear();
+            if scratch.reverse_merged.capacity() < current.len() + 1 {
+                scratch
+                    .reverse_merged
+                    .reserve(current.len() + 1 - scratch.reverse_merged.capacity());
+            }
             for &nbr in current {
                 if nbr == target_dense || nbr as usize >= self.len() {
                     continue;
                 }
-                if !merged.contains(&nbr) {
-                    merged.push(nbr);
+                if !scratch.reverse_merged.contains(&nbr) {
+                    scratch.reverse_merged.push(nbr);
                 }
             }
-            if !merged.contains(&incoming_dense) {
-                merged.push(incoming_dense);
+            if !scratch.reverse_merged.contains(&incoming_dense) {
+                scratch.reverse_merged.push(incoming_dense);
             }
-            self.set_layer_neighbors(layer, target_dense, &merged);
-            return merged.contains(&incoming_dense);
+            self.set_layer_neighbors(layer, target_dense, &scratch.reverse_merged);
+            return scratch.reverse_merged.contains(&incoming_dense);
         }
 
-        let mut scored = Vec::with_capacity(current.len() + 1);
+        scratch.reverse_scored.clear();
+        if scratch.reverse_scored.capacity() < current.len() + 1 {
+            scratch
+                .reverse_scored
+                .reserve(current.len() + 1 - scratch.reverse_scored.capacity());
+        }
         for &nbr in current {
             if nbr == target_dense || nbr as usize >= self.len() {
                 continue;
             }
-            if scored.iter().any(|(seen, _)| *seen == nbr) {
+            if scratch.reverse_scored.iter().any(|(seen, _)| *seen == nbr) {
                 continue;
             }
-            scored.push((nbr, self.distance_between_dense(target_dense, nbr)));
+            let dist = unsafe {
+                // Safety: target/incoming/current neighbors are all validated
+                // against `self.len()` at the top of this method.
+                self.distance_between_dense_unchecked(target_dense, nbr)
+            };
+            scratch.reverse_scored.push((nbr, dist));
         }
 
-        if !scored.iter().any(|(seen, _)| *seen == incoming_dense) {
-            scored.push((
-                incoming_dense,
-                self.distance_between_dense(target_dense, incoming_dense),
-            ));
+        if !scratch
+            .reverse_scored
+            .iter()
+            .any(|(seen, _)| *seen == incoming_dense)
+        {
+            let incoming_dist = unsafe {
+                // Safety: target/incoming/current neighbors are all validated
+                // against `self.len()` at the top of this method.
+                self.distance_between_dense_unchecked(target_dense, incoming_dense)
+            };
+            scratch.reverse_scored.push((incoming_dense, incoming_dist));
         }
 
-        scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        scratch
+            .reverse_scored
+            .sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-        let mut merged = self.select_diverse_neighbors(&scored, max_neighbors);
-        let mut kept_incoming = merged.contains(&incoming_dense);
-        if !kept_incoming && merged.len() < max_neighbors {
-            merged.push(incoming_dense);
+        self.select_diverse_neighbors_into(
+            &scratch.reverse_scored,
+            max_neighbors,
+            &mut scratch.reverse_merged,
+        );
+        let mut kept_incoming = scratch.reverse_merged.contains(&incoming_dense);
+        if !kept_incoming && scratch.reverse_merged.len() < max_neighbors {
+            scratch.reverse_merged.push(incoming_dense);
             kept_incoming = true;
         }
-        self.set_layer_neighbors(layer, target_dense, &merged);
+        self.set_layer_neighbors(layer, target_dense, &scratch.reverse_merged);
         kept_incoming
     }
 
@@ -1184,28 +1234,38 @@ impl FlatGraph {
             }
         }
 
-        self.connect_with_layer_neighbors(
-            doc_id,
-            embedding,
-            inserted_level,
-            &selected_neighbors,
-            layer0_max_neighbors,
-            upper_layer_max_neighbors,
-        )
+        self.connect_with_layer_neighbors(doc_id, embedding, inserted_level, &selected_neighbors)
     }
 
     /// Connect a freshly-added node using pre-selected neighbor IDs per layer.
     ///
-    /// This avoids repeating expensive diversity selection while holding the
-    /// write lock in staged parallel build flows.
+    /// This avoids recomputing diversity selection once the caller has already
+    /// chosen per-layer neighbors during construction.
+    #[cfg(test)]
     fn connect_with_layer_neighbors(
         &mut self,
         doc_id: u64,
         embedding: &[f32],
         inserted_level: usize,
         layer_neighbors: &[Vec<u32>],
-        layer0_max_neighbors: usize,
-        upper_layer_max_neighbors: usize,
+    ) -> bool {
+        let mut scratch = ConstructionScratch::default();
+        self.connect_with_layer_neighbors_with_scratch(
+            doc_id,
+            embedding,
+            inserted_level,
+            layer_neighbors,
+            &mut scratch,
+        )
+    }
+
+    fn connect_with_layer_neighbors_with_scratch(
+        &mut self,
+        doc_id: u64,
+        embedding: &[f32],
+        inserted_level: usize,
+        layer_neighbors: &[Vec<u32>],
+        scratch: &mut ConstructionScratch,
     ) -> bool {
         if embedding.len() != self.dimension {
             return false;
@@ -1245,37 +1305,45 @@ impl FlatGraph {
 
         for layer in 0..=effective_level {
             let max_nbrs = if layer == 0 {
-                layer0_max_neighbors
+                self.level0.cap
             } else {
-                upper_layer_max_neighbors
+                self.upper_layer_neighbor_cap
             };
             if max_nbrs == 0 {
                 continue;
             }
 
-            let mut selected = Vec::with_capacity(max_nbrs);
+            scratch.selected_neighbors.clear();
+            if scratch.selected_neighbors.capacity() < max_nbrs {
+                scratch
+                    .selected_neighbors
+                    .reserve(max_nbrs.saturating_sub(scratch.selected_neighbors.capacity()));
+            }
             if let Some(neighbors) = layer_neighbors.get(layer) {
                 for &nbr in neighbors {
                     if nbr == new_dense || nbr as usize >= self.len() {
                         continue;
                     }
-                    if selected.contains(&nbr) {
+                    if scratch.selected_neighbors.contains(&nbr) {
                         continue;
                     }
-                    selected.push(nbr);
-                    if selected.len() >= max_nbrs {
+                    scratch.selected_neighbors.push(nbr);
+                    if scratch.selected_neighbors.len() >= max_nbrs {
                         break;
                     }
                 }
             }
 
             // Forward edges: new_node -> selected neighbors.
-            self.set_layer_neighbors(layer, new_dense, &selected);
+            self.set_layer_neighbors(layer, new_dense, &scratch.selected_neighbors);
 
             // Reverse edges: neighbor -> new_node (bidirectional connectivity).
             let mut reachable = false;
-            for &nbr in &selected {
-                if self.merge_and_prune_reverse_edge(layer, nbr, new_dense, max_nbrs) {
+            for idx in 0..scratch.selected_neighbors.len() {
+                let nbr = scratch.selected_neighbors[idx];
+                if self.merge_and_prune_reverse_edge_with_scratch(
+                    layer, nbr, new_dense, max_nbrs, scratch,
+                ) {
                     reachable = true;
                 }
             }
@@ -1285,9 +1353,14 @@ impl FlatGraph {
             // graph. Extreme outliers may lose all reverse edges during pruning
             // because they are the farthest neighbor for every connected node.
             if !reachable {
-                if let Some(&closest_nbr) = selected.first() {
-                    let _ =
-                        self.merge_and_prune_reverse_edge(layer, closest_nbr, new_dense, max_nbrs);
+                if let Some(&closest_nbr) = scratch.selected_neighbors.first() {
+                    let _ = self.merge_and_prune_reverse_edge_with_scratch(
+                        layer,
+                        closest_nbr,
+                        new_dense,
+                        max_nbrs,
+                        scratch,
+                    );
                 }
             }
         }
@@ -1592,13 +1665,65 @@ pub(crate) struct SingleGraphBackend {
     max_layer_limit: usize,
 }
 
-#[derive(Clone, Default)]
-struct InsertPlan {
-    valid: bool,
-    inserted_level: usize,
-    /// Per-layer preselected neighbor IDs for the new node.
-    /// Each layer list is deduplicated and capped by that layer's max degree.
+#[derive(Default)]
+struct ConstructionScratch {
+    search_results: Vec<(u32, f32)>,
+    selected_neighbors: Vec<u32>,
+    reverse_scored: Vec<(u32, f32)>,
+    reverse_merged: Vec<u32>,
     layer_neighbors: Vec<Vec<u32>>,
+}
+
+impl ConstructionScratch {
+    fn reserve_for_backend(
+        &mut self,
+        layer_count_hint: usize,
+        ef_construction: usize,
+        max_neighbors: usize,
+    ) {
+        if self.search_results.capacity() < ef_construction {
+            self.search_results
+                .reserve(ef_construction.saturating_sub(self.search_results.capacity()));
+        }
+        if self.selected_neighbors.capacity() < max_neighbors {
+            self.selected_neighbors
+                .reserve(max_neighbors.saturating_sub(self.selected_neighbors.capacity()));
+        }
+        let reverse_cap = max_neighbors.saturating_add(1);
+        if self.reverse_scored.capacity() < reverse_cap {
+            self.reverse_scored
+                .reserve(reverse_cap.saturating_sub(self.reverse_scored.capacity()));
+        }
+        if self.reverse_merged.capacity() < reverse_cap {
+            self.reverse_merged
+                .reserve(reverse_cap.saturating_sub(self.reverse_merged.capacity()));
+        }
+        if self.layer_neighbors.len() < layer_count_hint {
+            self.layer_neighbors.resize_with(layer_count_hint, Vec::new);
+        }
+        for layer in self.layer_neighbors.iter_mut().take(layer_count_hint) {
+            if layer.capacity() < max_neighbors {
+                layer.reserve(max_neighbors.saturating_sub(layer.capacity()));
+            }
+        }
+    }
+
+    fn prepare_layers(&mut self, layer_count: usize) {
+        if self.layer_neighbors.len() < layer_count {
+            self.layer_neighbors.resize_with(layer_count, Vec::new);
+        }
+        for layer in self.layer_neighbors.iter_mut().take(layer_count) {
+            layer.clear();
+        }
+        self.search_results.clear();
+        self.selected_neighbors.clear();
+        self.reverse_scored.clear();
+        self.reverse_merged.clear();
+    }
+}
+
+thread_local! {
+    static CONSTRUCTION_SCRATCH: RefCell<ConstructionScratch> = RefCell::new(ConstructionScratch::default());
 }
 
 impl SingleGraphBackend {
@@ -1621,40 +1746,20 @@ impl SingleGraphBackend {
         }
     }
 
-    /// Build an insert plan by searching the existing graph at each layer.
-    ///
-    /// Implements the standard HNSW insert search pattern:
-    /// 1. Greedy descent from the top layer down to `inserted_level + 1` to find
-    ///    the best entry point.
-    /// 2. Beam search with `ef_construction` at each layer from
-    ///    `min(inserted_level, max_layer)` down to 0 to collect neighbor
-    ///    candidates and preselect per-layer neighbors.
-    fn build_insert_plan(
+    fn insert_into_existing_flat_with_scratch(
         &self,
-        flat: &FlatGraph,
+        flat: &mut FlatGraph,
         embedding: &[f32],
         origin_id: usize,
-    ) -> InsertPlan {
+        scratch: &mut ConstructionScratch,
+    ) {
         let new_doc_id = origin_id as u64;
-        if flat.origin_to_dense.contains_key(&new_doc_id) {
-            return InsertPlan::default();
-        }
-        if embedding.len() != flat.dimension {
-            return InsertPlan::default();
-        }
-        if flat.len() == 0 {
-            // First element: no neighbors to find.
-            return InsertPlan {
-                valid: true,
-                inserted_level: sampled_level(origin_id, self.max_layer_limit, self.m),
-                layer_neighbors: Vec::new(),
-            };
+        if flat.origin_to_dense.contains_key(&new_doc_id) || embedding.len() != flat.dimension {
+            return;
         }
 
         let inserted_level = sampled_level(origin_id, self.max_layer_limit, self.m);
 
-        // Phase 1: Greedy descent from the top of the existing graph down to
-        // one layer above the node's insert level (standard HNSW approach).
         let top = flat
             .max_layer
             .min(flat.entry_by_layer.len().saturating_sub(1));
@@ -1671,16 +1776,19 @@ impl SingleGraphBackend {
             entry_dist = new_dist;
         }
 
-        // Phase 2: At each layer from min(inserted_level, max_layer) down to 0,
-        // run a beam search with ef_construction and preselect neighbors.
         let search_bottom = inserted_level.min(flat.max_layer);
-        let mut layer_neighbors: Vec<Vec<u32>> = vec![Vec::new(); search_bottom + 1];
+        scratch.prepare_layers(search_bottom + 1);
 
         for layer in (0..=search_bottom).rev() {
-            let candidates =
-                flat.search_at_layer(embedding, entry, entry_dist, self.ef_construction, layer);
-            // Use the nearest found candidate as entry for the next lower layer.
-            if let Some(&(best_id, best_dist)) = candidates.first() {
+            flat.search_at_layer_into(
+                embedding,
+                entry,
+                entry_dist,
+                self.ef_construction,
+                layer,
+                &mut scratch.search_results,
+            );
+            if let Some(&(best_id, best_dist)) = scratch.search_results.first() {
                 entry = best_id;
                 entry_dist = best_dist;
             }
@@ -1690,74 +1798,40 @@ impl SingleGraphBackend {
                 self.upper_layer_neighbor_cap
             };
             if max_nbrs > 0 {
-                layer_neighbors[layer] = flat.select_diverse_neighbors(&candidates, max_nbrs);
+                flat.select_diverse_neighbors_into(
+                    &scratch.search_results,
+                    max_nbrs,
+                    &mut scratch.layer_neighbors[layer],
+                );
             }
         }
 
-        InsertPlan {
-            valid: true,
+        let layer_count = search_bottom + 1;
+        let layer_neighbors = std::mem::take(&mut scratch.layer_neighbors);
+        flat.connect_with_layer_neighbors_with_scratch(
+            origin_id as u64,
+            embedding,
             inserted_level,
-            layer_neighbors,
-        }
+            &layer_neighbors[..layer_count],
+            scratch,
+        );
+        scratch.layer_neighbors = layer_neighbors;
     }
 
-    fn apply_insert_plan(
+    fn sequential_insert_into_locked_graph(
         &self,
-        flat: &mut FlatGraph,
-        embedding: &[f32],
-        origin_id: usize,
-        plan: &InsertPlan,
+        flat_guard: &mut Option<FlatGraph>,
+        batch: &[(&[f32], usize)],
+        scratch: &mut ConstructionScratch,
     ) {
-        if !plan.valid {
-            return;
-        }
-        flat.connect_with_layer_neighbors(
-            origin_id as u64,
-            embedding,
-            plan.inserted_level,
-            &plan.layer_neighbors,
-            self.layer0_neighbor_cap,
-            self.upper_layer_neighbor_cap,
-        );
-    }
-
-    fn insert_into_existing_flat(&self, flat: &mut FlatGraph, embedding: &[f32], origin_id: usize) {
-        let plan = self.build_insert_plan(flat, embedding, origin_id);
-        self.apply_insert_plan(flat, embedding, origin_id, &plan);
-    }
-}
-
-impl AnnBackend for SingleGraphBackend {
-    fn name(&self) -> &'static str {
-        "kyro_single_graph"
-    }
-
-    fn insert(&self, embedding: &[f32], origin_id: usize) {
-        let mut flat_guard = self.flat_graph.write();
-        if let Some(flat) = flat_guard.as_mut() {
-            self.insert_into_existing_flat(flat, embedding, origin_id);
-            return;
-        }
-
-        *flat_guard = FlatGraph::new_single(
-            self.distance,
-            embedding,
-            origin_id as u64,
-            self.layer0_neighbor_cap,
-            self.upper_layer_neighbor_cap,
-        );
-    }
-
-    fn parallel_insert_slice(&self, batch: &[(&[f32], usize)]) {
         if batch.is_empty() {
             return;
         }
 
-        let mut flat_guard = self.flat_graph.write();
         if let Some(flat) = flat_guard.as_mut() {
             flat.reserve_for_additional(batch.len());
             for &(embedding, origin_id) in batch {
-                self.insert_into_existing_flat(flat, embedding, origin_id);
+                self.insert_into_existing_flat_with_scratch(flat, embedding, origin_id, scratch);
             }
             return;
         }
@@ -1771,12 +1845,70 @@ impl AnnBackend for SingleGraphBackend {
             self.layer0_neighbor_cap,
             self.upper_layer_neighbor_cap,
         );
+
         if let Some(flat) = flat_guard.as_mut() {
             flat.reserve_for_additional(rest.len());
             for &(embedding, origin_id) in rest {
-                self.insert_into_existing_flat(flat, embedding, origin_id);
+                self.insert_into_existing_flat_with_scratch(flat, embedding, origin_id, scratch);
             }
         }
+    }
+}
+
+impl AnnBackend for SingleGraphBackend {
+    fn name(&self) -> &'static str {
+        "kyro_single_graph"
+    }
+
+    fn insert(&self, embedding: &[f32], origin_id: usize) {
+        let mut flat_guard = self.flat_graph.write();
+        if let Some(flat) = flat_guard.as_mut() {
+            CONSTRUCTION_SCRATCH.with(|scratch| {
+                let mut scratch = scratch.borrow_mut();
+                scratch.reserve_for_backend(
+                    self.max_layer_limit.saturating_add(1),
+                    self.ef_construction,
+                    self.layer0_neighbor_cap.max(self.upper_layer_neighbor_cap),
+                );
+                self.insert_into_existing_flat_with_scratch(
+                    flat,
+                    embedding,
+                    origin_id,
+                    &mut scratch,
+                );
+            });
+            return;
+        }
+
+        *flat_guard = FlatGraph::new_single(
+            self.distance,
+            embedding,
+            origin_id as u64,
+            self.layer0_neighbor_cap,
+            self.upper_layer_neighbor_cap,
+        );
+    }
+
+    fn sequential_insert_slice(&self, batch: &[(&[f32], usize)]) {
+        if batch.is_empty() {
+            return;
+        }
+
+        {
+            let mut flat_guard = self.flat_graph.write();
+            let mut scratch = ConstructionScratch::default();
+            scratch.reserve_for_backend(
+                self.max_layer_limit.saturating_add(1),
+                self.ef_construction,
+                self.layer0_neighbor_cap.max(self.upper_layer_neighbor_cap),
+            );
+            self.sequential_insert_into_locked_graph(&mut flat_guard, batch, &mut scratch);
+        }
+        self.on_sequential_batch_complete();
+    }
+
+    fn parallel_insert_slice(&self, batch: &[(&[f32], usize)]) {
+        self.sequential_insert_slice(batch);
     }
 
     fn estimated_memory_bytes(&self) -> usize {
@@ -1937,7 +2069,7 @@ mod tests {
 
         for &query_idx in query_indices {
             let query = &dataset[query_idx];
-            let approx = backend.search(query, k, ef_search);
+            let approx = backend.search_with_cancel(query, k, ef_search, None);
             let approx_ids = approx.iter().map(|r| r.doc_id).collect::<HashSet<_>>();
 
             let mut exact = (0..dataset.len())
@@ -2270,7 +2402,7 @@ mod tests {
         backend.insert(&point, 9_001);
         backend.insert(&[41.5, -7.2, 1.6, 0.4], 9_002);
 
-        let results = backend.search(&point, 5, 128);
+        let results = backend.search_with_cancel(&point, 5, 128, None);
         assert!(!results.is_empty());
         assert!(contains_doc(&results, 9_001));
     }
@@ -2303,7 +2435,7 @@ mod tests {
             "incremental node should have at least one layer-0 edge"
         );
 
-        let results = backend.search(&incremental, 10, 256);
+        let results = backend.search_with_cancel(&incremental, 10, 256, None);
         assert!(contains_doc(&results, 9_999));
     }
 
@@ -2466,11 +2598,60 @@ mod tests {
             }
 
             for query_idx in [0usize, 7, 31, 63, 127, 255, 383, 511] {
-                let batch_results = batch_backend.search(&dataset[query_idx], K, 256);
-                let online_results = online_backend.search(&dataset[query_idx], K, 256);
+                let batch_results =
+                    batch_backend.search_with_cancel(&dataset[query_idx], K, 256, None);
+                let online_results =
+                    online_backend.search_with_cancel(&dataset[query_idx], K, 256, None);
                 assert_eq!(
                     batch_results, online_results,
                     "batch build path must match online insertion for {:?} query {}",
+                    distance, query_idx
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sequential_batch_build_matches_online_insert_results_across_metrics() {
+        const DATASET_SIZE: usize = 192;
+        const DIM: usize = 96;
+        const K: usize = 10;
+
+        for (distance, dataset) in [
+            (
+                DistanceMetric::Euclidean,
+                (0..DATASET_SIZE)
+                    .map(|seed| pseudo_random_vec(seed, DIM))
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DistanceMetric::Cosine,
+                clustered_cosine_dataset(DATASET_SIZE, DIM, 24, 20),
+            ),
+        ] {
+            let batch: Vec<(&[f32], usize)> = dataset
+                .iter()
+                .enumerate()
+                .map(|(id, v)| (v.as_slice(), id))
+                .collect();
+
+            let sequential_batch_backend =
+                backend_with_defaults(distance, 24, DATASET_SIZE, 8, 400);
+            sequential_batch_backend.sequential_insert_slice(&batch);
+
+            let online_backend = backend_with_defaults(distance, 24, DATASET_SIZE, 8, 400);
+            for &(embedding, origin_id) in &batch {
+                online_backend.insert(embedding, origin_id);
+            }
+
+            for query_idx in [0usize, 7, 31, 63, 127, 191] {
+                let sequential_results =
+                    sequential_batch_backend.search_with_cancel(&dataset[query_idx], K, 256, None);
+                let online_results =
+                    online_backend.search_with_cancel(&dataset[query_idx], K, 256, None);
+                assert_eq!(
+                    sequential_results, online_results,
+                    "sequential batch path must match online insertion for {:?} query {}",
                     distance, query_idx
                 );
             }
@@ -2499,7 +2680,7 @@ mod tests {
         let mut total_expected = 0usize;
         for query_id in 0..QUERIES {
             let query = &dataset[query_id * (DATASET_SIZE / QUERIES)];
-            let approx = backend.search(query, K, 1024);
+            let approx = backend.search_with_cancel(query, K, 1024, None);
 
             let mut exact = (0..DATASET_SIZE)
                 .map(|idx| {

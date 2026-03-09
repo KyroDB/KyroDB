@@ -1,25 +1,7 @@
+//! Long-running validation harness for cache-strategy A/B workloads.
 //!
-//! **Purpose**: Validate KyroDB A/B testing framework under sustained production-like load
-//!
-//! **What This Test Validates**:
-//! 1. Hybrid Semantic Cache achieves 70-90% hit rate (vs 30-40% LRU baseline)
-//! 2. No memory leaks under sustained load (4.32M queries)
-//! 3. Training task runs reliably every 10 minutes (72 cycles)
-//! 4. No performance degradation over time
-//! 5. Stats persistence survives restarts
-//!
-//! **Workload**:
-//! - Duration: 12 hours (configurable)
-//! - QPS: 100 queries/second
-//! - Distribution: Zipf (exponent=1.5) - 80/20 hot/cold
-//! - Corpus: 100,000 documents
-//! - A/B split: 50% LRU baseline, 50% Hybrid Semantic Cache
-//!
-//! **Run on Azure VM**:
-//! ```
-//! cargo build --release --bin validation_24h
-//! nohup ./target/release/validation_24h > validation.log 2>&1 &
-//! ```
+//! Exercises sustained mixed traffic, predictor retraining, memory growth, and
+//! stats persistence under a configurable synthetic workload.
 
 use anyhow::{bail, Context, Result};
 use kyrodb_engine::{
@@ -770,8 +752,13 @@ async fn main() -> Result<()> {
     println!();
 
     // Go/No-Go decision
-    let hit_rate_pass = (0.70..=0.90).contains(&learned_hit_rate);
-    let improvement_pass = (2.0..=3.5).contains(&improvement);
+    const HIT_RATE_MIN: f64 = 0.70;
+    const HIT_RATE_MAX: f64 = 0.90;
+    const IMPROVEMENT_MIN: f64 = 2.0;
+    const IMPROVEMENT_MAX: f64 = 3.5;
+
+    let hit_rate_pass = (HIT_RATE_MIN..=HIT_RATE_MAX).contains(&learned_hit_rate);
+    let improvement_pass = (IMPROVEMENT_MIN..=IMPROVEMENT_MAX).contains(&improvement);
     let memory_pass = initial_memory == 0.0 || memory_growth_pct.abs() < 5.0;
     let training_pass = !training_crashed;
 
@@ -783,11 +770,15 @@ async fn main() -> Result<()> {
     println!();
     println!("Criteria:");
     println!(
-        "  [OK] Hybrid Semantic Cache hit rate 70-90%:       {}",
+        "  [OK] Learned-cache hit rate in {:.0}%-{:.0}% target band: {}",
+        HIT_RATE_MIN * 100.0,
+        HIT_RATE_MAX * 100.0,
         if hit_rate_pass { "PASS" } else { "FAIL" }
     );
     println!(
-        "  [OK] Improvement 2.0-3.0x over LRU:       {}",
+        "  [OK] Improvement over LRU in {:.1}x-{:.1}x target band: {}",
+        IMPROVEMENT_MIN,
+        IMPROVEMENT_MAX,
         if improvement_pass { "PASS" } else { "FAIL" }
     );
     println!(

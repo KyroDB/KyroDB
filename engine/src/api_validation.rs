@@ -1,5 +1,6 @@
 use crate::adaptive_oversampling;
-use crate::proto::{InsertRequest, SearchRequest};
+use crate::proto::metadata_filter::FilterType;
+use crate::proto::{AndFilter, ExactMatch, InsertRequest, MetadataFilter, SearchRequest};
 
 /// Maximum embedding dimension to prevent DoS attacks.
 pub const MAX_EMBEDDING_DIM: usize = 4096;
@@ -70,6 +71,70 @@ pub fn validate_search_request(req: &SearchRequest) -> Result<SearchValidationPl
         search_k,
         ef_search_override,
     })
+}
+
+/// Canonicalize legacy search request fields into the structured filter form.
+///
+/// `metadata_filters` is a deprecated exact-match map. The runtime treats it as
+/// an AND of exact matches and merges it with `filter` when both are present.
+/// The normalized request clears the deprecated field so downstream hashing and
+/// filtering operate on a single canonical representation.
+pub fn normalize_search_request(mut req: SearchRequest) -> SearchRequest {
+    let legacy_filter = metadata_filters_to_filter(&req.metadata_filters);
+    req.metadata_filters.clear();
+    req.filter = merge_filters(req.filter.take(), legacy_filter);
+    req
+}
+
+fn metadata_filters_to_filter(
+    metadata_filters: &std::collections::HashMap<String, String>,
+) -> Option<MetadataFilter> {
+    if metadata_filters.is_empty() {
+        return None;
+    }
+
+    let mut exact_filters: Vec<MetadataFilter> = metadata_filters
+        .iter()
+        .map(|(key, value)| MetadataFilter {
+            filter_type: Some(FilterType::Exact(ExactMatch {
+                key: key.clone(),
+                value: value.clone(),
+            })),
+        })
+        .collect();
+    exact_filters.sort_by(
+        |left, right| match (&left.filter_type, &right.filter_type) {
+            (Some(FilterType::Exact(left)), Some(FilterType::Exact(right))) => {
+                left.key.cmp(&right.key).then(left.value.cmp(&right.value))
+            }
+            _ => std::cmp::Ordering::Equal,
+        },
+    );
+
+    if exact_filters.len() == 1 {
+        return exact_filters.pop();
+    }
+
+    Some(MetadataFilter {
+        filter_type: Some(FilterType::AndFilter(AndFilter {
+            filters: exact_filters,
+        })),
+    })
+}
+
+fn merge_filters(
+    structured_filter: Option<MetadataFilter>,
+    legacy_filter: Option<MetadataFilter>,
+) -> Option<MetadataFilter> {
+    match (structured_filter, legacy_filter) {
+        (None, None) => None,
+        (Some(filter), None) | (None, Some(filter)) => Some(filter),
+        (Some(left), Some(right)) => Some(MetadataFilter {
+            filter_type: Some(FilterType::AndFilter(AndFilter {
+                filters: vec![left, right],
+            })),
+        }),
+    }
 }
 
 /// Validate an insert request.
@@ -151,6 +216,49 @@ mod tests {
         assert_eq!(plan.ef_search_override, Some(77));
         assert!(plan.search_k >= 25);
         assert!(plan.search_k <= 10_000);
+    }
+
+    #[test]
+    fn normalize_search_request_lifts_legacy_metadata_filters() {
+        let mut req = baseline_search_request();
+        req.metadata_filters
+            .insert("tenant".to_string(), "t1".to_string());
+        req.metadata_filters
+            .insert("namespace".to_string(), "n1".to_string());
+
+        let normalized = normalize_search_request(req);
+        assert!(normalized.metadata_filters.is_empty());
+        match normalized.filter.expect("legacy filters must be lifted") {
+            MetadataFilter {
+                filter_type: Some(FilterType::AndFilter(and_filter)),
+            } => {
+                assert_eq!(and_filter.filters.len(), 2);
+            }
+            other => panic!("expected AndFilter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normalize_search_request_merges_structured_and_legacy_filters() {
+        let mut req = baseline_search_request();
+        req.filter = Some(MetadataFilter {
+            filter_type: Some(FilterType::Exact(ExactMatch {
+                key: "kind".to_string(),
+                value: "report".to_string(),
+            })),
+        });
+        req.metadata_filters
+            .insert("tenant".to_string(), "t1".to_string());
+
+        let normalized = normalize_search_request(req);
+        match normalized.filter.expect("filters must be merged") {
+            MetadataFilter {
+                filter_type: Some(FilterType::AndFilter(and_filter)),
+            } => {
+                assert_eq!(and_filter.filters.len(), 2);
+            }
+            other => panic!("expected merged AndFilter, got {:?}", other),
+        }
     }
 
     #[test]

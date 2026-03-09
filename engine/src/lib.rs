@@ -1,8 +1,7 @@
-//! KyroDB - High-performance vector database for RAG workloads
+//! KyroDB engine crate.
 //!
-//! **Hybrid Semantic Cache**: Combines Learned frequency prediction with semantic similarity
-//! for intelligent cache admission decisions in RAG workloads.
-//!
+//! Provides the single-node vector database runtime, including ANN search,
+//! tiered retrieval, persistence, auth, and observability components.
 
 // Deadlock detection in debug builds (parking_lot feature)
 #[cfg(debug_assertions)]

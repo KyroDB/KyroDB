@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
@@ -26,8 +26,6 @@ pub struct AbTestMetric {
 ///
 /// Appends metrics to CSV file for durability across restarts.
 pub struct AbStatsPersister {
-    #[allow(dead_code)] // Keep for future use (file rotation, path queries)
-    file_path: PathBuf,
     writer: RwLock<Option<csv::Writer<File>>>,
 }
 
@@ -55,7 +53,6 @@ impl AbStatsPersister {
             .from_writer(file);
 
         Ok(Self {
-            file_path,
             writer: RwLock::new(Some(writer)),
         })
     }

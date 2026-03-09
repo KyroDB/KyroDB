@@ -9,7 +9,7 @@
 //! - Hot tier results appear in k-NN output
 //! - Results are correctly merged and deduplicated
 //! - Cache admission works for query results
-//! - P99 latency remains <1ms
+//! - Search stays correct when results span hot and cold tiers
 
 use kyrodb_engine::*;
 use std::collections::HashMap;
@@ -517,8 +517,8 @@ fn test_knn_latency_with_hot_tier() {
     println!("  P99: {:?}", p99_latency);
     println!("  Max: {:?}", latencies.last().unwrap());
 
-    // Validate P99 < 10ms (relaxed for testing environment)
-    // Production target is <1ms, but CI/testing may be slower
+    // Keep a regression bound on the test environment without claiming a
+    // production latency target from this unit test.
     assert!(
         p99_latency < std::time::Duration::from_millis(10),
         "P99 latency should be <10ms (got {:?})",

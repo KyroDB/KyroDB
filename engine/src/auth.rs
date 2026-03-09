@@ -148,15 +148,15 @@ impl AuthManager {
             Self::validate_api_key(&entry.key)?;
             entry.tenant_info.validate()?;
 
-            // Verify tenant_id matches key prefix
-            let expected_prefix = format!("kyro_{}_", entry.tenant_info.tenant_id);
+            // Verify tenant_id matches the parsed tenant segment exactly.
+            let parsed_tenant_id = Self::tenant_id_from_key(&entry.key)?;
             let redacted = Self::redact_api_key(&entry.key);
             anyhow::ensure!(
-                entry.key.starts_with(&expected_prefix),
-                "API key {} does not match tenant_id {} (expected prefix: {})",
+                parsed_tenant_id == entry.tenant_info.tenant_id,
+                "API key {} does not match tenant_id {} (parsed tenant_id: {})",
                 redacted,
                 entry.tenant_info.tenant_id,
-                expected_prefix
+                parsed_tenant_id
             );
         }
 
@@ -190,26 +190,19 @@ impl AuthManager {
             redacted
         );
 
-        // Find the last underscore (separates tenant_id from secret)
-        let last_underscore_pos = key.rfind('_').ok_or_else(|| {
-            anyhow::anyhow!(
-                "API key must have format kyro_<tenant_id>_<secret>: {}",
-                redacted
-            )
-        })?;
-
-        anyhow::ensure!(
-            last_underscore_pos > 5, // Must be after "kyro_"
-            "API key must have format kyro_<tenant_id>_<secret>: {}",
-            redacted
-        );
-
-        let tenant_id = &key[5..last_underscore_pos]; // After "kyro_" and before last "_"
-        let secret = &key[last_underscore_pos + 1..]; // After last "_"
+        let (tenant_id, secret) = Self::split_api_key(key)?;
 
         anyhow::ensure!(
             !tenant_id.is_empty(),
             "tenant_id cannot be empty in API key: {}",
+            redacted
+        );
+
+        anyhow::ensure!(
+            tenant_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "tenant_id must be alphanumeric with underscores only in API key: {}",
             redacted
         );
 
@@ -233,6 +226,32 @@ impl AuthManager {
         );
 
         Ok(())
+    }
+
+    fn split_api_key(key: &str) -> Result<(&str, &str)> {
+        let redacted = Self::redact_api_key(key);
+        let last_underscore_pos = key.rfind('_').ok_or_else(|| {
+            anyhow::anyhow!(
+                "API key must have format kyro_<tenant_id>_<secret>: {}",
+                redacted
+            )
+        })?;
+
+        anyhow::ensure!(
+            last_underscore_pos > 5,
+            "API key must have format kyro_<tenant_id>_<secret>: {}",
+            redacted
+        );
+
+        Ok((
+            &key[5..last_underscore_pos],
+            &key[last_underscore_pos + 1..],
+        ))
+    }
+
+    fn tenant_id_from_key(key: &str) -> Result<&str> {
+        let (tenant_id, _) = Self::split_api_key(key)?;
+        Ok(tenant_id)
     }
 
     fn redact_api_key(key: &str) -> String {
@@ -284,15 +303,15 @@ impl AuthManager {
         Self::validate_api_key(&key)?;
         tenant_info.validate()?;
 
-        // Verify tenant_id matches key prefix
-        let expected_prefix = format!("kyro_{}_", tenant_info.tenant_id);
+        // Verify tenant_id matches the parsed tenant segment exactly.
+        let parsed_tenant_id = Self::tenant_id_from_key(&key)?;
         let redacted = Self::redact_api_key(&key);
         anyhow::ensure!(
-            key.starts_with(&expected_prefix),
-            "API key {} does not match tenant_id {} (expected prefix: {})",
+            parsed_tenant_id == tenant_info.tenant_id,
+            "API key {} does not match tenant_id {} (parsed tenant_id: {})",
             redacted,
             tenant_info.tenant_id,
-            expected_prefix
+            parsed_tenant_id
         );
 
         self.api_keys.write().insert(key, tenant_info);

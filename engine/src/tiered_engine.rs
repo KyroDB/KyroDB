@@ -9,17 +9,15 @@
 //! # Search Path (k-NN)
 //! ```text
 //! Query → L1b (Query Cache) → L2 (Hot Tier) → L3 (HNSW)
-//!         ↓ hit (25%)         ↓ hit (<1%)      ↓ always
+//!         ↓ hit               ↓ hit            ↓ fallback
 //!       return              return           return
 //! ```
 //!
 //! # Point Lookup Path (doc_id)
 //! ```text
 //! Get → L1a (Doc Cache) → L2 (Hot Tier) → L3 (HNSW)
-//!        ↓ hit (47%)       ↓ hit (<1%)      ↓ always
+//!        ↓ hit             ↓ hit            ↓ fallback
 //!      return            return           return
-//!
-//! Combined L1 hit rate: 72%+ (L1a + L1b)
 //! ```
 //!
 //! # Write Path
@@ -57,8 +55,8 @@ use tracing::{debug, error, info, instrument, trace, warn};
 /// - **Acceptable trade-off**: Temporary inconsistent snapshots are fine for metrics
 ///   (e.g., briefly `cache_hits` might appear > `total_queries`, but converges immediately)
 ///
-/// Alternative (single-lock-per-query) would increase P99 latency by 5-10% due to
-/// lock contention, which is unacceptable for a performance-critical database.
+/// Alternative designs that hold metrics locks across larger query sections would
+/// increase contention on the read path.
 #[derive(Debug, Clone, Default)]
 pub struct TieredEngineStats {
     /// Layer 1a (Document Cache) statistics - Learned frequency-based
@@ -946,12 +944,6 @@ impl TieredEngine {
     /// # Validation
     /// - `query` dimension must match backend dimension
     /// - `k` must be > 0 and <= 10,000 (reasonable upper bound)
-    ///
-    /// # Performance
-    /// - Hot tier scan: <200μs for 1K documents
-    /// - Cold tier HNSW: <1ms P99 @ 10M vectors
-    /// - Result merging: <100μs (deduplication + sorting)
-    /// - Total P99: <2ms typical
     pub fn knn_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         self.knn_search_with_ef(query, k, None)
     }
@@ -1331,9 +1323,8 @@ impl TieredEngine {
     /// - Prefer hot tier version (more recent, potentially updated)
     /// - Use hot tier distance (computed with current data)
     ///
-    /// # Performance
+    /// # Complexity
     /// O(n log n) where n = hot_results.len() + cold_results.len()
-    /// Typical: n < 2k, so <100μs for k=100
     fn merge_knn_results(
         hot_results: Vec<(u64, f32)>,
         cold_results: Vec<SearchResult>,
@@ -1905,8 +1896,8 @@ impl TieredEngine {
 
     /// Bulk load documents directly into cold tier (HNSW index).
     ///
-    /// This bypasses the hot tier entirely for maximum indexing speed.
-    /// Use for benchmarks, data migrations, and initial data loading.
+    /// This bypasses the hot tier and writes directly into the durable cold tier.
+    /// Use for controlled bulk ingest, data migrations, and initial data loading.
     ///
     /// # Parameters
     /// - `documents`: Vector of (doc_id, embedding, metadata) tuples
@@ -1960,47 +1951,6 @@ impl TieredEngine {
             duration_ms,
             rate_per_sec = rate,
             "bulk_load_cold_tier complete"
-        );
-
-        Ok((loaded, failed, duration_ms, rate))
-    }
-
-    /// Benchmark-only fast bulk load path.
-    ///
-    /// This bypasses WAL by delegating to `HnswBackend::bulk_insert` for significantly
-    /// faster index construction during benchmark runs.
-    ///
-    /// Production and pilot ingest paths must continue to use `bulk_load_cold_tier`
-    /// to preserve durability semantics.
-    #[instrument(level = "info", skip(self, documents), fields(count = documents.len()))]
-    pub fn bulk_load_cold_tier_fast(
-        &self,
-        documents: Vec<(u64, Vec<f32>, std::collections::HashMap<String, String>)>,
-    ) -> Result<(u64, u64, f32, f32)> {
-        use std::time::Instant;
-
-        let start = Instant::now();
-        let total = documents.len() as u64;
-        let doc_ids: Vec<u64> = documents.iter().map(|(id, _, _)| *id).collect();
-
-        let (loaded, failed) = self.cold_tier.bulk_insert(documents)?;
-        self.invalidate_caches_after_bulk_load(&doc_ids);
-
-        let elapsed = start.elapsed();
-        let duration_ms = elapsed.as_secs_f32() * 1000.0;
-        let rate = if elapsed.as_secs_f64() > 0.0 {
-            loaded as f32 / elapsed.as_secs_f32()
-        } else {
-            loaded as f32
-        };
-
-        info!(
-            total,
-            loaded,
-            failed,
-            duration_ms,
-            rate_per_sec = rate,
-            "bulk_load_cold_tier_fast complete"
         );
 
         Ok((loaded, failed, duration_ms, rate))

@@ -1,7 +1,7 @@
 //! HNSW-style vector index for k-NN search.
 //!
-//! Thin wrapper around KyroDB's internal ANN backend optimized for RAG:
-//! cosine similarity, type-safe u64 doc IDs, and strict runtime validation.
+//! Thin wrapper around KyroDB's internal ANN backend with type-safe u64 doc
+//! IDs and runtime validation at the public API boundary.
 
 use anyhow::Result;
 use std::sync::atomic::AtomicBool;
@@ -185,8 +185,8 @@ impl HnswVectorIndex {
 
     /// Notify backend that a sequential insert burst has completed.
     ///
-    /// Some backends keep a read-optimized search snapshot and need a one-shot
-    /// refresh after sequential insert-only phases.
+    /// This is a generic backend finalization hook for callers that insert
+    /// vectors one-by-one through `add_vector` instead of using `parallel_insert_batch`.
     pub fn complete_sequential_inserts(&mut self) {
         self.backend.on_sequential_batch_complete();
     }
@@ -203,8 +203,8 @@ impl HnswVectorIndex {
     /// - `origin_ids` are valid `usize`-representable u64 values
     /// - `self.current_count + data.len() <= self.max_elements`
     ///
-    /// For small batches (<100 vectors), falls through to sequential insert to
-    /// avoid scheduler overhead.
+    /// For small batches, the backend uses the same graph-construction
+    /// semantics through a scratch-reusing sequential batch path.
     pub fn parallel_insert_batch(&mut self, data: &[(&[f32], usize)]) -> Result<()> {
         self.parallel_insert_batch_impl(data, true)
     }
@@ -270,15 +270,11 @@ impl HnswVectorIndex {
             }
         }
 
-        // For small batches, sequential insert avoids Rayon thread-pool overhead
-        const PARALLEL_THRESHOLD: usize = 100;
-        if data.len() < PARALLEL_THRESHOLD {
-            for &(embedding, origin_id) in data {
-                self.backend.insert(embedding, origin_id);
-            }
-            // Ensure backends can refresh any read-optimized search snapshot once
-            // after a burst of sequential inserts.
-            self.backend.on_sequential_batch_complete();
+        // Small batches should still use a single scratch-aware batch path so
+        // we do not pay per-insert setup cost or drift in construction behavior.
+        const SEQUENTIAL_BATCH_THRESHOLD: usize = 100;
+        if data.len() < SEQUENTIAL_BATCH_THRESHOLD {
+            self.backend.sequential_insert_slice(data);
         } else {
             self.backend.parallel_insert_slice(data);
         }
@@ -318,8 +314,9 @@ impl HnswVectorIndex {
 
     /// Query fast path for trusted callers (FFI benchmark adapter).
     ///
-    /// Caller must guarantee finite values and metric-specific normalization
-    /// semantics where required.
+    /// Caller must guarantee finite values. Metric-specific normalization must
+    /// already hold, or the caller must have handled it before reaching this
+    /// trusted path.
     #[cfg(feature = "ffi-bench")]
     pub(crate) fn knn_search_with_ef_cancel_trusted(
         &self,
@@ -383,11 +380,11 @@ impl HnswVectorIndex {
             // Clamp safely: bounds must not be inverted.
             override_val.clamp(k.max(1), 10_000)
         } else {
-            // Adaptive: for very small indexes, crank this up to ensure near-perfect recall
+            // Adaptive: for very small indexes, search deeper so tiny-graph
+            // behavior stays stable without requiring callers to tune `ef_search`.
             let mut ef = 200; // RAG-optimized default for large corpora
             if self.current_count <= 1024 {
-                // Explore more of the graph when the index is small to guarantee recall in tests
-                // Use max of current_count and k scaled, with an upper safety bound
+                // Use the larger of current_count and k, then scale it with an upper bound.
                 let target = (self.current_count.max(k) * 4).max(32);
                 ef = ef.max(target.min(2048));
             }
@@ -456,6 +453,77 @@ impl HnswVectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deterministic_normalized_vector(seed: usize, dimension: usize) -> Vec<f32> {
+        let mut values = Vec::with_capacity(dimension);
+        let mut state = seed as u64 ^ 0x9E37_79B9_7F4A_7C15;
+        for i in 0..dimension {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407 ^ i as u64);
+            let raw = (((state >> 16) & 0xFFFF) as f32 / 32768.0) - 1.0;
+            values.push(raw);
+        }
+        normalize(values)
+    }
+
+    fn assert_batch_insert_matches_online_insert(batch_len: usize) {
+        const DIM: usize = 96;
+        const K: usize = 10;
+
+        let dataset: Vec<Vec<f32>> = (0..batch_len)
+            .map(|seed| deterministic_normalized_vector(seed, DIM))
+            .collect();
+        let batch: Vec<(&[f32], usize)> = dataset
+            .iter()
+            .enumerate()
+            .map(|(id, v)| (v.as_slice(), id))
+            .collect();
+
+        let mut online = HnswVectorIndex::new_with_params(
+            DIM,
+            batch_len,
+            DistanceMetric::Cosine,
+            24,
+            400,
+            false,
+        )
+        .unwrap();
+        for (id, vector) in dataset.iter().enumerate() {
+            online.add_vector(id as u64, vector).unwrap();
+        }
+        online.complete_sequential_inserts();
+
+        let mut batched = HnswVectorIndex::new_with_params(
+            DIM,
+            batch_len,
+            DistanceMetric::Cosine,
+            24,
+            400,
+            false,
+        )
+        .unwrap();
+        batched.parallel_insert_batch(&batch).unwrap();
+
+        for query_idx in [
+            0usize,
+            batch_len / 4,
+            batch_len / 2,
+            batch_len.saturating_sub(1),
+        ] {
+            let online_results = online
+                .knn_search_with_ef(&dataset[query_idx], K, Some(256))
+                .unwrap();
+            let batched_results = batched
+                .knn_search_with_ef(&dataset[query_idx], K, Some(256))
+                .unwrap();
+            assert_eq!(
+                batched_results, online_results,
+                "batch insertion must match online insertion for query {}",
+                query_idx
+            );
+        }
+    }
 
     fn normalize(mut v: Vec<f32>) -> Vec<f32> {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -577,5 +645,15 @@ mod tests {
         // Third insert should fail (capacity = 2)
         let result = index.add_vector(3, &[0.0, 0.0, 1.0, 0.0]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_small_batch_insert_matches_online_insert() {
+        assert_batch_insert_matches_online_insert(32);
+    }
+
+    #[test]
+    fn test_large_batch_insert_matches_online_insert() {
+        assert_batch_insert_matches_online_insert(160);
     }
 }

@@ -10,7 +10,9 @@
 // Performance: ~100ns per check (HashMap lookup + bucket update)
 
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(any(test, not(debug_assertions)))]
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -131,7 +133,7 @@ pub struct RateLimiter {
     /// Per-tenant token buckets (lazy initialized)
     buckets: Arc<parking_lot::RwLock<HashMap<String, Arc<Mutex<TokenBucket>>>>>,
     /// Tenants already warned about capacity mismatch (avoid log spam)
-    #[allow(dead_code)]
+    #[cfg(any(test, not(debug_assertions)))]
     warned_tenants: Arc<parking_lot::RwLock<HashSet<String>>>,
     /// Optional global token bucket (shared across all tenants)
     global_bucket: Option<Mutex<TokenBucket>>,
@@ -147,6 +149,7 @@ impl RateLimiter {
     pub fn new_with_global(max_qps_global: Option<u32>) -> Self {
         Self {
             buckets: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            #[cfg(any(test, not(debug_assertions)))]
             warned_tenants: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             global_bucket: max_qps_global.map(TokenBucket::new).map(Mutex::new),
         }
@@ -259,6 +262,7 @@ impl RateLimiter {
         if let Some(bucket) = buckets.get(tenant_id) {
             bucket.lock().reset();
         }
+        #[cfg(any(test, not(debug_assertions)))]
         self.warned_tenants.write().remove(tenant_id);
     }
 
@@ -266,6 +270,7 @@ impl RateLimiter {
     #[cfg(test)]
     pub fn clear(&self) {
         self.buckets.write().clear();
+        #[cfg(any(test, not(debug_assertions)))]
         self.warned_tenants.write().clear();
     }
 

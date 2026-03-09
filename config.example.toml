@@ -1,11 +1,22 @@
 # KyroDB Configuration Example (TOML)
 #
 # Copy this file to config.toml and customize for your deployment.
-# All settings are optional - defaults are production-ready.
+# This template is for local development and general customization, not for direct
+# pilot/production rollout. Start from `config.pilot.toml` for the hardened baseline.
 #
 # Environment variables override config file values:
 #   KYRODB__SERVER__PORT=50051 ./kyrodb_server
 #   KYRODB__CACHE__CAPACITY=50000 ./kyrodb_server --config config.toml
+#   KYRODB__ENVIRONMENT__TYPE=benchmark ./kyrodb_server --config config.toml
+
+# Deployment environment and safety posture
+[environment]
+# Allowed values:
+# - "production" (default): standard safety checks
+# - "pilot": stricter launch checks for external pilots
+# - "benchmark": permits benchmark-only cache/persistence settings
+# Set this in the config file here, or override with KYRODB__ENVIRONMENT__TYPE.
+type = "production"
 
 # Server Configuration
 [server]
@@ -62,9 +73,10 @@ enabled = false
 # Customer A might use 1000, Customer B might use 100,000
 capacity = 10000
 
-# Cache eviction strategy: "lru" or "learned"
-# - lru: Simple LRU eviction (baseline)
+# Cache eviction strategy: "lru", "learned", or "abtest"
+# - lru: Simple LRU eviction baseline (allowed only when environment.type = "benchmark"; see [environment] above)
 # - learned: Hybrid Semantic Cache with a learned hotness predictor
+# - abtest: 50/50 LRU vs learned split for baseline comparison (allowed only when environment.type = "benchmark"; see [environment] above)
 strategy = "learned"
 
 # Training interval for Hybrid Semantic Cache (seconds)

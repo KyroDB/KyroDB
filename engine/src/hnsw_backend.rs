@@ -767,7 +767,7 @@ impl HnswBackend {
             store.external_to_internal.insert(external_id, internal_id);
         }
 
-        // Rebuild HNSW index from compacted live docs using parallel insertion.
+        // Rebuild HNSW index from compacted live docs using batch insertion.
         let mut new_index = HnswVectorIndex::new_with_params(
             dimension,
             capacity,
@@ -886,7 +886,8 @@ impl HnswBackend {
             live_indices.push(doc_id);
         }
 
-        // Phase 2: Parallel HNSW graph construction
+        // Phase 2: Batch HNSW graph construction with the same backend semantics
+        // used by production inserts.
         let batch: Vec<(&[f32], usize)> = live_indices
             .iter()
             .map(|&doc_id| (embeddings[doc_id].as_slice(), doc_id))
@@ -1432,7 +1433,7 @@ impl HnswBackend {
         doc_store.internal_to_external.reserve(docs_vec.len());
 
         // Phase 1: Build the document store sequentially (cheap, deterministic internal IDs).
-        // Validate embeddings and normalize in-place before parallel HNSW insertion.
+        // Validate embeddings and normalize in-place before batch HNSW insertion.
         for (doc_id, embedding, metadata) in docs_vec {
             if embedding.len() != dimension {
                 anyhow::bail!(
@@ -1451,8 +1452,8 @@ impl HnswBackend {
             doc_store.external_to_internal.insert(doc_id, internal_id);
         }
 
-        // Phase 2: Parallel HNSW graph construction from pre-validated embeddings.
-        // Uses backend batch insertion for concurrent graph building where supported.
+        // Phase 2: Batch HNSW graph construction from pre-validated embeddings.
+        // The backend keeps graph semantics identical between small and large batches.
         let batch: Vec<(&[f32], usize)> = doc_store
             .embeddings
             .iter()
@@ -1774,7 +1775,7 @@ impl HnswBackend {
                 return Err(e).context("HNSW insert failed after WAL append");
             }
 
-            // Ensure read-optimized backend state stays active for sequential insert flows.
+            // Give the backend a single post-burst hook after per-document insert flows.
             index.complete_sequential_inserts();
 
             store.embeddings.push(std::mem::take(&mut embedding));
@@ -1835,29 +1836,12 @@ impl HnswBackend {
         }
     }
 
-    /// Bulk insert documents directly into HNSW index.
+    /// Non-durable batch insert helper for test-only construction paths.
     ///
-    /// This method is optimized for loading large batches of vectors quickly:
-    /// - Acquires write locks once (not per-vector)
-    /// - Pre-allocates capacity for document store arrays
-    /// - Validates all dimensions upfront before inserting
-    /// - Logs progress for long-running operations
-    ///
-    /// # Parameters
-    /// - `documents`: Vector of (doc_id, embedding, metadata) tuples
-    ///
-    /// # Returns
-    /// - `Ok((loaded, failed))`: Tuple of successfully loaded and failed counts
-    ///
-    /// # Note
-    /// This bypasses the hot tier and WAL for maximum speed. Use for:
-    /// - Benchmarks
-    /// - Data migrations
-    /// - Initial data loading
-    ///
-    /// For production streaming inserts, use `insert()` instead.
+    /// This bypasses WAL logging and must not be used by live runtime ingest.
+    #[cfg(test)]
     #[instrument(level = "info", skip(self, documents), fields(batch_size = documents.len()))]
-    pub fn bulk_insert(
+    fn bulk_insert(
         &self,
         documents: Vec<(u64, Vec<f32>, HashMap<String, String>)>,
     ) -> Result<(u64, u64)> {
@@ -1957,7 +1941,8 @@ impl HnswBackend {
         }
 
         // Phase 2: Insert all validated vectors into the HNSW index in one batch.
-        // parallel_insert_batch uses Rayon for batches >= 100 vectors.
+        // Small batches reuse the sequential construction scratch path; large
+        // batches use the backend batch insertion path with identical semantics.
         let base_internal_id = store.embeddings.len();
         if !normalized_docs.is_empty() {
             let batch_refs: Vec<(&[f32], usize)> = normalized_docs
@@ -2583,8 +2568,6 @@ impl HnswBackend {
     /// # Returns
     /// Vector of (doc_id, distance) pairs, sorted by distance (closest first)
     ///
-    /// **Performance**: <1ms P99 on 10M vectors (target)
-    ///
     /// **Note on Deletions**:
     /// This method uses a 2x oversampling heuristic to handle soft-deleted documents (tombstones).
     /// If the deletion rate is very high (>50%), it may return fewer than `k` results.
@@ -2680,9 +2663,6 @@ impl HnswBackend {
     /// This method amortizes lock acquisition overhead by:
     /// 1. Acquiring read locks once for all queries
     /// 2. Processing queries in parallel via Rayon
-    ///
-    /// **Performance**: ~50-100% faster than calling `knn_search` in a loop
-    /// for batches of 10+ queries.
     ///
     /// # Parameters
     /// - `queries`: Slice of query embedding vectors

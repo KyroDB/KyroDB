@@ -1,6 +1,4 @@
 // KyroDB v1 gRPC Service Definition
-// High-performance vector database optimized for RAG workloads
-// Primary protocol: gRPC (performance-critical), REST secondary (convenience)
 
 syntax = "proto3";
 
@@ -16,15 +14,14 @@ service KyroDBService {
   // Durability: ACK after WAL append (per fsync policy) and cold-tier update.
   rpc Insert(InsertRequest) returns (InsertResponse);
   
-  // Insert multiple documents in a streaming fashion
-  // Use for bulk imports (millions of vectors)
-  // Throughput: 50K-100K docs/sec
+  // Insert multiple documents in a streaming fashion.
+  // Use for bulk imports and controlled write pipelines.
   rpc BulkInsert(stream InsertRequest) returns (InsertResponse);
   
-  // Bulk load directly to HNSW index (bypasses hot tier)
-  // Use for benchmarks and data migrations - NOT for production traffic!
-  // This provides maximum indexing speed at the cost of no hot-tier caching.
-  // Warning: Data is only searchable after this call completes.
+  // Bulk load directly to the cold tier (bypasses hot tier).
+  // Use for controlled bulk ingest, backfills, and data migrations.
+  // Writes remain durable, but recent-write hot-tier acceleration is skipped.
+  // Data becomes searchable after the call completes.
   rpc BulkLoadHnsw(stream InsertRequest) returns (BulkLoadResponse);
   
   // Delete a document by ID
@@ -38,9 +35,8 @@ service KyroDBService {
   // READ OPERATIONS
   // ============================================================================
   
-  // Query for a specific document by ID (point lookup)
-  // Latency: <100ns cache hit, <1ms cache miss
-  // Query path: Cache → Hot Tier → HNSW
+  // Query for a specific document by ID (point lookup).
+  // Query path: cache -> hot tier -> cold tier.
   rpc Query(QueryRequest) returns (QueryResponse);
   
   // k-NN vector similarity search

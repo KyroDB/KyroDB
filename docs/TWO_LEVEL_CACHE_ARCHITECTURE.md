@@ -8,7 +8,7 @@ Document the cache architecture that drives KyroDB read performance: L1a documen
 
 - architecture and request flows (search, point lookup, write)
 - cache admission and invalidation behavior
-- benchmark evidence from repository validation artifacts
+- checked-in validation evidence from repository artifacts
 - tuning and observability guidance for production operation
 
 ## Commands
@@ -129,7 +129,6 @@ Reference run artifact:
 
 - `validation_12hour.json`
 - `validation_12hour_config.json`
-- `other_docs/paper_artifacts/validation_summary.json`
 
 Configuration snapshot:
 

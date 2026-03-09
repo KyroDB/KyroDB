@@ -49,8 +49,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_BRANCH={}", branch);
 
-    // Note: Removed chrono dependency
-
     // Target triple
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=TARGET_TRIPLE={}", target);

@@ -8,7 +8,8 @@
 // - Open: Failure threshold exceeded, requests fail fast
 // - Half-Open: Testing recovery, allow one request through
 //
-// Performance: <100ns state check (atomic read)
+// Hot path uses a small number of atomic reads/writes and only takes the mutex
+// on state transitions.
 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

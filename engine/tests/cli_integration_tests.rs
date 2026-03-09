@@ -71,7 +71,7 @@ fn test_cli_backup_create_full() -> Result<()> {
         if !wal_name.starts_with("wal_") || !wal_name.ends_with(".wal") {
             continue;
         }
-        let mut reader = WalReader::open(&entry.path())?;
+        let mut reader = WalReader::open(entry.path())?;
         let entries = reader.read_all()?;
         wal_entries_while_live += entries.len();
         wal_diag_live.push((wal_name, entries.len(), reader.corrupted_entries()));
@@ -155,7 +155,7 @@ fn test_cli_backup_list() -> Result<()> {
         if !wal_name.starts_with("wal_") || !wal_name.ends_with(".wal") {
             continue;
         }
-        let mut reader = WalReader::open(&entry.path())?;
+        let mut reader = WalReader::open(entry.path())?;
         let entries = reader.read_all()?;
         wal_entries_while_live += entries.len();
         wal_diag_live.push((wal_name, entries.len(), reader.corrupted_entries()));
@@ -272,7 +272,7 @@ fn test_cli_restore_from_backup() -> Result<()> {
         if !wal_name.starts_with("wal_") || !wal_name.ends_with(".wal") {
             continue;
         }
-        let mut reader = WalReader::open(&entry.path())?;
+        let mut reader = WalReader::open(entry.path())?;
         let entries = reader.read_all()?;
         wal_entries_while_live += entries.len();
         wal_diag_live.push((wal_name, entries.len(), reader.corrupted_entries()));

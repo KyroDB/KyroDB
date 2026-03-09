@@ -495,8 +495,8 @@ impl HotTier {
     /// # Future Optimization
     /// - SIMD vectorization (8× speedup on AVX2)
     /// - Pre-normalize embeddings (skip magnitude computation)
+    #[cfg(test)]
     #[inline]
-    #[allow(dead_code)]
     fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
         if a.len() != b.len() || a.is_empty() {
             return f32::INFINITY; // Invalid comparison

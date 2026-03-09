@@ -1,29 +1,25 @@
 #!/bin/bash
-# Validation - Comprehensive 1M Operation Load Test
+# Repeated library-test runner
 set -e
 
-echo "=== KyroDB Validation: 1M Operation Load Test ==="
+echo "=== KyroDB Validation: repeated library-test run ==="
 echo "Starting at: $(date)"
 echo ""
 
 # Test configuration
-TOTAL_OPS=1000000
-BATCH_SIZE=10000
-ITERATIONS=$((TOTAL_OPS / BATCH_SIZE))
+TOTAL_TEST_RUNS=100
 
 echo "Configuration:"
-echo "  Total Operations: $TOTAL_OPS"
-echo "  Batch Size: $BATCH_SIZE"
-echo "  Iterations: $ITERATIONS"
+echo "  Total Test Runs: $TOTAL_TEST_RUNS"
 echo ""
 
 # Run comprehensive test suite multiple times
-echo "Running test suite $ITERATIONS times..."
+echo "Running test suite $TOTAL_TEST_RUNS times..."
 START_TIME=$(date +%s)
 
-for i in $(seq 1 $ITERATIONS); do
-    PROGRESS=$((i * 100 / ITERATIONS))
-    echo -ne "\rProgress: [$i/$ITERATIONS] ${PROGRESS}% - Running tests..."
+for i in $(seq 1 $TOTAL_TEST_RUNS); do
+    PROGRESS=$((i * 100 / TOTAL_TEST_RUNS))
+    echo -ne "\rProgress: [$i/$TOTAL_TEST_RUNS] ${PROGRESS}% - Running tests..."
     
     # Run tests and capture output
     if ! cargo test --lib --quiet > test_output.log 2>&1; then
@@ -46,12 +42,12 @@ DURATION=$((END_TIME - START_TIME))
 DURATION=$((DURATION < 1 ? 1 : DURATION))
 echo ""
 echo "=== RESULTS ==="
-echo " All $TOTAL_OPS operations completed successfully"
+echo " Repeated test iterations completed successfully"
 echo "Duration: ${DURATION}s"
-THROUGHPUT=$((TOTAL_OPS / DURATION))
-echo "Throughput: ${THROUGHPUT} ops/sec"
+THROUGHPUT=$((TOTAL_TEST_RUNS / DURATION))
+echo "Throughput: ${THROUGHPUT} test runs/sec"
 echo "Final memory check:"
 ps aux | grep -E "cargo|rust" | grep -v grep | head -n 5
 echo ""
 echo "=== VALIDATION COMPLETE ==="
-echo "No crashes, no panics, no deadlocks detected"
+echo "No test failures were observed during this run"
