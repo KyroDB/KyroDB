@@ -3,7 +3,7 @@ ARG RUST_VERSION=1.93.1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG KYRODB_GIT=https://github.com/KyroDB/KyroDB.git
-ARG KYRODB_REF=8c1ec6f7b93156d4c46e5d3389c169ec874b068a
+ARG KYRODB_REF=cf53773f88c9c841cd770660fd1eaa70563e9a6b
 ARG RUST_CPU=x86-64-v3
 ARG RUSTFLAGS_EXTRA=""
 
@@ -26,7 +26,6 @@ ENV RUSTFLAGS="-C target-cpu=${RUST_CPU} ${RUSTFLAGS_EXTRA}"
 RUN cargo build --release --locked -p kyrodb-engine --lib --features ffi-bench
 
 FROM ${ANNB_BASE}
-ARG ANNB_BASE=ann-benchmarks:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \

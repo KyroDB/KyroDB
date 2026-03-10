@@ -113,9 +113,6 @@ class _AnnFfi:
 
 class KyroDB(BaseANN):
     def __init__(self, metric: str, params: dict[str, Any]):
-        self.metric = metric
-        self.params = params
-
         self.M = int(params.get("M", 16))
         self.ef_construction = int(params.get("ef_construction", 200))
         self.ef_search = int(params.get("ef_search", 50))
