@@ -94,7 +94,7 @@ class _AnnFfi:
                 continue
             try:
                 return ctypes.CDLL(path)
-            except OSError as exc:  # pragma: no cover - env dependent
+            except OSError as exc: 
                 last_error = exc
 
         if last_error is not None:
@@ -285,7 +285,7 @@ class KyroDB(BaseANN):
     def done(self) -> None:
         self._destroy_handle()
 
-    def __del__(self) -> None:  # pragma: no cover - defensive cleanup
+    def __del__(self) -> None:  
         try:
             self.done()
         except Exception:
