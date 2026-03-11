@@ -94,7 +94,7 @@ class _AnnFfi:
                 continue
             try:
                 return ctypes.CDLL(path)
-            except OSError as exc: 
+            except OSError as exc:
                 last_error = exc
 
         if last_error is not None:
@@ -126,6 +126,7 @@ class KyroDB(BaseANN):
         self._dimension = 0
         self._last_memory_kb = 0.0
         self._query_ids_buf = np.empty(0, dtype=np.uint32)
+        self._batch_results: list[list[int]] = []
 
         self.name = "KyroDB"
 
@@ -274,6 +275,15 @@ class KyroDB(BaseANN):
             return []
         return out_ids[:count].tolist()
 
+    def batch_query(self, X: np.ndarray, n: int) -> None:
+        queries = np.asarray(X, dtype=np.float32, order="C")
+        if queries.ndim != 2:
+            raise ValueError(f"expected 2D array for batch_query, got shape={queries.shape}")
+        self._batch_results = [self.query(q, n) for q in queries]
+
+    def get_batch_results(self) -> list[list[int]]:
+        return self._batch_results
+
     def get_memory_usage(self) -> float:
         if self._handle.value:
             memory_bytes = int(self._ffi.lib.kyrodb_ann_memory_bytes(self._handle))
@@ -285,7 +295,7 @@ class KyroDB(BaseANN):
     def done(self) -> None:
         self._destroy_handle()
 
-    def __del__(self) -> None:  
+    def __del__(self) -> None:
         try:
             self.done()
         except Exception:
