@@ -2,9 +2,11 @@ ARG ANNB_BASE=ann-benchmarks:latest
 ARG RUST_VERSION=1.93.1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
+ARG TARGETARCH
 ARG KYRODB_GIT=https://github.com/KyroDB/KyroDB.git
 ARG KYRODB_REF=84e703bd1bd2c30c3631082070e5891b30cd940b
-ARG RUST_CPU=x86-64-v3
+ARG RUST_CPU_AMD64=x86-64-v3
+ARG RUST_CPU_ARM64=generic
 ARG RUSTFLAGS_EXTRA=""
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -22,8 +24,13 @@ RUN git clone "$KYRODB_GIT" /src/kyrodb \
     && git checkout --detach "$KYRODB_REF"
 
 WORKDIR /src/kyrodb
-ENV RUSTFLAGS="-C target-cpu=${RUST_CPU} ${RUSTFLAGS_EXTRA}"
-RUN cargo build --release --locked -p kyrodb-engine --lib --features ffi-bench
+RUN case "${TARGETARCH}" in \
+        amd64) export KYRO_RUST_CPU="${RUST_CPU_AMD64}" ;; \
+        arm64) export KYRO_RUST_CPU="${RUST_CPU_ARM64}" ;; \
+        *) export KYRO_RUST_CPU=generic ;; \
+    esac \
+    && export RUSTFLAGS="-C target-cpu=${KYRO_RUST_CPU} ${RUSTFLAGS_EXTRA}" \
+    && cargo build --release --locked -p kyrodb-engine --lib --features ffi-bench
 
 FROM ${ANNB_BASE}
 
