@@ -100,6 +100,8 @@ go.work.sum
 *.key
 *.crt
 *.cer
+config.pilot.api_keys.yaml
+/tls/
 
 # Documentation scratch and experimental
 .github/copilot-instructions.md
@@ -153,3 +155,5 @@ docs/ENGINEERING_STATUS.md
 docs/research
 output
 /website
+kyrodb_booth_summary.html
+kyrodb_booth_summary.pdf

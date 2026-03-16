@@ -69,6 +69,13 @@ scripts/qa/run_fuzz_smoke.sh
 Pilot baseline note:
 
 - `config.pilot.toml` / `config.pilot.yaml` require a real API key file at `auth.api_keys_file`
+- `config.pilot.api_keys.example.yaml` is the checked-in smoke-test credential for local/default container runs only; copy it to `config.pilot.api_keys.yaml` and replace the placeholder key before any shared or external deployment
+
+Container deployment note:
+
+- `docker-compose.yml` is now runnable on a fresh checkout; it uses the checked-in example API key file and auto-generates an ephemeral self-signed gRPC cert inside the container when TLS is enabled and no certs are mounted
+- For VM deployment with real TLS material and a private engine key file, use the hardened overlay: `docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d`
+- The image health check no longer depends on a compose-only env var; it uses `KYRODB_HEALTHCHECK_API_KEY`, `API_SECRET`, or the first key in `auth.api_keys_file`
 
 ## Related Docs
 

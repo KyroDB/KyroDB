@@ -4,18 +4,29 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: kyrodb
+    init: true
     ports:
       - "50051:50051"
       - "51051:51051"
     volumes:
       - kyrodb-data:/data
-      - ./config.example.toml:/etc/kyrodb/config.toml:ro
+      - ./config.pilot.toml:/etc/kyrodb/config.toml:ro
+      - ./config.pilot.api_keys.example.yaml:/etc/kyrodb/api_keys.yaml:ro
     environment:
-      - RUST_LOG=kyrodb_engine=info
-      - KYRODB__SERVER__HOST=0.0.0.0
-      - KYRODB__PERSISTENCE__DATA_DIR=/data
+      RUST_LOG: kyrodb_engine=info
+      KYRODB__ENVIRONMENT__TYPE: pilot
+      KYRODB__SERVER__HOST: 0.0.0.0
+      KYRODB__SERVER__HTTP_HOST: 0.0.0.0
+      KYRODB__SERVER__OBSERVABILITY_AUTH: all
+      KYRODB__SERVER__TLS__ENABLED: "true"
+      KYRODB_AUTO_GENERATE_TLS: "true"
+      KYRODB_TLS_COMMON_NAME: localhost
+      KYRODB__AUTH__ENABLED: "true"
+      KYRODB__AUTH__API_KEYS_FILE: /etc/kyrodb/api_keys.yaml
+      KYRODB__PERSISTENCE__DATA_DIR: /data
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:51051/health"]
+      test:
+        ["CMD", "/usr/local/bin/kyrodb-healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3

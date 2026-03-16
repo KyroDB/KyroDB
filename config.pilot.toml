@@ -12,7 +12,11 @@ type = "pilot"
 host = "127.0.0.1"
 port = 50051
 http_host = "127.0.0.1"
-observability_auth = "metrics_and_slo"
+# Deliberately require auth on /health and /ready as well as /metrics and /slo.
+# These endpoints disclose runtime liveness/readiness state and should stay private
+# to trusted platform services. Pair this with API-key auth and network restrictions
+# on the HTTP observability port when the engine is exposed off-box.
+observability_auth = "all"
 
 [server.tls]
 enabled = false

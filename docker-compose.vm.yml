@@ -1,0 +1,11 @@
+services:
+  kyrodb:
+    volumes:
+      - ./config.pilot.api_keys.yaml:/run/kyrodb/api_keys.yaml:ro
+      - ./tls:/etc/kyrodb/tls:ro
+    environment:
+      KYRODB__AUTH__API_KEYS_FILE: /run/kyrodb/api_keys.yaml
+      KYRODB_AUTO_GENERATE_TLS: "false"
+      KYRODB_TLS_COMMON_NAME: engine.kyrodb.internal
+      KYRODB__SERVER__TLS__CERT_PATH: /etc/kyrodb/tls/server.crt
+      KYRODB__SERVER__TLS__KEY_PATH: /etc/kyrodb/tls/server.key

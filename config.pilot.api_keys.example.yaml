@@ -1,0 +1,8 @@
+api_keys:
+  - key: kyro_platform_runtime_replacewith32bytehexsecret000001
+    # The first key is also the default source for container health checks.
+    tenant_id: platform_runtime
+    tenant_name: Platform Runtime
+    max_qps: 100000
+    max_vectors: 100000000
+    enabled: true
