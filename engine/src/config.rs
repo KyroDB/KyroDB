@@ -189,7 +189,7 @@ pub struct CacheConfig {
     /// learned predictor training.
     pub search_access_log_top_n: usize,
 
-    /// Optional max age (seconds) for Hot Tier flush decisions.
+    /// Optional max age (seconds) for Hot Tier drain/eviction decisions.
     ///
     /// If not set, the server falls back to `training_interval_secs` for
     /// backward compatibility.

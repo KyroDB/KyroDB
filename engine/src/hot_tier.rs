@@ -1,16 +1,16 @@
-//! Hot Tier - Recent writes buffer (Layer 2)
+//! Hot Tier - Recent-write mirror / acceleration layer (Layer 2)
 //!
-//! Stores recently inserted documents before they're flushed to the cold tier (HNSW).
-//! This provides:
-//! - Fast writes (no HNSW index update overhead)
-//! - Immediate read availability (no waiting for HNSW index build)
-//! - Batched HNSW updates (better performance)
+//! Stores a bounded in-memory copy of recently written documents after the durable
+//! cold-tier write has already succeeded. This provides:
+//! - Fast point lookups for recent writes
+//! - Small linear-scan candidate sets for mixed hot/cold k-NN merges
+//! - Bounded memory for recent-write acceleration without changing durability
 //!
 //! # Architecture Position
 //! **Layer 2 in three-tier architecture**:
 //! - Layer 1 (Cache): Hot documents predicted by learned predictor + semantic similarity
-//! - Layer 2 (Hot Tier): Recent writes, not yet in HNSW
-//! - Layer 3 (Cold Tier): Full HNSW index for all documents
+//! - Layer 2 (Hot Tier): Recent-write mirror / acceleration set
+//! - Layer 3 (Cold Tier): Canonical HNSW index for all documents
 
 use parking_lot::RwLock;
 use std::cmp::Ordering as CmpOrdering;
@@ -19,12 +19,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::coherence::{digest_embedding, VectorCoherenceToken};
 use crate::config::DistanceMetric;
 use crate::simd;
 
 use tracing::warn;
 
 static DOT_DISTANCE_NON_NORMALIZED_WARNED: AtomicBool = AtomicBool::new(false);
+
+pub type HotTierMirrorDocument = (u64, Vec<f32>, HashMap<String, String>, VectorCoherenceToken);
 
 /// Hot tier statistics
 #[derive(Debug, Clone, Default)]
@@ -43,6 +46,8 @@ struct HotDocument {
     embedding: Vec<f32>,
     embedding_l2_norm: f32,
     metadata: HashMap<String, String>,
+    /// Canonical cold-tier token observed when this mirror entry was created.
+    coherence: VectorCoherenceToken,
     inserted_at: Instant,
 }
 
@@ -74,24 +79,26 @@ impl PartialOrd for TopKCandidate {
     }
 }
 
-/// Hot Tier - Buffer for recent writes
+/// Hot Tier - Bounded recent-write mirror
 ///
 /// Documents are kept here until:
 /// - Size threshold reached (e.g., 10K documents)
-/// - Time threshold reached (e.g., 60 seconds since last flush)
-/// - Manual flush triggered
+/// - Age threshold reached (e.g., 60 seconds since last drain)
+/// - Manual drain triggered
 ///
-/// Then they're batched and flushed to HNSW (cold tier).
+/// The backing documents are already durable in the cold tier. Draining the hot tier
+/// evicts these mirror entries and gives the engine a chance to reconcile any
+/// unexpected hot/cold divergence before eviction.
 pub struct HotTier {
     documents: Arc<RwLock<HashMap<u64, HotDocument>>>,
     stats: Arc<RwLock<HotTierStats>>,
 
     distance: DistanceMetric,
 
-    /// Flush when hot tier reaches this size
+    /// Drain when hot tier reaches this size.
     max_size: usize,
 
-    /// Flush when this much time passes since last flush
+    /// Drain when this much time passes since the last drain.
     max_age: Duration,
 }
 
@@ -99,8 +106,8 @@ impl HotTier {
     /// Create new hot tier
     ///
     /// # Parameters
-    /// - `max_size`: Flush to cold tier when this many documents accumulated
-    /// - `max_age`: Flush to cold tier after this duration since last flush
+    /// - `max_size`: Drain mirror entries when this many documents accumulate
+    /// - `max_age`: Drain mirror entries after this duration since the last drain
     ///
     /// # Defaults
     /// - `max_size`: 10,000 documents (tune based on write throughput)
@@ -115,15 +122,28 @@ impl HotTier {
         }
     }
 
-    /// Insert document into hot tier
+    /// Insert or refresh the in-memory mirror entry for a recently written document.
     ///
-    /// This is fast (no HNSW index update), just a HashMap insert.
+    /// The corresponding cold-tier write has already succeeded; this is a fast
+    /// `HashMap` update used only for recent-read acceleration.
     pub fn insert(&self, doc_id: u64, embedding: Vec<f32>, metadata: HashMap<String, String>) {
+        let coherence = VectorCoherenceToken::new(0, digest_embedding(&embedding));
+        self.insert_with_coherence(doc_id, embedding, metadata, coherence);
+    }
+
+    pub fn insert_with_coherence(
+        &self,
+        doc_id: u64,
+        embedding: Vec<f32>,
+        metadata: HashMap<String, String>,
+        coherence: VectorCoherenceToken,
+    ) {
         let embedding_l2_norm = Self::l2_norm(&embedding);
         let doc = HotDocument {
             embedding,
             embedding_l2_norm,
             metadata,
+            coherence,
             inserted_at: Instant::now(),
         };
 
@@ -136,8 +156,15 @@ impl HotTier {
 
     /// Get document from hot tier (if present)
     pub fn get(&self, doc_id: u64) -> Option<Vec<f32>> {
+        self.get_with_coherence(doc_id)
+            .map(|(embedding, _)| embedding)
+    }
+
+    pub fn get_with_coherence(&self, doc_id: u64) -> Option<(Vec<f32>, VectorCoherenceToken)> {
         let docs = self.documents.read();
-        let result = docs.get(&doc_id).map(|doc| doc.embedding.clone());
+        let result = docs
+            .get(&doc_id)
+            .map(|doc| (doc.embedding.clone(), doc.coherence));
 
         let mut stats = self.stats.write();
         if result.is_some() {
@@ -149,6 +176,12 @@ impl HotTier {
         result
     }
 
+    pub fn peek_with_coherence(&self, doc_id: u64) -> Option<(Vec<f32>, VectorCoherenceToken)> {
+        let docs = self.documents.read();
+        docs.get(&doc_id)
+            .map(|doc| (doc.embedding.clone(), doc.coherence))
+    }
+
     /// Get document metadata from hot tier (if present)
     pub fn get_metadata(&self, doc_id: u64) -> Option<HashMap<String, String>> {
         let docs = self.documents.read();
@@ -158,15 +191,25 @@ impl HotTier {
     /// Bulk fetch documents from hot tier (if present)
     #[allow(clippy::type_complexity)]
     pub fn bulk_fetch(&self, doc_ids: &[u64]) -> Vec<Option<(Vec<f32>, HashMap<String, String>)>> {
+        self.bulk_fetch_with_coherence(doc_ids)
+            .into_iter()
+            .map(|entry| entry.map(|(embedding, metadata, _coherence)| (embedding, metadata)))
+            .collect()
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn bulk_fetch_with_coherence(
+        &self,
+        doc_ids: &[u64],
+    ) -> Vec<Option<(Vec<f32>, HashMap<String, String>, VectorCoherenceToken)>> {
         // Take snapshot to avoid holding read lock during cloning
-        #[allow(clippy::type_complexity)]
-        let snapshot: Vec<Option<(Vec<f32>, HashMap<String, String>)>> = {
+        let snapshot: Vec<Option<(Vec<f32>, HashMap<String, String>, VectorCoherenceToken)>> = {
             let docs = self.documents.read();
             doc_ids
                 .iter()
                 .map(|id| {
                     docs.get(id)
-                        .map(|doc| (doc.embedding.clone(), doc.metadata.clone()))
+                        .map(|doc| (doc.embedding.clone(), doc.metadata.clone(), doc.coherence))
                 })
                 .collect()
         };
@@ -187,6 +230,11 @@ impl HotTier {
     /// Use `get()` or `bulk_fetch()` if you need stats tracking.
     pub fn exists(&self, doc_id: u64) -> bool {
         self.documents.read().contains_key(&doc_id)
+    }
+
+    /// Snapshot the current mirror doc IDs for background audit/reconciliation.
+    pub fn snapshot_doc_ids(&self) -> Vec<u64> {
+        self.documents.read().keys().copied().collect()
     }
 
     /// Update document metadata without changing embedding
@@ -284,7 +332,7 @@ impl HotTier {
             .collect()
     }
 
-    /// Check if flush is needed (based on size or age thresholds)
+    /// Check if the hot-tier mirror should be drained (size or age thresholds).
     pub fn needs_flush(&self) -> bool {
         let docs = self.documents.read();
 
@@ -314,16 +362,17 @@ impl HotTier {
         false
     }
 
-    /// Drain all documents from hot tier for flushing
+    /// Drain all hot-tier mirror entries for eviction/reconciliation.
     ///
-    /// Returns: Vec<(doc_id, embedding, metadata)> to be inserted into cold tier
+    /// Returns: `Vec<(doc_id, embedding, metadata, coherence)>` for optional cold-tier
+    /// reconciliation before the mirror entries are dropped.
     ///
-    /// This clears the hot tier and updates stats.
-    pub fn drain_for_flush(&self) -> Vec<(u64, Vec<f32>, HashMap<String, String>)> {
+    /// This clears the hot tier and updates drain statistics.
+    pub fn drain_for_flush(&self) -> Vec<HotTierMirrorDocument> {
         let mut docs = self.documents.write();
-        let drained: Vec<(u64, Vec<f32>, HashMap<String, String>)> = docs
+        let drained: Vec<HotTierMirrorDocument> = docs
             .drain()
-            .map(|(id, doc)| (id, doc.embedding, doc.metadata))
+            .map(|(id, doc)| (id, doc.embedding, doc.metadata, doc.coherence))
             .collect();
 
         let mut stats = self.stats.write();
@@ -570,22 +619,20 @@ impl HotTier {
         1.0 - dot_normalized
     }
 
-    /// Re-insert documents that failed to flush
+    /// Re-insert documents whose drain-time reconciliation failed.
     ///
-    /// Used when flush to cold tier fails - documents are put back into hot tier
-    /// to avoid data loss. Preserves original insertion timestamps where possible.
+    /// Used when a drain discovers a hot/cold mismatch and the cold-tier repair
+    /// fails. Documents are put back into the hot tier so the recent-write mirror
+    /// is not silently dropped while state is inconsistent.
     ///
     /// # Parameters
     /// - `documents`: Documents to re-insert (doc_id, embedding, metadata)
     ///
     /// # Behavior
-    /// - Re-inserted documents use current timestamp (preserves age-based flush logic)
+    /// - Re-inserted documents use current timestamp (preserves age-based drain logic)
     /// - Increments total_inserts counter (tracks all insert operations)
-    /// - Does NOT increment total_flushes (flush failed, not completed)
-    pub fn reinsert_failed_documents(
-        &self,
-        documents: Vec<(u64, Vec<f32>, HashMap<String, String>)>,
-    ) {
+    /// - Does NOT increment total_flushes (drain failed, not completed)
+    pub fn reinsert_failed_documents(&self, documents: Vec<HotTierMirrorDocument>) {
         if documents.is_empty() {
             return;
         }
@@ -593,12 +640,13 @@ impl HotTier {
         let mut docs = self.documents.write();
         let reinsert_count = documents.len();
 
-        for (doc_id, embedding, metadata) in documents {
+        for (doc_id, embedding, metadata, coherence) in documents {
             let embedding_l2_norm = Self::l2_norm(&embedding);
             let doc = HotDocument {
                 embedding,
                 embedding_l2_norm,
                 metadata,
+                coherence,
                 inserted_at: Instant::now(), // Use current timestamp
             };
             docs.insert(doc_id, doc);

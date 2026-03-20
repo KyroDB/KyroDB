@@ -2,8 +2,8 @@
 //
 // This test validates the complete query journey through all three layers:
 // - Layer 1: Hybrid Semantic Cache (RMI + semantic prediction)
-// - Layer 2: Hot tier (recent writes buffer)
-// - Layer 3: Cold tier (HNSW + persistence)
+// - Layer 2: Hot tier (recent-write mirror / acceleration layer)
+// - Layer 3: Cold tier (canonical HNSW + persistence)
 
 use kyrodb_engine::*;
 use std::collections::HashMap;
@@ -61,7 +61,7 @@ fn test_three_tier_query_journey() {
     assert_eq!(stats.cache_hits, 0); // Cache empty initially
     println!("Cold tier stats: {} searches", stats.cold_tier_searches);
 
-    // Step 2: Insert new documents (should go to hot tier)
+    // Step 2: Insert new documents (durable in cold tier + mirrored in hot tier)
     println!("\n=== Step 2: Hot tier inserts ===");
     engine
         .insert(100, normalize(vec![0.25, 0.75]), HashMap::new())
@@ -70,7 +70,16 @@ fn test_three_tier_query_journey() {
         .insert(101, normalize(vec![0.30, 0.70]), HashMap::new())
         .unwrap();
 
-    // Query documents in hot tier (before flush)
+    assert!(
+        engine.cold_tier().fetch_document(100).is_some(),
+        "Doc 100 should already be durable in cold tier"
+    );
+    assert!(
+        engine.cold_tier().fetch_document(101).is_some(),
+        "Doc 101 should already be durable in cold tier"
+    );
+
+    // Query documents from the hot-tier mirror before it is drained.
     let result = engine.query(100, None);
     assert!(result.is_some(), "Doc 100 should be in hot tier");
 
@@ -78,9 +87,9 @@ fn test_three_tier_query_journey() {
     assert_eq!(stats.hot_tier_hits, 1, "Expected 1 hot tier hit");
     println!("Hot tier hit: doc 100");
 
-    // Step 3: Flush hot tier to cold tier
-    println!("\n=== Step 3: Flushing to cold tier ===");
-    // Insert one more to trigger flush (hot_tier_max_size=3)
+    // Step 3: Drain the hot-tier mirror
+    println!("\n=== Step 3: Draining hot tier mirror ===");
+    // Insert one more to trigger drain (hot_tier_max_size=3)
     engine
         .insert(102, normalize(vec![0.35, 0.65]), HashMap::new())
         .unwrap();
@@ -88,7 +97,7 @@ fn test_three_tier_query_journey() {
     println!("Flushed {} documents", flushed);
     assert!(flushed > 0, "Should have flushed at least some documents");
 
-    // Query a DIFFERENT document (101) that was flushed but not cached
+    // Query a DIFFERENT document (101) after the hot-tier mirror was drained.
     // This should hit cold tier (not cache, not hot tier)
     let query_101 = normalize(vec![0.30, 0.70]);
     let result = engine.query(101, Some(&query_101));

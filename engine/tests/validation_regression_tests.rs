@@ -8,6 +8,7 @@
 use kyrodb_engine::{
     AbTestSplitter, AccessEvent, AccessPatternLogger, AccessType, CacheStrategy, CachedVector,
     LearnedCachePredictor, LearnedCacheStrategy, LruCacheStrategy, SemanticAdapter,
+    VectorCoherenceToken,
 };
 use rand::distributions::Distribution;
 use rand_distr::Zipf;
@@ -16,9 +17,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Helper: Create test vector
 fn create_test_vector(doc_id: u64) -> CachedVector {
+    let embedding = vec![0.5; 128];
     CachedVector {
         doc_id,
-        embedding: vec![0.5; 128],
+        coherence: VectorCoherenceToken::for_embedding(1, &embedding),
+        embedding,
         distance: 0.1,
         cached_at: Instant::now(),
     }

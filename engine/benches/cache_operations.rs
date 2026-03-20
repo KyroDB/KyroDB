@@ -7,7 +7,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kyrodb_engine::{
     AccessEvent, AccessType, CacheStrategy, CachedVector, LearnedCachePredictor,
-    LearnedCacheStrategy, LruCacheStrategy, VectorCache,
+    LearnedCacheStrategy, LruCacheStrategy, VectorCache, VectorCoherenceToken,
 };
 use std::time::{Instant, SystemTime};
 
@@ -28,9 +28,11 @@ fn bench_cache_lookup(c: &mut Criterion) {
 
         // Pre-populate cache
         for i in 0..size.min(1000) {
+            let embedding = generate_embedding(768, i as u64);
             cache.insert(CachedVector {
                 doc_id: i as u64,
-                embedding: generate_embedding(768, i as u64),
+                coherence: VectorCoherenceToken::for_embedding(1, &embedding),
+                embedding,
                 distance: 0.5,
                 cached_at: Instant::now(),
             });
@@ -65,6 +67,7 @@ fn bench_cache_insert(c: &mut Criterion) {
                 b.iter(|| {
                     let cached = CachedVector {
                         doc_id,
+                        coherence: VectorCoherenceToken::for_embedding(1, &embedding),
                         embedding: embedding.clone(),
                         distance: 0.5,
                         cached_at: Instant::now(),
@@ -91,6 +94,7 @@ fn bench_lru_eviction(c: &mut Criterion) {
     for i in 0..1000 {
         strategy.insert_cached(CachedVector {
             doc_id: i,
+            coherence: VectorCoherenceToken::for_embedding(1, &embedding),
             embedding: embedding.clone(),
             distance: 0.5,
             cached_at: Instant::now(),
@@ -102,6 +106,7 @@ fn bench_lru_eviction(c: &mut Criterion) {
         b.iter(|| {
             let cached = CachedVector {
                 doc_id,
+                coherence: VectorCoherenceToken::for_embedding(1, &embedding),
                 embedding: embedding.clone(),
                 distance: 0.5,
                 cached_at: Instant::now(),
@@ -160,9 +165,11 @@ fn bench_cache_stats(c: &mut Criterion) {
 
     // Simulate some operations
     for i in 0..1000 {
+        let embedding = generate_embedding(768, i);
         cache.insert(CachedVector {
             doc_id: i,
-            embedding: generate_embedding(768, i),
+            coherence: VectorCoherenceToken::for_embedding(1, &embedding),
+            embedding,
             distance: 0.5,
             cached_at: Instant::now(),
         });

@@ -80,6 +80,7 @@ async fn test_full_ab_test_flow() {
             if strategy.should_cache(doc_id, &query) {
                 let cached = CachedVector {
                     doc_id,
+                    coherence: kyrodb_engine::VectorCoherenceToken::for_embedding(1, &query),
                     embedding: query.clone(),
                     distance: 0.0,
                     cached_at: Instant::now(),
@@ -161,6 +162,7 @@ async fn test_cache_hit_rate_improves() {
             // Cache miss: insert
             let cached = CachedVector {
                 doc_id,
+                coherence: kyrodb_engine::VectorCoherenceToken::for_embedding(1, &query),
                 embedding: query.clone(),
                 distance: 0.0,
                 cached_at: Instant::now(),
@@ -309,6 +311,7 @@ async fn test_learned_predictor_influences_admission() {
     for idx in 0..50u64 {
         let cached = CachedVector {
             doc_id: 1_000 + idx,
+            coherence: kyrodb_engine::VectorCoherenceToken::for_embedding(1, &[0.0; 8]),
             embedding: vec![0.0; 8],
             distance: 0.0,
             cached_at: Instant::now(),
@@ -359,6 +362,7 @@ async fn test_concurrent_cache_access() {
                 // Insert
                 let cached = CachedVector {
                     doc_id,
+                    coherence: kyrodb_engine::VectorCoherenceToken::for_embedding(1, &embedding),
                     embedding: embedding.clone(),
                     distance: 0.0,
                     cached_at: Instant::now(),

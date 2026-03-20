@@ -43,6 +43,15 @@ RPC groups:
 - reads: `Query`, `Search`, `BulkSearch`, `BulkQuery`
 - admin: `Health`, `Metrics`, `FlushHotTier`, `CreateSnapshot`, `GetConfig`
 
+Operation semantics:
+
+- `Insert` is durable-first: successful writes are committed to the cold tier before the response returns.
+- `UpdateMetadata` is durable-first: the cold tier is canonical, and the hot tier is only mirrored if the document is resident there.
+- `UpdateMetadata.namespace` is a selector/boundary check, not a namespace-rewrite field; reserved tenant/namespace keys are preserved on update.
+- Query/search responses strip reserved internal metadata keys such as `__tenant_id__`, `__tenant_idx__`, and `__namespace__`.
+- Read APIs only surface documents backed by a canonical cold-tier record; L1a/hot-tier embeddings carry canonical coherence tokens (version + 128-bit integrity digest), are revalidated before they are served, hot-tier-only drift is ignored, and stale mirrors are scrubbed when detected.
+- `FlushHotTier` drains/reconciles the hot-tier mirror; it does not make buffered writes durable because inserts are already durable before the RPC returns, and it will not let mirror state overwrite an existing canonical cold-tier record.
+
 ### Input Validation
 
 - `InsertRequest.doc_id >= 1`

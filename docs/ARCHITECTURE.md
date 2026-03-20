@@ -66,7 +66,7 @@ flowchart LR
 | Tiered engine | query/search orchestration across cache/hot/cold tiers | `engine/src/tiered_engine.rs` |
 | L1a (HSC) | point-query/embedding cache with learned + semantic admission | `engine/src/cache_strategy.rs`, `engine/src/semantic_adapter.rs`, `engine/src/vector_cache.rs` |
 | L1b | scoped semantic query-result cache | `engine/src/query_hash_cache.rs` |
-| L2 | recent-write buffer, fast scan path | `engine/src/hot_tier.rs` |
+| L2 | recent-write mirror, coherence-checked fast scan path | `engine/src/hot_tier.rs` |
 | L3 | HNSW index + metadata index + WAL integration | `engine/src/hnsw_backend.rs`, `engine/src/ann_backend.rs`, `engine/src/persistence.rs` |
 | Auth + tenancy | API key validation, tenant-local/global ID mapping, isolation | `engine/src/auth.rs`, `engine/src/bin/kyrodb_server.rs` |
 | Observability | health/ready/slo/metrics/usage endpoint surface | `engine/src/bin/kyrodb_server.rs`, `engine/src/metrics.rs` |

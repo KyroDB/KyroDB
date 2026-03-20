@@ -10,13 +10,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::coherence::VectorCoherenceToken;
 use crate::lru_index::LruIndex;
 
-/// Cached vector with metadata
+/// Cached vector with metadata.
+///
+/// `coherence` is the canonical cold-tier token observed when this L1a entry
+/// was created. Reads must re-check it before serving the cached embedding.
 #[derive(Clone, Debug)]
 pub struct CachedVector {
     pub doc_id: u64,
     pub embedding: Vec<f32>,
+    pub coherence: VectorCoherenceToken,
     pub distance: f32,
     pub cached_at: Instant,
 }
@@ -222,9 +227,11 @@ mod tests {
     use super::*;
 
     fn create_test_vector(doc_id: u64, dim: usize) -> CachedVector {
+        let embedding = vec![0.5; dim];
         CachedVector {
             doc_id,
-            embedding: vec![0.5; dim],
+            coherence: VectorCoherenceToken::for_embedding(0, &embedding),
+            embedding,
             distance: 0.1,
             cached_at: Instant::now(),
         }

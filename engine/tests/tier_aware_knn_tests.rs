@@ -2,8 +2,8 @@
 //!
 //! Tests validate that k-NN queries correctly search across all three tiers:
 //! - Layer 1b (Query Cache): Semantic similarity for paraphrased queries
-//! - Layer 2 (Hot Tier): Recent writes not yet flushed to HNSW
-//! - Layer 3 (Cold Tier): HNSW index for bulk vectors
+//! - Layer 2 (Hot Tier): Recent-write mirror / acceleration layer
+//! - Layer 3 (Cold Tier): Canonical HNSW index for bulk vectors
 //!
 //! Key validation points:
 //! - Hot tier results appear in k-NN output
@@ -58,8 +58,8 @@ fn test_knn_searches_hot_tier() {
     )
     .unwrap();
 
-    // Insert 3 documents into hot tier (NOT flushed)
-    println!("Inserting 3 documents to hot tier");
+    // Insert 3 documents into the hot-tier mirror.
+    println!("Inserting 3 documents to hot tier mirror");
     engine
         .insert(
             100,
@@ -82,11 +82,15 @@ fn test_knn_searches_hot_tier() {
         )
         .unwrap();
 
-    // Verify they're in hot tier
+    // Verify they're in the hot-tier mirror and already durable in cold tier.
     assert_eq!(
         engine.hot_tier().len(),
         3,
         "Hot tier should have 3 documents"
+    );
+    assert!(
+        engine.cold_tier().fetch_document(100).is_some(),
+        "Doc 100 should already be durable in cold tier"
     );
 
     // k-NN search with query close to hot tier documents

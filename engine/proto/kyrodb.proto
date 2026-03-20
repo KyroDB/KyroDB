@@ -70,7 +70,12 @@ service KyroDBService {
   // ADMIN OPERATIONS
   // ============================================================================
   
-  // Force flush hot tier to cold tier (for testing/backups)
+  // Drain/reconcile the hot-tier mirror (for testing, shutdown, or backpressure).
+  // Inserts are already durable before they enter the hot tier; this operation
+  // bounds memory, keeps existing cold-tier records authoritative, and only uses
+  // mirror state to repair missing/partial canonical records before eviction.
+  // Regular read paths perform per-document coherence checks, while background
+  // maintenance periodically audits and scrubs stale mirror entries.
   rpc FlushHotTier(FlushRequest) returns (FlushResponse);
   
   // Create snapshot for backup
@@ -158,7 +163,7 @@ message UpdateMetadataRequest {
   uint64 doc_id = 1;
   map<string, string> metadata = 2;
   bool merge = 3;  // true = merge with existing, false = replace
-  string namespace = 4;  // Optional namespace
+  string namespace = 4;  // Optional namespace selector; does not rewrite stored namespace
 }
 
 message UpdateMetadataResponse {

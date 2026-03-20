@@ -468,9 +468,33 @@ async fn main() -> Result<()> {
             (vec.embedding, true)
         } else {
             // Cache miss - fetch from storage
-            let embedding = doc_store
-                .fetch(doc_id)
-                .ok_or_else(|| anyhow::anyhow!("Document {} not found in store", doc_id))?;
+            fn fetch(&self, doc_id: u64) -> Option<Vec<f32>> {
+                if doc_id >= self.corpus_size as u64 {
+                    return None;
+                }
+
+                let topic_index = (doc_id as usize) % self.topic_bases.len();
+                let mut embedding = self.topic_bases[topic_index].clone();
+                debug_assert_eq!(embedding.len(), self.embedding_dim);
+
+                let mut rng = ChaCha8Rng::seed_from_u64(doc_id);
+                if let Ok(noise) = Normal::new(0.0, self.noise_stddev as f64) {
+                    for value in embedding.iter_mut() {
+                        *value += noise.sample(&mut rng) as f32;
+                    }
+                }
+
+                normalize_embedding(&mut embedding);
+                Some(embedding)
+            }
+
+            /// Fetch document with coherence score (simulates disk read)
+            fn fetch_document_with_coherence(&self, doc_id: u64) -> Option<(Vec<f32>, f32)> {
+                let embedding = self.fetch(doc_id)?;
+                // Generate a deterministic coherence score based on doc_id
+                let coherence = ((doc_id % 100) as f32) / 100.0;
+                Some((embedding, coherence))
+            }
 
             // Decide if we should cache based on strategy
             let should_cache = match strategy_id {
@@ -488,6 +512,7 @@ async fn main() -> Result<()> {
                 let cached = CachedVector {
                     doc_id,
                     embedding: embedding.clone(),
+                    coherence,
                     distance: 0.5,
                     cached_at: Instant::now(),
                 };

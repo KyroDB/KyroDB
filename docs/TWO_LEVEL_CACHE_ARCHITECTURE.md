@@ -46,8 +46,11 @@ curl -s http://127.0.0.1:51051/metrics \
 - k-NN path order is `L1b -> L2 -> L3`; point lookup path order is `L1a -> L2 -> L3`.
 - Search response hydration uses metadata-only fetch when `include_embeddings=false`, and cache-aware embedding fetch when `include_embeddings=true`.
 - `TieredEngine::insert` is durable-first: write through cold tier (WAL + HNSW) before ACK, then place recent copy in L2.
+- `TieredEngine::update_metadata` is durable-first: update cold tier first, then mirror the change into L2 if the document is resident there.
+- L1a and L2 embeddings carry canonical cold-tier coherence tokens (version + 128-bit integrity digest); reads only serve them when both the token and the mirrored payload still match cold state.
 - insert path performs targeted L1b invalidation (`invalidate_doc` + distance-boundary invalidation), not global clear-per-write.
-- Flush/migration events invalidate L1b entries to prevent stale query-result reuse.
+- Metadata updates conservatively clear L1b because filter membership changes cannot be invalidated precisely from doc-local state alone.
+- Hot-tier drain normally just evicts mirror entries; L1b is only cleared if drain detects drift or repairs missing canonical state.
 - Cache benefits are workload-dependent; cold traffic and weak query reuse lower hit rate.
 
 ## Layer Topology
@@ -58,7 +61,7 @@ flowchart LR
       L1A["L1a: Document Cache\n(doc_id -> embedding)"]
       L1B["L1b: Query Cache\n(scope + query hash / similarity -> top-k)"]
     end
-    L2["Layer 2 - Hot Tier\nrecent writes buffer"]
+    L2["Layer 2 - Hot Tier\nrecent-write mirror"]
     L3["Layer 3 - Cold Tier\nHNSW + WAL + snapshots"]
 
     L1A <--> L2
@@ -107,9 +110,10 @@ flowchart TD
 ```mermaid
 flowchart TD
     I["Insert(doc_id, embedding, metadata)"] --> D["L3 durable write\n(WAL + HNSW)"]
-    D --> ACK["ACK to client"]
-    ACK --> L2["Insert into L2 hot tier"]
-    L2 --> BG["Background/forced flush reconciliation"]
+    D --> INV["Invalidate affected L1b entries"]
+    INV --> L2["Mirror into L2 hot tier"]
+    L2 --> ACK["ACK to client"]
+    ACK --> BG["Background/forced drain / reconciliation"]
 ```
 
 ## Why Two L1 Layers (L1a + L1b)
@@ -203,7 +207,10 @@ Important nuance:
 
 ## Failure and Correctness Notes
 
-- L1b invalidation is selective on insert and full clear on hot-tier flush/reconciliation paths.
+- L1b invalidation is selective on insert; hot-tier drain only clears L1b when it detects drift or repairs canonical state.
+- Read paths only serve hot-tier or cached results when a canonical cold-tier record exists and the mirrored coherence token still matches canonical cold state.
+- Hot-tier mirrors whose payload or token diverges from canonical cold state are scrubbed immediately on observation instead of waiting for a later drain.
+- Background maintenance periodically audits the hot-tier mirror so drift is scrubbed without adding full-tier work to the read path.
 - Delete path invalidates L1a directly and removes L1b entries referencing deleted docs.
 - Search timeout paths use bounded worker concurrency and cancellation to avoid unbounded backlog growth.
 - Scope-aware query cache prevents cross-scope/tenant reuse.

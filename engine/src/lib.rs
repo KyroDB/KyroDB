@@ -53,6 +53,9 @@ pub mod proto {
 // Metadata filtering logic
 pub mod metadata_filter;
 
+// Vector coherence tokens and integrity digest validation
+pub mod coherence;
+
 // Adaptive oversampling for filtered search
 pub mod adaptive_oversampling;
 
@@ -103,7 +106,7 @@ pub mod persistence;
 // Backup and restore: Full/incremental backups, PITR, retention policies
 pub mod backup;
 
-// Hot tier: Recent writes buffer (Layer 2)
+// Hot tier: Recent-write mirror (Layer 2)
 pub mod hot_tier;
 
 // Tiered engine: Three-layer architecture orchestrator
@@ -152,6 +155,9 @@ pub use learned_cache::{AccessEvent, AccessType, CachePredictorStats, LearnedCac
 
 // Access logger components
 pub use access_logger::{hash_embedding, AccessLoggerStats, AccessPatternLogger};
+pub use coherence::{
+    digest_embedding, embedding_matches_token, VectorCoherenceToken, VectorIntegrityDigest,
+};
 
 // A/B testing components
 pub use ab_stats::{AbStatsPersister, AbTestMetric, AbTestSummary};
@@ -188,7 +194,7 @@ pub use backup::{
 };
 
 // Hot tier components (Layer 2)
-pub use hot_tier::{HotTier, HotTierStats};
+pub use hot_tier::{HotTier, HotTierMirrorDocument, HotTierStats};
 
 // Tiered engine components (three-layer architecture)
 pub use tiered_engine::{

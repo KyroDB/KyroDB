@@ -5,12 +5,14 @@
 use kyrodb_engine::{
     AccessEvent, AccessPatternLogger, AccessType, CacheStrategy, CachedVector,
     LearnedCachePredictor, LearnedCacheStrategy, SemanticAdapter, SemanticConfig,
+    VectorCoherenceToken,
 };
 use std::time::{Instant, SystemTime};
 
 fn create_test_vector(doc_id: u64, embedding: Vec<f32>) -> CachedVector {
     CachedVector {
         doc_id,
+        coherence: VectorCoherenceToken::for_embedding(1, &embedding),
         embedding,
         distance: 0.1,
         cached_at: Instant::now(),

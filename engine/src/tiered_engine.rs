@@ -3,8 +3,8 @@
 //! Coordinates all tiers:
 //! - **Layer 1a (Document Cache)**: Learned frequency-based cache (hot documents)
 //! - **Layer 1b (Query Cache)**: Semantic search-result cache (paraphrased queries)
-//! - **Layer 2 (Hot Tier)**: Recent writes buffer (fast writes, periodic flush)
-//! - **Layer 3 (Cold Tier)**: HNSW index (all documents, approximate k-NN search)
+//! - **Layer 2 (Hot Tier)**: Recent-write mirror and acceleration layer
+//! - **Layer 3 (Cold Tier)**: Canonical HNSW index with durability (WAL + recovery)
 //!
 //! # Search Path (k-NN)
 //! ```text
@@ -22,15 +22,18 @@
 //!
 //! # Write Path
 //! ```text
-//! Insert → WAL + HNSW (durable ACK) → Hot Tier (recent-write acceleration)
-//!        → Background flush reconciles remaining hot-only state (if any)
+//! Insert → invalidate L1a → WAL + HNSW (canonical write)
+//!        → invalidate affected L1b entries → Hot Tier mirror
+//!        → ACK
+//!        → Background audits/drain evict mirror entries and reconcile unexpected drift
 //! ```
 
 use crate::config::{DistanceMetric, RecoveryMode};
 use crate::proto::MetadataFilter;
 use crate::{
-    AccessPatternLogger, CacheLifecycleStats, CacheStrategy, CachedVector, CircuitBreaker,
-    FsyncPolicy, HnswBackend, HotTier, QueryHashCache, SearchResult,
+    embedding_matches_token, AccessPatternLogger, CacheLifecycleStats, CacheStrategy, CachedVector,
+    CircuitBreaker, FsyncPolicy, HnswBackend, HotTier, HotTierMirrorDocument, QueryHashCache,
+    SearchResult, VectorCoherenceToken,
 };
 use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
@@ -112,6 +115,14 @@ pub enum PointQueryTier {
     Cache,
     HotTier,
     ColdTier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalVectorState {
+    Match,
+    TokenMismatch,
+    LocalCorruption,
+    Missing,
 }
 
 /// Execution path used to serve a k-NN search.
@@ -236,6 +247,7 @@ struct TieredEngineComponents {
     cache_circuit_breaker: Arc<CircuitBreaker>,
     hot_tier_circuit_breaker: Arc<CircuitBreaker>,
     cold_tier_circuit_breaker: Arc<CircuitBreaker>,
+    last_hot_tier_coherence_audit: Arc<RwLock<Instant>>,
 }
 
 /// Tiered Engine - Two-level cache vector database
@@ -271,6 +283,9 @@ pub struct TieredEngine {
 
     /// Semaphore bounding blocking search workers.
     pub(crate) search_worker_semaphore: Arc<Semaphore>,
+
+    /// Last completed full hot-tier coherence audit.
+    last_hot_tier_coherence_audit: Arc<RwLock<Instant>>,
 }
 
 impl TieredEngine {
@@ -344,6 +359,7 @@ impl TieredEngine {
             cache_circuit_breaker: Arc::new(CircuitBreaker::new()),
             hot_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
             cold_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
+            last_hot_tier_coherence_audit: Arc::new(RwLock::new(Instant::now())),
         })
     }
 
@@ -375,6 +391,7 @@ impl TieredEngine {
             cold_tier_circuit_breaker: components.cold_tier_circuit_breaker,
             query_semaphore: components.query_semaphore,
             search_worker_semaphore: components.search_worker_semaphore,
+            last_hot_tier_coherence_audit: components.last_hot_tier_coherence_audit,
         })
     }
 
@@ -412,6 +429,7 @@ impl TieredEngine {
             cold_tier_circuit_breaker: components.cold_tier_circuit_breaker,
             query_semaphore: components.query_semaphore,
             search_worker_semaphore: components.search_worker_semaphore,
+            last_hot_tier_coherence_audit: components.last_hot_tier_coherence_audit,
         })
     }
 
@@ -468,6 +486,7 @@ impl TieredEngine {
             cold_tier_circuit_breaker: Arc::new(CircuitBreaker::new()),
             query_semaphore,
             search_worker_semaphore,
+            last_hot_tier_coherence_audit: Arc::new(RwLock::new(Instant::now())),
         })
     }
 
@@ -517,7 +536,7 @@ impl TieredEngine {
     /// TieredEngine should not hold stats/access-logger locks across strategy calls.
     ///
     /// # Returns
-    /// - `Some(embedding)` if document found in any tier
+    /// - `Some(embedding)` if a canonical document exists and can be served
     /// - `None` if document doesn't exist
     pub fn query(&self, doc_id: u64, query_embedding: Option<&[f32]>) -> Option<Vec<f32>> {
         self.query_with_source(doc_id, query_embedding)
@@ -539,18 +558,32 @@ impl TieredEngine {
         // Layer 1: Check cache with circuit breaker protection
         if !self.cache_circuit_breaker.is_open() {
             if let Some(cached) = self.cache_strategy.get_cached(doc_id) {
-                // Cache hit - record success
-                self.cache_circuit_breaker.record_success();
+                match self.canonical_vector_state(
+                    doc_id,
+                    &cached.embedding,
+                    cached.coherence,
+                    "point query cache hit",
+                ) {
+                    CanonicalVectorState::Match => {
+                        // Cache hit - record success
+                        self.cache_circuit_breaker.record_success();
 
-                // Update stats (no other locks held)
-                {
-                    let mut stats = self.stats.write();
-                    stats.cache_hits += 1;
-                } // stats lock released
+                        // Update stats (no other locks held)
+                        {
+                            let mut stats = self.stats.write();
+                            stats.cache_hits += 1;
+                        } // stats lock released
 
-                self.log_point_access(doc_id);
+                        self.log_point_access(doc_id);
 
-                return Some((cached.embedding, PointQueryTier::Cache));
+                        return Some((cached.embedding, PointQueryTier::Cache));
+                    }
+                    CanonicalVectorState::TokenMismatch
+                    | CanonicalVectorState::LocalCorruption
+                    | CanonicalVectorState::Missing => {
+                        self.invalidate_stale_cache_entry(doc_id, "point query cache hit");
+                    }
+                }
             }
 
             // Cache miss - not a failure, just continue to next tier
@@ -572,32 +605,47 @@ impl TieredEngine {
 
         // Layer 2: Check hot tier with circuit breaker protection
         if !self.hot_tier_circuit_breaker.is_open() {
-            if let Some(embedding) = self.hot_tier.get(doc_id) {
-                // Hot tier hit - record success
-                self.hot_tier_circuit_breaker.record_success();
+            if let Some((embedding, coherence)) = self.hot_tier.get_with_coherence(doc_id) {
+                match self.canonical_vector_state(
+                    doc_id,
+                    &embedding,
+                    coherence,
+                    "point query hot-tier hit",
+                ) {
+                    CanonicalVectorState::Match => {
+                        // Hot tier hit - record success
+                        self.hot_tier_circuit_breaker.record_success();
 
-                // Update stats (isolated)
-                {
-                    let mut stats = self.stats.write();
-                    stats.hot_tier_hits += 1;
-                } // Lock released
+                        // Update stats (isolated)
+                        {
+                            let mut stats = self.stats.write();
+                            stats.hot_tier_hits += 1;
+                        } // Lock released
 
-                // Cache admission decision for L1a (isolated)
-                let should_cache_decision = self.cache_strategy.should_cache(doc_id, &embedding);
+                        // Cache admission decision for L1a (isolated)
+                        let should_cache_decision =
+                            self.cache_strategy.should_cache(doc_id, &embedding);
 
-                if should_cache_decision {
-                    let cached = CachedVector {
-                        doc_id,
-                        embedding: embedding.clone(),
-                        distance: 0.0,
-                        cached_at: Instant::now(),
-                    };
-                    self.cache_strategy.insert_cached(cached);
+                        if should_cache_decision {
+                            let cached = CachedVector {
+                                doc_id,
+                                embedding: embedding.clone(),
+                                coherence,
+                                distance: 0.0,
+                                cached_at: Instant::now(),
+                            };
+                            self.cache_strategy.insert_cached(cached);
+                        }
+
+                        self.log_point_access(doc_id);
+
+                        return Some((embedding, PointQueryTier::HotTier));
+                    }
+                    CanonicalVectorState::TokenMismatch | CanonicalVectorState::LocalCorruption => {
+                        self.discard_stale_hot_mirror(doc_id, "point query hot-tier hit");
+                    }
+                    CanonicalVectorState::Missing => {}
                 }
-
-                self.log_point_access(doc_id);
-
-                return Some((embedding, PointQueryTier::HotTier));
             }
 
             // Hot tier miss - update stats (isolated)
@@ -619,7 +667,9 @@ impl TieredEngine {
 
         // Layer 3: Fetch from cold tier with circuit breaker protection
         if !self.cold_tier_circuit_breaker.is_open() {
-            if let Some(embedding) = self.cold_tier.fetch_document(doc_id) {
+            if let Some((embedding, coherence)) =
+                self.cold_tier.fetch_document_with_coherence(doc_id)
+            {
                 // Cold tier success - record it
                 self.cold_tier_circuit_breaker.record_success();
 
@@ -636,6 +686,7 @@ impl TieredEngine {
                     let cached = CachedVector {
                         doc_id,
                         embedding: embedding.clone(),
+                        coherence,
                         distance: 0.0,
                         cached_at: Instant::now(),
                     };
@@ -660,30 +711,47 @@ impl TieredEngine {
             );
         }
 
-        // Document not found in any tier
+        // Document not found in a canonical cold-backed state
         None
     }
 
     /// Get document with metadata
     ///
     /// Retrieves both the embedding and metadata for a given document ID.
-    /// Checks Hot Tier first, then Cold Tier.
+    /// Metadata is read from the canonical cold tier when available; the hot tier
+    /// only serves the embedding fast path. Mirror-only drift is not returned to
+    /// callers as a real document.
     pub fn get_document_with_metadata(
         &self,
         doc_id: u64,
     ) -> Option<(Vec<f32>, std::collections::HashMap<String, String>)> {
-        // Check hot tier first
-        if let Some(embedding) = self.hot_tier.get(doc_id) {
-            if let Some(metadata) = self.hot_tier.get_metadata(doc_id) {
+        if let Some(metadata) = self.cold_tier.fetch_metadata(doc_id) {
+            if let Some((embedding, coherence)) = self.hot_tier.get_with_coherence(doc_id) {
+                match self.canonical_vector_state(
+                    doc_id,
+                    &embedding,
+                    coherence,
+                    "document-with-metadata hot-tier hit",
+                ) {
+                    CanonicalVectorState::Match => return Some((embedding, metadata)),
+                    CanonicalVectorState::TokenMismatch | CanonicalVectorState::LocalCorruption => {
+                        self.discard_stale_hot_mirror(doc_id, "document-with-metadata hot-tier hit")
+                    }
+                    CanonicalVectorState::Missing => {}
+                }
+            }
+            if let Some((embedding, _coherence)) =
+                self.cold_tier.fetch_document_with_coherence(doc_id)
+            {
                 return Some((embedding, metadata));
             }
         }
 
-        // Check cold tier
-        if let Some(embedding) = self.cold_tier.fetch_document(doc_id) {
-            if let Some(metadata) = self.cold_tier.fetch_metadata(doc_id) {
-                return Some((embedding, metadata));
-            }
+        if self.hot_tier.exists(doc_id) {
+            warn!(
+                doc_id,
+                "refusing to serve hot-tier-only document without canonical cold-tier metadata"
+            );
         }
 
         None
@@ -692,20 +760,42 @@ impl TieredEngine {
     /// Get embedding by ID with L1a cache participation (no metrics side effects).
     ///
     /// Used for response hydration paths where we want cache acceleration without
-    /// mutating point-query counters/training state.
+    /// mutating point-query counters/training state. Only serves cache/hot-tier
+    /// entries when a canonical cold-tier record exists.
     pub fn get_embedding_cache_aware(&self, doc_id: u64) -> Option<Vec<f32>> {
         if let Some(cached) = self.cache_strategy.peek_cached(doc_id) {
-            return Some(cached.embedding);
+            if self.canonical_vector_state(
+                doc_id,
+                &cached.embedding,
+                cached.coherence,
+                "cache-aware embedding cache hit",
+            ) == CanonicalVectorState::Match
+            {
+                return Some(cached.embedding);
+            }
+            self.invalidate_stale_cache_entry(doc_id, "cache-aware embedding cache hit");
         }
-        if let Some(embedding) = self.hot_tier.get(doc_id) {
-            return Some(embedding);
+        if let Some((embedding, coherence)) = self.hot_tier.get_with_coherence(doc_id) {
+            match self.canonical_vector_state(
+                doc_id,
+                &embedding,
+                coherence,
+                "cache-aware embedding hot-tier hit",
+            ) {
+                CanonicalVectorState::Match => return Some(embedding),
+                CanonicalVectorState::TokenMismatch | CanonicalVectorState::LocalCorruption => {
+                    self.discard_stale_hot_mirror(doc_id, "cache-aware embedding hot-tier hit");
+                }
+                CanonicalVectorState::Missing => {}
+            }
         }
         self.cold_tier.fetch_document(doc_id)
     }
 
     /// Get document metadata by ID
     ///
-    /// Checks hot tier first, then cold tier.
+    /// Returns canonical cold-tier metadata only. Mirror-only drift is ignored
+    /// rather than exposed as a real document.
     ///
     /// # Parameters
     /// - `doc_id`: Document identifier
@@ -714,20 +804,40 @@ impl TieredEngine {
     /// - `Some(metadata)` if found
     /// - `None` if not found
     pub fn get_metadata(&self, doc_id: u64) -> Option<std::collections::HashMap<String, String>> {
-        if let Some(metadata) = self.hot_tier.get_metadata(doc_id) {
+        if let Some(metadata) = self.cold_tier.fetch_metadata(doc_id) {
             return Some(metadata);
         }
-        self.cold_tier.fetch_metadata(doc_id)
+        if self.hot_tier.exists(doc_id) {
+            warn!(
+                doc_id,
+                "ignoring hot-tier metadata because cold tier has no canonical record"
+            );
+        }
+        None
     }
 
-    /// Lightweight existence probe that avoids cloning embeddings
+    /// Lightweight existence probe for canonical documents.
     pub fn exists(&self, doc_id: u64) -> bool {
-        self.hot_tier.exists(doc_id) || self.cold_tier.exists(doc_id)
+        let exists = self.cold_tier.current_coherence_token(doc_id).is_some();
+        if !exists && self.hot_tier.exists(doc_id) {
+            warn!(
+                doc_id,
+                "ignoring hot-tier mirror for existence check because no canonical cold-tier record exists"
+            );
+        }
+        exists
     }
 
-    /// Update document metadata without changing embedding
+    /// Update document metadata without changing embedding.
     ///
-    /// Checks hot tier first, then cold tier. Updates are logged to WAL (in cold tier).
+    /// The cold tier is canonical for metadata durability. Successful updates are
+    /// written there first, then mirrored into the hot tier if the document
+    /// currently has a resident recent-write copy.
+    ///
+    /// Query-cache entries for filtered searches cannot be invalidated precisely on
+    /// metadata changes: a document can become newly eligible for a cached filter
+    /// scope without appearing in the old result set. Successful metadata updates
+    /// therefore conservatively clear L1b.
     ///
     /// # Parameters
     /// - `doc_id`: Document ID to update
@@ -743,21 +853,38 @@ impl TieredEngine {
         metadata: std::collections::HashMap<String, String>,
         merge: bool,
     ) -> Result<bool> {
-        // Try hot tier first
-        if self
-            .hot_tier
-            .update_metadata(doc_id, metadata.clone(), merge)
-        {
-            return Ok(true);
+        let existed = self
+            .cold_tier
+            .update_metadata(doc_id, metadata.clone(), merge)?;
+
+        if !existed {
+            if self.hot_tier.exists(doc_id) {
+                warn!(
+                    doc_id,
+                    "metadata update found document in hot tier but not cold tier; refusing hot-only mutation"
+                );
+            }
+            return Ok(false);
         }
 
-        // Fallback to cold tier (with WAL logging)
-        self.cold_tier.update_metadata(doc_id, metadata, merge)
+        let mirrored = self.hot_tier.update_metadata(doc_id, metadata, merge);
+        if mirrored {
+            trace!(doc_id, "mirrored metadata update into hot tier");
+        }
+
+        // Filtered query-cache entries can become stale both when a document stops
+        // matching a filter and when it starts matching one. The latter case cannot
+        // be invalidated precisely from doc_id-only reverse indexes.
+        self.query_cache.clear();
+
+        Ok(true)
     }
 
     /// Delete document by ID
     ///
-    /// Removes from both hot and cold tiers.
+    /// Deletes the canonical cold-tier record first, then removes any hot-tier
+    /// mirror entry. This prevents the mirror from being dropped before the durable
+    /// delete succeeds.
     ///
     /// # Returns
     /// - `Ok(true)` if document was found and deleted in at least one tier
@@ -768,11 +895,19 @@ impl TieredEngine {
     /// - L1b (query cache) entries referencing the document are removed via reverse index lookup
     ///   (`doc_id -> cached query keys`) to avoid full-cache scans on deletes.
     pub fn delete(&self, doc_id: u64) -> Result<bool> {
-        // Delete from hot tier
+        let cold_deleted = self.cold_tier.delete(doc_id)?;
         let hot_deleted = self.hot_tier.delete(doc_id);
 
-        // Delete from cold tier (WAL + Soft Delete)
-        let cold_deleted = self.cold_tier.delete(doc_id)?;
+        if hot_deleted && !cold_deleted {
+            warn!(
+                doc_id,
+                "deleted hot-tier mirror entry without matching canonical cold-tier record"
+            );
+        }
+
+        if !cold_deleted && !hot_deleted {
+            return Ok(false);
+        }
 
         // Invalidate document cache entries (L1a)
         self.cache_strategy.invalidate(doc_id);
@@ -786,7 +921,7 @@ impl TieredEngine {
             );
         }
 
-        Ok(hot_deleted || cold_deleted)
+        Ok(true)
     }
 
     /// Bulk query documents by ID
@@ -819,11 +954,35 @@ impl TieredEngine {
         let mut results = vec![None; doc_ids.len()];
         let mut missing_indices = Vec::new();
 
-        // 1. Try Hot Tier (batch)
-        let hot_results = self.hot_tier.bulk_fetch(doc_ids);
+        // 1. Try Hot Tier embeddings, but always pair them with canonical cold-tier metadata.
+        let hot_results = self.hot_tier.bulk_fetch_with_coherence(doc_ids);
         for (i, res) in hot_results.into_iter().enumerate() {
-            if let Some(doc) = res {
-                results[i] = Some((doc.0, doc.1, PointQueryTier::HotTier));
+            let doc_id = doc_ids[i];
+            if let Some((embedding, _hot_metadata, coherence)) = res {
+                match self.canonical_vector_state(
+                    doc_id,
+                    &embedding,
+                    coherence,
+                    "bulk query hot-tier hit",
+                ) {
+                    CanonicalVectorState::Match => {
+                        if let Some(canonical_metadata) = self.cold_tier.fetch_metadata(doc_id) {
+                            results[i] =
+                                Some((embedding, canonical_metadata, PointQueryTier::HotTier));
+                        } else {
+                            warn!(
+                                doc_id,
+                                "bulk query found canonical vector without canonical metadata; falling back to cold tier"
+                            );
+                            missing_indices.push(i);
+                        }
+                    }
+                    CanonicalVectorState::TokenMismatch | CanonicalVectorState::LocalCorruption => {
+                        self.discard_stale_hot_mirror(doc_id, "bulk query hot-tier hit");
+                        missing_indices.push(i);
+                    }
+                    CanonicalVectorState::Missing => missing_indices.push(i),
+                }
             } else {
                 missing_indices.push(i);
             }
@@ -872,11 +1031,21 @@ impl TieredEngine {
             .filter(|&&id| self.hot_tier.exists(id) || self.cold_tier.exists(id))
             .count() as u64;
 
-        // Delete from hot tier (efficient batch)
-        self.hot_tier.batch_delete(&unique_doc_ids);
+        if unique_deleted == 0 {
+            return Ok(0);
+        }
 
         // Delete from cold tier (efficient batch with WAL logging)
-        self.cold_tier.batch_delete(&unique_doc_ids)?;
+        let cold_deleted = self.cold_tier.batch_delete(&unique_doc_ids)?;
+        let hot_deleted = self.hot_tier.batch_delete(&unique_doc_ids);
+
+        if hot_deleted as u64 > cold_deleted {
+            warn!(
+                hot_deleted,
+                cold_deleted,
+                "batch delete removed hot-tier mirror entries without matching canonical cold-tier records"
+            );
+        }
 
         // Invalidate caches
         for &id in &unique_doc_ids {
@@ -1009,10 +1178,17 @@ impl TieredEngine {
         let cache_generation = cacheable.then(|| self.query_cache.invalidation_generation());
         if cacheable {
             if let Some(cached) = self.query_cache.get_scoped(query_cache_scope, query, k) {
+                let (cached, pruned_noncanonical) =
+                    self.filter_search_results_to_canonical(cached, "query-cache hit");
+                if !pruned_noncanonical {
+                    let mut stats = self.stats.write();
+                    stats.query_cache_hits += 1;
+                    stats.total_queries += 1;
+                    return Ok((cached, SearchExecutionPath::CacheHit));
+                }
+
                 let mut stats = self.stats.write();
-                stats.query_cache_hits += 1;
-                stats.total_queries += 1;
-                return Ok((cached, SearchExecutionPath::CacheHit));
+                stats.query_cache_misses += 1;
             } else {
                 let mut stats = self.stats.write();
                 stats.query_cache_misses += 1;
@@ -1023,7 +1199,8 @@ impl TieredEngine {
 
         // Step 1: Search Layer 2 (Hot Tier) - recent writes
         // Over-fetch by 2× to ensure good candidates after merging
-        let hot_results = self.hot_tier.knn_search(query, k * 2);
+        let hot_results =
+            self.filter_hot_knn_results_to_canonical(self.hot_tier.knn_search(query, k * 2));
 
         debug!(
             "Hot tier search returned {} results (requested {})",
@@ -1189,8 +1366,15 @@ impl TieredEngine {
                     self.query_cache
                         .get_scoped(query_cache_scope, query.as_ref(), k)
                 {
-                    cached_results[i] = Some(cached);
-                    cache_hits += 1;
+                    let (cached, pruned_noncanonical) =
+                        self.filter_search_results_to_canonical(cached, "batch query-cache hit");
+                    if pruned_noncanonical {
+                        cache_misses += 1;
+                        miss_indices.push(i);
+                    } else {
+                        cached_results[i] = Some(cached);
+                        cache_hits += 1;
+                    }
                 } else {
                     cache_misses += 1;
                     miss_indices.push(i);
@@ -1232,7 +1416,9 @@ impl TieredEngine {
 
         let hot_results: Vec<Vec<(u64, f32)>> = miss_queries
             .iter()
-            .map(|query| self.hot_tier.knn_search(query, k * 2))
+            .map(|query| {
+                self.filter_hot_knn_results_to_canonical(self.hot_tier.knn_search(query, k * 2))
+            })
             .collect();
 
         {
@@ -1319,9 +1505,10 @@ impl TieredEngine {
     /// - `k`: Number of final results to return
     ///
     /// # Deduplication Policy
-    /// If same doc_id appears in both hot and cold tier:
-    /// - Prefer hot tier version (more recent, potentially updated)
-    /// - Use hot tier distance (computed with current data)
+    /// If the same doc_id appears in both hot and cold tier:
+    /// - Prefer the hot-tier distance only after coherence checks prove the
+    ///   mirror still matches canonical cold-tier state
+    /// - Otherwise keep the cold-tier candidate
     ///
     /// # Complexity
     /// O(n log n) where n = hot_results.len() + cold_results.len()
@@ -1361,6 +1548,175 @@ impl TieredEngine {
         final_results.truncate(k);
 
         final_results
+    }
+
+    fn filter_hot_knn_results_to_canonical(&self, hot_results: Vec<(u64, f32)>) -> Vec<(u64, f32)> {
+        hot_results
+            .into_iter()
+            .filter_map(|(doc_id, distance)| {
+                let Some((hot_embedding, hot_coherence)) =
+                    self.hot_tier.peek_with_coherence(doc_id)
+                else {
+                    warn!(
+                        doc_id,
+                        "ignoring hot-tier k-NN candidate because mirror coherence is unavailable"
+                    );
+                    return None;
+                };
+                match self.canonical_vector_state(
+                    doc_id,
+                    &hot_embedding,
+                    hot_coherence,
+                    "hot-tier k-NN candidate",
+                ) {
+                    CanonicalVectorState::Match => Some((doc_id, distance)),
+                    CanonicalVectorState::TokenMismatch | CanonicalVectorState::LocalCorruption => {
+                        self.discard_stale_hot_mirror(doc_id, "hot-tier k-NN candidate");
+                        None
+                    }
+                    CanonicalVectorState::Missing => None,
+                }
+            })
+            .collect()
+    }
+
+    fn filter_search_results_to_canonical(
+        &self,
+        results: Vec<SearchResult>,
+        source: &'static str,
+    ) -> (Vec<SearchResult>, bool) {
+        let mut filtered = Vec::with_capacity(results.len());
+        let mut pruned = false;
+
+        for result in results {
+            if self.cold_tier.exists(result.doc_id) {
+                filtered.push(result);
+            } else {
+                warn!(
+                    doc_id = result.doc_id,
+                    source, "ignoring cached search result without canonical cold-tier record"
+                );
+                self.query_cache.invalidate_doc(result.doc_id);
+                pruned = true;
+            }
+        }
+
+        (filtered, pruned)
+    }
+
+    fn canonical_vector_state(
+        &self,
+        doc_id: u64,
+        mirrored_embedding: &[f32],
+        mirrored_coherence: VectorCoherenceToken,
+        source: &'static str,
+    ) -> CanonicalVectorState {
+        match self.cold_tier.current_coherence_token(doc_id) {
+            Some(canonical_coherence) if canonical_coherence != mirrored_coherence => {
+                warn!(
+                    doc_id,
+                    source,
+                    mirrored_version = mirrored_coherence.version,
+                    mirrored_digest_hi = mirrored_coherence.digest.hi,
+                    mirrored_digest_lo = mirrored_coherence.digest.lo,
+                    canonical_version = canonical_coherence.version,
+                    canonical_digest_hi = canonical_coherence.digest.hi,
+                    canonical_digest_lo = canonical_coherence.digest.lo,
+                    "rejecting non-canonical vector coherence token"
+                );
+                CanonicalVectorState::TokenMismatch
+            }
+            Some(_) if !embedding_matches_token(mirrored_embedding, mirrored_coherence) => {
+                warn!(
+                    doc_id,
+                    source,
+                    mirrored_version = mirrored_coherence.version,
+                    mirrored_digest_hi = mirrored_coherence.digest.hi,
+                    mirrored_digest_lo = mirrored_coherence.digest.lo,
+                    "rejecting mirrored vector payload that does not match its coherence token"
+                );
+                CanonicalVectorState::LocalCorruption
+            }
+            Some(_) => CanonicalVectorState::Match,
+            None => {
+                warn!(
+                    doc_id,
+                    source,
+                    mirrored_version = mirrored_coherence.version,
+                    mirrored_digest_hi = mirrored_coherence.digest.hi,
+                    mirrored_digest_lo = mirrored_coherence.digest.lo,
+                    "rejecting vector without canonical cold-tier record"
+                );
+                CanonicalVectorState::Missing
+            }
+        }
+    }
+
+    fn audit_hot_tier_coherence_if_due(&self, source: &'static str) {
+        if self.hot_tier.is_empty() {
+            *self.last_hot_tier_coherence_audit.write() = Instant::now();
+            return;
+        }
+
+        if self.last_hot_tier_coherence_audit.read().elapsed() < self.config.flush_interval {
+            return;
+        }
+
+        let removed = self.audit_hot_tier_coherence(source);
+        if removed > 0 {
+            warn!(
+                source,
+                removed, "hot-tier coherence audit scrubbed non-canonical mirror entries"
+            );
+        }
+    }
+
+    fn audit_hot_tier_coherence(&self, source: &'static str) -> usize {
+        let snapshot = self.hot_tier.snapshot_doc_ids();
+        let mut stale_doc_ids = Vec::new();
+
+        for doc_id in snapshot {
+            let Some((embedding, coherence)) = self.hot_tier.peek_with_coherence(doc_id) else {
+                continue;
+            };
+            match self.canonical_vector_state(doc_id, &embedding, coherence, source) {
+                CanonicalVectorState::Match => {}
+                CanonicalVectorState::TokenMismatch
+                | CanonicalVectorState::LocalCorruption
+                | CanonicalVectorState::Missing => stale_doc_ids.push(doc_id),
+            }
+        }
+
+        if !stale_doc_ids.is_empty() {
+            for doc_id in &stale_doc_ids {
+                self.hot_tier.delete(*doc_id);
+                self.cache_strategy.invalidate(*doc_id);
+            }
+            self.query_cache.clear();
+            debug!(
+                source,
+                stale_doc_ids = ?stale_doc_ids,
+                "coherence audit removed stale hot-tier mirrors and cleared query cache"
+            );
+        }
+
+        *self.last_hot_tier_coherence_audit.write() = Instant::now();
+        stale_doc_ids.len()
+    }
+
+    fn discard_stale_hot_mirror(&self, doc_id: u64, source: &'static str) {
+        let removed_hot = self.hot_tier.delete(doc_id);
+        self.cache_strategy.invalidate(doc_id);
+        self.query_cache.clear();
+        debug!(
+            doc_id,
+            source, removed_hot, "discarded stale hot-tier mirror and cleared query cache"
+        );
+    }
+
+    fn invalidate_stale_cache_entry(&self, doc_id: u64, source: &'static str) {
+        self.cache_strategy.invalidate(doc_id);
+        debug!(doc_id, source, "discarded stale L1a cache entry");
     }
 
     /// k-NN search with per-layer timeouts and graceful degradation
@@ -1468,14 +1824,21 @@ impl TieredEngine {
                 self.query_cache
                     .get_scoped(query_cache_scope, normalized_query.as_ref(), k)
             {
-                {
-                    let mut stats = self.stats.write();
-                    stats.query_cache_hits += 1;
-                    stats.total_queries += 1;
+                let (cached, pruned_noncanonical) =
+                    self.filter_search_results_to_canonical(cached, "timed query-cache hit");
+                if !pruned_noncanonical {
+                    {
+                        let mut stats = self.stats.write();
+                        stats.query_cache_hits += 1;
+                        stats.total_queries += 1;
+                    }
+                    drop(query_permit);
+                    self.refresh_queue_depth_metric();
+                    return Ok((cached, SearchExecutionPath::CacheHit));
                 }
-                drop(query_permit);
-                self.refresh_queue_depth_metric();
-                return Ok((cached, SearchExecutionPath::CacheHit));
+
+                let mut stats = self.stats.write();
+                stats.query_cache_misses += 1;
             } else {
                 let mut stats = self.stats.write();
                 stats.query_cache_misses += 1;
@@ -1524,7 +1887,7 @@ impl TieredEngine {
                     .await
                     {
                         Ok(Ok(hot)) => {
-                            hot_results = hot;
+                            hot_results = self.filter_hot_knn_results_to_canonical(hot);
                             self.hot_tier_circuit_breaker.record_success();
                         }
                         Ok(Err(e)) => {
@@ -1735,8 +2098,9 @@ impl TieredEngine {
     ///
     /// # Write Flow
     /// 1. Persist to cold tier (WAL + HNSW) before ACK
-    /// 2. Add to hot tier for recent-write acceleration
-    /// 3. Background flush reconciles any hot-only state
+    /// 2. Invalidate affected query-cache entries
+    /// 3. Mirror the recent write into hot tier for acceleration
+    /// 4. Background drain later evicts the hot-tier copy and repairs unexpected drift
     ///
     /// # Emergency Eviction
     /// If hot tier exceeds hard limit (2x soft limit), triggers emergency flush
@@ -1805,7 +2169,12 @@ impl TieredEngine {
         );
 
         // Keep recent writes in hot tier to accelerate mixed hot/cold search merges.
-        self.hot_tier.insert(doc_id, embedding, metadata);
+        let coherence = self
+            .cold_tier
+            .current_coherence_token(doc_id)
+            .ok_or_else(|| anyhow!("insert succeeded but cold tier has no canonical token"))?;
+        self.hot_tier
+            .insert_with_coherence(doc_id, embedding, metadata, coherence);
 
         let mut stats = self.stats.write();
         stats.total_inserts += 1;
@@ -1827,71 +2196,117 @@ impl TieredEngine {
 
         info!(
             documents = count,
-            "emergency flush: force-flushing all hot tier documents"
+            "emergency hot-tier drain: evicting all mirror entries"
         );
 
-        // Track failed documents for re-insertion
+        let (success_count, should_clear_query_cache) =
+            self.reconcile_drained_hot_tier_documents(documents, "emergency")?;
+
+        if should_clear_query_cache {
+            self.query_cache.clear();
+        }
+
+        Ok(success_count)
+    }
+
+    fn reconcile_drained_hot_tier_documents(
+        &self,
+        documents: Vec<HotTierMirrorDocument>,
+        drain_kind: &'static str,
+    ) -> Result<(usize, bool)> {
         let mut failed_documents = Vec::new();
         let mut success_count = 0;
+        let mut should_clear_query_cache = false;
 
-        // Reconcile hot-tier state into cold tier (only when metadata diverges or doc missing).
-        for (doc_id, embedding, metadata) in documents {
-            let needs_sync = match self.cold_tier.fetch_metadata(doc_id) {
-                Some(existing) => existing != metadata,
-                None => true,
-            };
+        for (doc_id, embedding, metadata, mirror_coherence) in documents {
+            let cold_embedding = self.cold_tier.fetch_document_with_coherence(doc_id);
+            let cold_metadata = self.cold_tier.fetch_metadata(doc_id);
 
-            if needs_sync {
-                match self
-                    .cold_tier
-                    .insert(doc_id, embedding.clone(), metadata.clone())
-                {
-                    Ok(()) => {
-                        success_count += 1;
-                    }
-                    Err(e) => {
-                        error!(
+            match (cold_embedding.as_ref(), cold_metadata.as_ref()) {
+                (Some((canonical_embedding, canonical_coherence)), Some(canonical_metadata)) => {
+                    let token_diverged = *canonical_coherence != mirror_coherence;
+                    let embedding_diverged = canonical_embedding != &embedding;
+                    let metadata_diverged = canonical_metadata != &metadata;
+
+                    if token_diverged || embedding_diverged || metadata_diverged {
+                        warn!(
                             doc_id,
-                            error = %e,
-                            "failed to flush document to cold tier during emergency flush"
+                            drain_kind,
+                            mirror_version = mirror_coherence.version,
+                            mirror_digest_hi = mirror_coherence.digest.hi,
+                            mirror_digest_lo = mirror_coherence.digest.lo,
+                            canonical_version = canonical_coherence.version,
+                            canonical_digest_hi = canonical_coherence.digest.hi,
+                            canonical_digest_lo = canonical_coherence.digest.lo,
+                            token_diverged,
+                            embedding_diverged,
+                            metadata_diverged,
+                            "hot-tier drain found mirror divergence; keeping cold tier authoritative"
                         );
-                        failed_documents.push((doc_id, embedding, metadata));
+
+                        if embedding_diverged {
+                            self.cache_strategy.invalidate(doc_id);
+                        }
+                        should_clear_query_cache = true;
+                    }
+
+                    success_count += 1;
+                }
+                (None, None) | (Some(_), None) | (None, Some(_)) => {
+                    warn!(
+                        doc_id,
+                        drain_kind,
+                        cold_has_embedding = cold_embedding.is_some(),
+                        cold_has_metadata = cold_metadata.is_some(),
+                        "hot-tier drain found missing or partial canonical state; attempting repair from mirror"
+                    );
+
+                    match self
+                        .cold_tier
+                        .insert(doc_id, embedding.clone(), metadata.clone())
+                    {
+                        Ok(()) => {
+                            success_count += 1;
+                            should_clear_query_cache = true;
+                        }
+                        Err(e) => {
+                            error!(
+                                doc_id,
+                                drain_kind,
+                                error = %e,
+                                "failed to repair canonical cold-tier state from hot-tier mirror"
+                            );
+                            failed_documents.push((doc_id, embedding, metadata, mirror_coherence));
+                        }
                     }
                 }
-            } else {
-                success_count += 1;
             }
         }
 
-        // Re-insert failed documents back into hot tier
         if !failed_documents.is_empty() {
             let fail_count = failed_documents.len();
-            error!(
+            warn!(
+                drain_kind,
                 failed = fail_count,
                 succeeded = success_count,
-                "emergency flush partial failure"
+                "hot-tier drain had repair failures; re-inserting failed mirror entries"
             );
 
             self.hot_tier.reinsert_failed_documents(failed_documents);
 
-            // Update failure metric
             let mut stats = self.stats.write();
             stats.hot_tier_flush_failures += 1;
 
             if success_count == 0 {
                 anyhow::bail!(
-                    "emergency flush completely failed: all {} documents remain in hot tier",
+                    "{} hot-tier drain completely failed: all {} documents remain in hot tier",
+                    drain_kind,
                     fail_count
                 );
             }
         }
 
-        // Emergency flush moved documents to cold tier; clear L1b query cache.
-        if success_count > 0 {
-            self.query_cache.clear();
-        }
-
-        Ok(success_count)
+        Ok((success_count, should_clear_query_cache))
     }
 
     /// Bulk load documents directly into cold tier (HNSW index).
@@ -1966,10 +2381,14 @@ impl TieredEngine {
         self.query_cache.clear();
     }
 
-    /// Flush hot tier to cold tier (manual trigger)
+    /// Drain the hot tier mirror (manual trigger)
     ///
-    /// This is called periodically by background task,
-    /// or can be called manually for testing/shutdown.
+    /// This is called periodically by the background maintenance task, or can be
+    /// called manually for testing/shutdown. Documents are already durable before
+    /// they enter the hot tier; this operation bounds memory and reconciles any
+    /// unexpected hot/cold drift before evicting the mirror entries. Existing
+    /// cold-tier records remain authoritative; the mirror is only used to repair
+    /// missing or partially missing canonical state.
     ///
     /// # Error Handling
     /// - On partial failure: re-inserts failed documents back into hot tier
@@ -1987,80 +2406,24 @@ impl TieredEngine {
             return Ok(0);
         }
 
-        // Track failed documents for re-insertion
-        let mut failed_documents = Vec::new();
-        let mut success_count = 0;
+        let (success_count, should_clear_query_cache) =
+            self.reconcile_drained_hot_tier_documents(documents, "manual")?;
 
-        // Reconcile hot-tier state into cold tier (only when metadata diverges or doc missing).
-        for (doc_id, embedding, metadata) in documents {
-            let needs_sync = match self.cold_tier.fetch_metadata(doc_id) {
-                Some(existing) => existing != metadata,
-                None => true,
-            };
-
-            if needs_sync {
-                match self
-                    .cold_tier
-                    .insert(doc_id, embedding.clone(), metadata.clone())
-                {
-                    Ok(()) => {
-                        success_count += 1;
-                    }
-                    Err(e) => {
-                        error!(
-                            doc_id,
-                            error = %e,
-                            "failed to flush document to cold tier; will re-insert to hot tier"
-                        );
-                        failed_documents.push((doc_id, embedding, metadata));
-                    }
-                }
-            } else {
-                success_count += 1;
-            }
-        }
-
-        // Re-insert failed documents back into hot tier to prevent data loss
-        if !failed_documents.is_empty() {
-            let fail_count = failed_documents.len();
-            warn!(
-                failed = fail_count,
-                succeeded = success_count,
-                "partial flush failure; re-inserting failed documents to hot tier"
-            );
-
-            self.hot_tier.reinsert_failed_documents(failed_documents);
-
-            // Update failure metric
-            let mut stats = self.stats.write();
-            stats.hot_tier_flush_failures += 1;
-
-            if success_count == 0 {
-                // Complete failure - return error
-                anyhow::bail!(
-                    "flush completely failed: all {} documents re-inserted to hot tier",
-                    fail_count
-                );
-            }
-            // Partial success - return success count but log warning (already done above)
-        }
-
-        // Flush moved documents from hot tier to cold tier, which changes k-NN result
-        // sets for cold-tier searches. Clear L1b to prevent serving stale cached results.
-        if success_count > 0 {
+        if should_clear_query_cache {
             self.query_cache.clear();
         }
 
         Ok(success_count)
     }
 
-    /// Spawn background flush task
+    /// Spawn background hot-tier drain task.
     ///
-    /// Periodically checks if hot tier needs flushing and flushes to cold tier.
+    /// Periodically checks if the hot tier should be drained and evicts mirror
+    /// entries once they age out or exceed size thresholds.
     ///
     /// # Graceful Shutdown
     /// Accepts a broadcast receiver for shutdown signal. When shutdown is signaled,
-    /// performs a final flush (if needed) and stops gracefully.
+    /// forces a final drain/reconciliation before stopping gracefully.
     pub fn spawn_flush_task(
         self: Arc<Self>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
@@ -2073,13 +2436,14 @@ impl TieredEngine {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        self.audit_hot_tier_coherence_if_due("background hot-tier coherence audit");
                         if self.hot_tier.needs_flush() {
                             match self.flush_hot_tier(false) {
                                 Ok(count) => {
                                     if count > 0 {
                                         info!(
                                             count,
-                                            "Background flush: documents moved to cold tier"
+                                            "Background hot-tier drain completed"
                                         );
                                     }
                                 }
@@ -2090,20 +2454,20 @@ impl TieredEngine {
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        info!("Flush task received shutdown signal, performing final flush");
+                        info!("Flush task received shutdown signal, performing final hot-tier drain");
 
-                        // Final flush before shutdown
-                        if self.hot_tier.needs_flush() {
-                            match self.flush_hot_tier(true) {
-                                Ok(count) => {
-                                    info!(
-                                        count,
-                                        "Final flush: documents moved to cold tier before shutdown"
-                                    );
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "Final flush failed during shutdown");
-                                }
+                        // Final forced drain before shutdown. This must run even
+                        // when age/size thresholds have not been reached yet so
+                        // fresh mirror entries still get reconciled.
+                        match self.flush_hot_tier(true) {
+                            Ok(count) => {
+                                info!(
+                                    count,
+                                    "Final hot-tier drain completed before shutdown"
+                                );
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Final hot-tier drain failed during shutdown");
                             }
                         }
 
@@ -2501,18 +2865,403 @@ mod tests {
             )
             .unwrap();
 
+        // Inserts are durable before the hot-tier mirror is drained.
+        assert!(engine.cold_tier().fetch_document(10).is_some());
+        assert!(engine.cold_tier().fetch_document(11).is_some());
         assert!(engine.hot_tier().needs_flush());
 
-        // Manual flush
+        // Manual drain of the hot-tier mirror.
         let flushed = engine.flush_hot_tier(false).unwrap();
         assert_eq!(flushed, 2);
 
         // Hot tier should be empty
         assert_eq!(engine.hot_tier().len(), 0);
 
-        // Documents should be in cold tier
+        // Documents must remain in the canonical cold tier.
         assert!(engine.cold_tier().fetch_document(10).is_some());
         assert!(engine.cold_tier().fetch_document(11).is_some());
+    }
+
+    #[test]
+    fn test_flush_hot_tier_keeps_cold_tier_authoritative_on_divergence() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        let cache = LruCacheStrategy::new(16);
+        let query_cache = Arc::new(QueryHashCache::new(32, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            Arc::clone(&query_cache),
+            vec![normalize(vec![1.0, 0.0])],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hot_tier_max_size: 8,
+                hnsw_max_elements: 32,
+                embedding_dimension: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let canonical_embedding = normalize(vec![0.0, 1.0]);
+        let mut canonical_metadata = std::collections::HashMap::new();
+        canonical_metadata.insert("state".to_string(), "canonical".to_string());
+        engine
+            .insert(10, canonical_embedding.clone(), canonical_metadata.clone())
+            .unwrap();
+
+        let divergent_embedding = normalize(vec![1.0, 1.0]);
+        let mut divergent_metadata = std::collections::HashMap::new();
+        divergent_metadata.insert("state".to_string(), "hot-only".to_string());
+        engine
+            .hot_tier
+            .insert(10, divergent_embedding, divergent_metadata);
+
+        let scope = 91;
+        let query = normalize(vec![0.0, 1.0]);
+        query_cache.insert_with_k_scoped(
+            scope,
+            query.clone(),
+            vec![SearchResult {
+                doc_id: 10,
+                distance: 0.0,
+            }],
+            1,
+        );
+        assert!(
+            query_cache.get_scoped(scope, &query, 1).is_some(),
+            "test setup should populate the query cache"
+        );
+
+        let flushed = engine.flush_hot_tier(true).unwrap();
+        assert_eq!(flushed, 1, "flush should evict the divergent mirror entry");
+        assert_eq!(engine.hot_tier().len(), 0, "hot tier should be drained");
+        assert_eq!(
+            engine.cold_tier.fetch_document(10).as_ref(),
+            Some(&canonical_embedding),
+            "flush must not let the mirror overwrite canonical cold-tier embeddings"
+        );
+        assert_eq!(
+            engine.cold_tier.fetch_metadata(10).as_ref(),
+            Some(&canonical_metadata),
+            "flush must not let the mirror overwrite canonical cold-tier metadata"
+        );
+        assert!(
+            query_cache.get_scoped(scope, &query, 1).is_none(),
+            "detected divergence should clear L1b because cached search results may be stale"
+        );
+    }
+
+    #[test]
+    fn test_flush_hot_tier_repairs_missing_cold_record_from_mirror() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            Arc::clone(&query_cache),
+            vec![vec![1.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hot_tier_max_size: 4,
+                hnsw_max_elements: 16,
+                embedding_dimension: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("state".to_string(), "repaired".to_string());
+        engine.hot_tier.insert(77, vec![2.0], metadata.clone());
+        assert!(
+            engine.cold_tier.fetch_document(77).is_none(),
+            "test setup requires a missing canonical cold-tier record"
+        );
+
+        let scope = 12;
+        let query = vec![2.0];
+        query_cache.insert_with_k_scoped(
+            scope,
+            query.clone(),
+            vec![SearchResult {
+                doc_id: 77,
+                distance: 0.0,
+            }],
+            1,
+        );
+
+        let flushed = engine.flush_hot_tier(true).unwrap();
+        assert_eq!(
+            flushed, 1,
+            "flush should repair and evict the orphaned mirror"
+        );
+        assert_eq!(
+            engine.cold_tier.fetch_document(77).as_deref(),
+            Some(&[1.0][..]),
+            "flush repair should preserve the mirror document through canonical normalization"
+        );
+        assert_eq!(
+            engine.cold_tier.fetch_metadata(77).as_ref(),
+            Some(&metadata),
+            "repaired cold-tier record should preserve mirrored metadata"
+        );
+        assert!(
+            query_cache.get_scoped(scope, &query, 1).is_none(),
+            "repairing canonical state should invalidate L1b"
+        );
+    }
+
+    #[test]
+    fn test_update_metadata_uses_cold_tier_as_source_of_truth_for_hot_docs() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        let dir = TempDir::new().unwrap();
+        let cache = LruCacheStrategy::new(16);
+        let query_cache = Arc::new(QueryHashCache::new(32, 0.85));
+        let config = TieredEngineConfig {
+            hot_tier_max_size: 8,
+            hnsw_max_elements: 32,
+            embedding_dimension: 2,
+            data_dir: Some(dir.path().to_string_lossy().to_string()),
+            fsync_policy: FsyncPolicy::Always,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![normalize(vec![1.0, 0.0])],
+            vec![std::collections::HashMap::new()],
+            config,
+        )
+        .unwrap();
+
+        let mut original = std::collections::HashMap::new();
+        original.insert("state".to_string(), "draft".to_string());
+        engine
+            .insert(10, normalize(vec![0.0, 1.0]), original.clone())
+            .unwrap();
+
+        assert_eq!(
+            engine.hot_tier.get_metadata(10).as_ref(),
+            Some(&original),
+            "hot tier should mirror original metadata"
+        );
+        assert_eq!(
+            engine.cold_tier.fetch_metadata(10).as_ref(),
+            Some(&original),
+            "cold tier should persist original metadata"
+        );
+
+        let mut updated = std::collections::HashMap::new();
+        updated.insert("state".to_string(), "published".to_string());
+        updated.insert("owner".to_string(), "kyro".to_string());
+
+        assert!(
+            engine.update_metadata(10, updated.clone(), false).unwrap(),
+            "metadata update should succeed for a resident hot-tier document"
+        );
+
+        assert_eq!(
+            engine.cold_tier.fetch_metadata(10).as_ref(),
+            Some(&updated),
+            "cold tier must remain canonical after metadata update"
+        );
+        assert_eq!(
+            engine.hot_tier.get_metadata(10).as_ref(),
+            Some(&updated),
+            "hot tier must mirror the canonical metadata after update"
+        );
+    }
+
+    #[test]
+    fn test_update_metadata_clears_query_cache() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        let cache = LruCacheStrategy::new(16);
+        let query_cache = Arc::new(QueryHashCache::new(32, 0.85));
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 32,
+            embedding_dimension: 2,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            Arc::clone(&query_cache),
+            vec![normalize(vec![1.0, 0.0]), normalize(vec![0.0, 1.0])],
+            vec![std::collections::HashMap::new(); 2],
+            config,
+        )
+        .unwrap();
+
+        let scope = 77;
+        let query = normalize(vec![1.0, 0.0]);
+        let (_results, path) = engine
+            .knn_search_with_ef_detailed_scoped(&query, 1, None, scope)
+            .expect("initial search should populate the scoped query cache");
+        assert_ne!(path, SearchExecutionPath::CacheHit);
+        assert!(
+            query_cache.get_scoped(scope, &query, 1).is_some(),
+            "scoped query cache should contain the freshly computed result"
+        );
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("category".to_string(), "updated".to_string());
+        assert!(
+            engine.update_metadata(0, metadata, false).unwrap(),
+            "metadata update should succeed"
+        );
+
+        assert!(
+            query_cache.get_scoped(scope, &query, 1).is_none(),
+            "metadata updates must clear L1b because filter membership can change"
+        );
+    }
+
+    #[test]
+    fn test_get_metadata_prefers_cold_tier_source_of_truth() {
+        fn normalize(mut v: Vec<f32>) -> Vec<f32> {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                v.iter_mut().for_each(|x| *x /= norm);
+            }
+            v
+        }
+
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 16,
+            embedding_dimension: 2,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![normalize(vec![1.0, 0.0])],
+            vec![std::collections::HashMap::new()],
+            config,
+        )
+        .unwrap();
+
+        let mut canonical = std::collections::HashMap::new();
+        canonical.insert("role".to_string(), "canonical".to_string());
+        engine
+            .insert(9, normalize(vec![0.0, 1.0]), canonical.clone())
+            .unwrap();
+
+        let mut divergent = std::collections::HashMap::new();
+        divergent.insert("role".to_string(), "hot-only".to_string());
+        assert!(
+            engine.hot_tier.update_metadata(9, divergent.clone(), false),
+            "hot tier should accept direct test-only mutation"
+        );
+        assert_eq!(
+            engine.hot_tier.get_metadata(9).as_ref(),
+            Some(&divergent),
+            "test setup must create divergent mirror metadata"
+        );
+
+        assert_eq!(
+            engine.get_metadata(9).as_ref(),
+            Some(&canonical),
+            "metadata reads must prefer canonical cold-tier state over divergent mirror metadata"
+        );
+    }
+
+    #[test]
+    fn test_delete_scrubs_hot_only_orphan_after_cold_delete_attempt() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 16,
+            embedding_dimension: 1,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0]],
+            vec![std::collections::HashMap::new()],
+            config,
+        )
+        .unwrap();
+
+        engine
+            .hot_tier
+            .insert(99, vec![2.0], std::collections::HashMap::new());
+        assert!(
+            engine.hot_tier.exists(99),
+            "test setup must create a hot-tier orphan"
+        );
+        assert!(
+            engine.cold_tier.fetch_document(99).is_none(),
+            "test setup requires no canonical cold-tier record"
+        );
+
+        assert!(
+            engine.delete(99).unwrap(),
+            "delete should scrub hot-tier orphans even when cold tier is missing the record"
+        );
+        assert!(
+            !engine.hot_tier.exists(99),
+            "hot-tier orphan should be removed during delete cleanup"
+        );
+    }
+
+    #[test]
+    fn test_batch_delete_scrubs_hot_only_orphans_after_cold_delete_attempt() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let config = TieredEngineConfig {
+            hnsw_max_elements: 16,
+            embedding_dimension: 1,
+            ..Default::default()
+        };
+
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0]],
+            vec![std::collections::HashMap::new()],
+            config,
+        )
+        .unwrap();
+
+        engine
+            .hot_tier
+            .insert(55, vec![5.0], std::collections::HashMap::new());
+        engine
+            .hot_tier
+            .insert(56, vec![6.0], std::collections::HashMap::new());
+
+        let deleted = engine.batch_delete(&[55, 56]).unwrap();
+        assert_eq!(
+            deleted, 2,
+            "batch delete should count scrubbed hot-tier orphans as removed entries"
+        );
+        assert!(!engine.hot_tier.exists(55));
+        assert!(!engine.hot_tier.exists(56));
     }
 
     #[test]
@@ -3186,6 +3935,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_shutdown_forces_final_hot_tier_reconciliation_for_fresh_mirrors() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = Arc::new(
+            TieredEngine::new(
+                Box::new(cache),
+                query_cache,
+                vec![vec![1.0]],
+                vec![std::collections::HashMap::new()],
+                TieredEngineConfig {
+                    hnsw_max_elements: 16,
+                    embedding_dimension: 1,
+                    flush_interval: Duration::from_secs(3600),
+                    hot_tier_max_age: Duration::from_secs(3600),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        engine
+            .hot_tier
+            .insert(99, vec![9.0], std::collections::HashMap::new());
+        assert!(
+            !engine.hot_tier.needs_flush(),
+            "test setup requires a fresh mirror entry below normal drain thresholds"
+        );
+        assert!(
+            !engine.cold_tier.exists(99),
+            "test setup requires the mirror entry to be hot-tier-only before shutdown"
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let handle = Arc::clone(&engine).spawn_flush_task(shutdown_rx);
+
+        shutdown_tx
+            .send(())
+            .expect("shutdown signal should be delivered to flush task");
+        handle
+            .await
+            .expect("flush task should stop cleanly after shutdown");
+
+        assert!(
+            engine.cold_tier.exists(99),
+            "shutdown must force final drain/reconciliation even for fresh mirror entries"
+        );
+        assert!(
+            !engine.hot_tier.exists(99),
+            "final shutdown drain should evict the repaired mirror entry"
+        );
+    }
+
+    #[tokio::test]
     async fn test_scoped_query_cache_isolation() {
         fn normalize(mut v: Vec<f32>) -> Vec<f32> {
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -3511,8 +4313,18 @@ mod tests {
 
         // Simulate failed flush scenario: documents that couldn't be flushed
         let failed_docs = vec![
-            (10, vec![10.0, 0.0], std::collections::HashMap::new()),
-            (11, vec![11.0, 0.0], std::collections::HashMap::new()),
+            (
+                10,
+                vec![10.0, 0.0],
+                std::collections::HashMap::new(),
+                VectorCoherenceToken::for_embedding(1, &[10.0, 0.0]),
+            ),
+            (
+                11,
+                vec![11.0, 0.0],
+                std::collections::HashMap::new(),
+                VectorCoherenceToken::for_embedding(1, &[11.0, 0.0]),
+            ),
         ];
 
         hot_tier.reinsert_failed_documents(failed_docs);
@@ -3523,5 +4335,509 @@ mod tests {
         assert!(hot_tier.get(2).is_some());
         assert!(hot_tier.get(10).is_some());
         assert!(hot_tier.get(11).is_some());
+    }
+
+    #[test]
+    fn test_point_queries_ignore_hot_only_orphans() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("state".to_string(), "orphan".to_string());
+        engine.hot_tier.insert(99, vec![9.0], metadata);
+        engine.cache_strategy.insert_cached(CachedVector {
+            doc_id: 99,
+            embedding: vec![9.0],
+            coherence: VectorCoherenceToken::new(1, crate::VectorIntegrityDigest::ZERO),
+            distance: 0.0,
+            cached_at: Instant::now(),
+        });
+
+        assert!(
+            engine.query_with_source(99, None).is_none(),
+            "point queries must not serve hot-only orphans"
+        );
+        assert!(
+            engine.cache_strategy.peek_cached(99).is_none(),
+            "query path should invalidate non-canonical L1a entries"
+        );
+        assert!(
+            engine.get_embedding_cache_aware(99).is_none(),
+            "cache-aware embedding fetch must not serve hot-only orphans"
+        );
+        assert!(
+            engine.get_metadata(99).is_none(),
+            "metadata reads must ignore hot-only orphans"
+        );
+        assert!(
+            !engine.exists(99),
+            "existence checks must reflect canonical cold-tier state only"
+        );
+        assert!(
+            engine.hot_tier.exists(99),
+            "orphan mirror is preserved for later reconciliation; reads just refuse to serve it"
+        );
+    }
+
+    #[test]
+    fn test_point_queries_refresh_stale_cached_version_from_cold_tier() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        engine
+            .insert(7, vec![7.0], std::collections::HashMap::new())
+            .unwrap();
+        engine
+            .flush_hot_tier(true)
+            .expect("test setup should evict hot-tier mirror");
+
+        engine.cache_strategy.insert_cached(CachedVector {
+            doc_id: 7,
+            embedding: vec![70.0],
+            coherence: VectorCoherenceToken::for_embedding(0, &[70.0]),
+            distance: 0.0,
+            cached_at: Instant::now(),
+        });
+
+        let canonical_coherence = engine
+            .cold_tier
+            .current_coherence_token(7)
+            .expect("canonical token must exist");
+        let canonical_embedding = engine
+            .cold_tier
+            .fetch_document(7)
+            .expect("canonical embedding must exist");
+
+        let (embedding, tier) = engine
+            .query_with_source(7, None)
+            .expect("point query should recover from stale cache entry");
+
+        assert_eq!(tier, PointQueryTier::ColdTier);
+        assert_eq!(
+            embedding, canonical_embedding,
+            "point query must fall back to canonical cold-tier embedding"
+        );
+
+        let refreshed = engine
+            .cache_strategy
+            .peek_cached(7)
+            .expect("cold-tier recovery should refresh L1a with canonical state");
+        assert_eq!(refreshed.coherence, canonical_coherence);
+        assert_eq!(refreshed.embedding, canonical_embedding);
+    }
+
+    #[test]
+    fn test_point_queries_scrub_stale_hot_version_mirror() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        engine
+            .insert(7, vec![0.0, 1.0], std::collections::HashMap::new())
+            .unwrap();
+        engine.hot_tier.insert_with_coherence(
+            7,
+            vec![1.0, 0.0],
+            std::collections::HashMap::new(),
+            VectorCoherenceToken::for_embedding(999, &[1.0, 0.0]),
+        );
+
+        let canonical_embedding = engine
+            .cold_tier
+            .fetch_document(7)
+            .expect("canonical embedding must exist");
+
+        let (embedding, tier) = engine
+            .query_with_source(7, None)
+            .expect("point query should recover from stale hot-tier mirror");
+
+        assert_eq!(
+            tier,
+            PointQueryTier::ColdTier,
+            "stale hot-tier mirrors must be bypassed in favor of canonical cold-tier state"
+        );
+        assert_eq!(embedding, canonical_embedding);
+        assert!(
+            !engine.hot_tier.exists(7),
+            "stale hot-tier mirrors should be scrubbed immediately after detection"
+        );
+    }
+
+    #[test]
+    fn test_bulk_query_uses_canonical_metadata_and_skips_hot_only_orphans() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0]],
+            vec![std::collections::HashMap::from([(
+                "state".to_string(),
+                "cold".to_string(),
+            )])],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut canonical_metadata = std::collections::HashMap::new();
+        canonical_metadata.insert("state".to_string(), "canonical".to_string());
+        engine
+            .insert(7, vec![7.0], canonical_metadata.clone())
+            .unwrap();
+
+        let mut divergent_metadata = std::collections::HashMap::new();
+        divergent_metadata.insert("state".to_string(), "hot-only".to_string());
+        assert!(
+            engine
+                .hot_tier
+                .update_metadata(7, divergent_metadata, false),
+            "test setup must create divergent hot-tier metadata"
+        );
+
+        let mut orphan_metadata = std::collections::HashMap::new();
+        orphan_metadata.insert("state".to_string(), "orphan".to_string());
+        engine.hot_tier.insert(77, vec![77.0], orphan_metadata);
+
+        let results = engine.bulk_query_with_source(&[7, 77], true);
+        assert_eq!(results.len(), 2);
+
+        let canonical = results[0]
+            .as_ref()
+            .expect("canonical hot-tier document should still be queryable");
+        assert_eq!(canonical.1, canonical_metadata);
+        assert_eq!(canonical.2, PointQueryTier::HotTier);
+
+        assert!(
+            results[1].is_none(),
+            "bulk query must not surface hot-only orphan documents"
+        );
+    }
+
+    #[test]
+    fn test_bulk_query_scrubs_stale_hot_version_mirrors() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let canonical_metadata =
+            std::collections::HashMap::from([("state".to_string(), "canonical".to_string())]);
+        engine
+            .insert(7, vec![7.0], canonical_metadata.clone())
+            .unwrap();
+        engine.hot_tier.insert_with_coherence(
+            7,
+            vec![70.0],
+            std::collections::HashMap::from([("state".to_string(), "stale".to_string())]),
+            VectorCoherenceToken::for_embedding(999, &[70.0]),
+        );
+
+        let results = engine.bulk_query_with_source(&[7], true);
+        let canonical = results[0]
+            .as_ref()
+            .expect("bulk query should recover from stale hot-tier mirror");
+        assert_eq!(canonical.2, PointQueryTier::ColdTier);
+        assert_eq!(canonical.1, canonical_metadata);
+        assert!(
+            !engine.hot_tier.exists(7),
+            "bulk query should scrub stale hot-tier mirrors after falling back to cold tier"
+        );
+    }
+
+    #[test]
+    fn test_knn_search_ignores_hot_only_orphan_candidates() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        engine
+            .insert(7, vec![0.0, 1.0], std::collections::HashMap::new())
+            .unwrap();
+        engine
+            .hot_tier
+            .insert(77, vec![0.99, 0.01], std::collections::HashMap::new());
+
+        let results = engine
+            .knn_search(&[1.0, 0.0], 1)
+            .expect("k-NN search should succeed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].doc_id, 0,
+            "hot-only orphan candidates must not displace canonical search results"
+        );
+    }
+
+    #[test]
+    fn test_knn_search_scrubs_stale_hot_version_candidates() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        engine
+            .insert(7, vec![0.0, 1.0], std::collections::HashMap::new())
+            .unwrap();
+        engine.hot_tier.insert_with_coherence(
+            7,
+            vec![1.0, 0.0],
+            std::collections::HashMap::new(),
+            VectorCoherenceToken::for_embedding(999, &[1.0, 0.0]),
+        );
+
+        let results = engine
+            .knn_search(&[0.0, 1.0], 1)
+            .expect("k-NN search should succeed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].doc_id, 7,
+            "k-NN search must ignore stale hot-tier distances and return canonical cold-tier ranking"
+        );
+        assert!(
+            !engine.hot_tier.exists(7),
+            "k-NN search should scrub stale hot-tier mirrors after detection"
+        );
+    }
+
+    #[test]
+    fn test_point_queries_scrub_hot_mirror_with_corrupted_payload() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            query_cache,
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        engine
+            .insert(7, vec![0.0, 1.0], std::collections::HashMap::new())
+            .unwrap();
+        let canonical = engine
+            .cold_tier
+            .current_coherence_token(7)
+            .expect("canonical token must exist");
+        engine.hot_tier.insert_with_coherence(
+            7,
+            vec![1.0, 0.0],
+            std::collections::HashMap::new(),
+            canonical,
+        );
+
+        let (embedding, tier) = engine
+            .query_with_source(7, None)
+            .expect("point query should recover from locally corrupted hot-tier payload");
+
+        assert_eq!(tier, PointQueryTier::ColdTier);
+        assert_eq!(embedding, vec![0.0, 1.0]);
+        assert!(
+            !engine.hot_tier.exists(7),
+            "local hot-tier payload corruption must scrub the mirror immediately"
+        );
+    }
+
+    #[test]
+    fn test_query_cache_hit_recomputes_when_cached_result_is_noncanonical() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            Arc::clone(&query_cache),
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let scope = 313;
+        let query = vec![1.0, 0.0];
+        query_cache.insert_with_k_scoped(
+            scope,
+            query.clone(),
+            vec![SearchResult {
+                doc_id: 77,
+                distance: 0.0,
+            }],
+            1,
+        );
+        engine
+            .hot_tier
+            .insert(77, vec![1.0, 0.0], std::collections::HashMap::new());
+
+        let (results, path) = engine
+            .knn_search_with_ef_detailed_scoped(&query, 1, None, scope)
+            .expect("search should recover from non-canonical cached results");
+
+        assert_ne!(
+            path,
+            SearchExecutionPath::CacheHit,
+            "non-canonical cached results must not be treated as valid query-cache hits"
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].doc_id, 0,
+            "search should recompute against canonical state after rejecting bad cache entries"
+        );
+        assert!(
+            query_cache.get_scoped(scope, &query, 1).is_none(),
+            "generation bump from invalidating bad cache entries should prevent same-request repopulation"
+        );
+
+        let (_second_results, second_path) = engine
+            .knn_search_with_ef_detailed_scoped(&query, 1, None, scope)
+            .expect("second search should repopulate the query cache");
+        assert_ne!(second_path, SearchExecutionPath::CacheHit);
+        assert!(
+            query_cache.get_scoped(scope, &query, 1).is_some(),
+            "subsequent search should repopulate the query cache with canonical results"
+        );
+    }
+
+    #[test]
+    fn test_background_coherence_audit_scrubs_corrupted_hot_mirror_and_query_cache() {
+        let cache = LruCacheStrategy::new(8);
+        let query_cache = Arc::new(QueryHashCache::new(16, 0.85));
+        let engine = TieredEngine::new(
+            Box::new(cache),
+            Arc::clone(&query_cache),
+            vec![vec![1.0, 0.0]],
+            vec![std::collections::HashMap::new()],
+            TieredEngineConfig {
+                hnsw_max_elements: 16,
+                embedding_dimension: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        engine
+            .insert(7, vec![0.0, 1.0], std::collections::HashMap::new())
+            .unwrap();
+        let canonical = engine
+            .cold_tier
+            .current_coherence_token(7)
+            .expect("canonical token must exist");
+        engine.hot_tier.insert_with_coherence(
+            7,
+            vec![1.0, 0.0],
+            std::collections::HashMap::new(),
+            canonical,
+        );
+
+        let scope = 919;
+        let query = vec![1.0, 0.0];
+        query_cache.insert_with_k_scoped(
+            scope,
+            query.clone(),
+            vec![SearchResult {
+                doc_id: 7,
+                distance: 0.0,
+            }],
+            1,
+        );
+
+        let removed = engine.audit_hot_tier_coherence("test background hot-tier coherence audit");
+        assert_eq!(
+            removed, 1,
+            "background coherence audit should scrub the corrupted hot-tier mirror"
+        );
+        assert!(
+            query_cache.get_scoped(scope, &query, 1).is_none(),
+            "background coherence audit should clear potentially stale query-cache entries"
+        );
+
+        let (results, path) = engine
+            .knn_search_with_ef_detailed_scoped(&query, 1, None, scope)
+            .expect("search should recompute canonically after the background coherence audit");
+
+        assert_ne!(path, SearchExecutionPath::CacheHit);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].doc_id, 0,
+            "background audit should clear stale query cache entries and force canonical recomputation"
+        );
+        assert!(
+            !engine.hot_tier.exists(7),
+            "background audit should scrub corrupted hot-tier entries"
+        );
     }
 }

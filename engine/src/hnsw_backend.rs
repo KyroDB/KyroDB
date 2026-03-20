@@ -5,6 +5,7 @@
 //!
 //! **Persistence**: WAL + snapshots for durability and fast recovery.
 
+use crate::coherence::{digest_embedding, VectorCoherenceToken, VectorIntegrityDigest};
 use crate::config::{DistanceMetric, RecoveryMode};
 use crate::hnsw_index::{HnswVectorIndex, SearchResult};
 use crate::metadata_filter;
@@ -377,6 +378,8 @@ impl MetadataInvertedIndex {
 struct DocumentStore {
     embeddings: Vec<Vec<f32>>,
     metadata: Vec<HashMap<String, String>>,
+    versions: Vec<u64>,
+    digests: Vec<VectorIntegrityDigest>,
     external_to_internal: HashMap<u64, usize>,
     internal_to_external: Vec<Option<u64>>,
 }
@@ -747,22 +750,30 @@ impl HnswBackend {
 
         let old_embeddings = std::mem::take(&mut store.embeddings);
         let old_metadata = std::mem::take(&mut store.metadata);
+        let old_versions = std::mem::take(&mut store.versions);
+        let old_digests = std::mem::take(&mut store.digests);
         let old_internal_to_external = std::mem::take(&mut store.internal_to_external);
 
         store.embeddings = Vec::with_capacity(live);
         store.metadata = Vec::with_capacity(live);
+        store.versions = Vec::with_capacity(live);
+        store.digests = Vec::with_capacity(live);
         store.internal_to_external = Vec::with_capacity(live);
         store.external_to_internal.clear();
 
-        for ((embedding, metadata), ext) in old_embeddings
+        for ((((embedding, metadata), version), digest), ext) in old_embeddings
             .into_iter()
             .zip(old_metadata.into_iter())
+            .zip(old_versions.into_iter())
+            .zip(old_digests.into_iter())
             .zip(old_internal_to_external.into_iter())
         {
             let Some(external_id) = ext else { continue };
             let internal_id = store.embeddings.len();
             store.embeddings.push(embedding);
             store.metadata.push(metadata);
+            store.versions.push(version);
+            store.digests.push(digest);
             store.internal_to_external.push(Some(external_id));
             store.external_to_internal.insert(external_id, internal_id);
         }
@@ -898,8 +909,12 @@ impl HnswBackend {
         let mut doc_store = DocumentStore {
             embeddings,
             metadata,
+            versions: Vec::new(),
+            digests: Vec::new(),
             ..Default::default()
         };
+        doc_store.versions.reserve(doc_store.embeddings.len());
+        doc_store.digests.reserve(doc_store.embeddings.len());
         doc_store
             .internal_to_external
             .reserve(doc_store.embeddings.len());
@@ -911,8 +926,14 @@ impl HnswBackend {
                 doc_store
                     .external_to_internal
                     .insert(external_id, internal_id);
+                doc_store.versions.push(1);
+                doc_store
+                    .digests
+                    .push(digest_embedding(&doc_store.embeddings[internal_id]));
             } else {
                 doc_store.internal_to_external.push(None);
+                doc_store.versions.push(0);
+                doc_store.digests.push(VectorIntegrityDigest::ZERO);
             }
         }
 
@@ -1072,8 +1093,12 @@ impl HnswBackend {
         let mut doc_store = DocumentStore {
             embeddings,
             metadata,
+            versions: Vec::new(),
+            digests: Vec::new(),
             ..Default::default()
         };
+        doc_store.versions.reserve(doc_store.embeddings.len());
+        doc_store.digests.reserve(doc_store.embeddings.len());
         doc_store
             .internal_to_external
             .reserve(doc_store.embeddings.len());
@@ -1085,8 +1110,14 @@ impl HnswBackend {
                 doc_store
                     .external_to_internal
                     .insert(external_id, internal_id);
+                doc_store.versions.push(1);
+                doc_store
+                    .digests
+                    .push(digest_embedding(&doc_store.embeddings[internal_id]));
             } else {
                 doc_store.internal_to_external.push(None);
+                doc_store.versions.push(0);
+                doc_store.digests.push(VectorIntegrityDigest::ZERO);
             }
         }
 
@@ -1430,6 +1461,8 @@ impl HnswBackend {
         let mut doc_store = DocumentStore::default();
         doc_store.embeddings.reserve(docs_vec.len());
         doc_store.metadata.reserve(docs_vec.len());
+        doc_store.versions.reserve(docs_vec.len());
+        doc_store.digests.reserve(docs_vec.len());
         doc_store.internal_to_external.reserve(docs_vec.len());
 
         // Phase 1: Build the document store sequentially (cheap, deterministic internal IDs).
@@ -1448,6 +1481,10 @@ impl HnswBackend {
             let internal_id = doc_store.embeddings.len();
             doc_store.embeddings.push(embedding);
             doc_store.metadata.push(metadata);
+            doc_store.versions.push(1);
+            doc_store
+                .digests
+                .push(digest_embedding(&doc_store.embeddings[internal_id]));
             doc_store.internal_to_external.push(Some(doc_id));
             doc_store.external_to_internal.insert(doc_id, internal_id);
         }
@@ -1643,6 +1680,7 @@ impl HnswBackend {
         let mut embedding = embedding;
         let distance = self.index.read().distance_metric();
         normalize_in_place_if_needed(distance, &mut embedding)?;
+        let embedding_digest = digest_embedding(&embedding);
 
         let mut attempted_compaction = false;
         loop {
@@ -1651,7 +1689,7 @@ impl HnswBackend {
 
             // Read-only preflight under write gate: avoid long-held index/store write locks while
             // performing WAL fsync.
-            let (old_internal_id, old_metadata) = {
+            let (old_internal_id, old_metadata, next_version) = {
                 let index = self.index.read();
                 let store = self.doc_store.read();
                 if index.is_full() {
@@ -1683,7 +1721,16 @@ impl HnswBackend {
 
                 let old_internal_id = store.external_to_internal.get(&doc_id).copied();
                 let old_metadata = old_internal_id.map(|id| store.metadata[id].clone());
-                (old_internal_id, old_metadata)
+                // Coherence versions only track replacement of the currently
+                // live canonical record. Delete + reinsert starts a fresh epoch.
+                let prior_version = old_internal_id
+                    .and_then(|id| store.versions.get(id).copied())
+                    .unwrap_or(0);
+                (
+                    old_internal_id,
+                    old_metadata,
+                    prior_version.saturating_add(1),
+                )
             };
 
             let embedding_for_wal = embedding.clone();
@@ -1780,9 +1827,10 @@ impl HnswBackend {
 
             store.embeddings.push(std::mem::take(&mut embedding));
             store.metadata.push(metadata);
+            store.versions.push(next_version);
+            store.digests.push(embedding_digest);
             store.internal_to_external.push(Some(doc_id));
             store.external_to_internal.insert(doc_id, internal_id);
-
             // Upsert semantics: keep the newest internal id live and tombstone the previous one.
             if let Some(old_internal_id) = old_internal_id {
                 store.internal_to_external[old_internal_id] = None;
@@ -1908,8 +1956,15 @@ impl HnswBackend {
 
         // Phase 1: Validate and normalize. Do not mutate doc_store yet.
         // This guarantees atomic visibility when batch index insertion fails.
-        let mut normalized_docs: Vec<(u64, Vec<f32>, HashMap<String, String>)> =
-            Vec::with_capacity(documents.len());
+        type VersionedDocumentInsert = (
+            u64,
+            Vec<f32>,
+            HashMap<String, String>,
+            u64,
+            VectorIntegrityDigest,
+        );
+
+        let mut normalized_docs: Vec<VersionedDocumentInsert> = Vec::with_capacity(documents.len());
 
         for (doc_id, embedding, metadata) in documents {
             if !seen_ids.insert(doc_id) {
@@ -1937,7 +1992,11 @@ impl HnswBackend {
                 continue;
             }
 
-            normalized_docs.push((doc_id, embedding, metadata));
+            // Bulk insert rejects existing IDs up front, so each inserted record
+            // starts a fresh coherence epoch at version 1.
+            let next_version = 1;
+            let digest = digest_embedding(&embedding);
+            normalized_docs.push((doc_id, embedding, metadata, next_version, digest));
         }
 
         // Phase 2: Insert all validated vectors into the HNSW index in one batch.
@@ -1948,7 +2007,7 @@ impl HnswBackend {
             let batch_refs: Vec<(&[f32], usize)> = normalized_docs
                 .iter()
                 .enumerate()
-                .map(|(offset, (_, emb, _))| (emb.as_slice(), base_internal_id + offset))
+                .map(|(offset, (_, emb, _, _, _))| (emb.as_slice(), base_internal_id + offset))
                 .collect();
             index.parallel_insert_batch(&batch_refs)?;
         }
@@ -1956,14 +2015,20 @@ impl HnswBackend {
         // Phase 3: Commit doc_store mappings only after successful index insertion.
         store.embeddings.reserve(normalized_docs.len());
         store.metadata.reserve(normalized_docs.len());
+        store.versions.reserve(normalized_docs.len());
+        store.digests.reserve(normalized_docs.len());
         store.internal_to_external.reserve(normalized_docs.len());
 
-        for (offset, (doc_id, embedding, metadata)) in normalized_docs.into_iter().enumerate() {
+        for (offset, (doc_id, embedding, metadata, version, digest)) in
+            normalized_docs.into_iter().enumerate()
+        {
             let internal_id = base_internal_id + offset;
             let metadata_for_index = metadata.clone();
 
             store.embeddings.push(embedding);
             store.metadata.push(metadata);
+            store.versions.push(version);
+            store.digests.push(digest);
             store.internal_to_external.push(Some(doc_id));
             store.external_to_internal.insert(doc_id, internal_id);
             meta_updates.push((internal_id as u64, metadata_for_index));
@@ -2151,12 +2216,37 @@ impl HnswBackend {
         store.embeddings.get(*internal_id).cloned()
     }
 
+    /// Fetch document embedding with canonical coherence token.
+    #[instrument(level = "trace", skip(self), fields(doc_id))]
+    pub fn fetch_document_with_coherence(
+        &self,
+        doc_id: u64,
+    ) -> Option<(Vec<f32>, VectorCoherenceToken)> {
+        let store = self.doc_store.read();
+        let internal_id = store.external_to_internal.get(&doc_id)?;
+        let embedding = store.embeddings.get(*internal_id)?.clone();
+        let version = *store.versions.get(*internal_id)?;
+        let digest = *store.digests.get(*internal_id)?;
+        Some((embedding, VectorCoherenceToken::new(version, digest)))
+    }
+
     /// Fetch document metadata by ID (O(1) lookup)
     #[instrument(level = "trace", skip(self), fields(doc_id))]
     pub fn fetch_metadata(&self, doc_id: u64) -> Option<HashMap<String, String>> {
         let store = self.doc_store.read();
         let internal_id = store.external_to_internal.get(&doc_id)?;
         store.metadata.get(*internal_id).cloned()
+    }
+
+    /// Return the current canonical coherence token for an active document.
+    #[instrument(level = "trace", skip(self), fields(doc_id))]
+    pub fn current_coherence_token(&self, doc_id: u64) -> Option<VectorCoherenceToken> {
+        let store = self.doc_store.read();
+        let internal_id = store.external_to_internal.get(&doc_id)?;
+        Some(VectorCoherenceToken::new(
+            *store.versions.get(*internal_id)?,
+            *store.digests.get(*internal_id)?,
+        ))
     }
 
     /// Bulk fetch documents by ID (O(1) lookup)
@@ -2175,6 +2265,31 @@ impl HnswBackend {
                 let emb = store.embeddings.get(*internal_id)?;
                 let meta = store.metadata.get(*internal_id)?;
                 Some((emb.clone(), meta.clone()))
+            })
+            .collect()
+    }
+
+    #[instrument(level = "trace", skip(self), fields(count = doc_ids.len()))]
+    #[allow(clippy::type_complexity)]
+    pub fn bulk_fetch_with_coherence(
+        &self,
+        doc_ids: &[u64],
+    ) -> Vec<Option<(Vec<f32>, HashMap<String, String>, VectorCoherenceToken)>> {
+        let store = self.doc_store.read();
+
+        doc_ids
+            .iter()
+            .map(|&id| {
+                let internal_id = store.external_to_internal.get(&id)?;
+                let emb = store.embeddings.get(*internal_id)?;
+                let meta = store.metadata.get(*internal_id)?;
+                let version = store.versions.get(*internal_id)?;
+                let digest = store.digests.get(*internal_id)?;
+                Some((
+                    emb.clone(),
+                    meta.clone(),
+                    VectorCoherenceToken::new(*version, *digest),
+                ))
             })
             .collect()
     }
@@ -3293,6 +3408,37 @@ mod tests {
 
         // Test out of range
         assert!(backend.fetch_document(100).is_none());
+    }
+
+    #[test]
+    fn delete_then_reinsert_starts_fresh_coherence_epoch() -> Result<()> {
+        let backend = HnswBackend::new(2, DistanceMetric::Cosine, Vec::new(), Vec::new(), 16)?;
+
+        backend.insert(7, normalize(vec![1.0, 0.0]), HashMap::new())?;
+        let first = backend
+            .current_coherence_token(7)
+            .expect("live insert must expose a coherence token");
+        assert_eq!(
+            first.version, 1,
+            "fresh insert should start at coherence version 1"
+        );
+
+        assert!(backend.delete(7)?);
+        assert!(
+            backend.current_coherence_token(7).is_none(),
+            "deleted documents must not expose a canonical coherence token"
+        );
+
+        backend.insert(7, normalize(vec![0.0, 1.0]), HashMap::new())?;
+        let second = backend
+            .current_coherence_token(7)
+            .expect("reinserted document must expose a coherence token");
+        assert_eq!(
+            second.version, 1,
+            "delete + reinsert should start a fresh coherence epoch instead of retaining historical tombstone versions"
+        );
+
+        Ok(())
     }
 
     #[test]

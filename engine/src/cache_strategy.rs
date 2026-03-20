@@ -622,13 +622,16 @@ impl CacheStrategy for SharedLearnedCacheStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coherence::VectorCoherenceToken;
     use crate::learned_cache::AccessEvent;
     use std::time::{Instant, SystemTime};
 
     fn create_test_vector(doc_id: u64) -> CachedVector {
+        let embedding = vec![0.5; 128];
         CachedVector {
             doc_id,
-            embedding: vec![0.5; 128],
+            coherence: VectorCoherenceToken::for_embedding(0, &embedding),
+            embedding,
             distance: 0.1,
             cached_at: Instant::now(),
         }

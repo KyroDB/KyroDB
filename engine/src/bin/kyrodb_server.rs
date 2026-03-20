@@ -952,6 +952,13 @@ impl KyroDBServiceImpl {
         hasher.finish()
     }
 
+    fn sanitize_public_metadata(mut metadata: HashMap<String, String>) -> HashMap<String, String> {
+        metadata.remove("__tenant_id__");
+        metadata.remove("__tenant_idx__");
+        metadata.remove("__namespace__");
+        metadata
+    }
+
     fn map_search_error(&self, error: anyhow::Error) -> Status {
         let message = error.to_string();
         self.state.metrics.record_query_failure();
@@ -1084,7 +1091,7 @@ impl KyroDBServiceImpl {
                     }
                 }
 
-                metadata
+                Self::sanitize_public_metadata(metadata)
             } else {
                 HashMap::new()
             };
@@ -1915,19 +1922,21 @@ impl KyroDbService for KyroDBServiceImpl {
             }
         }
 
+        // `namespace` on UpdateMetadata is a boundary selector, not a mutation API.
+        // Preserve canonical reserved keys from the stored document regardless of
+        // merge/replace mode so callers cannot strip or rewrite tenant/namespace scope.
         let mut metadata = req.metadata;
         metadata.remove("__tenant_id__");
         metadata.remove("__tenant_idx__");
         metadata.remove("__namespace__");
-        if let Some(tenant) = &tenant {
-            metadata.insert("__tenant_id__".to_string(), tenant.tenant_id.clone());
-            metadata.insert(
-                "__tenant_idx__".to_string(),
-                tenant.tenant_index.to_string(),
-            );
+        if let Some(existing_tenant_id) = existing_metadata.get("__tenant_id__") {
+            metadata.insert("__tenant_id__".to_string(), existing_tenant_id.clone());
         }
-        if !req.namespace.is_empty() {
-            metadata.insert("__namespace__".to_string(), req.namespace.clone());
+        if let Some(existing_tenant_idx) = existing_metadata.get("__tenant_idx__") {
+            metadata.insert("__tenant_idx__".to_string(), existing_tenant_idx.clone());
+        }
+        if let Some(existing_namespace) = existing_metadata.get("__namespace__") {
+            metadata.insert("__namespace__".to_string(), existing_namespace.clone());
         }
 
         match engine.update_metadata(global_doc_id, metadata, req.merge) {
@@ -1994,11 +2003,11 @@ impl KyroDbService for KyroDBServiceImpl {
 
         // Fetch metadata first to enforce tenant/namespace checks without
         // revealing existence via embedding lookup timing.
-        let metadata = engine.get_metadata(global_doc_id).unwrap_or_default();
+        let internal_metadata = engine.get_metadata(global_doc_id).unwrap_or_default();
 
         if let Some(tenant) = &tenant {
             let expected = tenant.tenant_index.to_string();
-            if metadata.get("__tenant_idx__") != Some(&expected) {
+            if internal_metadata.get("__tenant_idx__") != Some(&expected) {
                 // Hide cross-tenant existence.
                 self.record_tenant_query_usage(Some(tenant));
                 return Ok(Response::new(QueryResponse {
@@ -2013,7 +2022,7 @@ impl KyroDbService for KyroDBServiceImpl {
         }
 
         if !req.namespace.is_empty() {
-            let doc_namespace = metadata
+            let doc_namespace = internal_metadata
                 .get("__namespace__")
                 .map(|s| s.as_str())
                 .unwrap_or("");
@@ -2054,7 +2063,7 @@ impl KyroDbService for KyroDBServiceImpl {
                     doc_id = req.doc_id,
                     latency_ms = latency_ms,
                     embedding_returned = req.include_embedding,
-                    metadata_keys = metadata.len(),
+                    metadata_keys = internal_metadata.len(),
                     "Document found"
                 );
 
@@ -2066,7 +2075,7 @@ impl KyroDbService for KyroDBServiceImpl {
                     } else {
                         vec![]
                     },
-                    metadata,
+                    metadata: Self::sanitize_public_metadata(internal_metadata),
                     served_from: Self::map_query_tier(served_from),
                     error: String::new(),
                 }))
@@ -2345,6 +2354,10 @@ impl KyroDbService for KyroDBServiceImpl {
                 }
             } else {
                 self.state.metrics.record_cache_hit(false);
+            }
+
+            if found {
+                metadata = Self::sanitize_public_metadata(metadata);
             }
 
             query_responses.push(QueryResponse {
@@ -2710,7 +2723,7 @@ impl KyroDbService for KyroDBServiceImpl {
         let start = Instant::now();
         let req = request.into_inner();
 
-        info!(force = req.force, "Flush hot tier requested");
+        info!(force = req.force, "Hot-tier drain/reconcile requested");
 
         let engine = &self.state.engine;
 
@@ -2721,7 +2734,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 info!(
                     docs_flushed = docs_flushed,
                     latency_ms = latency_ms,
-                    "Hot tier flushed successfully"
+                    "Hot-tier drain/reconcile completed"
                 );
 
                 Ok(Response::new(FlushResponse {
@@ -2732,7 +2745,7 @@ impl KyroDbService for KyroDBServiceImpl {
                 }))
             }
             Err(e) => {
-                error!(error = %e, "Flush failed");
+                error!(error = %e, "Hot-tier drain/reconcile failed");
                 Err(Status::internal(format!("Flush failed: {}", e)))
             }
         }
@@ -4117,8 +4130,8 @@ mod tests {
         observability_auth_middleware, usage_handler, BatchSearchKey, DeleteRequest,
         GrpcPanicContainmentLayer, HealthStatus, InsertRequest, KyroDBServiceImpl, KyroDbService,
         QueryRequest, SearchErrorKind, SearchExecutionPath, SearchRequest, ServerState,
-        SnapshotRequest, TenantContext, TieredEngine, TieredEngineConfig, MAX_EMBEDDING_DIM,
-        MAX_KNN_K, MIN_DOC_ID,
+        SnapshotRequest, TenantContext, TieredEngine, TieredEngineConfig, UpdateMetadataRequest,
+        MAX_EMBEDDING_DIM, MAX_KNN_K, MIN_DOC_ID,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -4709,6 +4722,145 @@ mod tests {
             response.total_found, 8,
             "total_found must count all filtered hits found in the oversampled candidate set"
         );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_replace_preserves_namespace_and_reserved_scope() {
+        let service = build_validation_test_service();
+        let doc_id = 41u64;
+        let embedding = vec![0.2; 16];
+
+        service
+            .state
+            .engine
+            .insert(
+                doc_id,
+                embedding,
+                HashMap::from([
+                    ("__namespace__".to_string(), "blue".to_string()),
+                    ("owner".to_string(), "initial".to_string()),
+                ]),
+            )
+            .expect("seed namespaced document");
+
+        let response = service
+            .update_metadata(Request::new(UpdateMetadataRequest {
+                doc_id,
+                metadata: HashMap::from([
+                    ("color".to_string(), "navy".to_string()),
+                    ("__namespace__".to_string(), "red".to_string()),
+                ]),
+                merge: false,
+                namespace: String::new(),
+            }))
+            .await
+            .expect("metadata update should succeed")
+            .into_inner();
+
+        assert!(response.success);
+        assert!(response.existed);
+
+        let metadata = service
+            .state
+            .engine
+            .get_metadata(doc_id)
+            .expect("updated metadata must be readable");
+        assert_eq!(
+            metadata.get("__namespace__").map(String::as_str),
+            Some("blue"),
+            "replace updates must preserve the stored namespace"
+        );
+        assert_eq!(
+            metadata.get("color").map(String::as_str),
+            Some("navy"),
+            "user metadata should still be replaced"
+        );
+        assert!(
+            !metadata.contains_key("owner"),
+            "replace updates should remove non-reserved fields that are not supplied"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_response_hides_reserved_metadata_keys() {
+        let service = build_validation_test_service();
+        let doc_id = 52u64;
+
+        service
+            .state
+            .engine
+            .insert(
+                doc_id,
+                vec![0.3; 16],
+                HashMap::from([
+                    ("__tenant_id__".to_string(), "internal".to_string()),
+                    ("__tenant_idx__".to_string(), "7".to_string()),
+                    ("__namespace__".to_string(), "blue".to_string()),
+                    ("visible".to_string(), "yes".to_string()),
+                ]),
+            )
+            .expect("seed document with reserved metadata");
+
+        let response = service
+            .query(Request::new(QueryRequest {
+                doc_id,
+                include_embedding: false,
+                namespace: String::new(),
+            }))
+            .await
+            .expect("query should succeed")
+            .into_inner();
+
+        assert!(response.found);
+        assert_eq!(
+            response.metadata.get("visible").map(String::as_str),
+            Some("yes")
+        );
+        assert!(!response.metadata.contains_key("__tenant_id__"));
+        assert!(!response.metadata.contains_key("__tenant_idx__"));
+        assert!(!response.metadata.contains_key("__namespace__"));
+    }
+
+    #[tokio::test]
+    async fn search_response_hides_reserved_metadata_keys() {
+        let service = build_validation_test_service();
+        let doc_id = 61u64;
+        let embedding = vec![0.4; 16];
+
+        service
+            .state
+            .engine
+            .insert(
+                doc_id,
+                embedding.clone(),
+                HashMap::from([
+                    ("__namespace__".to_string(), "blue".to_string()),
+                    ("visible".to_string(), "yes".to_string()),
+                ]),
+            )
+            .expect("seed namespaced document");
+
+        let response = service
+            .search(Request::new(SearchRequest {
+                query_embedding: embedding,
+                k: 1,
+                ef_search: 128,
+                include_embeddings: false,
+                filter: None,
+                metadata_filters: HashMap::new(),
+                namespace: "blue".to_string(),
+                min_score: 0.0,
+            }))
+            .await
+            .expect("search should succeed")
+            .into_inner();
+
+        assert_eq!(response.results.len(), 1);
+        let metadata = &response.results[0].metadata;
+        assert_eq!(metadata.get("visible").map(String::as_str), Some("yes"));
+        assert!(!metadata.contains_key("__namespace__"));
+        assert!(!metadata.contains_key("__tenant_id__"));
+        assert!(!metadata.contains_key("__tenant_idx__"));
     }
 
     #[tokio::test]
