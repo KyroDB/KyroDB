@@ -11,7 +11,7 @@ use kyrodb_engine::{
     learned_cache::LearnedCachePredictor,
     ndcg::{calculate_mrr, calculate_ndcg, calculate_recall_at_k, RankingResult},
     training_task::{spawn_training_task, TrainingConfig},
-    QueryHashCache, TieredEngine, TieredEngineConfig,
+    AdaptiveAdmissionConfig, QueryHashCache, TieredEngine, TieredEngineConfig,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -1282,19 +1282,20 @@ async fn main() -> Result<()> {
     );
     learned_predictor.set_target_hot_entries(hot_target);
     learned_predictor.set_threshold_smoothing(0.01);
-    learned_predictor.set_auto_tune(true);
-    learned_predictor.set_target_utilization(0.95);
-    learned_predictor.set_adjustment_rate(0.08);
     learned_predictor.set_miss_demotion_threshold(3);
     learned_predictor.set_miss_penalty_rate(0.8);
     learned_predictor.set_working_set_boost(Duration::from_secs(60), 0.02);
 
     // Layer 1a: Document Cache (Learned frequency-based)
     // Create strategy for training task
-    let learned_strategy_for_training = Arc::new(LearnedCacheStrategy::new(
-        learned_cache_capacity,
-        learned_predictor,
-    ));
+    let learned_strategy_for_training = Arc::new(
+        LearnedCacheStrategy::new(learned_cache_capacity, learned_predictor)
+            .with_adaptive_admission(AdaptiveAdmissionConfig {
+                target_utilization: 0.95,
+                max_bias: 0.20,
+                ..AdaptiveAdmissionConfig::default()
+            }),
+    );
 
     // Layer 1b: Query Search Cache (Semantic similarity-based)
     // Capacity: 300 queries, threshold: 0.25 (MS MARCO median paraphrase similarity)
@@ -1487,8 +1488,6 @@ async fn main() -> Result<()> {
         predictor_capacity,
         recency_halflife: Duration::from_secs(600),
         admission_threshold: 0.08,
-        auto_tune_enabled: true,
-        target_utilization: 0.92,
     };
 
     let training_cycles = Arc::new(AtomicU64::new(0));
@@ -1646,10 +1645,11 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Get query embedding for access logging / training
-        // For semantic workload: use actual query embedding from index
-        // For temporal workload: use None (no semantic embedding)
-        let query_embedding_for_cache = match &workload_gen {
+        // Optional point-query API parameter.
+        // The current L1a document-cache path is doc-centric and does not use this
+        // value for admission decisions, but the validator preserves the semantic
+        // workload shape at the call site.
+        let point_query_embedding_hint = match &workload_gen {
             WorkloadGenerator::Semantic(_) if query_embeddings.is_some() => {
                 // Use actual query embedding from the sampled index
                 query_embeddings
@@ -1667,7 +1667,7 @@ async fn main() -> Result<()> {
         let stats_before = engine.stats();
 
         // Query through TieredEngine (L1a + hot/cold tiers; L1b is search-only)
-        let embedding_opt = engine.query(doc_id, query_embedding_for_cache);
+        let embedding_opt = engine.query(doc_id, point_query_embedding_hint);
 
         if let Some(_embedding) = embedding_opt {
             // Track document access for quality metrics

@@ -34,12 +34,6 @@ pub struct TrainingConfig {
 
     /// Admission threshold (default: 0.15)
     pub admission_threshold: f32,
-
-    /// Auto-tune threshold based on utilization
-    pub auto_tune_enabled: bool,
-
-    /// Target cache utilization for auto-tuning
-    pub target_utilization: f32,
 }
 
 impl Default for TrainingConfig {
@@ -51,8 +45,6 @@ impl Default for TrainingConfig {
             min_events_for_training: 100,
             predictor_capacity: 10_000,
             admission_threshold: 0.15,
-            auto_tune_enabled: true,
-            target_utilization: 0.85,
         }
     }
 }
@@ -139,8 +131,6 @@ fn train_predictor(
         config.recency_halflife,
         config.interval,
     )?;
-    predictor.set_auto_tune(config.auto_tune_enabled);
-    predictor.set_target_utilization(config.target_utilization);
     // Set target_hot_entries before training to preserve threshold calibration
     predictor.set_target_hot_entries(target_hot_entries);
     predictor.train_from_accesses(events)?;
@@ -503,8 +493,6 @@ mod tests {
         assert_eq!(config.predictor_capacity, 10_000);
         assert_eq!(config.recency_halflife, Duration::from_secs(1800));
         assert_eq!(config.admission_threshold, 0.15);
-        assert!(config.auto_tune_enabled);
-        assert_eq!(config.target_utilization, 0.85);
     }
 
     #[tokio::test]

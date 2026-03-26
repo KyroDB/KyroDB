@@ -556,6 +556,13 @@ async fn end_to_end_hsc_training_and_semantic_metrics() -> Result<()> {
             Duration::from_secs(20),
         )
         .await?;
+        wait_for_metric_at_least(
+            http_port,
+            "kyrodb_hsc_admission_controller_enabled",
+            1.0,
+            Duration::from_secs(20),
+        )
+        .await?;
 
         // Drive post-training admissions on fresh doc_ids so semantic decision path executes.
         for doc_id in 1001u64..=1016 {

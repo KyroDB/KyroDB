@@ -56,6 +56,9 @@ pub mod metadata_filter;
 // Vector coherence tokens and integrity digest validation
 pub mod coherence;
 
+// Strategy-layer adaptive admission controller for HSC
+pub mod adaptive_admission;
+
 // Adaptive oversampling for filtered search
 pub mod adaptive_oversampling;
 
@@ -74,10 +77,7 @@ pub mod hnsw_index;
 // HNSW backend: Integration layer for cache + HNSW
 pub mod hnsw_backend;
 
-// Learned index: learned predictor (Learned Frequency Predictor) for cache prediction
-pub mod learned_predictor_core;
-
-// Cache prediction: Hybrid frequency + semantic similarity
+// Cache prediction: Hybrid frequency + semantic admission
 pub mod learned_cache;
 pub(crate) mod lru_index;
 
@@ -88,10 +88,10 @@ pub mod access_logger;
 pub mod ab_stats; // Metrics persistence (CSV format)
 pub mod cache_strategy; // CacheStrategy trait + LRU/Learned implementations + A/B splitter
 pub mod query_hash_cache; // Query hash cache (L1b): Semantic similarity-based query caching
-pub mod training_task; // Background learned predictor training task (tokio::spawn, 60-second interval)
+pub mod training_task; // Background learned predictor training task
 pub mod vector_cache; // In-memory vector cache with LRU eviction
 
-// Semantic layer: Hybrid cache decisions (frequency + similarity)
+// Semantic layer: Hybrid cache admission decisions (frequency + document similarity)
 pub mod semantic_adapter;
 
 // Quality metrics: NDCG@10, MRR, Recall@k for ranking validation
@@ -145,16 +145,12 @@ pub use hnsw_index::{HnswVectorIndex, SearchResult};
 // HNSW backend (cache integration)
 pub use hnsw_backend::HnswBackend;
 
-// Learned index components (frequency predictor for cache prediction)
-pub use learned_predictor_core::{
-    LearnedPredictorIndex, LearnedPredictorSegment, LocalLinearModel,
-};
-
 // Cache predictor components
 pub use learned_cache::{AccessEvent, AccessType, CachePredictorStats, LearnedCachePredictor};
 
 // Access logger components
 pub use access_logger::{hash_embedding, AccessLoggerStats, AccessPatternLogger};
+pub use adaptive_admission::AdaptiveAdmissionConfig;
 pub use coherence::{
     digest_embedding, embedding_matches_token, VectorCoherenceToken, VectorIntegrityDigest,
 };

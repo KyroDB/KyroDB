@@ -339,8 +339,6 @@ async fn main() -> Result<()> {
         min_events_for_training: 100,
         predictor_capacity: config.cache_capacity,
         admission_threshold: 0.15,
-        auto_tune_enabled: true,
-        target_utilization: 0.85,
     };
 
     // Create shutdown channel (unused in validation, but required for API)

@@ -54,6 +54,12 @@ export KYRODB__HNSW__DIMENSION=768
 ### Cache/HSC Contract
 
 - Outside `benchmark` mode, `cache.strategy` must be `learned` (HSC fail-closed).
+- Base predictor threshold lives at `cache.admission_threshold`.
+- Strategy-layer adaptive admission tuning lives under `cache.adaptive_admission`:
+  - `enabled`
+  - `target_utilization`
+  - `control_interval_secs`
+  - `max_bias`
 - L1a semantic admission tuning lives under `cache.semantic`:
   - `high_confidence_threshold`
   - `low_confidence_threshold`

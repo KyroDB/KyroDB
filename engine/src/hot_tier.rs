@@ -8,7 +8,7 @@
 //!
 //! # Architecture Position
 //! **Layer 2 in three-tier architecture**:
-//! - Layer 1 (Cache): Hot documents predicted by learned predictor + semantic similarity
+//! - Layer 1 (Cache): Exact document cache with learned hotness + semantic admission
 //! - Layer 2 (Hot Tier): Recent-write mirror / acceleration set
 //! - Layer 3 (Cold Tier): Canonical HNSW index for all documents
 

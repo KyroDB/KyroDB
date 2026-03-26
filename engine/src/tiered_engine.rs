@@ -525,7 +525,7 @@ impl TieredEngine {
     /// Query - unified three-tier path
     ///
     /// # Query Flow
-    /// 1. Check cache (L1) - Learned frequency prediction + semantic similarity
+    /// 1. Check L1a exact document cache - admission driven by learned hotness + semantic similarity
     /// 2. If miss, check hot tier (L2) - recent writes
     /// 3. If miss, search HNSW (L3) - full k-NN search
     /// 4. Cache admission decision (should we cache this result?)
@@ -2792,8 +2792,10 @@ mod tests {
             .hsc_lifecycle_stats()
             .expect("learned strategy should expose lifecycle stats");
         assert!(lifecycle.semantic_enabled);
+        assert!(lifecycle.admission_controller_enabled);
         assert_eq!(lifecycle.access_logger_depth, 4);
         assert_eq!(lifecycle.hot_doc_count, 0);
+        assert!(lifecycle.target_utilization > 0.0);
     }
 
     #[test]

@@ -267,11 +267,66 @@ fn append_hsc_lifecycle_metrics(state: &ServerState, prometheus_text: &mut Strin
         u64::from(stats.predictor_trained)
     ));
 
-    prometheus_text.push_str("# HELP kyrodb_hsc_cache_threshold Current HSC admission threshold\n");
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_predictor_threshold Current trained predictor threshold before adaptive bias\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_predictor_threshold gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_predictor_threshold {:.6}\n",
+        stats.predictor_threshold
+    ));
+
+    prometheus_text
+        .push_str("# HELP kyrodb_hsc_cache_threshold Current effective HSC admission threshold\n");
     prometheus_text.push_str("# TYPE kyrodb_hsc_cache_threshold gauge\n");
     prometheus_text.push_str(&format!(
         "kyrodb_hsc_cache_threshold {:.6}\n",
         stats.cache_threshold
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_admission_controller_enabled Whether strategy-layer adaptive admission is active (0|1)\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_admission_controller_enabled gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_admission_controller_enabled {}\n",
+        u64::from(stats.admission_controller_enabled)
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_admission_bias Current adaptive admission bias applied to the predictor threshold\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_admission_bias gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_admission_bias {:.6}\n",
+        stats.admission_bias
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_target_utilization Target L1a utilization for adaptive admission\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_target_utilization gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_target_utilization {:.6}\n",
+        stats.target_utilization
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_cache_utilization Current L1a utilization observed by adaptive admission\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_cache_utilization gauge\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_cache_utilization {:.6}\n",
+        stats.cache_utilization
+    ));
+
+    prometheus_text.push_str(
+        "# HELP kyrodb_hsc_admission_controller_adjustments_total Total adaptive-admission control updates\n",
+    );
+    prometheus_text.push_str("# TYPE kyrodb_hsc_admission_controller_adjustments_total counter\n");
+    prometheus_text.push_str(&format!(
+        "kyrodb_hsc_admission_controller_adjustments_total {}\n",
+        stats.admission_controller_adjustments
     ));
 
     prometheus_text
@@ -3428,9 +3483,6 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(config.cache.training_interval_secs),
         )
         .context("Failed to create Hybrid Semantic Cache predictor")?;
-        let mut learned_predictor = learned_predictor;
-        learned_predictor.set_auto_tune(config.cache.auto_tune_threshold);
-        learned_predictor.set_target_utilization(config.cache.target_utilization);
 
         // L1a is always HSC (learned + semantic) for non-benchmark environments.
         let semantic_adapter = SemanticAdapter::with_config(SemanticConfig {
@@ -3440,11 +3492,14 @@ async fn main() -> anyhow::Result<()> {
             max_cached_embeddings: config.cache.semantic.max_cached_embeddings,
             similarity_scan_limit: config.cache.semantic.similarity_scan_limit,
         });
-        let learned_strategy = Arc::new(LearnedCacheStrategy::new_with_semantic(
-            config.cache.capacity,
-            learned_predictor,
-            semantic_adapter,
-        ));
+        let learned_strategy = Arc::new(
+            LearnedCacheStrategy::new_with_semantic(
+                config.cache.capacity,
+                learned_predictor,
+                semantic_adapter,
+            )
+            .with_adaptive_admission(config.cache.adaptive_admission.clone()),
+        );
 
         let (strategy_box, learned_for_training, effective_strategy): (
             Box<dyn kyrodb_engine::CacheStrategy>,
@@ -3638,8 +3693,6 @@ async fn main() -> anyhow::Result<()> {
                         .saturating_mul(config.cache.predictor_capacity_multiplier.max(1))
                         .min(config.hnsw.max_elements.max(1)),
                     admission_threshold: config.cache.admission_threshold,
-                    auto_tune_enabled: config.cache.auto_tune_threshold,
-                    target_utilization: config.cache.target_utilization,
                 };
 
                 let training_shutdown_rx = shutdown_tx.subscribe();
@@ -5390,7 +5443,9 @@ mod tests {
         let mut output = String::new();
         append_hsc_lifecycle_metrics(&state, &mut output);
         assert!(output.contains("kyrodb_hsc_predictor_trained"));
+        assert!(output.contains("kyrodb_hsc_predictor_threshold"));
         assert!(output.contains("kyrodb_hsc_access_logger_depth 3"));
+        assert!(output.contains("kyrodb_hsc_admission_controller_enabled 1"));
         assert!(output.contains("kyrodb_hsc_semantic_enabled 1"));
         assert!(output.contains("kyrodb_hsc_training_skips_total 1"));
     }

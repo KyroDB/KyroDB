@@ -117,11 +117,18 @@ min_training_samples = 100
 # Admission threshold (0.0-1.0) for the learned strategy.
 admission_threshold = 0.15
 
-# Auto-tune admission threshold based on cache utilization.
-auto_tune_threshold = true
+[cache.adaptive_admission]
+# Enable strategy-layer adaptive admission control.
+enabled = true
 
-# Target cache utilization (0.0-1.0) used by auto-tuning.
-target_utilization = 0.85
+# Target steady-state L1a utilization.
+target_utilization = 0.90
+
+# Minimum interval between controller updates.
+control_interval_secs = 15
+
+# Maximum bias added on top of the predictor threshold.
+max_bias = 0.18
 
 # HNSW Configuration (Vector Search Backend)
 [hnsw]

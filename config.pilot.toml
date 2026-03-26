@@ -58,8 +58,12 @@ query_cache_similarity_threshold = 0.52 # Deliberately recall-oriented for pilot
 search_access_log_top_n = 16
 min_training_samples = 100
 admission_threshold = 0.15
-auto_tune_threshold = true
-target_utilization = 0.85
+
+[cache.adaptive_admission]
+enabled = true
+target_utilization = 0.90
+control_interval_secs = 15
+max_bias = 0.18
 
 [cache.semantic]
 high_confidence_threshold = 0.60

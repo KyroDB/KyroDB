@@ -36,12 +36,12 @@ PY
 
 # Inspect live cache metrics (server must be running)
 curl -s http://127.0.0.1:51051/metrics \
-  | grep -E 'kyrodb_cache_(hits|misses|hit_rate|size)|kyrodb_training_cycles_completed_total|kyrodb_hsc_(predictor_trained|cache_threshold|tracked_docs|hot_doc_count|training_skips_total|access_logger_depth|semantic_enabled|semantic_fast_path_decisions_total|semantic_slow_path_decisions_total|semantic_hits_total|semantic_misses_total|semantic_cached_embeddings)'
+  | grep -E 'kyrodb_cache_(hits|misses|hit_rate|size)|kyrodb_training_cycles_completed_total|kyrodb_hsc_(predictor_trained|predictor_threshold|cache_threshold|admission_controller_enabled|admission_bias|target_utilization|cache_utilization|admission_controller_adjustments_total|tracked_docs|hot_doc_count|training_skips_total|access_logger_depth|semantic_enabled|semantic_fast_path_decisions_total|semantic_slow_path_decisions_total|semantic_hits_total|semantic_misses_total|semantic_cached_embeddings)'
 ```
 
 ## Key Contracts
 
-- L1a is HSC (learned predictor + semantic adapter) outside benchmark mode; non-HSC L1a strategies are benchmark-only.
+- L1a is HSC (learned predictor + strategy-layer adaptive admission controller + semantic adapter) outside benchmark mode; non-HSC L1a strategies are benchmark-only.
 - L1b is a semantic query-result cache (`QueryHashCache`) with scope isolation (`scope + query_hash` keying).
 - k-NN path order is `L1b -> L2 -> L3`; point lookup path order is `L1a -> L2 -> L3`.
 - Search response hydration uses metadata-only fetch when `include_embeddings=false`, and cache-aware embedding fetch when `include_embeddings=true`.
@@ -175,7 +175,13 @@ Prometheus metrics expose aggregate cache behavior:
 - `kyrodb_cache_size`
 - `kyrodb_training_cycles_completed_total`
 - `kyrodb_hsc_predictor_trained`
+- `kyrodb_hsc_predictor_threshold`
 - `kyrodb_hsc_cache_threshold`
+- `kyrodb_hsc_admission_controller_enabled`
+- `kyrodb_hsc_admission_bias`
+- `kyrodb_hsc_target_utilization`
+- `kyrodb_hsc_cache_utilization`
+- `kyrodb_hsc_admission_controller_adjustments_total`
 - `kyrodb_hsc_tracked_docs`
 - `kyrodb_hsc_hot_doc_count`
 - `kyrodb_hsc_training_skips_total`
@@ -189,6 +195,7 @@ Prometheus metrics expose aggregate cache behavior:
 
 Important nuance:
 
+- `kyrodb_hsc_predictor_threshold` is the threshold learned from the training window; `kyrodb_hsc_cache_threshold` is the effective runtime threshold after adaptive admission bias.
 - `/metrics` exports aggregate cache counters and HSC lifecycle metrics; detailed L1a/L1b split is still available via validation harness stats (`TieredEngineStats`) and validation artifacts, not as separate Prometheus counters.
 
 ## Tuning Guidance
@@ -202,6 +209,8 @@ Important nuance:
     - higher threshold is stricter and may collapse similarity hit rate.
 - `cache.training_interval_secs`, `cache.training_window_secs`, `cache.recency_halflife_secs`:
     - govern adaptation speed vs stability of learned admission.
+- `cache.adaptive_admission`:
+    - governs strategy-layer biasing around the predictor threshold using live L1a occupancy and feedback pressure.
 - `cache.logger_window_size`:
     - increases historical signal depth at higher memory cost.
 

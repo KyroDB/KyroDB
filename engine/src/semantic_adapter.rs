@@ -1,15 +1,13 @@
 //! Semantic Adapter for Hybrid Semantic Cache
 //!
+//! Adds semantic awareness to document-cache admission:
+//! - Cosine similarity over recently admitted document embeddings
+//! - Configurable bounded embedding history (default: 100K embeddings)
+//! - Hybrid decision score compared against the strategy's effective threshold
 //!
-//! Adds semantic awareness to frequency-based prediction:
-//! - Cosine similarity for semantic matching
-//! - Bounded embedding cache (100K recent embeddings)
-//! - Hybrid decision: frequency (55%) + semantic (45%)
-//!
-//! Performance characteristics:
-//! - Fast path (high/low confidence): 4-8ns (frequency check only)
-//! - Slow path (uncertain): 1-5ms (semantic similarity scan)
-//! - Memory overhead: ~38 MB for 100K embeddings (384-dim f32)
+//! Memory note:
+//! - 100K x 384-dim `f32` embeddings require ~146.5 MiB of raw float storage
+//!   before `Vec`, `IndexMap`, and allocator overhead.
 
 use indexmap::IndexMap;
 use parking_lot::RwLock;
@@ -79,14 +77,14 @@ struct EmbeddingCacheState {
     expected_dim: Option<usize>,
 }
 
-/// Lightweight semantic layer over frequency-based Learned predictor (forms Hybrid Semantic Cache)
+/// Lightweight semantic layer over the frequency-based predictor (forms Hybrid Semantic Cache)
 ///
 /// Strategy:
 /// 1. Check frequency-based prediction (4-8ns)
-/// 2. If high confidence (>= 0.60): definitely cache (fast path)
-/// 3. If low confidence (<= 0.25): definitely don't cache (fast path)
-/// 4. If uncertain: check semantic similarity (slow path)
-/// 5. Hybrid decision: average frequency + semantic scores
+/// 2. If frequency is far above the current effective threshold: cache immediately
+/// 3. If semantic history is empty: bootstrap on frequency only
+/// 4. Otherwise, check similarity against recently admitted document embeddings
+/// 5. Compare the hybrid score against the strategy's effective threshold
 pub struct SemanticAdapter {
     /// Embedding cache with dimension tracking under a single lock.
     cache_state: Arc<RwLock<EmbeddingCacheState>>,
@@ -123,13 +121,24 @@ impl SemanticAdapter {
     ///
     /// # Parameters
     /// - `freq_score`: Frequency-based hotness score from learned predictor (0.0-1.0)
-    /// - `embedding`: Query embedding vector
+    /// - `embedding`: Candidate document embedding under admission
+    /// - `effective_threshold`: Strategy-layer threshold after adaptive admission bias
     ///
     /// # Returns
     /// `true` if vector should be cached, `false` otherwise
-    pub fn should_cache(&self, freq_score: f32, embedding: &[f32]) -> bool {
-        // Fast path: high confidence (definitely hot)
-        if freq_score >= self.config.high_confidence_threshold {
+    pub fn should_cache(
+        &self,
+        freq_score: f32,
+        embedding: &[f32],
+        effective_threshold: f32,
+    ) -> bool {
+        let effective_threshold = effective_threshold.clamp(0.05, 1.0);
+        let fast_accept_threshold = self
+            .config
+            .high_confidence_threshold
+            .max((effective_threshold + 0.25).min(1.0));
+
+        if freq_score >= fast_accept_threshold {
             self.stats.write().fast_path_decisions += 1;
             return true;
         }
@@ -139,32 +148,19 @@ impl SemanticAdapter {
         // Bootstrap: seed semantic cache with top docs during warmup
         if cache_size == 0 {
             self.stats.write().fast_path_decisions += 1;
-            return freq_score > 0.20; // Align with predictor admission floor
+            return freq_score > effective_threshold.max(0.20);
         }
 
-        // After bootstrap: TRUST the predictor's learned threshold
-        // Semantic layer acts as BOOSTER only, not a second gatekeeper
         self.stats.write().slow_path_decisions += 1;
         let semantic_score = self.compute_semantic_score(embedding);
 
-        // Strong semantic matches can override frequency in two tiers:
-        // 1. Extremely similar embeddings (>=0.96) skip frequency checks entirely
-        // 2. Above semantic threshold (default 0.80) can admit with relaxed freq floor
-        if semantic_score >= 0.96 {
-            return true;
-        }
-
-        if semantic_score >= self.config.semantic_similarity_threshold && freq_score >= 0.10 {
-            return true;
-        }
-
-        // Definite reject: both frequency and semantic low
-        if freq_score <= self.config.low_confidence_threshold && semantic_score < 0.38 {
+        // Definite reject: both frequency and semantic signal are weak.
+        if semantic_score < 0.38 && freq_score <= (effective_threshold * 0.75) {
             return false;
         }
 
-        // Hybrid boost: rescale semantic similarity so that 0.35 maps to 0
-        // and 1.0 maps to 1.0, then weight semantic contribution at 45%
+        // Hybrid score uses the same semantic normalization as before, but the
+        // controller-owned effective threshold determines how selective HSC is.
         let semantic_floor = 0.35;
         let normalized_semantic = if semantic_score <= semantic_floor {
             0.0
@@ -172,11 +168,17 @@ impl SemanticAdapter {
             ((semantic_score - semantic_floor) / (1.0 - semantic_floor)).clamp(0.0, 1.0)
         };
 
-        let hybrid_score = freq_score * 0.55 + normalized_semantic * 0.45;
+        let semantic_bonus = if semantic_score >= 0.96 {
+            0.06
+        } else if semantic_score >= self.config.semantic_similarity_threshold {
+            0.02
+        } else {
+            0.0
+        };
 
-        // Keep admission floor aligned with predictor defaults while allowing
-        // high-semantic matches to boost borderline frequency scores.
-        hybrid_score >= 0.18
+        let hybrid_score =
+            (freq_score * 0.55 + normalized_semantic * 0.45 + semantic_bonus).clamp(0.0, 1.0);
+        hybrid_score >= effective_threshold
     }
 
     /// Compute semantic similarity score
@@ -187,7 +189,7 @@ impl SemanticAdapter {
     /// # Performance
     /// - Empty cache: <1μs
     /// - Scan 1000 embeddings (384-dim): 1-5ms
-    fn compute_semantic_score(&self, query_embedding: &[f32]) -> f32 {
+    fn compute_semantic_score(&self, candidate_embedding: &[f32]) -> f32 {
         let state = self.cache_state.read();
 
         if state.entries.is_empty() {
@@ -202,21 +204,21 @@ impl SemanticAdapter {
         let mut max_similarity = 0.0f32;
 
         for (_, cached_embedding) in state.entries.iter().skip(scan_start) {
-            if query_embedding.len() != cached_embedding.len() {
+            if candidate_embedding.len() != cached_embedding.len() {
                 debug_assert!(
                     false,
-                    "Embedding dimension mismatch: query={}, cached={}",
-                    query_embedding.len(),
+                    "Embedding dimension mismatch: candidate={}, cached={}",
+                    candidate_embedding.len(),
                     cached_embedding.len()
                 );
                 tracing::warn!(
-                    query_dim = query_embedding.len(),
+                    candidate_dim = candidate_embedding.len(),
                     cached_dim = cached_embedding.len(),
                     "Skipping embedding with dimension mismatch"
                 );
                 continue;
             }
-            let similarity = cosine_similarity(query_embedding, cached_embedding);
+            let similarity = cosine_similarity(candidate_embedding, cached_embedding);
 
             // Handle NaN/Inf from zero vectors
             if !similarity.is_finite() {
@@ -393,8 +395,8 @@ mod tests {
     fn test_semantic_adapter_fast_path_high_confidence() {
         let adapter = SemanticAdapter::new();
 
-        // High frequency score (>0.75) should skip semantic check
-        let should_cache = adapter.should_cache(0.85, &vec![0.5; 384]);
+        // High frequency score (>= 0.60) should skip semantic check
+        let should_cache = adapter.should_cache(0.85, &vec![0.5; 384], 0.18);
         assert!(should_cache);
 
         // Verify fast path used
@@ -407,8 +409,8 @@ mod tests {
     fn test_semantic_adapter_fast_path_low_confidence() {
         let adapter = SemanticAdapter::new();
 
-        // Low frequency score (<0.3) should skip semantic check
-        let should_cache = adapter.should_cache(0.2, &vec![0.5; 384]);
+        // Cold-start bootstrap still rejects low scores when history is empty.
+        let should_cache = adapter.should_cache(0.2, &vec![0.5; 384], 0.18);
         assert!(!should_cache);
 
         // Verify fast path used
@@ -422,9 +424,8 @@ mod tests {
         let adapter = SemanticAdapter::new();
 
         // Uncertain frequency score (0.25-0.75) with empty cache
-        let should_cache = adapter.should_cache(0.5, &vec![0.5; 384]);
+        let should_cache = adapter.should_cache(0.5, &vec![0.5; 384], 0.18);
 
-        // Target 2.5× cache capacity (~175 docs) for Zipf 1.4 distribution
         assert!(should_cache);
 
         // Verify fast path used (cold-start bypass)
@@ -450,12 +451,12 @@ mod tests {
             .cache_embedding(100, cached_embedding.clone())
             .unwrap();
 
-        // Query with very similar embedding
-        let query_embedding = vec![0.99; 384];
-        let should_cache = adapter.should_cache(0.5, &query_embedding);
+        // Candidate embedding with very high similarity to a cached admission history entry
+        let candidate_embedding = vec![0.99; 384];
+        let should_cache = adapter.should_cache(0.5, &candidate_embedding, 0.18);
 
-        // Cosine similarity should be very high (~1.0)
-        // Warm-up phase (< 1000): 0.5 * 0.7 + 1.0 * 0.3 = 0.65 > 0.35 → cache
+        // Cosine similarity should be very high (~1.0), which trips the semantic
+        // fast-admit override in the hybrid admission logic.
         assert!(should_cache);
 
         // Verify slow path and semantic hit
@@ -526,7 +527,7 @@ mod tests {
                     let embedding = vec![doc_id as f32; 384];
 
                     // Make decision
-                    adapter_clone.should_cache(0.5, &embedding);
+                    adapter_clone.should_cache(0.5, &embedding, 0.18);
 
                     // Cache embedding
                     let _ = adapter_clone.cache_embedding(doc_id, embedding);
@@ -552,5 +553,21 @@ mod tests {
         assert_eq!(config.semantic_similarity_threshold, 0.80);
         assert_eq!(config.max_cached_embeddings, 100_000);
         assert_eq!(config.similarity_scan_limit, 2000);
+    }
+
+    #[test]
+    fn test_effective_threshold_controls_semantic_selectivity() {
+        let adapter = SemanticAdapter::new();
+        adapter.cache_embedding(1, vec![1.0; 384]).unwrap();
+
+        let candidate_embedding = vec![0.97; 384];
+        assert!(
+            adapter.should_cache(0.05, &candidate_embedding, 0.20),
+            "low threshold should admit strong semantic neighbor"
+        );
+        assert!(
+            !adapter.should_cache(0.05, &candidate_embedding, 0.55),
+            "high threshold should reject the same candidate"
+        );
     }
 }

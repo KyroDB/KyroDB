@@ -10,10 +10,14 @@
 //! - L1a (this module): Document-level cache with Learned frequency prediction
 //! - L1b (query_hash_cache): Query-level cache with semantic similarity
 
-use crate::learned_cache::LearnedCachePredictor;
+use crate::adaptive_admission::{
+    AdaptiveAdmissionConfig, AdaptiveAdmissionController, AdaptiveAdmissionSignals,
+    AdaptiveAdmissionSnapshot,
+};
+use crate::learned_cache::{FeedbackBacklog, LearnedCachePredictor};
 use crate::semantic_adapter::SemanticAdapter;
 use crate::vector_cache::{CachedVector, VectorCache};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -25,7 +29,13 @@ use tracing::{instrument, trace};
 #[derive(Debug, Clone, Default)]
 pub struct CacheLifecycleStats {
     pub predictor_trained: bool,
+    pub predictor_threshold: f32,
     pub cache_threshold: f32,
+    pub admission_controller_enabled: bool,
+    pub admission_bias: f32,
+    pub target_utilization: f32,
+    pub cache_utilization: f32,
+    pub admission_controller_adjustments: u64,
     pub tracked_docs: usize,
     pub hot_doc_count: usize,
     pub training_skips: u64,
@@ -165,8 +175,11 @@ impl CacheStrategy for LruCacheStrategy {
 pub struct LearnedCacheStrategy {
     pub cache: Arc<VectorCache>,
     pub predictor: Arc<parking_lot::RwLock<LearnedCachePredictor>>,
+    admission_controller: parking_lot::RwLock<AdaptiveAdmissionController>,
+    predictor_feedback_owner: parking_lot::RwLock<HashMap<u64, bool>>,
     /// Optional semantic adapter for hybrid frequency+semantic admission
     semantic_adapter: Option<SemanticAdapter>,
+    cache_insertions: AtomicU64,
     training_skips: AtomicU64,
     name: String,
 }
@@ -183,7 +196,12 @@ impl LearnedCacheStrategy {
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
+            admission_controller: parking_lot::RwLock::new(AdaptiveAdmissionController::new(
+                AdaptiveAdmissionConfig::default(),
+            )),
+            predictor_feedback_owner: parking_lot::RwLock::new(HashMap::with_capacity(capacity)),
             semantic_adapter: None,
+            cache_insertions: AtomicU64::new(0),
             training_skips: AtomicU64::new(0),
             name: "learned_predictor".to_string(),
         }
@@ -191,9 +209,11 @@ impl LearnedCacheStrategy {
 
     /// Create new Learned Cache strategy with semantic adapter (hybrid frequency+semantic)
     ///
-    /// Combines Learned frequency prediction with semantic similarity for cache admission.
+    /// Combines Learned frequency prediction with document-embedding similarity
+    /// for cache admission.
     /// When frequency score is uncertain (between low and high confidence thresholds),
-    /// semantic similarity is used as a tiebreaker.
+    /// similarity against recent admitted document embeddings is used as a
+    /// tiebreaker.
     ///
     /// # Parameters
     /// - `capacity`: Cache capacity
@@ -209,10 +229,22 @@ impl LearnedCacheStrategy {
         Self {
             cache: Arc::new(VectorCache::new(capacity)),
             predictor: Arc::new(parking_lot::RwLock::new(predictor)),
+            admission_controller: parking_lot::RwLock::new(AdaptiveAdmissionController::new(
+                AdaptiveAdmissionConfig::default(),
+            )),
+            predictor_feedback_owner: parking_lot::RwLock::new(HashMap::with_capacity(capacity)),
             semantic_adapter: Some(semantic_adapter),
+            cache_insertions: AtomicU64::new(0),
             training_skips: AtomicU64::new(0),
             name: "learned_semantic".to_string(),
         }
+    }
+
+    /// Override adaptive admission config before the strategy is shared.
+    pub fn with_adaptive_admission(mut self, config: AdaptiveAdmissionConfig) -> Self {
+        self.admission_controller =
+            parking_lot::RwLock::new(AdaptiveAdmissionController::new(config));
+        self
     }
 
     /// Check if this strategy has a semantic adapter attached
@@ -268,6 +300,41 @@ impl LearnedCacheStrategy {
         let bucket = (hasher.finish() & 0xFFFF) as u16;
         bucket as f32 / u16::MAX as f32
     }
+
+    fn admission_signals(&self, feedback_backlog: FeedbackBacklog) -> AdaptiveAdmissionSignals {
+        let cache_stats = self.cache.stats();
+        AdaptiveAdmissionSignals {
+            cache_size: cache_stats.size,
+            cache_capacity: cache_stats.capacity,
+            cache_hits: cache_stats.hits,
+            cache_misses: cache_stats.misses,
+            cache_evictions: cache_stats.evictions,
+            cache_insertions: self.cache_insertions.load(Ordering::Relaxed),
+            false_positive_docs: feedback_backlog.false_positive_docs,
+            false_negative_docs: feedback_backlog.false_negative_docs,
+            miss_streak_docs: feedback_backlog.miss_streak_docs,
+        }
+    }
+
+    fn admission_snapshot(
+        &self,
+        predictor_threshold: f32,
+        admission_floor: f32,
+        feedback_backlog: FeedbackBacklog,
+        refresh: bool,
+    ) -> AdaptiveAdmissionSnapshot {
+        let signals = self.admission_signals(feedback_backlog);
+        {
+            let controller = self.admission_controller.read();
+            if !refresh || !controller.needs_refresh() {
+                return controller.snapshot(predictor_threshold, admission_floor, signals);
+            }
+        }
+
+        self.admission_controller
+            .write()
+            .observe(predictor_threshold, admission_floor, signals)
+    }
 }
 
 impl CacheStrategy for LearnedCacheStrategy {
@@ -287,7 +354,24 @@ impl CacheStrategy for LearnedCacheStrategy {
                 let predictor = self.predictor.read();
                 if predictor.is_trained() {
                     let predicted = predictor.lookup_hotness(doc_id).unwrap_or(0.0);
-                    predictor.record_cache_miss(doc_id, predicted);
+                    let predictor_threshold = predictor.cache_threshold();
+                    let admission_floor = predictor.admission_floor();
+                    let feedback_backlog = predictor.feedback_backlog();
+                    drop(predictor);
+
+                    let admission = self.admission_snapshot(
+                        predictor_threshold,
+                        admission_floor,
+                        feedback_backlog,
+                        true,
+                    );
+                    let predictor = self.predictor.read();
+                    predictor.record_cache_miss(
+                        doc_id,
+                        predicted,
+                        predictor_threshold,
+                        admission.effective_threshold,
+                    );
                 }
                 None
             }
@@ -343,17 +427,30 @@ impl CacheStrategy for LearnedCacheStrategy {
 
         // Get frequency-based prediction (learned predictor)
         let freq_score = predictor.lookup_hotness(doc_id).unwrap_or(0.0);
-        let threshold = predictor.cache_threshold().max(predictor.admission_floor());
+        let predictor_threshold = predictor.cache_threshold();
+        let admission_floor = predictor.admission_floor();
+        let feedback_backlog = predictor.feedback_backlog();
+        drop(predictor);
+
+        let admission =
+            self.admission_snapshot(predictor_threshold, admission_floor, feedback_backlog, true);
+        let effective_threshold = admission.effective_threshold;
 
         // If semantic adapter is present, use hybrid decision
         if let Some(ref adapter) = self.semantic_adapter {
-            let should_admit = adapter.should_cache(freq_score, embedding);
+            let should_admit = adapter.should_cache(freq_score, embedding, effective_threshold);
+            let predictor_owned = freq_score >= predictor_threshold;
 
             if should_admit {
+                self.predictor_feedback_owner
+                    .write()
+                    .insert(doc_id, predictor_owned);
                 trace!(
                     doc_id,
                     freq_score,
-                    threshold,
+                    predictor_threshold,
+                    effective_threshold,
+                    admission_bias = admission.admission_bias,
                     "admit (hybrid semantic+freq)"
                 );
                 // Cache embedding for future semantic lookups
@@ -361,10 +458,13 @@ impl CacheStrategy for LearnedCacheStrategy {
                     tracing::warn!(doc_id, error = %e, "SemanticAdapter: cache_embedding rejected");
                 }
             } else {
+                self.predictor_feedback_owner.write().remove(&doc_id);
                 trace!(
                     doc_id,
                     freq_score,
-                    threshold,
+                    predictor_threshold,
+                    effective_threshold,
+                    admission_bias = admission.admission_bias,
                     "reject (hybrid semantic+freq)"
                 );
             }
@@ -373,22 +473,49 @@ impl CacheStrategy for LearnedCacheStrategy {
         }
 
         // Pure frequency-based admission (frequency predictor only)
-        let should_admit = freq_score >= threshold;
+        let should_admit = freq_score >= effective_threshold;
+        if should_admit {
+            self.predictor_feedback_owner
+                .write()
+                .insert(doc_id, freq_score >= predictor_threshold);
+        } else {
+            self.predictor_feedback_owner.write().remove(&doc_id);
+        }
 
         if should_admit {
-            trace!(doc_id, freq_score, threshold, "admit (freq >= threshold)");
+            trace!(
+                doc_id,
+                freq_score,
+                predictor_threshold,
+                effective_threshold,
+                admission_bias = admission.admission_bias,
+                "admit (freq >= effective threshold)"
+            );
         } else {
-            trace!(doc_id, freq_score, threshold, "reject (freq < threshold)");
+            trace!(
+                doc_id,
+                freq_score,
+                predictor_threshold,
+                effective_threshold,
+                admission_bias = admission.admission_bias,
+                "reject (freq < effective threshold)"
+            );
         }
 
         should_admit
     }
     #[instrument(level = "trace", skip(self, cached_vector), fields(doc_id = cached_vector.doc_id))]
     fn insert_cached(&self, cached_vector: CachedVector) {
+        self.cache_insertions.fetch_add(1, Ordering::Relaxed);
         let evicted_doc_id = self.cache.insert(cached_vector);
         if let Some(evicted) = evicted_doc_id {
+            let predictor_owned = self
+                .predictor_feedback_owner
+                .write()
+                .remove(&evicted)
+                .unwrap_or(false);
             let predictor = self.predictor.read();
-            if predictor.is_trained() {
+            if predictor.is_trained() && predictor_owned {
                 predictor.record_eviction(evicted);
             }
         }
@@ -399,6 +526,7 @@ impl CacheStrategy for LearnedCacheStrategy {
         // data updates/deletions, NOT cache-pressure evictions. Recording invalidations
         // as evictions would contaminate the predictor's training signal since invalidated
         // items will never be requested again (they've been deleted from the source).
+        self.predictor_feedback_owner.write().remove(&doc_id);
         self.cache.remove(doc_id);
     }
 
@@ -409,14 +537,23 @@ impl CacheStrategy for LearnedCacheStrategy {
     fn stats(&self) -> String {
         let stats = self.cache.stats();
         let predictor = self.predictor.read();
+        let admission = self.admission_snapshot(
+            predictor.cache_threshold(),
+            predictor.admission_floor(),
+            predictor.feedback_backlog(),
+            false,
+        );
 
         let base_stats = format!(
-            "Learned: {} hits, {} misses, {:.2}% hit rate, {} evictions, {} tracked docs",
+            "Learned: {} hits, {} misses, {:.2}% hit rate, {} evictions, {} tracked docs, eff_threshold {:.3}, bias {:+.3}, util {:.1}%",
             stats.hits,
             stats.misses,
             stats.hit_rate * 100.0,
             stats.evictions,
-            predictor.tracked_count()
+            predictor.tracked_count(),
+            admission.effective_threshold,
+            admission.admission_bias,
+            admission.current_utilization * 100.0
         );
 
         // Append semantic stats if adapter is present
@@ -441,9 +578,21 @@ impl CacheStrategy for LearnedCacheStrategy {
 
     fn lifecycle_stats(&self) -> Option<CacheLifecycleStats> {
         let predictor = self.predictor.read();
+        let admission = self.admission_snapshot(
+            predictor.cache_threshold(),
+            predictor.admission_floor(),
+            predictor.feedback_backlog(),
+            false,
+        );
         let mut lifecycle = CacheLifecycleStats {
             predictor_trained: predictor.is_trained(),
-            cache_threshold: predictor.cache_threshold(),
+            predictor_threshold: predictor.cache_threshold(),
+            cache_threshold: admission.effective_threshold,
+            admission_controller_enabled: admission.enabled,
+            admission_bias: admission.admission_bias,
+            target_utilization: admission.target_utilization,
+            cache_utilization: admission.current_utilization,
+            admission_controller_adjustments: admission.adjustments,
             tracked_docs: predictor.tracked_count(),
             hot_doc_count: self.cache.len(),
             training_skips: self.training_skips.load(Ordering::Relaxed),
@@ -796,6 +945,116 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_adaptive_admission_config_is_exposed_via_lifecycle() {
+        let predictor = LearnedCachePredictor::new(128).unwrap();
+        let strategy = LearnedCacheStrategy::new(32, predictor).with_adaptive_admission(
+            AdaptiveAdmissionConfig {
+                enabled: true,
+                target_utilization: 0.93,
+                control_interval_secs: 30,
+                max_bias: 0.12,
+            },
+        );
+
+        let lifecycle = strategy
+            .lifecycle_stats()
+            .expect("learned strategy should expose lifecycle stats");
+        assert!(lifecycle.admission_controller_enabled);
+        assert!((lifecycle.target_utilization - 0.93).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_controller_assisted_admission_does_not_poison_false_positive_feedback() {
+        let mut predictor = LearnedCachePredictor::new(128).unwrap();
+        let mut events = Vec::new();
+        for _ in 0..64 {
+            events.push(AccessEvent {
+                doc_id: 1,
+                timestamp: SystemTime::now(),
+                access_type: crate::learned_cache::AccessType::Read,
+            });
+        }
+        for _ in 0..8 {
+            events.push(AccessEvent {
+                doc_id: 2,
+                timestamp: SystemTime::now(),
+                access_type: crate::learned_cache::AccessType::Read,
+            });
+        }
+        predictor.train_from_accesses(&events).unwrap();
+
+        let doc2_score = predictor.predict_hotness(2);
+        predictor.set_cache_threshold((doc2_score + 0.03).min(0.95));
+
+        let strategy = LearnedCacheStrategy::new(1, predictor).with_adaptive_admission(
+            AdaptiveAdmissionConfig {
+                enabled: true,
+                target_utilization: 0.95,
+                control_interval_secs: 0,
+                max_bias: 0.20,
+            },
+        );
+
+        assert!(
+            strategy.should_cache(2, &vec![0.5; 128]),
+            "underfilled controller should relax threshold enough to admit doc 2"
+        );
+        strategy.insert_cached(create_test_vector(2));
+        strategy.insert_cached(create_test_vector(99));
+
+        let feedback = strategy.predictor.read().feedback_backlog();
+        assert_eq!(
+            feedback.false_positive_docs, 0,
+            "controller-assisted admission must not be recorded as predictor false positive"
+        );
+    }
+
+    #[test]
+    fn test_controller_relaxed_threshold_does_not_create_predictor_false_negative() {
+        let mut predictor = LearnedCachePredictor::new(128).unwrap();
+        let mut events = Vec::new();
+        for _ in 0..64 {
+            events.push(AccessEvent {
+                doc_id: 1,
+                timestamp: SystemTime::now(),
+                access_type: crate::learned_cache::AccessType::Read,
+            });
+        }
+        for _ in 0..8 {
+            events.push(AccessEvent {
+                doc_id: 2,
+                timestamp: SystemTime::now(),
+                access_type: crate::learned_cache::AccessType::Read,
+            });
+        }
+        predictor.train_from_accesses(&events).unwrap();
+
+        let doc2_score = predictor.predict_hotness(2);
+        predictor.set_cache_threshold((doc2_score + 0.03).min(0.95));
+
+        let strategy = LearnedCacheStrategy::new(16, predictor).with_adaptive_admission(
+            AdaptiveAdmissionConfig {
+                enabled: true,
+                target_utilization: 0.95,
+                control_interval_secs: 0,
+                max_bias: 0.20,
+            },
+        );
+
+        assert!(
+            strategy.get_cached(2).is_none(),
+            "doc should miss because it is not yet cached"
+        );
+
+        let feedback = strategy.predictor.read().feedback_backlog();
+        assert_eq!(
+            feedback.false_negative_docs, 0,
+            "controller-relaxed misses must not be counted as predictor false negatives"
+        );
+        assert_eq!(feedback.miss_streak_docs, 1);
+    }
+
+    #[test]
     fn test_ab_test_splitter_distribution() {
         let lru = Arc::new(LruCacheStrategy::new(10));
         let predictor = LearnedCachePredictor::new(100).unwrap();
@@ -857,7 +1116,12 @@ mod tests {
         // Seed runtime feedback in the currently active predictor.
         {
             let predictor = strategy.predictor.read();
-            predictor.record_cache_miss(7, 0.0);
+            predictor.record_cache_miss(
+                7,
+                0.0,
+                predictor.cache_threshold(),
+                predictor.cache_threshold(),
+            );
             predictor.record_eviction(9);
         }
         let feedback_before = strategy.predictor.read().feedback_backlog();

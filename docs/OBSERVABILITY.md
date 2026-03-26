@@ -64,7 +64,13 @@ curl -H "x-api-key: <ADMIN_API_KEY>" "http://127.0.0.1:51051/usage?scope=all"
 - `kyrodb_wal_writes_failed`
 - `kyrodb_training_cycles_completed_total`
 - `kyrodb_hsc_predictor_trained`
+- `kyrodb_hsc_predictor_threshold`
 - `kyrodb_hsc_cache_threshold`
+- `kyrodb_hsc_admission_controller_enabled`
+- `kyrodb_hsc_admission_bias`
+- `kyrodb_hsc_target_utilization`
+- `kyrodb_hsc_cache_utilization`
+- `kyrodb_hsc_admission_controller_adjustments_total`
 - `kyrodb_hsc_tracked_docs`
 - `kyrodb_hsc_hot_doc_count`
 - `kyrodb_hsc_training_skips_total`
@@ -79,6 +85,11 @@ curl -H "x-api-key: <ADMIN_API_KEY>" "http://127.0.0.1:51051/usage?scope=all"
 - `kyrodb_memory_used_bytes`
 - `kyrodb_disk_used_bytes`
 - `kyrodb_ready`
+
+HSC metric note:
+
+- `kyrodb_hsc_predictor_threshold` is the trained threshold coming out of the hotness model.
+- `kyrodb_hsc_cache_threshold` is the effective runtime threshold after strategy-layer adaptive admission bias.
 
 ## Prometheus Example
 

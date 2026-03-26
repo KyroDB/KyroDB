@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::adaptive_admission::AdaptiveAdmissionConfig;
+
 // ============================================================================
 // Main Configuration Structure
 // ============================================================================
@@ -207,11 +209,8 @@ pub struct CacheConfig {
     /// Admission threshold for cache (0.0-1.0)
     pub admission_threshold: f32,
 
-    /// Auto-tune admission threshold based on utilization
-    pub auto_tune_threshold: bool,
-
-    /// Target cache utilization for auto-tuning (0.0-1.0)
-    pub target_utilization: f32,
+    /// Strategy-layer adaptive admission controller.
+    pub adaptive_admission: AdaptiveAdmissionConfig,
 
     /// Semantic adapter tuning for HSC admission.
     pub semantic: SemanticAdapterConfig,
@@ -265,8 +264,7 @@ impl Default for CacheConfig {
             recency_halflife_secs: 1800,
             min_training_samples: 100,
             admission_threshold: 0.15,
-            auto_tune_threshold: true,
-            target_utilization: 0.85,
+            adaptive_admission: AdaptiveAdmissionConfig::default(),
             semantic: SemanticAdapterConfig::default(),
         }
     }
@@ -838,6 +836,28 @@ impl KyroDbConfig {
             self.cache.min_training_samples
         );
         anyhow::ensure!(
+            (0.0..=1.0).contains(&self.cache.admission_threshold),
+            "cache.admission_threshold must be in [0.0, 1.0], got {}",
+            self.cache.admission_threshold
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.cache.adaptive_admission.target_utilization),
+            "cache.adaptive_admission.target_utilization must be in [0.0, 1.0], got {}",
+            self.cache.adaptive_admission.target_utilization
+        );
+        anyhow::ensure!(
+            self.cache.adaptive_admission.control_interval_secs > 0,
+            "cache.adaptive_admission.control_interval_secs must be > 0, got {}",
+            self.cache.adaptive_admission.control_interval_secs
+        );
+        anyhow::ensure!(
+            self.cache.adaptive_admission.max_bias.is_finite()
+                && self.cache.adaptive_admission.max_bias > 0.0
+                && self.cache.adaptive_admission.max_bias <= 0.5,
+            "cache.adaptive_admission.max_bias must be in (0.0, 0.5], got {}",
+            self.cache.adaptive_admission.max_bias
+        );
+        anyhow::ensure!(
             self.cache.training_interval_secs > 0,
             "training_interval_secs must be > 0, got {}",
             self.cache.training_interval_secs
@@ -1285,6 +1305,30 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "training_interval_secs must be > 0"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_admission_config_validation() {
+        let mut config = KyroDbConfig::default();
+        config.cache.adaptive_admission.control_interval_secs = 0;
+        assert!(
+            config.validate().is_err(),
+            "adaptive admission control interval must be positive"
+        );
+
+        let mut config = KyroDbConfig::default();
+        config.cache.adaptive_admission.max_bias = 0.0;
+        assert!(
+            config.validate().is_err(),
+            "adaptive admission max_bias must be positive"
+        );
+
+        let mut config = KyroDbConfig::default();
+        config.cache.adaptive_admission.target_utilization = 1.1;
+        assert!(
+            config.validate().is_err(),
+            "adaptive admission target_utilization must stay in [0, 1]"
         );
     }
 

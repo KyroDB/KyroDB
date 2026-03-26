@@ -57,8 +57,11 @@ cache:
   search_access_log_top_n: 16
   min_training_samples: 100
   admission_threshold: 0.15
-  auto_tune_threshold: true
-  target_utilization: 0.85
+  adaptive_admission:
+    enabled: true
+    target_utilization: 0.90
+    control_interval_secs: 15
+    max_bias: 0.18
   semantic:
     high_confidence_threshold: 0.60
     low_confidence_threshold: 0.25

@@ -1,7 +1,7 @@
 // End-to-end integration test for three-tier architecture
 //
 // This test validates the complete query journey through all three layers:
-// - Layer 1: Hybrid Semantic Cache (RMI + semantic prediction)
+// - Layer 1: Hybrid Semantic Cache (learned hotness + semantic admission)
 // - Layer 2: Hot tier (recent-write mirror / acceleration layer)
 // - Layer 3: Cold tier (canonical HNSW + persistence)
 

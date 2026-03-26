@@ -258,8 +258,6 @@ async fn test_background_training_updates_predictor() {
         min_events_for_training: 100,
         predictor_capacity: 100,
         admission_threshold: 0.15,
-        auto_tune_enabled: true,
-        target_utilization: 0.85,
     };
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);

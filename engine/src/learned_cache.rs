@@ -1,15 +1,15 @@
 //! Hybrid Semantic Cache Predictor (Frequency Component)
 //!
 //! **Purpose**: Learned frequency prediction for document-level hotness.
-//! Combined with semantic similarity adapter for hybrid cache admission decisions.
+//! Combined with the semantic adapter for hybrid cache admission decisions.
 //!
-//! This module predicts cache hotness: doc_id → P(hot | recent_accesses)
-//! learned predictor learns access patterns and predicts which documents should be cached.
+//! This module learns cache hotness as `doc_id -> hotness_score` from recent access traffic.
+//! The production predictor is a direct hash map rebuilt from sliding-window access logs.
 //!
 //! Architecture:
-//! - learned predictor stores doc_id → hotness_score (O(log n) lookup)
-//! - Semantic adapter computes embedding similarity (optional hybrid layer)
-//! - Access logger feeds training data
+//! - Predictor stores `doc_id -> hotness_score` with O(1) lookups
+//! - Semantic adapter boosts borderline admissions using document-embedding similarity
+//! - Access logger feeds retraining windows
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -50,14 +50,15 @@ pub enum AccessType {
     Write,
 }
 
-/// Hybrid Semantic Cache predictor using learned predictor to predict document hotness (frequency component)
+/// Hybrid Semantic Cache predictor for document hotness (frequency component)
 ///
 /// Predicts P(hot | recent_accesses) for each document ID.
 /// Documents with high predicted hotness are kept in cache.
 ///
 /// # Architecture
-/// - Layer 1: Root model (coarse-grained segment selection)
-/// - Layer 2: Segment models (fine-grained hotness prediction per doc_id)
+/// - Sliding-window access aggregation
+/// - `doc_id -> hotness_score` lookup table
+/// - Feedback corrections from misses and evictions
 /// - Training: Updates from access pattern logger every 10 minutes
 ///
 /// # Example
@@ -106,15 +107,6 @@ pub struct LearnedCachePredictor {
     /// Exponential moving average factor for threshold calibration (0 = no smoothing)
     threshold_smoothing: f32,
 
-    /// Target cache utilization for auto-tuning (0.0-1.0)
-    target_utilization: f32,
-
-    /// Threshold adjustment rate for calibration (0.0-1.0)
-    threshold_adjustment_rate: f32,
-
-    /// Auto-tune threshold based on cache utilization
-    auto_tune_enabled: bool,
-
     /// Training window (how far back to consider accesses)
     training_window: Duration,
 
@@ -129,9 +121,6 @@ pub struct LearnedCachePredictor {
 
     /// Training interval (how often to retrain)
     training_interval: Duration,
-
-    /// Last calibration timestamp (for rate-limited auto-tuning)
-    last_calibration: Arc<parking_lot::RwLock<SystemTime>>,
 
     /// FEEDBACK LOOP: Track false positives (predicted hot but evicted without re-access)
     /// doc_id → number of times evicted from cache
@@ -198,7 +187,6 @@ impl LearnedCachePredictor {
     /// - Training window: 1 hour (faster adaptation)
     /// - Recency half-life: 30 minutes (faster decay)
     /// - Training interval: 10 minutes
-    /// - Auto-tune: ENABLED (target 80% utilization for learning headroom)
     pub fn new(capacity: usize) -> Result<Self> {
         // Use learned predictor as WIDE NET (recall-focused), semantic adapter filters false positives.
         // Threshold balances recall (don't reject hot docs) vs precision (don't admit cold docs).
@@ -220,15 +208,11 @@ impl LearnedCachePredictor {
             unseen_admission_chance: 0.35,
             target_hot_entries: capacity,
             threshold_smoothing: 0.3,
-            target_utilization: 0.80,
-            threshold_adjustment_rate: 0.10,
-            auto_tune_enabled: false,
             training_window: Duration::from_secs(3600),
             recency_halflife: Duration::from_secs(1800),
             capacity,
             last_trained: UNIX_EPOCH,
             training_interval: Duration::from_secs(600),
-            last_calibration: Arc::new(parking_lot::RwLock::new(UNIX_EPOCH)),
             false_positives: Arc::new(RwLock::new(HashMap::new())),
             false_negatives: Arc::new(RwLock::new(HashMap::new())),
             diversity_bucket_count: DEFAULT_DIVERSITY_BUCKETS,
@@ -256,15 +240,11 @@ impl LearnedCachePredictor {
             unseen_admission_chance: 0.20,
             target_hot_entries: capacity,
             threshold_smoothing: 0.6,
-            target_utilization: 0.85,
-            threshold_adjustment_rate: 0.05,
-            auto_tune_enabled: false,
             training_window,
             recency_halflife,
             capacity,
             last_trained: UNIX_EPOCH,
             training_interval,
-            last_calibration: Arc::new(parking_lot::RwLock::new(UNIX_EPOCH)),
             false_positives: Arc::new(RwLock::new(HashMap::new())),
             false_negatives: Arc::new(RwLock::new(HashMap::new())),
             diversity_bucket_count: DEFAULT_DIVERSITY_BUCKETS,
@@ -321,9 +301,8 @@ impl LearnedCachePredictor {
 
     /// Decide if document should be cached based on predicted hotness
     ///
-    /// Returns `true` if predicted hotness > cache_threshold
-    ///
-    /// PERMISSIVE by default (threshold=0.3): caches anything reasonably hot
+    /// Returns `true` if the miss-adjusted hotness score clears the current
+    /// admission floor derived from the trained threshold.
     pub fn should_cache(&self, doc_id: u64) -> bool {
         // Use the new admission_score for the caching decision.
         let score = self.admission_score(doc_id);
@@ -526,71 +505,6 @@ impl LearnedCachePredictor {
         }
     }
 
-    /// Auto-calibrate threshold based on current cache utilization
-    ///
-    /// Adjusts admission threshold to maintain target cache utilization (default: 85%).
-    /// Called periodically by cache strategy to dynamically tune threshold.
-    ///
-    /// # Parameters
-    /// - `current_cache_size`: Current number of entries in cache
-    ///
-    /// # Algorithm
-    /// - If utilization < 75%: Lower threshold by 5% (admit more)
-    /// - If utilization > 95%: Raise threshold by 5% (admit less)
-    /// - Clamped to [0.05, 0.95] bounds
-    pub fn calibrate_threshold(&mut self, current_cache_size: usize) {
-        if !self.auto_tune_enabled {
-            return;
-        }
-
-        // RATE LIMITING: Only calibrate once every 60 seconds to prevent per-query instability
-        const CALIBRATION_INTERVAL_SECS: u64 = 60;
-        let now = SystemTime::now();
-        let mut last_cal = self.last_calibration.write();
-        if let Ok(elapsed) = now.duration_since(*last_cal) {
-            if elapsed.as_secs() < CALIBRATION_INTERVAL_SECS {
-                return; // Too soon, skip calibration
-            }
-        }
-        *last_cal = now;
-        drop(last_cal);
-
-        let capacity = self.capacity;
-        if capacity == 0 {
-            return;
-        }
-
-        let current_utilization = current_cache_size as f32 / capacity as f32;
-        let target = self.target_utilization;
-        let rate = self.threshold_adjustment_rate;
-
-        let lower_bound = target * 0.9;
-        let upper_bound = target * 1.1;
-
-        if current_utilization < lower_bound {
-            let new_threshold = self.cache_threshold * (1.0 - rate);
-            self.cache_threshold = new_threshold.max(self.admission_floor);
-        } else if current_utilization > upper_bound {
-            let new_threshold = self.cache_threshold * (1.0 + rate);
-            self.cache_threshold = new_threshold.min(0.95);
-        }
-    }
-
-    /// Enable or disable auto-tuning
-    pub fn set_auto_tune(&mut self, enabled: bool) {
-        self.auto_tune_enabled = enabled;
-    }
-
-    /// Set target cache utilization (0.0-1.0)
-    pub fn set_target_utilization(&mut self, target: f32) {
-        self.target_utilization = target.clamp(0.1, 1.0);
-    }
-
-    /// Set threshold adjustment rate (0.0-1.0)
-    pub fn set_adjustment_rate(&mut self, rate: f32) {
-        self.threshold_adjustment_rate = rate.clamp(0.01, 0.5);
-    }
-
     /// Maximum number of documents this predictor can track
     pub fn capacity_limit(&self) -> usize {
         self.capacity
@@ -778,8 +692,20 @@ impl LearnedCachePredictor {
 
     /// FEEDBACK LOOP: Called when cache misses a document (predicted cold but accessed)
     /// This indicates learned predictor missed a hot document (false negative)
-    pub fn record_cache_miss(&self, doc_id: u64, predicted_hotness: f32) {
-        if predicted_hotness < self.cache_threshold {
+    ///
+    /// `predictor_threshold` and `decision_threshold` must come from the same
+    /// admission decision. We only count a false negative when both the base
+    /// predictor threshold and the current runtime policy would have rejected
+    /// the document; otherwise the miss was caused by controller/semantic policy
+    /// rather than the predictor.
+    pub fn record_cache_miss(
+        &self,
+        doc_id: u64,
+        predicted_hotness: f32,
+        predictor_threshold: f32,
+        decision_threshold: f32,
+    ) {
+        if predicted_hotness < predictor_threshold.min(decision_threshold) {
             *self.false_negatives.write().entry(doc_id).or_insert(0) += 1;
         }
 
@@ -1172,7 +1098,12 @@ mod tests {
         assert!(baseline > 0.5);
 
         for _ in 0..8 {
-            predictor.record_cache_miss(1, 0.0);
+            predictor.record_cache_miss(
+                1,
+                0.0,
+                predictor.cache_threshold(),
+                predictor.cache_threshold(),
+            );
         }
 
         predictor.train_from_accesses(&accesses).unwrap();
